@@ -24,12 +24,6 @@ gvfproject/
 
 - **ROS版本**: ROS Noetic
 - **Ubuntu版本**: Ubuntu 20.04 (ROS Noetic)
-- **依赖包**:
-  - catkin_tools 或 catkin_make
-  - Eigen3
-  - PCL (Point Cloud Library)
-  - OpenCV
-  - cv_bridge
 
 ## Git拉取和使用
 
