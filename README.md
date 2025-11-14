@@ -30,7 +30,6 @@ gvfproject/
 ### 1. 从Git仓库拉取代码
 
 ```bash
-# 克隆仓库（请替换为实际的Git仓库地址）
 git clone https://github.com/Guangming-Planning-and-Control-Group/GVF_close_loop_planning.git
 cd gvfproject
 ```
