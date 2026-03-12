@@ -19,7 +19,17 @@
 #include <ros/ros.h>
 
 //Nlopt optimization
-#include <nlopt.hpp>
+#ifdef __has_include
+#  if __has_include(<nlopt.hpp>)
+#    include <nlopt.hpp>
+#  elif __has_include(<nlopt/nlopt.hpp>)
+#    include <nlopt/nlopt.hpp>
+#  else
+#    error "nlopt.hpp not found. Please install libnlopt-dev or ros-noetic-nlopt."
+#  endif
+#else
+#  include <nlopt.hpp>
+#endif
 
 //自定义
 #include <bspline_race/UniformBspline_3d.h>

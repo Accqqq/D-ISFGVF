@@ -117,6 +117,10 @@ private:
   double resolution_, inv_resolution_, time_resolution_, inv_time_resolution_;
   Eigen::Vector3d origin_, map_size_3d_;
   double time_origin_;
+
+  /* z-band constraint */
+  double z_min_, z_max_;
+  double z_ref_, w_z_;
   
   /* path pruning */
   int path_sample_interval_;

@@ -29,6 +29,7 @@ void gvf::init(ros::NodeHandle& nh, const std::string& particle, const std::stri
     nh.param("gvf/gvf_use_kinopath", use_kinopath_, true);
     nh.param("gvf/gvf_use_quad_fit", use_quad_fit_, true);
     nh.param("gvf/gvf_inflation", gvf_.obstacles_inflation_, -1.0);
+    nh.param("gvf/path_vis_timeout_sec", path_vis_timeout_sec_, 1.0);
     
     nh.param("gvf/local_update_range_x", gvf_.local_update_range_(0), -1.0);
     nh.param("gvf/local_update_range_y", gvf_.local_update_range_(1), -1.0);
@@ -105,6 +106,8 @@ void gvf::init(ros::NodeHandle& nh, const std::string& particle, const std::stri
     update_range_pub_ = nh.advertise<visualization_msgs::Marker>(particle +"/gvf/update_range", 10);
     gvf_vis_pub_ = nh.advertise<visualization_msgs::MarkerArray>(particle +"/gvf/traj_vis", 10);
     vector_field_pub_ = nh.advertise<visualization_msgs::MarkerArray>(particle +"/gvf/vector_field", 10);
+
+    last_path_recv_time_ = ros::Time(0);
 }
 
 void gvf::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
@@ -266,7 +269,11 @@ void gvf::odomCallback(const nav_msgs::OdometryConstPtr& odom)
 void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
 {
     if (use_kinopath_) return;  // 如果使用动力学路径，则不处理A*路径
-    if (msg->poses.empty()) return;
+    last_path_recv_time_ = ros::Time::now();
+    if (msg->poses.empty()) {
+        last_path_.poses.clear();
+        return;
+    }
     if (std::isnan(gvf_.camera_pos_(0)) || 
         std::isnan(gvf_.camera_pos_(1)) || 
         std::isnan(gvf_.camera_pos_(2))) return;
@@ -322,7 +329,11 @@ void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
 void gvf::kinoPathCallback(const nav_msgs::Path::ConstPtr& msg)
 {
     if (!use_kinopath_) return;  // 如果不使用动力学路径，则不处理
-    if (msg->poses.empty()) return;
+    last_path_recv_time_ = ros::Time::now();
+    if (msg->poses.empty()) {
+        last_path_.poses.clear();
+        return;
+    }
     if (std::isnan(gvf_.camera_pos_(0)) || 
         std::isnan(gvf_.camera_pos_(1)) || 
         std::isnan(gvf_.camera_pos_(2))) return;
@@ -502,8 +513,10 @@ Eigen::Vector3d gvf::calcGuidingVectorField3D(const Eigen::Vector3d pos)
     Eigen::Vector3d n = (-grad_out_3d).normalized();        
 
     /* ---------- 2. 由vel_buffer获得切向量 ---------- */
-    // Eigen::Vector3d tau = getTangentVector(pos);
-    Eigen::Vector3d tau = estimateTangentViaQuadraticFit(pos);
+    Eigen::Vector3d tau = getTangentVector(pos);
+    if (tau.squaredNorm() < 1e-6) {
+        tau = estimateTangentViaQuadraticFit(pos);
+    }
 
     /* ---------- 3. 计算引导向量 ---------- */
     // Eigen::Vector3d guiding_vec = gvf_.K1_ * tau - gvf_.K2_ * dist * n;
@@ -704,8 +717,6 @@ void gvf::visCallback(const ros::TimerEvent& /*event*/) {
 }
 
 void gvf::publishPathCylinderVisualization() {
-    if (last_path_.poses.empty()) return;
-    
     // 创建MarkerArray来存储多个圆柱体
     visualization_msgs::MarkerArray cylinder_array;
     
@@ -717,6 +728,19 @@ void gvf::publishPathCylinderVisualization() {
     delete_marker.id = 0;
     delete_marker.action = visualization_msgs::Marker::DELETEALL;
     cylinder_array.markers.push_back(delete_marker);
+
+    // 没有新路径输入时，清空可视化（否则 RViz 会一直保留上一次的 Marker）
+    const bool stale = (path_vis_timeout_sec_ > 0.0) &&
+                       (last_path_recv_time_.toSec() > 0.0) &&
+                       ((ros::Time::now() - last_path_recv_time_).toSec() > path_vis_timeout_sec_);
+    if (stale) {
+        last_path_.poses.clear();
+    }
+
+    if (last_path_.poses.size() < 2) {
+        gvf_vis_pub_.publish(cylinder_array);
+        return;
+    }
     
     // 圆柱体参数设置
     double cylinder_radius = 0.05;  // 圆柱体半径，可以根据需要调整

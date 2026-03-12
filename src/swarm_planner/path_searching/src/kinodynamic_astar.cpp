@@ -145,7 +145,14 @@ int KinodynamicAstar::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v, 
       cur_node->node_state = IN_CLOSE_SET;
       iter_num_ += 1;
 
-      double res = 1 / 2.0, time_res = 1 / 1.0, time_res_init = 1 / 20.0;
+      
+      double res = 1 / 2.0, time_res = time_resolution_, time_res_init = 1 / 20.0;
+      // 防御：time_res 合理范围 (0, 1]
+      if (time_res <= 1e-3 || time_res > 1.0) {
+        // 没配或配错：默认三档
+        time_res = 0.3333333333;
+      }
+
       Eigen::Matrix<double, 6, 1> cur_state = cur_node->state;
       Eigen::Matrix<double, 6, 1> pro_state;
       vector<PathNodePtr> tmp_expand_nodes;
@@ -165,13 +172,37 @@ int KinodynamicAstar::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v, 
       {
         for (double ax = -max_acc_; ax <= max_acc_ + 1e-3; ax += max_acc_ * res)
           for (double ay = -max_acc_; ay <= max_acc_ + 1e-3; ay += max_acc_ * res)
-            for (double az = 0; az <= 0 + 1e-3; az += max_acc_ * res)
+            for (double az = -max_acc_; az <= max_acc_ + 1e-3; az += max_acc_ * res)
             {
               um << ax, ay, az;
               inputs.push_back(um);
             }
-        for (double tau = time_res * max_tau_; tau <= max_tau_; tau += time_res * max_tau_)
-          durations.push_back(tau);
+
+        durations.clear();
+
+        const double step = time_res * max_tau_;
+
+        // 防御：step 太小就退化到三档
+        if (step < 1e-3) {
+          durations.push_back(max_tau_ / 3.0);
+          durations.push_back(2.0 * max_tau_ / 3.0);
+          durations.push_back(max_tau_);
+        } else {
+          for (double tau = step; tau <= max_tau_ + 1e-6; tau += step) {
+            durations.push_back(tau);
+          }
+          // 防御：如果由于 time_res=1 之类导致只有一个 tau，则强制三档
+          if (durations.size() == 1) {
+            durations.clear();
+            durations.push_back(max_tau_ / 3.0);
+            durations.push_back(2.0 * max_tau_ / 3.0);
+            durations.push_back(max_tau_);
+          }
+        }
+
+            ROS_WARN_STREAM_THROTTLE(1.0, "[KINO] tau bins=" << durations.size()
+    << ", tau0=" << durations.front() << ", tau_last=" << durations.back()
+    << ", time_res=" << time_res << ", max_tau=" << max_tau_);
       }
 
       for (size_t i = 0; i < inputs.size(); ++i)
@@ -183,6 +214,8 @@ int KinodynamicAstar::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v, 
           pro_t = cur_node->time + tau;
 
           Eigen::Vector3d pro_pos = pro_state.head(3);
+          if (!edt_environment_->sdf_map_->isInMap(pro_pos)) continue;
+          if (use_z_bound_ && (pro_pos.z() < z_min_ || pro_pos.z() > z_max_)) continue;
 
           Eigen::Vector3i pro_id = posToIndex(pro_pos);
           int pro_t_id = timeToIndex(pro_t);
@@ -220,8 +253,19 @@ int KinodynamicAstar::search(Eigen::Vector3d start_pt, Eigen::Vector3d start_v, 
             double dt = tau * double(k) / double(check_num_);
             stateTransit(cur_state, xt, um, dt);
             pos = xt.head(3);
-            
-            if (edt_environment_->sdf_map_->getInflateOccupancy(pos) == 1) {
+
+            if (!edt_environment_->sdf_map_->isInMap(pos)) {
+              is_occ = true;
+              break;
+            }
+
+            if (use_z_bound_ && (pos.z() < z_min_ || pos.z() > z_max_)) {
+              is_occ = true;
+              break;
+            }
+
+            const int occ = edt_environment_->sdf_map_->getInflateOccupancy(pos);
+            if (occ != 0) {
               is_occ = true;
               break;
             }
@@ -347,6 +391,11 @@ void KinodynamicAstar::setParam(ros::NodeHandle& nh)
   nh.param("search/check_num", check_num_, -1);
   nh.param("search/optimistic", optimistic_, true);
   nh.param("search/margin", margin_, 0.3);  // 从launch文件获取margin参数，默认值0.3
+  nh.param("search/z_min", z_min_, -1.0);
+  nh.param("search/z_max", z_max_, -1.0);
+  
+  if (z_min_ > z_max_) std::swap(z_min_, z_max_);
+  use_z_bound_ = (z_min_ > -0.5 && z_max_ > -0.5);
   tie_breaker_ = 1.0 + 1.0 / 10000;
 
   double vel_margin;

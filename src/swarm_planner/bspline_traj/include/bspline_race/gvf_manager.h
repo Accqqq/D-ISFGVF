@@ -7,6 +7,7 @@
 #include <regex>
 #include <algorithm>
 #include <iostream>
+#include <cmath>
 #include <math.h>
 #include <numeric>
 #include <memory>
@@ -68,6 +69,7 @@ class gvf_manager
         double safe_distance_;  // 安全距离参数
         double collision_threshold_;  // 碰撞检测阈值参数
         ros::Time last_replan_time_;  // 上次重规划时间
+        ros::Time last_switch_time_;  // 上次接受新轨迹时间（抗抖：最小保持时间）
         int current_traj_index_;  // 当前轨迹执行索引
         double last_yaw;  // 上次yaw角度
         std::string cloud_topic_, odom_topic_, cmd_topic_;
@@ -76,6 +78,37 @@ class gvf_manager
         int num_points_to_take_;  // 获取的路径点数量
         double exec_timer_interval;  // exec_timer的重规划时间间隔
         double kino_timer_interval;  // kino_timer的重规划时间间隔
+
+        double slow_radius = 1.0;//开始减速半径
+        double stop_radius = 0.3;//判定到达目标点半径  
+        double goal_reach_radius_ = 2.0;// m，判定到达目标点半径
+        double start_pt_change_threshold_ = 1.0; // m，起点变化阈值
+
+        double cmd_vel_max_ = 1.25;          // m/s，GVF 输出速度限幅
+        double cmd_k_pull_ = 2.0;           // 回拉增益：ref_pos += k_pull*(pos-ref_pos)*dt（越大越贴身但更慢）
+        double cmd_lookahead_time_ = 0.2;   // s，小前视时间：cmd_pos = ref_pos + T*vel（越大越快但更“猛”）
+        double cmd_lookahead_dist_ = 0.4;   // m，cmd_pos 相对真实 pos 的最大水平前视距离
+        double cmd_max_step_ = 0.03;        // m/tick，单周期 cmd_pos 最大移动（抑制跳点/起步弹射） 
+        double cmd_speed_max_ = 1.25;        // m/s，cmd_pos 的最大速度
+        double cmd_vel_lpf_hz_ = 4.0;       // Hz，vel 低通截止频率
+
+        Eigen::Vector3d ref_pos;//前馈积分参考点
+        bool ref_initialized = false;//是否已经初始化参考点
+
+        // 碰撞触发重规划的去抖
+        int collision_check_horizon_pts_ = 120;       // 只检查未来 N 个轨迹点
+        int collision_consecutive_hits_ = 3;         // 连续 K 个点触发才算碰撞风险
+        double collision_replan_cooldown_ = 0.5;     // s，碰撞触发重规划冷却时间
+        ros::Time last_collision_replan_time_ = ros::Time(0);
+
+        // 轨迹切换的去抖（连续满足 K 次才允许触发）
+        int switch_confirm_goal_progress_cnt_ = 0;
+        int switch_confirm_track_error_cnt_ = 0;
+        int switch_confirm_near_end_cnt_ = 0;
+
+        // 新轨迹最近点索引去抖：避免 new_i0=nearestIdxInTraj() 在对称/平坦段来回跳导致 topo_dev/topo_side 抖动
+        int last_new_i0_ = 0;
+        bool has_last_new_i0_ = false;
         
         // 轨迹拼接参数
         int max_trajectory_concatenation_points_;  // 最大轨迹拼接点数
@@ -102,6 +135,9 @@ class gvf_manager
             Eigen::MatrixXd last_vel;  
             // ros::Subscriber odom_sub;
             Eigen::Vector3d start_pt, goal_pt, odom;
+
+
+            
         };
 
         std::vector<gvfManager> swarmParticlesManager;
@@ -120,10 +156,23 @@ class gvf_manager
         ros::Publisher  kino_path_pub;  // 新增发布者
         ros::Timer      kino_timer;     // 新增定时器
         ros::Publisher  goal_vis_pub;   // 新增目标点可视化发布者
+        ros::Timer      exec_fsm_timer;      // 新增 FSM 状态机定时器
+
+        ros::Subscriber cmd_enable_sub; // 新增订阅者
 
     private:
         int test_traj_index_;  // 测试轨迹执行索引
         bool use_test_cmd_;    // 是否使用测试命令模式
+        bool enable_gvfcmd_control; //标记是否收到 gvf 控制指令
+
+        enum FSM_EXEC_STATE { INIT, WAIT_TARGET, GEN_NEW_TRAJ, REPLAN_TRAJ, EXEC_TRAJ };
+        FSM_EXEC_STATE exec_state_;
+
+        // --------- Replan helpers (candidate + switch decision) ---------
+        bool shouldAcceptCandidate(const Eigen::MatrixXd& old_traj, const Eigen::MatrixXd& old_vel, int old_i0,
+                                  const Eigen::MatrixXd& new_traj, const Eigen::MatrixXd& new_vel, int new_i0,
+                                  const Eigen::Vector3d& goal_pt, std::string& reason_out, const Eigen::VectorXd& time);
+        void publishPathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel);
 
     public:
         gvf_manager(){};  
@@ -134,7 +183,10 @@ class gvf_manager
         void goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg);
         void odomCallback(const nav_msgs::Odometry::ConstPtr& msg); 
         void execTimerCallback(const ros::TimerEvent& event);
-        void astaropt();
+
+        bool astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
+                      int& new_i0_out, Eigen::VectorXd& time);
+                      
         bool checkCollision();
         void cmdCallback(const ros::TimerEvent& event);
         void test_cmdCallback(const ros::TimerEvent& event);  // 新增测试命令回调函数
@@ -144,7 +196,13 @@ class gvf_manager
                             ros::Publisher& marker_pub, const std::string& particle_index);
         std::vector<Eigen::Vector3d> correctPathToCenter(
                 const std::vector<Eigen::Vector3d>& raw_path);
+                
+        void cmdEnableCallback(const std_msgs::Bool::ConstPtr& msg);  // 新增：回调函数声明  
 
+        void changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call);
+        void FSMCallback(const ros::TimerEvent& event);
+        double cul_score(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, const Eigen::Vector3d& goal_pt, int i0,
+                         const Eigen::VectorXd& time);
 
         //inline func 
         inline Eigen::Vector3d esdfGrad(const Eigen::Vector3d& p) const

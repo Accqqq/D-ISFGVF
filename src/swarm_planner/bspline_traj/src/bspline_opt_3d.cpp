@@ -168,74 +168,55 @@ namespace FLAG_Race
         }
     }
 
-    void bspline_optimizer::calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
-                                                        Eigen::MatrixXd &gradient)
-    {
-    cost = 0.0;
-    /* abbreviation */
-    double ts, /*vm2, am2, */ ts_inv2;
-    // vm2 = max_vel_ * max_vel_;
-    // am2 = max_acc_ * max_acc_;
+	    void bspline_optimizer::calcFeasibilityCost(const Eigen::MatrixXd &q, double &cost,
+	                                                        Eigen::MatrixXd &gradient)
+	    {
+	    cost = 0.0;
+	    /* abbreviation */
+	    double ts, vm2, am2, ts_inv2, ts_inv4;
+	    ts = bspline_interval_;
+	    vm2 = max_vel_ * max_vel_;
+	    am2 = max_acc_ * max_acc_;
+	    ts_inv2 = 1.0 / ts / ts;
+	    ts_inv4 = ts_inv2 * ts_inv2;
 
-    ts = bspline_interval_;
-    ts_inv2 = 1 / ts / ts;
-    /* velocity feasibility */
-    for (int i = 0; i < q.cols() - 1; i++)
-    {
-      Eigen::Vector3d vi = (q.col(i + 1) - q.col(i)) / ts;
-      for (int j = 0; j < 2; j++)
-      {
-        if (vi(j) > max_vel_)
-        {
-          cost += pow(vi(j) - max_vel_, 2) * ts_inv2; // multiply ts_inv3 to make vel and acc has similar magnitude
+	    /* velocity feasibility (fast-planner style) */
+	    for (int i = 0; i < q.cols() - 1; i++)
+	    {
+	      const Eigen::VectorXd vi = q.col(i + 1) - q.col(i);
+	      for (int j = 0; j < Dim_; j++)
+	      {
+	        const double vd = vi(j) * vi(j) * ts_inv2 - vm2;
+	        if (vd > 0.0)
+	        {
+	          cost += vd * vd;
 
-          gradient(j, i + 0) += -2 * (vi(j) - max_vel_) / ts * ts_inv2;
-          gradient(j, i + 1) += 2 * (vi(j) - max_vel_) / ts * ts_inv2;
-        }
-        else if (vi(j) < -max_vel_)
-        {
-          cost += pow(vi(j) + max_vel_, 2) * ts_inv2;
+	          const double temp_v = 4.0 * vd * ts_inv2;
+	          gradient(j, i + 0) += -temp_v * vi(j);
+	          gradient(j, i + 1) += temp_v * vi(j);
+	        }
+	      }
+	    }
 
-          gradient(j, i + 0) += -2 * (vi(j) + max_vel_) / ts * ts_inv2;
-          gradient(j, i + 1) += 2 * (vi(j) + max_vel_) / ts * ts_inv2;
-        }
-        else
-        {
-          /* code */
-        }
-      }
-    }
-    /* acceleration feasibility */
-    for (int i = 0; i < q.cols() - 2; i++)
-    {
-      Eigen::Vector3d ai = (q.col(i + 2) - 2 * q.col(i + 1) + q.col(i)) * ts_inv2;
+	    /* acceleration feasibility (fast-planner style) */
+	    for (int i = 0; i < q.cols() - 2; i++)
+	    {
+	      const Eigen::VectorXd ai = q.col(i + 2) - 2 * q.col(i + 1) + q.col(i);
+	      for (int j = 0; j < Dim_; j++)
+	      {
+	        const double ad = ai(j) * ai(j) * ts_inv4 - am2;
+	        if (ad > 0.0)
+	        {
+	          cost += ad * ad;
 
-      for (int j = 0; j < 2; j++)
-      {
-        if (ai(j) > max_acc_)
-        {
-          cost += pow(ai(j) - max_acc_, 2);
-
-          gradient(j, i + 0) += 2 * (ai(j) - max_acc_) * ts_inv2;
-          gradient(j, i + 1) += -4 * (ai(j) - max_acc_) * ts_inv2;
-          gradient(j, i + 2) += 2 * (ai(j) - max_acc_) * ts_inv2;
-        }
-        else if (ai(j) < -max_acc_)
-        {
-          cost += pow(ai(j) + max_acc_, 2);
-
-          gradient(j, i + 0) += 2 * (ai(j) + max_acc_) * ts_inv2;
-          gradient(j, i + 1) += -4 * (ai(j) + max_acc_) * ts_inv2;
-          gradient(j, i + 2) += 2 * (ai(j) + max_acc_) * ts_inv2;
-        }
-        else
-        {
-          /* code */
-        }
-      }
-
-    }
-    }
+	          const double temp_a = 4.0 * ad * ts_inv4;
+	          gradient(j, i + 0) += temp_a * ai(j);
+	          gradient(j, i + 1) += -2.0 * temp_a * ai(j);
+	          gradient(j, i + 2) += temp_a * ai(j);
+	        }
+	      }
+	    }
+	    }
     
     void bspline_optimizer::calcEsdfCost(const Eigen::MatrixXd &q, double &cost,
                                                         Eigen::MatrixXd &gradient)
@@ -412,6 +393,8 @@ namespace FLAG_Race
                     q[j*Dim_+i] = control_points_(j+p_order_,i);
                 }
             }
+            // 兜底：如果 nlopt 优化失败，保持初始变量，避免 best_variable_ 写入非法值。
+            best_variable_ = q;
 
             const double  bound = 10.0;
             for (size_t i = 0; i <variable_num; i++)
@@ -431,6 +414,11 @@ namespace FLAG_Race
         catch(std::exception &e)
         {
             std::cout << "nlopt failed: " << e.what() << std::endl;
+            // 确保 best_variable_ 始终有效，避免控制点被污染。
+            best_variable_ = q;
+        }
+        if ((int)best_variable_.size() != variable_num) {
+            best_variable_ = q;
         }
         for (size_t j = 0; j < cps_num_-2*p_order_; j++)
         {

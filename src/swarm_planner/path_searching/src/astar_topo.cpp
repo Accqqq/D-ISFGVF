@@ -69,7 +69,7 @@ int AstarTopo::search(Eigen::Vector3d start_pt, Eigen::Vector3d end_pt, bool dyn
       /* ---------- expansion loop ---------- */
       for (double dx = -resolution_; dx <= resolution_ + 1e-3; dx += resolution_)
         for (double dy = -resolution_; dy <= resolution_ + 1e-3; dy += resolution_)
-          for (double dz = -resolution_; dz <= resolution_ + 1e-3; dz += resolution_) 
+          for (double dz = -resolution_; dz <= resolution_ + 1e-3; dz += resolution_)
           {
             d_pos << dx, dy, dz;
 
@@ -82,6 +82,10 @@ int AstarTopo::search(Eigen::Vector3d start_pt, Eigen::Vector3d end_pt, bool dyn
                 pro_pos(2) >= map_size_3d_(2)) {
               continue;
             }
+
+            // if (pro_pos(2) < z_min_ || pro_pos(2) > z_max_) {
+            //   continue;
+            // }
 
             Eigen::Vector3i pro_id = posToIndex(pro_pos);
             int pro_t_id;
@@ -99,6 +103,10 @@ int AstarTopo::search(Eigen::Vector3d start_pt, Eigen::Vector3d end_pt, bool dyn
 
             double tmp_g_score, tmp_f_score;
             tmp_g_score = d_pos.squaredNorm() + cur_node->g_score;
+            if (w_z_ > 0.0) {
+              const double dz_ref = pro_pos(2) - z_ref_;
+              tmp_g_score += w_z_ * dz_ref * dz_ref;
+            }
             tmp_f_score = tmp_g_score + lambda_heu_ * getEuclHeu(pro_pos, end_pt);
 
             if (pro_node == NULL) {
@@ -157,6 +165,11 @@ void AstarTopo::setParam(ros::NodeHandle& nh) {
   nh.param("astar/margin", margin_, -1.0);
   nh.param("astar/allocate_num", allocate_num_, -1);
   nh.param("astar/path_sample_interval", path_sample_interval_, 5); // 默认每5个点采样一个
+  nh.param("astar/z_min", z_min_, 0.8);
+  nh.param("astar/z_max", z_max_, 1.2);
+  if (z_min_ > z_max_) std::swap(z_min_, z_max_);
+  nh.param("astar/z_ref", z_ref_, 1.0);
+  nh.param("astar/w_z", w_z_, 0.0);
   tie_breaker_ = 1.0 + 1.0 / 10000;
 
   // cout << "margin:" << margin_ << endl;

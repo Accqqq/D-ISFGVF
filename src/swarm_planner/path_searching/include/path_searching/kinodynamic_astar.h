@@ -130,6 +130,8 @@ class KinodynamicAstar {
   int allocate_num_, check_num_;
   double tie_breaker_;
   bool optimistic_;
+  double z_min_, z_max_;
+  bool use_z_bound_;
 
   /* map */
   double resolution_, inv_resolution_, time_resolution_, inv_time_resolution_;

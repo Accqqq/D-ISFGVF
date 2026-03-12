@@ -22,7 +22,10 @@
         <param name="gvf/cloud_topic"      type="string" value="/drone_1_cloud_registered" />
         <param name="gvf/odom_topic"       type="string" value="/drone_1_visual_slam/odom" />
         <param name="gvf/cmd_topic"       type="string" value="/drone_1_planning/pos_cmd" />
-         <param name="gvf/planInterval"     value="0.5" /> 
+         <!-- 重归划时间 -->
+        <param name="gvf/planInterval"     value="0.5" /> 
+        <!-- <param name="gvf/planInterval"     value="1.0" /> -->
+
         <param name="gvf/num_points_to_take" value="30" />
         <param name="gvf/use_test_cmd" value="false" />
         <!-- This param decide tracking vel -->
@@ -119,8 +122,8 @@
         <param name="planning/lambda3" value="10.0" />
         <param name="planning/dist_p" value="0.5" />
         <param name="planning/safe_distance" value="0.4" />
-        <param name="planning/planning/opt_maxeval" value="200" />
-        <param name="planning/planning/opt_maxtime" value="0.02" />
+        <param name="planning/opt_maxeval" value="200" />
+        <param name="planning/opt_maxtime" value="0.02" />
     </node>
 
     <node name="rviz" pkg="rviz" type="rviz" required="true" args="-d $(find so3_quadrotor_simulator)/config/experiment.rviz" />

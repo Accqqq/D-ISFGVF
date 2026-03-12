@@ -107,6 +107,8 @@ class gvf
         bool use_kinopath_;
         bool use_quad_fit_;  // 添加新参数
         std::vector<Eigen::Vector3d> velocity_buffer_;
+        ros::Time last_path_recv_time_;
+        double path_vis_timeout_sec_;
 
     public:
         gvf(){};  

@@ -13,8 +13,8 @@
     <arg name="local_update_range_y" value="6.0"/>
     <arg name="local_update_range_z" value="2.5"/>
     
-    <arg name="v_max" value="2.5"/>     
-    <arg name="a_max" value="3.5"/>     
+    <arg name="v_max" value="2.0"/>     
+    <arg name="a_max" value="2.5"/>     
     
   <node name="formation_planning" pkg="bspline_race" type="formation_planning" output="screen">
         <!-- Plan Manager -->
@@ -24,10 +24,74 @@
         <param name="gvf/planInterval"     value="0.5" /> 
         <param name="gvf/num_points_to_take" value="30" />
         <param name="gvf/use_test_cmd" value="false" />
-        <!-- This param decide tracking vel -->
-        <param name="gvf/gvf_gain1"       value="2.5"/>
-        <!-- This param decide backing vel -->
-        <param name="gvf/gvf_gain2"       value="-2.0"/>
+
+        <!-- 重规划切换 + 轨迹拼接 -->
+        <!-- 注意：本工程里“换轨迟滞(稳定优先)”始终生效，不再依赖 enable_trajectory_concatenation。
+             enable_trajectory_concatenation 仅用于“发布段融合”：发布时保留旧轨迹未来一小段再接新轨迹，让控制更平滑。
+             它不会改变 KinoA* 的搜索起点选择逻辑（论文闭环：第一次用 odom，之后用 last_traj 最近点）。 -->
+        <param name="gvf/enable_trajectory_concatenation" value="false" />
+        <!-- 当 trajectory_keep_time <= 0 时：保留旧轨迹未来 N 个点 -->
+        <param name="gvf/max_trajectory_concatenation_points" value="50" />
+        <!-- 保留旧轨迹未来 keep_time 秒；<=0 则改用 max_trajectory_concatenation_points -->
+        <param name="gvf/trajectory_keep_time" value="1.0" />
+        <!-- 旧/新轨迹拼接处的混合点数（建议 10~20；0 会导致拼接处出现明显折点） -->
+        <param name="gvf/trajectory_blend_points" value="20" />
+        <!-- 发布段融合时：旧轨迹 keep_end 与新轨迹的接入点允许的最大距离，超过则跳过融合 -->
+        <param name="gvf/concat_max_join_dist" value="0.8" />
+        <!-- 切换迟滞参数（用于抑制左右来回换路） -->
+        <param name="gvf/switch_eval_horizon_pts" value="60" />
+        <param name="gvf/switch_clearance_hysteresis" value="0.15" />
+        <param name="gvf/switch_min_hold_time" value="1.0" />
+        <param name="gvf/switch_confirm_goal_progress" value="2" />
+        <param name="gvf/switch_confirm_track_error" value="2" />
+        <param name="gvf/switch_confirm_near_end" value="1" />
+        <!-- unknown/out-of-map 常见“前缀可靠、远端未知”，这里要求前缀段至少 N 个点可用 ESDF 才允许切换 -->
+        <param name="gvf/switch_prefix_min_reliable_pts" value="6" />
+        <!-- 旧轨迹剩余点数 <= N 时强制进入 near-end 兜底，避免 remain_old≈0 时“无轨迹可跟” -->
+        <param name="gvf/switch_near_end_hard_pts" value="5" />
+        <!-- new_i0 最近点索引窗口去抖（避免对称/平坦段 nearestIdxInTraj 抖动导致 topo_side/topo_dev 抖动） -->
+        <param name="gvf/switch_new_i0_window" value="20" />
+        <!-- out-of-map 处理：默认视为 unreliable，只有连续越界或越界比例过大才判为危险 -->
+        <param name="gvf/oob_hard_N" value="4" />
+        <param name="gvf/oob_hard_ratio" value="0.35" />
+        <!-- unknown/unreliable 下的二段安全判据：occ-free 必要；再要求 (可靠距离>=safe_small) 或 (occ 邻域也为空) -->
+        <param name="gvf/switch_safe_distance_small" value="0.28" />
+        <param name="gvf/switch_occ_neigh_radius" value="0.12" />
+        <param name="gvf/switch_occ_neigh_samples" value="6" />
+        <param name="gvf/switch_topo_dev_thr" value="0.8" />
+        <param name="gvf/switch_topo_clearance_margin" value="0.25" />
+        <param name="gvf/switch_topo_cmp_pts" value="60" />
+        <param name="gvf/switch_caution_margin" value="0.10" />
+        <param name="gvf/switch_progress_clearance_slack" value="0.05" />
+        <param name="gvf/switch_emergency_prefix_pts" value="20" />
+        <!-- 贴墙/碰撞触发时，要求新轨迹前缀的最小距离至少比当前位置/旧前缀好这么多 -->
+        <param name="gvf/switch_emergency_improve_delta" value="0.05" />
+        <param name="gvf/switch_topo_side_ahead_pts" value="25" />
+        <!-- 如果飞机已经明显偏离旧轨迹：允许切换（避免“越飘越远”） -->
+        <param name="gvf/switch_max_track_error" value="0.8" />
+        <!-- 如果新轨迹能显著更接近目标：允许切换（避免死守旧安全轨迹） -->
+        <param name="gvf/switch_goal_progress_margin" value="0.6" />
+        <!-- ESDF 距离在未知/越界区域可能为 10000；此时跳过迟滞拒绝逻辑 -->
+        <param name="gvf/switch_unknown_distance" value="50.0" />
+
+        <!-- KinoA*: guide points 采样 -->
+        <param name="gvf/kino_sample_ts" value="0.15" />
+        <param name="gvf/kino_sample_ts_min" value="0.05" />
+        <param name="gvf/kino_max_guide_pts" value="60" />
+
+        <!-- 发布给 GVF / RViz 的路径长度（只发布当前位置之后一段，避免“永远很长”） -->
+        <param name="gvf/path_pub_from_current" value="true" />
+        <param name="gvf/path_pub_future_pts" value="200" />
+
+        <!-- 到达目标附近并且速度很小就停止重规划（避免 start≈goal 时反复出圈/长轨迹） -->
+        <param name="gvf/replan_stop_radius" value="0.35" />
+        <param name="gvf/replan_stop_vel" value="0.20" />
+        <!-- 该参数决定前向跟踪速度 -->
+        <!-- <param name="gvf/gvf_gain1"       value="2.5"/> -->
+        <param name="gvf/gvf_gain1"       value="1.5"/>
+        <!-- 该参数决定后退/回拉速度 -->
+        <!-- <param name="gvf/gvf_gain2"       value="-2.0"/> -->
+        <param name="gvf/gvf_gain2"       value="-2.2"/>
         <param name="gvf/gvf_k3"          value="1.0"/>
         <param name="gvf/gvf_k4"          value="1.0"/>
         <param name="gvf/gvf_inflation"  value="0.099" /> 
@@ -47,6 +111,25 @@
         <param name="gvf/k2_min_scale" value="0.5" />
         <param name="gvf/k2_max_scale" value="2.0" />
         <param name="gvf/debug_output" value="true" />
+
+
+       <param name="gvf/debug_gate" value="true"/>
+
+        <!-- vel_max: GVF 速度限幅（越大越快，但也更容易超调/抖动） -->
+        <param name="gvf/cmd/vel_max" value="2.0" />
+        <!-- k_pull: 回拉增益，越大 ref_pos 越贴着飞机（更稳但更慢） -->
+        <param name="gvf/cmd/k_pull" value="2.0" />
+        <!-- lookahead_time: 前视时间 T，cmd_pos = pos + T*vel（越大越快，但更“猛”） -->
+        <param name="gvf/cmd/lookahead_time" value="0.3" />
+        <!-- lookahead_dist: 前视点最大水平距离 Lmax（越大越快，但更“猛”） -->
+        <param name="gvf/cmd/lookahead_dist" value="0.6" />
+        <!-- max_step: 单周期 cmd_pos 最大移动（防跳点/起步弹射/一卡一卡） -->
+        <param name="gvf/cmd/max_step" value="0.05" />
+        <!-- speed_max: cmd_pos 的最大速度 -->
+        <param name="gvf/cmd/speed_max" value="2.0" />
+        <!-- vel_lpf_hz: vel 低通截止频率 -->
+        <param name="gvf/cmd/vel_lpf_hz" value="4.0" />
+        
 
         <!-- SDF Map -->
         <param name="sdf_map/resolution"   value="0.1" /> 
@@ -92,35 +175,57 @@
         <param name="astar/resolution_astar" value="0.1" type="double"/>
         <param name="astar/time_resolution" value="0.8" type="double"/>
         <param name="astar/margin" value="0.6" type="double"/>
+        <param name="astar/z_min" value="0.8" type="double"/>
+        <param name="astar/z_max" value="1.2" type="double"/>
+        <param name="astar/z_ref" value="1.0" type="double"/>
+        <param name="astar/w_z" value="20.0" type="double"/>
         <param name="astar/allocate_num" value="1000000" type="int"/>
         <param name="astar/path_sample_interval" value="2" type="int"/>
 
           <!-- kinodynamic path searching -->
         <param name="search/max_tau" value="0.6" type="double"/>
-        <param name="search/init_max_tau" value="0.8" type="double"/>
-        <param name="search/max_vel" value="3.0" type="double"/>
-        <param name="search/max_acc" value="3.5" type="double"/>
+        <param name="search/init_max_tau" value="0.6" type="double"/>
+        <param name="search/max_vel" value="2.0" type="double"/>
+        <param name="search/max_acc" value="2.5" type="double"/>
         <param name="search/w_time" value="10.0" type="double"/>
-        <param name="search/horizon" value="6.0" type="double"/>
+        <param name="search/horizon" value="5.0" type="double"/>
         <param name="search/lambda_heu" value="5.0" type="double"/>
-        <param name="search/resolution_astar" value="0.1" type="double"/>
-        <param name="search/time_resolution" value="0.8" type="double"/>
-        <param name="search/margin" value="0.1" type="double"/>
+        <param name="search/resolution_astar" value="0.05" type="double"/>
+        <param name="search/time_resolution" value="0.33" type="double"/>
+        <param name="search/margin" value="0.5" type="double"/>
         <param name="search/allocate_num" value="100000" type="int"/>
         <param name="search/check_num" value="5" type="int"/>
+        <param name="search/z_min" value="0.8" type="double"/>
+        <param name="search/z_max" value="1.2" type="double"/>
+
+        <!-- kinodynamic path searching -->
+        <!-- <param name="search/max_tau" value="0.6" type="double"/>
+        <param name="search/init_max_tau" value="0.8" type="double"/>
+        <param name="search/max_vel" value="2.5" type="double"/>
+        <param name="search/max_acc" value="3.0" type="double"/>
+        <param name="search/w_time" value="10.0" type="double"/>
+        <param name="search/horizon" value="6.0" type="double"/>
+        <param name="search/lambda_heu" value="10.0" type="double"/>
+        <param name="search/resolution_astar" value="0.1" type="double"/>
+        <param name="search/time_resolution" value="0.8" type="double"/>
+        <param name="search/margin" value="0.6" type="double"/>
+        <param name="search/allocate_num" value="100000" type="int"/>
+        <param name="search/check_num" value="5" type="int"/> -->
+
+
         <!-- bspline opt -->
         <param name="planning/traj_order" value="3"/>
         <param name="planning/dimension" value="3" />
         <param name="planning/TrajSampleRate" value="50" />
         <param name="planning/max_vel" value="$(arg v_max)" />
         <param name="planning/max_acc" value="$(arg a_max)" />
-        <param name="planning/lambda1" value="5.0" />
-        <param name="planning/lambda2" value="0.0001" />
+        <param name="planning/lambda1" value="8.0" />
+        <param name="planning/lambda2" value="5.0" />
         <param name="planning/lambda3" value="10.0" />
         <param name="planning/dist_p" value="0.5" />
         <param name="planning/safe_distance" value="0.4" />
-        <param name="planning/planning/opt_maxeval" value="200" />
-        <param name="planning/planning/opt_maxtime" value="0.02" />
+        <param name="planning/opt_maxeval" value="200" />
+        <param name="planning/opt_maxtime" value="0.02" />
     </node>
 
     <node pkg="map_generator" type="local_sensing" name="map_generator" output="screen">
