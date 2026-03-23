@@ -110,6 +110,34 @@ class gvf
         ros::Time last_path_recv_time_;
         double path_vis_timeout_sec_;
 
+        // ===== Reparameterized path cache =====
+        std::vector<double> sample_w_;                  // 弧长参数 w_i
+        std::vector<Eigen::Vector3d> sample_p_;         // p(w_i)
+        std::vector<Eigen::Vector3d> sample_dp_;        // dp/dw at w_i
+        std::vector<Eigen::Vector3d> sample_tangent_;   // unit tangent t(w_i)
+
+        double total_w_ = 0.0;
+        bool reparam_ready_ = false;
+        double next_path_w_anchor_ = 0.0;
+        bool has_next_path_w_anchor_ = false;
+
+        // ===== Lifted GVF parameters =====
+        double progress_window_ = 1.0;   // 局部投影搜索窗口
+        double progress_rho0_ = 0.2;     // alpha(rho)
+        double progress_delta_ = 0.2;    // sigma(e_parallel)
+        double alpha_min_ = 0.05;        // 保证alpha始终>0，避免切向项退化
+
+        struct LiftedGuidanceResult {
+          Eigen::Vector3d v_cmd = Eigen::Vector3d::Zero();   // 前3维物理速度
+          double w_proj = 0.0;                               // 当前投影到路径上的w
+          double w_dot = 0.0;                                // progress更新率
+          double e_parallel = 0.0;                           // along-track error
+          Eigen::Vector3d e_perp = Eigen::Vector3d::Zero();  // lateral error
+          Eigen::Vector3d ref_pt = Eigen::Vector3d::Zero();  // p(w)
+          Eigen::Vector3d tangent = Eigen::Vector3d::Zero(); // t(w)
+          bool valid = false;
+        };
+
     public:
         gvf(){};  
         ~gvf(){};
@@ -135,6 +163,19 @@ class gvf
         Eigen::Vector3d calcGuidingVectorField3D(const Eigen::Vector3d pos);
         Eigen::Vector3d estimateTangentViaQuadraticFit(const Eigen::Vector3d& pos);
         Eigen::Vector3d getTangentVector(const Eigen::Vector3d& pos);
+
+        void buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg);
+        void setNextPathWAnchor(double w_anchor);
+        Eigen::Vector3d evalPathByW(double w) const;
+        Eigen::Vector3d evalTangentByW(double w) const;
+        Eigen::Vector3d evalDpDwByW(double w) const;
+
+        double projectToPathLocal(const Eigen::Vector3d& x,
+                                  double w_prev,
+                                  double window) const;
+
+        LiftedGuidanceResult calcLiftedGuidance3D(const Eigen::Vector3d& pos,
+                                                  double w_prev) const;
         
         inline void posToIndex(const Eigen::Vector3d& pos, Eigen::Vector3i& id);
         inline void indexToPos(const Eigen::Vector3i& id, Eigen::Vector3d& pos);

@@ -21,6 +21,7 @@ namespace FLAG_Race
         nh.param("gvf/enable_trajectory_concatenation", enable_trajectory_concatenation_, false);
         nh.param("gvf/max_trajectory_concatenation_points", max_trajectory_concatenation_points_, 50);
 
+
         // nh.param("gvf/flight_height", flight_height_, 1.0);  // 设定飞行高度
         last_replan_time_ = ros::Time(0);  // 初始化上次重规划时间
         last_switch_time_ = ros::Time(0);
@@ -130,6 +131,13 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
         manager.is_first_goal = true;  // 重置标志位
         manager.receive_goal = true;
     }
+
+    progress_w_ = 0.0;
+    progress_initialized_ = false;
+    ref_pos = start_pt;
+    ref_initialized = false;
+    last_cmd_pos_ = start_pt;
+    cmd_pos_initialized_ = false;
 }
 
 void gvf_manager::cmdCallback(const ros::TimerEvent& event)
@@ -178,7 +186,20 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     }
 
     // ===================== 1) 论文式闭环：用真实 pos 查 GVF =====================
-    Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(pos);
+    // Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(pos);
+    // double vel_mag = vel.norm();
+
+    auto& pm = swarmParticlesManager[0];
+
+    auto out = pm.gvf_->calcLiftedGuidance3D(pos, progress_w_);
+    if (!out.valid) {
+        ROS_WARN_THROTTLE(1.0, "[GVF] lifted guidance invalid");
+        return;
+    }
+
+    progress_w_ = out.w_proj + out.w_dot * dt;
+
+    Eigen::Vector3d vel = out.v_cmd;
     double vel_mag = vel.norm();
 
     ROS_WARN_THROTTLE(1.0, "[GVF] vel: (%.2f)", vel.norm());
@@ -260,13 +281,10 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     // ======================================================================
 
     // ===================== 5) cmd_pos 速率限制（用速度上限 * dt） =====================
-    static bool cmd_init = false;
-    static Eigen::Vector3d last_cmd_pos;
-
-    if (!cmd_init)
+    if (!cmd_pos_initialized_)
     {
-        last_cmd_pos = pos;
-        cmd_init = true;
+        last_cmd_pos_ = pos;
+        cmd_pos_initialized_ = true;
     }
 
     // 用“命令点速度上限”换算成每周期最大步长；再叠加单周期硬上限 cmd_max_step_
@@ -276,16 +294,16 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         max_step = std::min(max_step_from_speed, cmd_max_step_);
     }
 
-    Eigen::Vector3d step = cmd_pos - last_cmd_pos;
+    Eigen::Vector3d step = cmd_pos - last_cmd_pos_;
     double step_xy = step.head<2>().norm();
     if (step_xy > max_step && step_xy > 1e-6)
     {
         step *= (max_step / step_xy);
-        cmd_pos = last_cmd_pos + step;
+        cmd_pos = last_cmd_pos_ + step;
     }
-    last_cmd_pos = cmd_pos;
+    last_cmd_pos_ = cmd_pos;
 
-    ROS_WARN_THROTTLE(1.0, "[GVF] cmd_lastpos: (%.2f, %.2f, %.2f)", last_cmd_pos.x(), last_cmd_pos.y(), last_cmd_pos.z());
+    ROS_WARN_THROTTLE(1.0, "[GVF] cmd_lastpos: (%.2f, %.2f, %.2f)", last_cmd_pos_.x(), last_cmd_pos_.y(), last_cmd_pos_.z());
 
 
     // ===================== 6) 发布 PositionCommand（只发位置+yaw） =====================
@@ -2160,10 +2178,10 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
             double dt = time(i) - time(i - 1);
             if (dt <= 1e-6) continue;
 
-                Eigen::Vector3d pt = traj.row(i).transpose();
-                if (!pm.sdf_map_ || !pm.sdf_map_->isInMap(pt)) { 
-                    continue;
-                }
+            Eigen::Vector3d pt = traj.row(i).transpose();
+            if (!pm.sdf_map_ || !pm.sdf_map_->isInMap(pt)) {
+                continue;
+            }
             if (pm.sdf_map_->isUnknown(pt)) {
                 continue;
             }
@@ -2187,23 +2205,24 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         double J_old = 0.0;
         double J_new = 0.0;
 
-
         reason_out = "accept_default";
+        if (new_traj.rows() <= 0 || new_vel.rows() != new_traj.rows()) {
+            switch_reason = "reject_empty_new";
+            reason_out = switch_reason;
+            return false;
+        }
         if (old_traj.rows() <= 0 || old_vel.rows() != old_traj.rows()) {
             switch_reason = "accept_no_old_traj";
-            accept_new = true;
+            reason_out = switch_reason;
+            return true;
         }
-	        if (new_traj.rows() <= 0 || new_vel.rows() != new_traj.rows()) {
-	            switch_reason = "reject_empty_new";
-	            accept_new = false;
-	        }
 
         //检查旧轨迹是否发生碰撞，或者旧轨迹快结束
-        if(checkCollision() || ((old_traj.rows()-1 - old_i0) <= (old_traj.rows()-1)/2))
+        if (checkCollision() || ((old_traj.rows() - 1 - old_i0) <= (old_traj.rows() - 1) / 2))
         {
             switch_reason = "accept_collision&timout";
             accept_new = true;
-        }else{
+        } else {
             //旧轨迹仍然安全，检查新旧轨迹代价
             J_old = cul_score(old_traj, old_vel, goal_pt, old_i0, time);
             J_new = cul_score(new_traj, new_vel, goal_pt, new_i0, time);
@@ -2217,109 +2236,7 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                 accept_new = false;
                 switch_reason = "reject_worse_new";
             }
-
         }
-        
-        // auto minDistFuture = [&](const Eigen::MatrixXd& traj, int i0, int K, int& reliable_pts) {
-        //     reliable_pts = 0;
-        //     if (!pm.sdf_map_ || traj.rows() <= 0) return std::numeric_limits<double>::infinity();
-        //     i0 = std::max(0, std::min(i0, (int)traj.rows() - 1));
-        //     int i1 = std::min((int)traj.rows(), i0 + std::max(1, K));
-
-        //     double md = std::numeric_limits<double>::infinity();
-        //     for (int i = i0; i < i1; ++i) {
-        //         Eigen::Vector3d pt(traj(i, 0), traj(i, 1), traj(i, 2));
-        //         if (!pm.sdf_map_->isInMap(pt)) continue;
-        //         if (pm.sdf_map_->isUnknown(pt)) continue;
-        //         reliable_pts++;
-        //         md = std::min(md, pm.sdf_map_->getDistance(pt));
-        //     }
-        //     return md;
-        // };
-
-        // auto maxDevAligned = [&](const Eigen::MatrixXd& a, int a_i0, const Eigen::MatrixXd& b, int b_i0, int cmp_pts) {
-        //     if (a.rows() <= 0 || b.rows() <= 0) return 0.0;
-        //     a_i0 = std::max(0, std::min(a_i0, (int)a.rows() - 1));
-        //     b_i0 = std::max(0, std::min(b_i0, (int)b.rows() - 1));
-        //     int n = std::max(1, cmp_pts);
-        //     n = std::min(n, std::min((int)a.rows() - a_i0, (int)b.rows() - b_i0));
-        //     double md = 0.0;
-        //     for (int k = 0; k < n; ++k) {
-        //         Eigen::Vector3d pa(a(a_i0 + k, 0), a(a_i0 + k, 1), a(a_i0 + k, 2));
-        //         Eigen::Vector3d pb(b(b_i0 + k, 0), b(b_i0 + k, 1), b(b_i0 + k, 2));
-        //         md = std::max(md, (pa - pb).norm());
-        //     }
-        //     return md;
-        // };
-
-        // int K, cmp_pts;
-        // double hyster, topo_thr, min_hold, prog_margin, clearance_slack;
-        // ros::param::param("~gvf/switch_eval_horizon_pts", K, 120);
-        // ros::param::param("~gvf/switch_topo_cmp_pts", cmp_pts, 60);
-        // ros::param::param("~gvf/switch_clearance_hysteresis", hyster, 0.15);
-        // ros::param::param("~gvf/switch_topo_dev_thr", topo_thr, 0.8);
-        // ros::param::param("~gvf/switch_min_hold_time", min_hold, 0.8);
-        // ros::param::param("~gvf/switch_goal_progress_margin", prog_margin, 0.3);
-        // ros::param::param("~gvf/switch_progress_clearance_slack", clearance_slack, 0.05);
-
-        // int old_rel = 0, new_rel = 0;
-        // const double old_md = minDistFuture(old_traj, old_i0, K, old_rel);
-        // const double new_md = minDistFuture(new_traj, new_i0, K, new_rel);
-        // const double topo_dev = maxDevAligned(old_traj, old_i0, new_traj, new_i0, cmp_pts);
-
-        // const Eigen::Vector3d old_end(old_traj(old_traj.rows() - 1, 0), old_traj(old_traj.rows() - 1, 1),
-        //                               old_traj(old_traj.rows() - 1, 2));
-        // const Eigen::Vector3d new_end(new_traj(new_traj.rows() - 1, 0), new_traj(new_traj.rows() - 1, 1),
-        //                               new_traj(new_traj.rows() - 1, 2));
-
-        // const double old_end_goal = (old_end - goal_pt).norm();
-        // const double new_end_goal = (new_end - goal_pt).norm();
-
-        // const bool progress_better = (new_end_goal + prog_margin < old_end_goal);
-        // const bool old_safe = std::isfinite(old_md) && (old_md >= safe_distance_);
-        // const bool new_safe = std::isfinite(new_md) && (new_md >= safe_distance_);
-
-        // const double hold_time = (last_switch_time_.isZero()) ? 1e9 : (ros::Time::now() - last_switch_time_).toSec();
-
-        // bool accept_new = true;
-        // std::string switch_reason = "accept_default";
-
-        // if (hold_time < min_hold && old_safe) {
-        //     if (new_md >= old_md + hyster) {
-        //         accept_new = true;
-        //         switch_reason = "accept_hold_new_clearer";
-        //     } else if (progress_better && (new_md + clearance_slack >= old_md)) {
-        //         accept_new = true;
-        //         switch_reason = "accept_hold_progress_better";
-        //     } else {
-        //         accept_new = false;
-        //         switch_reason = "reject_hold_keep_old";
-        //     }
-        // } else {
-        //     if (!old_safe) {
-        //         if (new_safe || (new_md >= old_md + hyster)) {
-        //             accept_new = true;
-        //             switch_reason = "accept_old_unsafe";
-        //         } else {
-        //             accept_new = false;
-        //             switch_reason = "reject_new_not_safer";
-        //         }
-        //     } else {
-        //         if (new_md >= old_md + hyster) {
-        //             accept_new = true;
-        //             switch_reason = "accept_new_clearer";
-        //         } else if (progress_better && (new_md + clearance_slack >= old_md)) {
-        //             accept_new = true;
-        //             switch_reason = "accept_goal_progress_better";
-        //         } else if (topo_dev > topo_thr) {
-        //             accept_new = false;
-        //             switch_reason = "reject_topology_flip_keep_old";
-        //         } else {
-        //             accept_new = false;
-        //             switch_reason = "reject_keep_old";
-        //         }
-        //     }
-        // }
 
         ROS_INFO_THROTTLE(1.0,
             "\033[36m[GVF][SWITCH]\033[0m accept=%d reason=%s J_old=%.3f J_new=%.3f ",
@@ -2455,7 +2372,7 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
 
     void gvf_manager::FSMCallback(const ros::TimerEvent& event)
     {
-        auto& pm = swarmParticlesManager[0]; 
+        auto& pm = swarmParticlesManager[0];
         Eigen::Vector3d current_pos(odom_.x(), odom_.y(), odom_.z());
         ros::Time current_time = ros::Time::now();
 
@@ -2472,22 +2389,21 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
             case GEN_NEW_TRAJ:{
                 Eigen::MatrixXd cand_traj, cand_vel;
                 Eigen::VectorXd cand_time;
-		                int new_i0 = 0;
-		                if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
-		                    pm.last_traj = cand_traj;
-		                    pm.last_vel = cand_vel;
-	                    current_traj_index_ = new_i0;
-	                    last_switch_time_ = current_time;
-	                    publishPathMsg(pm.last_traj, pm.last_vel);
-	                } else {
-	                    ROS_WARN_THROTTLE(1.0, "[GVF] GEN_NEW_TRAJ: plan failed, keep old");
-	                    publishPathMsg(pm.last_traj, pm.last_vel);
-	                }
-	                last_replan_time_ = current_time;
-	                changeFSMExecState(EXEC_TRAJ, "FSM");
-	            break;
+                int new_i0 = 0;
+                if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
+                    pm.last_traj = cand_traj;
+                    pm.last_vel = cand_vel;
+                    current_traj_index_ = new_i0;
+                    last_switch_time_ = current_time;
+                    publishPathMsg(pm.last_traj, pm.last_vel);
+                } else {
+                    ROS_WARN_THROTTLE(1.0, "[GVF] GEN_NEW_TRAJ: plan failed, keep old");
+                    publishPathMsg(pm.last_traj, pm.last_vel);
+                }
+                last_replan_time_ = current_time;
+                changeFSMExecState(EXEC_TRAJ, "FSM");
+                break;
             }
-	
 
             case EXEC_TRAJ:{
                 if (pm.last_traj.rows() > 0) {
@@ -2525,22 +2441,19 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
             }
 
             case REPLAN_TRAJ:{
-                
-                // 每次重规划先保存旧轨迹（用于决定是否接受候选）
                 const Eigen::MatrixXd old_traj = pm.last_traj;
                 const Eigen::MatrixXd old_vel  = pm.last_vel;
-
                 Eigen::MatrixXd cand_traj, cand_vel;
                 Eigen::VectorXd cand_time;
-			    int new_i0 = 0;
-                
-                // 重规划前先在旧轨迹上更新当前索引
+                int new_i0 = 0;
+
                 if (pm.last_traj.rows() > 0) {
-                    int best = 0;
+                    const int prev_i0 = std::max(0, std::min(current_traj_index_, (int)pm.last_traj.rows() - 1));
+                    int best = prev_i0;
                     double best_d = std::numeric_limits<double>::infinity();
-                    for (int i = 0; i < pm.last_traj.rows(); ++i) {
+                    for (int i = prev_i0; i < pm.last_traj.rows(); ++i) {
                         Eigen::Vector3d traj_point(pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
-                        double d = (traj_point - current_pos).squaredNorm();  // 用平方距离更快
+                        double d = (traj_point - current_pos).squaredNorm();
                         if (d < best_d) { best_d = d; best = i; }
                     }
                     current_traj_index_ = best;
@@ -2549,6 +2462,39 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                     current_traj_index_ = 0;
                 }
 
+                auto computeOldPathAnchor = [&](double fallback_w) {
+                    std::pair<double, int> result(fallback_w, std::max(0, current_traj_index_));
+                    if (!(pm.gvf_ && pm.gvf_->reparam_ready_ &&
+                          pm.gvf_->sample_w_.size() == static_cast<size_t>(old_traj.rows()) &&
+                          old_traj.rows() > 0)) {
+                        return result;
+                    }
+
+                    int anchor_idx = std::max(0, std::min(current_traj_index_, (int)old_traj.rows() - 1));
+                    double best_d = std::numeric_limits<double>::infinity();
+                    for (int i = anchor_idx; i < old_traj.rows(); ++i) {
+                        Eigen::Vector3d traj_point(old_traj(i,0), old_traj(i,1), old_traj(i,2));
+                        double d = (traj_point - current_pos).squaredNorm();
+                        if (d < best_d) {
+                            best_d = d;
+                            anchor_idx = i;
+                        }
+                    }
+                    result.first = pm.gvf_->sample_w_[anchor_idx];
+                    result.second = anchor_idx;
+                    return result;
+                };
+
+                auto computeKeepPathAnchor = [&]() {
+                    std::pair<double, int> result(0.0, std::max(0, current_traj_index_));
+                    if (!(pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty())) {
+                        return result;
+                    }
+                    result.first = pm.gvf_->sample_w_.front();
+                    return result;
+                };
+
+                bool switched_to_new = false;
                 if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
                     bool accept_new = true;
                     std::string reason;
@@ -2558,31 +2504,52 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                                                            new_i0, pm.goal_pt, reason, cand_time);
                     }
                     if (accept_new) {
+                        const auto anchor = computeOldPathAnchor(progress_w_);
+                        const double w_anchor = anchor.first;
+                        const int anchor_idx = anchor.second;
+
+                        ROS_WARN("[GVF][ANCHOR] curr_i0=%d anchor_idx=%d w_anchor=%.3f old_rows=%d new_i0=%d", 
+                                 current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows(), new_i0);
+
                         pm.last_traj = cand_traj;
                         pm.last_vel = cand_vel;
                         current_traj_index_ = new_i0;
                         last_switch_time_ = current_time;
+                        if (pm.gvf_) {
+                            pm.gvf_->setNextPathWAnchor(w_anchor);
+                        }
+                        switched_to_new = true;
+                    } else {
+                        const auto anchor = computeKeepPathAnchor();
+                        const double w_anchor = anchor.first;
+                        const int anchor_idx = anchor.second;
+                        if (pm.gvf_) {
+                            pm.gvf_->setNextPathWAnchor(w_anchor);
+                        }
+                        ROS_WARN("[GVF][ANCHOR][KEEP] curr_i0=%d anchor_idx=%d start_w=%.3f old_rows=%d", 
+                                 current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows());
                     }
                 }
                 else {
                     ROS_WARN_THROTTLE(1.0, "[GVF] REPLAN_TRAJ: plan failed, keep old");
+                    const auto anchor = computeKeepPathAnchor();
+                    const double w_anchor = anchor.first;
+                    const int anchor_idx = anchor.second;
+                    if (pm.gvf_) {
+                        pm.gvf_->setNextPathWAnchor(w_anchor);
+                    }
+                    ROS_WARN("[GVF][ANCHOR][KEEP] curr_i0=%d anchor_idx=%d start_w=%.3f old_rows=%d", 
+                             current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows());
                 }
-	                
-	            publishPathMsg(pm.last_traj, pm.last_vel);              
+
+                publishPathMsg(pm.last_traj, pm.last_vel);
                 last_replan_time_ = current_time;
 
-                // ROS_INFO_THROTTLE(1.0, "[GVF] idx=%d rows=%d", current_traj_index_, (int)pm.last_traj.rows());
-
                 changeFSMExecState(EXEC_TRAJ, "FSM");
-	            
-	            break;
+
+                break;
             }
         }
-    }
-
-    void gvf_manager::Build4Dpathform3D(Eigen::MatrixXd& 3d_pos, Eigen::MatrixXd& 3d_vel,Eigen::MatrixXd& 4d_pos){
-        
-        
     }
 
 

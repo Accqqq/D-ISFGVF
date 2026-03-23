@@ -94,6 +94,8 @@ class gvf_manager
 
         Eigen::Vector3d ref_pos;//前馈积分参考点
         bool ref_initialized = false;//是否已经初始化参考点
+        Eigen::Vector3d last_cmd_pos_ = Eigen::Vector3d::Zero();
+        bool cmd_pos_initialized_ = false;
 
         // 碰撞触发重规划的去抖
         int collision_check_horizon_pts_ = 120;       // 只检查未来 N 个轨迹点
@@ -113,6 +115,10 @@ class gvf_manager
         // 轨迹拼接参数
         int max_trajectory_concatenation_points_;  // 最大轨迹拼接点数
         bool enable_trajectory_concatenation_;     // 是否启用轨迹拼接
+
+
+        double progress_w_ = 0.0;
+        bool progress_initialized_ = false;
 
         struct gvfManager {
             std::string index;

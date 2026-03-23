@@ -44,6 +44,11 @@ void gvf::init(ros::NodeHandle& nh, const std::string& particle, const std::stri
     nh.param("gvf/k2_max_scale", gvf_.k2_max_scale_, 1.8);
     nh.param("gvf/debug_output", gvf_.debug_output_, true);
 
+    nh.param("gvf/progress_window", progress_window_, 1.0);
+    nh.param("gvf/progress_rho0", progress_rho0_, 0.5);
+    nh.param("gvf/progress_delta", progress_delta_, 0.3);
+    nh.param("gvf/alpha_min", alpha_min_, 0.05);
+
     gvf_.local_bound_inflate_ = std::max(gvf_.resolution_, gvf_.local_bound_inflate_);
     gvf_.resolution_inv_ = 1.0 / gvf_.resolution_;
     gvf_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, gvf_.ground_height_);
@@ -272,6 +277,12 @@ void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
     last_path_recv_time_ = ros::Time::now();
     if (msg->poses.empty()) {
         last_path_.poses.clear();
+        reparam_ready_ = false;
+        sample_w_.clear();
+        sample_p_.clear();
+        sample_dp_.clear();
+        sample_tangent_.clear();
+        total_w_ = 0.0;
         return;
     }
     if (std::isnan(gvf_.camera_pos_(0)) || 
@@ -280,6 +291,7 @@ void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
 
     last_path_ = *msg; 
     gvf_.last_camera_pos_ = gvf_.camera_pos_;
+    buildReparamTableFromPathMsg(msg);
     // ROS_INFO("[GVF] Received path with %zu poses", msg->poses.size());
 
     this->resetBuffer(gvf_.camera_pos_ - gvf_.local_update_range_,
@@ -332,6 +344,12 @@ void gvf::kinoPathCallback(const nav_msgs::Path::ConstPtr& msg)
     last_path_recv_time_ = ros::Time::now();
     if (msg->poses.empty()) {
         last_path_.poses.clear();
+        reparam_ready_ = false;
+        sample_w_.clear();
+        sample_p_.clear();
+        sample_dp_.clear();
+        sample_tangent_.clear();
+        total_w_ = 0.0;
         return;
     }
     if (std::isnan(gvf_.camera_pos_(0)) || 
@@ -340,6 +358,7 @@ void gvf::kinoPathCallback(const nav_msgs::Path::ConstPtr& msg)
 
     last_path_ = *msg; 
     gvf_.last_camera_pos_ = gvf_.camera_pos_;
+    buildReparamTableFromPathMsg(msg);
 
     this->resetBuffer(gvf_.camera_pos_ - gvf_.local_update_range_,
                       gvf_.camera_pos_ + gvf_.local_update_range_);
@@ -717,6 +736,8 @@ void gvf::visCallback(const ros::TimerEvent& /*event*/) {
 }
 
 void gvf::publishPathCylinderVisualization() {
+    if (last_path_.poses.empty()) return;
+    
     // 创建MarkerArray来存储多个圆柱体
     visualization_msgs::MarkerArray cylinder_array;
     
@@ -728,19 +749,6 @@ void gvf::publishPathCylinderVisualization() {
     delete_marker.id = 0;
     delete_marker.action = visualization_msgs::Marker::DELETEALL;
     cylinder_array.markers.push_back(delete_marker);
-
-    // 没有新路径输入时，清空可视化（否则 RViz 会一直保留上一次的 Marker）
-    const bool stale = (path_vis_timeout_sec_ > 0.0) &&
-                       (last_path_recv_time_.toSec() > 0.0) &&
-                       ((ros::Time::now() - last_path_recv_time_).toSec() > path_vis_timeout_sec_);
-    if (stale) {
-        last_path_.poses.clear();
-    }
-
-    if (last_path_.poses.size() < 2) {
-        gvf_vis_pub_.publish(cylinder_array);
-        return;
-    }
     
     // 圆柱体参数设置
     double cylinder_radius = 0.05;  // 圆柱体半径，可以根据需要调整
@@ -1011,5 +1019,202 @@ void gvf::publishESDF() {
 
   // ROS_INFO("pub esdf");
 }
+
+void gvf::setNextPathWAnchor(double w_anchor)
+{
+    next_path_w_anchor_ = w_anchor;
+    has_next_path_w_anchor_ = true;
+}
+
+void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
+{
+    sample_w_.clear();
+    sample_p_.clear();
+    sample_dp_.clear();
+    sample_tangent_.clear();
+    total_w_ = 0.0;
+    reparam_ready_ = false;
+
+    if (!msg || msg->poses.size() < 2) return;
+
+    const size_t N = msg->poses.size();
+    sample_w_.resize(N, 0.0);
+    sample_p_.resize(N, Eigen::Vector3d::Zero());
+    sample_dp_.resize(N, Eigen::Vector3d::Zero());
+    sample_tangent_.resize(N, Eigen::Vector3d::Zero());
+
+    // 1) 读取路径点
+    for (size_t i = 0; i < N; ++i) {
+        sample_p_[i] = Eigen::Vector3d(
+            msg->poses[i].pose.position.x,
+            msg->poses[i].pose.position.y,
+            msg->poses[i].pose.position.z
+        );
+    }
+
+    // 2) 近似弧长参数化：新轨迹起点先继承旧轨迹当前progress锚点，再按新轨迹自身弧长继续累加
+    sample_w_[0] = has_next_path_w_anchor_ ? next_path_w_anchor_ : 0.0;
+    has_next_path_w_anchor_ = false;
+    for (size_t i = 1; i < N; ++i) {
+        double ds = (sample_p_[i] - sample_p_[i - 1]).norm();
+        sample_w_[i] = sample_w_[i - 1] + ds;
+    }
+    total_w_ = sample_w_.back();
+
+    // 3) 用真实 w 间隔做标准差分，得到 dp/dw
+    for (size_t i = 0; i < N; ++i) {
+        Eigen::Vector3d dp = Eigen::Vector3d::Zero();
+
+        if (i == 0) {
+            double dw = std::max(1e-9, sample_w_[1] - sample_w_[0]);
+            dp = (sample_p_[1] - sample_p_[0]) / dw;
+        } else if (i == N - 1) {
+            double dw = std::max(1e-9, sample_w_[N - 1] - sample_w_[N - 2]);
+            dp = (sample_p_[N - 1] - sample_p_[N - 2]) / dw;
+        } else {
+            double dw = std::max(1e-9, sample_w_[i + 1] - sample_w_[i - 1]);
+            dp = (sample_p_[i + 1] - sample_p_[i - 1]) / dw;
+        }
+
+        sample_dp_[i] = dp;
+        if (dp.norm() > 1e-6) {
+            sample_tangent_[i] = dp.normalized();
+        } else {
+            sample_tangent_[i] = Eigen::Vector3d::Zero();
+        }
+    }
+
+    reparam_ready_ = true;
+
+    ROS_WARN("[GVF][REPARAM] start_w=%.3f end_w=%.3f points=%zu",
+             sample_w_.front(), sample_w_.back(), sample_w_.size());
+}
+
+Eigen::Vector3d gvf::evalPathByW(double w) const
+{
+    if (!reparam_ready_ || sample_w_.empty()) return Eigen::Vector3d::Zero();
+
+    if (w <= sample_w_.front()) return sample_p_.front();
+    if (w >= sample_w_.back())  return sample_p_.back();
+
+    auto it = std::lower_bound(sample_w_.begin(), sample_w_.end(), w);
+    size_t i1 = std::distance(sample_w_.begin(), it);
+    size_t i0 = i1 - 1;
+
+    double w0 = sample_w_[i0];
+    double w1 = sample_w_[i1];
+    double s = (w - w0) / std::max(1e-9, w1 - w0);
+
+    return (1.0 - s) * sample_p_[i0] + s * sample_p_[i1];
+}
+
+
+Eigen::Vector3d gvf::evalDpDwByW(double w) const
+{
+    if (!reparam_ready_ || sample_w_.empty()) return Eigen::Vector3d::Zero();
+
+    if (w <= sample_w_.front()) return sample_dp_.front();
+    if (w >= sample_w_.back())  return sample_dp_.back();
+
+    auto it = std::lower_bound(sample_w_.begin(), sample_w_.end(), w);
+    size_t i1 = std::distance(sample_w_.begin(), it);
+    size_t i0 = i1 - 1;
+
+    double w0 = sample_w_[i0];
+    double w1 = sample_w_[i1];
+    double s = (w - w0) / std::max(1e-9, w1 - w0);
+
+    return (1.0 - s) * sample_dp_[i0] + s * sample_dp_[i1];
+}
+
+Eigen::Vector3d gvf::evalTangentByW(double w) const
+{
+    Eigen::Vector3d dp = evalDpDwByW(w);
+    if (dp.norm() > 1e-6) return dp.normalized();
+    return Eigen::Vector3d::Zero();
+}
+
+double gvf::projectToPathLocal(const Eigen::Vector3d& x,
+                               double w_prev,
+                               double window) const
+{
+    if (!reparam_ready_ || sample_w_.empty()) return 0.0;
+
+    double w_min = std::max(sample_w_.front(), w_prev - window);
+    double w_max = std::min(sample_w_.back(),  w_prev + window);
+
+    double best_w = w_prev;
+    double best_cost = std::numeric_limits<double>::infinity();
+
+    for (size_t i = 0; i < sample_w_.size(); ++i) {
+        double wi = sample_w_[i];
+        if (wi < w_min || wi > w_max) continue;
+
+        double cost = (sample_p_[i] - x).squaredNorm()
+                    + 2.0 * (wi - w_prev) * (wi - w_prev);  // continuity penalty
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_w = wi;
+        }
+    }
+    return best_w;
+}
+
+gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
+                                              double w_prev) const
+{
+    LiftedGuidanceResult out;
+    if (!reparam_ready_ || sample_w_.size() < 2) return out;
+
+    // 1) 局部投影到路径，得到当前参考进度
+    double w = projectToPathLocal(pos, w_prev, progress_window_);
+
+    // 2) 查询参考点和切向
+    Eigen::Vector3d p = evalPathByW(w);
+    Eigen::Vector3d dpdw = evalDpDwByW(w);
+    double dpdw_norm = dpdw.norm();
+    if (dpdw_norm < 1e-6) return out;
+
+    Eigen::Vector3d t = dpdw / dpdw_norm;
+
+    // 3) 误差分解
+    Eigen::Vector3d e = pos - p;
+    double e_parallel = t.dot(e);
+    Eigen::Vector3d e_perp = e - e_parallel * t;
+    double rho = e_perp.norm();
+
+    // 4) q_r(rho)
+    double r = gvf_.convergence_bandwidth_;
+    double q = (rho > 1e-6) ? std::tanh(rho / r) / rho : 1.0 / r;
+
+    // 5) alpha(rho), 保证 > 0
+    double alpha = alpha_min_ + (1.0 - alpha_min_) /
+                   (1.0 + (rho / progress_rho0_) * (rho / progress_rho0_));
+
+    // 6) sigma(e_parallel)
+    double sigma = std::tanh(e_parallel / progress_delta_);
+
+    // 7) lifted GVF 的前3维：实际给无人机用的速度
+    Eigen::Vector3d v_cmd =
+        gvf_.K1_ * alpha * t
+        + gvf_.K2_ * q * e_perp;
+
+    // 8) progress 更新律
+    double w_dot =
+        gvf_.K1_ * alpha
+        + gvf_.K3_ * sigma;
+
+    out.v_cmd = v_cmd;
+    out.w_proj = w;
+    out.w_dot = w_dot;
+    out.e_parallel = e_parallel;
+    out.e_perp = e_perp;
+    out.ref_pt = p;
+    out.tangent = t;
+    out.valid = true;
+    return out;
+}
+
+
 
 }

@@ -88,10 +88,10 @@
         <param name="gvf/replan_stop_vel" value="0.20" />
         <!-- 该参数决定前向跟踪速度 -->
         <!-- <param name="gvf/gvf_gain1"       value="2.5"/> -->
-        <param name="gvf/gvf_gain1"       value="1.5"/>
+        <param name="gvf/gvf_gain1"       value="2.0"/>
         <!-- 该参数决定后退/回拉速度 -->
         <!-- <param name="gvf/gvf_gain2"       value="-2.0"/> -->
-        <param name="gvf/gvf_gain2"       value="-2.2"/>
+        <param name="gvf/gvf_gain2"       value="-1.2"/>
         <param name="gvf/gvf_k3"          value="1.0"/>
         <param name="gvf/gvf_k4"          value="1.0"/>
         <param name="gvf/gvf_inflation"  value="0.099" /> 
