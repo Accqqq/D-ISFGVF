@@ -24,55 +24,41 @@
         <param name="gvf/planInterval"     value="0.5" /> 
         <param name="gvf/num_points_to_take" value="30" />
         <param name="gvf/use_test_cmd" value="false" />
+        <!-- <param name="gvf/circle_test/enable" value="false" />
+        <param name="gvf/circle_test/auto_start" value="false" />
+        <param name="gvf/circle_test/shape" value="figure8" />
+        <param name="gvf/circle_test/radius" value="8.0" />
+        <param name="gvf/circle_test/figure8_radius" value="10.0" />
+        <param name="gvf/circle_test/height" value="1.0" />
+        <param name="gvf/circle_test/points" value="480" />
+        <param name="gvf/circle_test/lookahead_pts" value="40" />
+        <param name="gvf/circle_test/realign_min_progress" value="3.0" />
+        <param name="gvf/circle_test/join_search_window" value="30" />
+        <param name="gvf/circle_test/join_lookahead_pts" value="8" />
+        <param name="gvf/circle_test/join_exit_dist" value="0.8" />
+        <param name="gvf/circle_test/join_exit_stable_needed" value="5" />
+        <param name="gvf/circle_test/center_x" value="0.0" />
+        <param name="gvf/circle_test/center_y" value="0.0" />
+        <param name="gvf/circle_test/center_z" value="0.0" /> -->
 
-        <!-- 重规划切换 + 轨迹拼接 -->
-        <!-- 注意：本工程里“换轨迟滞(稳定优先)”始终生效，不再依赖 enable_trajectory_concatenation。
-             enable_trajectory_concatenation 仅用于“发布段融合”：发布时保留旧轨迹未来一小段再接新轨迹，让控制更平滑。
-             它不会改变 KinoA* 的搜索起点选择逻辑（论文闭环：第一次用 odom，之后用 last_traj 最近点）。 -->
-        <param name="gvf/enable_trajectory_concatenation" value="false" />
-        <!-- 当 trajectory_keep_time <= 0 时：保留旧轨迹未来 N 个点 -->
-        <param name="gvf/max_trajectory_concatenation_points" value="50" />
-        <!-- 保留旧轨迹未来 keep_time 秒；<=0 则改用 max_trajectory_concatenation_points -->
-        <param name="gvf/trajectory_keep_time" value="1.0" />
-        <!-- 旧/新轨迹拼接处的混合点数（建议 10~20；0 会导致拼接处出现明显折点） -->
-        <param name="gvf/trajectory_blend_points" value="20" />
-        <!-- 发布段融合时：旧轨迹 keep_end 与新轨迹的接入点允许的最大距离，超过则跳过融合 -->
-        <param name="gvf/concat_max_join_dist" value="0.8" />
-        <!-- 切换迟滞参数（用于抑制左右来回换路） -->
-        <param name="gvf/switch_eval_horizon_pts" value="60" />
-        <param name="gvf/switch_clearance_hysteresis" value="0.15" />
-        <param name="gvf/switch_min_hold_time" value="1.0" />
-        <param name="gvf/switch_confirm_goal_progress" value="2" />
-        <param name="gvf/switch_confirm_track_error" value="2" />
-        <param name="gvf/switch_confirm_near_end" value="1" />
-        <!-- unknown/out-of-map 常见“前缀可靠、远端未知”，这里要求前缀段至少 N 个点可用 ESDF 才允许切换 -->
-        <param name="gvf/switch_prefix_min_reliable_pts" value="6" />
-        <!-- 旧轨迹剩余点数 <= N 时强制进入 near-end 兜底，避免 remain_old≈0 时“无轨迹可跟” -->
-        <param name="gvf/switch_near_end_hard_pts" value="5" />
-        <!-- new_i0 最近点索引窗口去抖（避免对称/平坦段 nearestIdxInTraj 抖动导致 topo_side/topo_dev 抖动） -->
-        <param name="gvf/switch_new_i0_window" value="20" />
-        <!-- out-of-map 处理：默认视为 unreliable，只有连续越界或越界比例过大才判为危险 -->
-        <param name="gvf/oob_hard_N" value="4" />
-        <param name="gvf/oob_hard_ratio" value="0.35" />
-        <!-- unknown/unreliable 下的二段安全判据：occ-free 必要；再要求 (可靠距离>=safe_small) 或 (occ 邻域也为空) -->
-        <param name="gvf/switch_safe_distance_small" value="0.28" />
-        <param name="gvf/switch_occ_neigh_radius" value="0.12" />
-        <param name="gvf/switch_occ_neigh_samples" value="6" />
-        <param name="gvf/switch_topo_dev_thr" value="0.8" />
-        <param name="gvf/switch_topo_clearance_margin" value="0.25" />
-        <param name="gvf/switch_topo_cmp_pts" value="60" />
-        <param name="gvf/switch_caution_margin" value="0.10" />
-        <param name="gvf/switch_progress_clearance_slack" value="0.05" />
-        <param name="gvf/switch_emergency_prefix_pts" value="20" />
-        <!-- 贴墙/碰撞触发时，要求新轨迹前缀的最小距离至少比当前位置/旧前缀好这么多 -->
-        <param name="gvf/switch_emergency_improve_delta" value="0.05" />
-        <param name="gvf/switch_topo_side_ahead_pts" value="25" />
-        <!-- 如果飞机已经明显偏离旧轨迹：允许切换（避免“越飘越远”） -->
-        <param name="gvf/switch_max_track_error" value="0.8" />
-        <!-- 如果新轨迹能显著更接近目标：允许切换（避免死守旧安全轨迹） -->
-        <param name="gvf/switch_goal_progress_margin" value="0.6" />
-        <!-- ESDF 距离在未知/越界区域可能为 10000；此时跳过迟滞拒绝逻辑 -->
-        <param name="gvf/switch_unknown_distance" value="50.0" />
+        <param name="gvf/circle_test/enable" value="false" />
+        <param name="gvf/circle_test/auto_start" value="false" />
+        <!-- circle/figure8 -->
+        <param name="gvf/circle_test/shape" value="circle" />
+        <param name="gvf/circle_test/radius" value="8.0" />
+        <param name="gvf/circle_test/figure8_radius" value="10.0" />
+        <param name="gvf/circle_test/height" value="1.0" />
+        <param name="gvf/circle_test/points" value="480" />
+        <param name="gvf/circle_test/lookahead_pts" value="40" />
+        <param name="gvf/circle_test/realign_min_progress" value="3.0" />
+        <param name="gvf/circle_test/join_search_window" value="30" />
+        <param name="gvf/circle_test/join_lookahead_pts" value="8" />
+        <param name="gvf/circle_test/join_exit_dist" value="0.8" />
+        <param name="gvf/circle_test/join_exit_stable_needed" value="5" />
+        <param name="gvf/circle_test/center_x" value="0.0" />
+        <param name="gvf/circle_test/center_y" value="0.0" />
+        <param name="gvf/circle_test/center_z" value="0.0" />
+
 
         <!-- KinoA*: guide points 采样 -->
         <param name="gvf/kino_sample_ts" value="0.15" />

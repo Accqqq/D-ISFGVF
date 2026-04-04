@@ -1202,7 +1202,7 @@ gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
     // 8) progress 更新律
     double w_dot =
         gvf_.K1_ * alpha
-        + gvf_.K3_ * sigma;
+        + gvf_.K1_ * sigma;
 
     out.v_cmd = v_cmd;
     out.w_proj = w;
@@ -1214,7 +1214,5 @@ gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
     out.valid = true;
     return out;
 }
-
-
 
 }

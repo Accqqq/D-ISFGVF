@@ -100,8 +100,6 @@ class gvf_manager
         // 碰撞触发重规划的去抖
         int collision_check_horizon_pts_ = 120;       // 只检查未来 N 个轨迹点
         int collision_consecutive_hits_ = 3;         // 连续 K 个点触发才算碰撞风险
-        double collision_replan_cooldown_ = 0.5;     // s，碰撞触发重规划冷却时间
-        ros::Time last_collision_replan_time_ = ros::Time(0);
 
         // 轨迹切换的去抖（连续满足 K 次才允许触发）
         int switch_confirm_goal_progress_cnt_ = 0;
@@ -119,6 +117,34 @@ class gvf_manager
 
         double progress_w_ = 0.0;
         bool progress_initialized_ = false;
+        bool enable_circle_reference_test_ = false;
+        bool circle_reference_auto_start_ = false;
+        bool circle_reference_auto_started_ = false;
+        bool circle_reference_ready_ = false;
+        std::string reference_shape_ = "circle";
+        double circle_reference_radius_ = 4.0;
+        double figure8_reference_radius_ = 4.0;
+        double circle_reference_height_ = 1.0;
+        int circle_reference_points_ = 240;
+        int circle_reference_lookahead_pts_ = 30;
+        double circle_reference_realign_min_progress_ = 3.0;
+        int figure8_join_search_window_ = 30;
+        int figure8_join_lookahead_pts_ = 8;
+        double figure8_join_exit_dist_ = 0.8;
+        int figure8_join_exit_stable_needed_ = 5;
+        bool figure8_join_mode_ = false;
+        int figure8_join_idx_ = -1;
+        int figure8_join_stable_count_ = 0;
+        double circle_reference_center_x_ = 0.0;
+        double circle_reference_center_y_ = 0.0;
+        double circle_reference_center_z_ = 0.0;
+        Eigen::Vector3d circle_reference_center_ = Eigen::Vector3d::Zero();
+        Eigen::MatrixXd circle_reference_traj_;
+        Eigen::MatrixXd circle_reference_vel_;
+        std::vector<double> circle_reference_w_;
+        double circle_reference_total_w_ = 0.0;
+        double circle_reference_progress_anchor_w_ = 0.0;
+        int circle_reference_index_ = 0;
 
         struct gvfManager {
             std::string index;
@@ -133,15 +159,15 @@ class gvf_manager
             ros::Time last_time;  // 上一次时间定时器
             bool is_initialized = false; 
             bool receive_startpt = false;
-            bool is_first_goal = true;  // 添加标志位
+            bool is_first_goal = false;  // 添加标志位
             bool receive_goal = false;
             bool is_first_kinogoal = true;
             std::vector<Eigen::Vector3d> last_path;  // 存储上一次的轨迹
             Eigen::MatrixXd last_traj;  // 存储上一次的轨迹矩阵
             Eigen::MatrixXd last_vel;  
+            Eigen::VectorXd last_traj_time_;
             // ros::Subscriber odom_sub;
             Eigen::Vector3d start_pt, goal_pt, odom;
-
 
             
         };
@@ -166,6 +192,8 @@ class gvf_manager
 
         ros::Subscriber cmd_enable_sub; // 新增订阅者
 
+        ros::Publisher  circle_ref_pub_;
+
     private:
         int test_traj_index_;  // 测试轨迹执行索引
         bool use_test_cmd_;    // 是否使用测试命令模式
@@ -174,11 +202,6 @@ class gvf_manager
         enum FSM_EXEC_STATE { INIT, WAIT_TARGET, GEN_NEW_TRAJ, REPLAN_TRAJ, EXEC_TRAJ };
         FSM_EXEC_STATE exec_state_;
 
-        // --------- Replan helpers (candidate + switch decision) ---------
-        bool shouldAcceptCandidate(const Eigen::MatrixXd& old_traj, const Eigen::MatrixXd& old_vel, int old_i0,
-                                  const Eigen::MatrixXd& new_traj, const Eigen::MatrixXd& new_vel, int new_i0,
-                                  const Eigen::Vector3d& goal_pt, std::string& reason_out, const Eigen::VectorXd& time);
-        void publishPathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel);
 
     public:
         gvf_manager(){};  
@@ -209,6 +232,16 @@ class gvf_manager
         void FSMCallback(const ros::TimerEvent& event);
         double cul_score(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, const Eigen::Vector3d& goal_pt, int i0,
                          const Eigen::VectorXd& time);
+
+                // --------- Replan helpers (candidate + switch decision) ---------
+        bool shouldAcceptCandidate(const Eigen::MatrixXd& old_traj, const Eigen::MatrixXd& old_vel, const Eigen::VectorXd& old_time, int old_i0,
+                        const Eigen::MatrixXd& new_traj, const Eigen::MatrixXd& new_vel, const Eigen::VectorXd& new_time, int new_i0,
+                        const Eigen::Vector3d& goal_pt, std::string& reason_out);
+        void publishPathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel);
+        void publishReferencePathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, ros::Publisher& pub);
+        void generateCircleReference(const Eigen::Vector3d& center);
+        void generateFigureEightReference(const Eigen::Vector3d& center);
+        std::pair<Eigen::Vector3d, Eigen::Vector3d> getCircleReferenceGoal(const Eigen::Vector3d& curr_pos);
 
         //inline func 
         inline Eigen::Vector3d esdfGrad(const Eigen::Vector3d& p) const

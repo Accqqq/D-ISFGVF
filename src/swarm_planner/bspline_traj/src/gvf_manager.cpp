@@ -18,13 +18,47 @@ namespace FLAG_Race
         nh.param("gvf/collision_threshold", collision_threshold_, 0.05);  // 添加碰撞检测阈值参数读取
         nh.param("gvf/use_test_cmd", use_test_cmd_, false);  // 是否使用测试命令模式
 
+
         nh.param("gvf/enable_trajectory_concatenation", enable_trajectory_concatenation_, false);
         nh.param("gvf/max_trajectory_concatenation_points", max_trajectory_concatenation_points_, 50);
+
+        nh.param("gvf/circle_test/enable", enable_circle_reference_test_, false);
+        nh.param("gvf/circle_test/auto_start", circle_reference_auto_start_, false);
+        nh.param<std::string>("gvf/circle_test/shape", reference_shape_, std::string("circle"));
+        nh.param("gvf/circle_test/radius", circle_reference_radius_, 4.0);
+        nh.param("gvf/circle_test/figure8_radius", figure8_reference_radius_, 4.0);
+        nh.param("gvf/circle_test/height", circle_reference_height_, 1.0);
+        nh.param("gvf/circle_test/points", circle_reference_points_, 240);
+        nh.param("gvf/circle_test/lookahead_pts", circle_reference_lookahead_pts_, 30);
+        nh.param("gvf/circle_test/realign_min_progress", circle_reference_realign_min_progress_, 3.0);
+        nh.param("gvf/circle_test/join_search_window", figure8_join_search_window_, 30);
+        nh.param("gvf/circle_test/join_lookahead_pts", figure8_join_lookahead_pts_, 8);
+        nh.param("gvf/circle_test/join_exit_dist", figure8_join_exit_dist_, 0.8);
+        nh.param("gvf/circle_test/join_exit_stable_needed", figure8_join_exit_stable_needed_, 5);
+        nh.param("gvf/circle_test/center_x", circle_reference_center_x_, 0.0);
+        nh.param("gvf/circle_test/center_y", circle_reference_center_y_, 0.0);
+        nh.param("gvf/circle_test/center_z", circle_reference_center_z_, 0.0);
+
+
+        nh.param("gvf/slow_radius", slow_radius, 1.0);
+        nh.param("gvf/stop_radius", stop_radius, 0.3);
+        nh.param("gvf/cmd/vel_max", cmd_vel_max_, 1.5);
+        nh.param("gvf/cmd/k_pull", cmd_k_pull_, 2.0);
+        nh.param("gvf/cmd/lookahead_time", cmd_lookahead_time_, 0.2);
+        nh.param("gvf/cmd/lookahead_dist", cmd_lookahead_dist_, 0.5);
+        nh.param("gvf/cmd/max_step", cmd_max_step_, 0.03);
+        nh.param("gvf/cmd/speed_max", cmd_speed_max_, 1.5);
+        nh.param("gvf/cmd/vel_lpf_hz", cmd_vel_lpf_hz_, 3.5);
+
+	        nh.param("gvf/collision_check_horizon_pts", collision_check_horizon_pts_, 120);
+	        nh.param("gvf/collision_consecutive_hits", collision_consecutive_hits_, 3);
+
+        nh.param("gvf/goal_reach_radius", goal_reach_radius_, 2.0);
+        nh.param("gvf/start_pt_change_threshold", start_pt_change_threshold_, 1.0);
 
 
         // nh.param("gvf/flight_height", flight_height_, 1.0);  // 设定飞行高度
         last_replan_time_ = ros::Time(0);  // 初始化上次重规划时间
-        last_switch_time_ = ros::Time(0);
         current_traj_index_ = 0;  // 初始化当前轨迹索引
         test_traj_index_ = 0;  // 初始化测试轨迹索引
         last_yaw = 0.0;  // 初始化yaw角度
@@ -53,22 +87,8 @@ namespace FLAG_Race
 
         exec_fsm_timer = nh.createTimer(ros::Duration(0.02), &gvf_manager::FSMCallback, this);  // FSM 状态机定时器
 
-        nh.param("gvf/slow_radius", slow_radius, 1.0);
-        nh.param("gvf/stop_radius", stop_radius, 0.3);
-        nh.param("gvf/cmd/vel_max", cmd_vel_max_, 1.5);
-        nh.param("gvf/cmd/k_pull", cmd_k_pull_, 2.0);
-        nh.param("gvf/cmd/lookahead_time", cmd_lookahead_time_, 0.2);
-        nh.param("gvf/cmd/lookahead_dist", cmd_lookahead_dist_, 0.5);
-        nh.param("gvf/cmd/max_step", cmd_max_step_, 0.03);
-        nh.param("gvf/cmd/speed_max", cmd_speed_max_, 1.5);
-        nh.param("gvf/cmd/vel_lpf_hz", cmd_vel_lpf_hz_, 3.5);
+        circle_ref_pub_ = nh.advertise<nav_msgs::Path>("/particle0/circle_reference", 1, true);
 
-	        nh.param("gvf/collision_check_horizon_pts", collision_check_horizon_pts_, 120);
-	        nh.param("gvf/collision_consecutive_hits", collision_consecutive_hits_, 3);
-	        nh.param("gvf/collision_replan_cooldown", collision_replan_cooldown_, 0.5);
-
-        nh.param("gvf/goal_reach_radius", goal_reach_radius_, 2.0);
-        nh.param("gvf/start_pt_change_threshold", start_pt_change_threshold_, 1.0);
 	        // nh.param("gvf/debug_gate", debug_gate_, false);
 
 	        // ROS_INFO("[GVF] debug_gate=%s (param: ~gvf/debug_gate)", debug_gate_ ? "true" : "false");
@@ -94,7 +114,6 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
     marker.pose.position.x = msg->pose.position.x;
     marker.pose.position.y = msg->pose.position.y;
     marker.pose.position.z = msg->pose.position.z+1.0;
-    // marker.pose.position.z = flight_height_;  // 固定高度1.0米
     
     // 设置目标点的方向
     marker.pose.orientation.w = 1.0;
@@ -121,8 +140,35 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
         msg->pose.position.x,
         msg->pose.position.y,
         msg->pose.position.z+1.0
-        // flight_height_
     );
+
+
+    progress_w_ = 0.0;
+    progress_initialized_ = false;
+    ref_pos = start_pt;
+    ref_initialized = false;
+    last_cmd_pos_ = start_pt;
+    cmd_pos_initialized_ = false;
+
+    if (enable_circle_reference_test_) {
+        if (reference_shape_ == "figure8" || reference_shape_ == "8" || reference_shape_ == "lemniscate") {
+            generateFigureEightReference(goal_pt);
+        } else {
+            generateCircleReference(goal_pt);
+        }
+        if (circle_reference_ready_) {
+            auto circle_goal = getCircleReferenceGoal(start_pt);
+            goal_pt = circle_goal.first;
+        }
+    } else {
+        circle_reference_ready_ = false;
+        circle_reference_traj_.resize(0, 0);
+        circle_reference_vel_.resize(0, 0);
+        circle_reference_w_.clear();
+        circle_reference_total_w_ = 0.0;
+        circle_reference_progress_anchor_w_ = 0.0;
+        circle_reference_index_ = 0;
+    }
 
     for (auto& manager : swarmParticlesManager) {
         manager.receive_startpt = true;
@@ -132,12 +178,6 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
         manager.receive_goal = true;
     }
 
-    progress_w_ = 0.0;
-    progress_initialized_ = false;
-    ref_pos = start_pt;
-    ref_initialized = false;
-    last_cmd_pos_ = start_pt;
-    cmd_pos_initialized_ = false;
 }
 
 void gvf_manager::cmdCallback(const ros::TimerEvent& event)
@@ -166,15 +206,6 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     const double cmd_speed_max = cmd_speed_max_; 
     const double vel_lpf_hz = cmd_vel_lpf_hz_;
 
-    // 命令点移动速度上限（m/s）：代替旧的“max_step固定米数”
-    // 如果你还没做成rosparam：先写死 2.5 或 3.0
-    // const double cmd_speed_max = 1.5;   // e.g. 2.5~3.0
-
-    // // vel 低通截止频率（Hz），抑制障碍物/重规划导致的方向突变
-    // // 如果你还没做成rosparam：先写死 3.0
-    // const double vel_lpf_hz = 2.0;      // e.g. 2.0~5.0
-    // // ======================================================================
-
     // 固定控制周期（你 timer 50Hz）
     const double dt = 0.02;
 
@@ -198,6 +229,7 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     }
 
     progress_w_ = out.w_proj + out.w_dot * dt;
+    progress_initialized_ = true;
 
     Eigen::Vector3d vel = out.v_cmd;
     double vel_mag = vel.norm();
@@ -266,17 +298,21 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     double dy_real = goal.y() - pos.y();
     double real_dis_to_goal = std::sqrt(dx_real*dx_real + dy_real*dy_real);
 
-    if (real_dis_to_goal < stop_radius)
+    const bool circle_mode_active = enable_circle_reference_test_ && circle_reference_ready_;
+    if (!circle_mode_active)
     {
-        cmd_pos = goal;
-        vel.setZero();
-        vel_f.setZero();
-    }
-    else if (real_dis_to_goal < slow_radius)
-    {
-        double s = (real_dis_to_goal - stop_radius) / (slow_radius - stop_radius);
-        s = std::max(0.0, std::min(1.0, s));
-        cmd_pos = s * cmd_pos + (1.0 - s) * goal;
+        if (real_dis_to_goal < stop_radius)
+        {
+            cmd_pos = goal;
+            vel.setZero();
+            vel_f.setZero();
+        }
+        else if (real_dis_to_goal < slow_radius)
+        {
+            double s = (real_dis_to_goal - stop_radius) / (slow_radius - stop_radius);
+            s = std::max(0.0, std::min(1.0, s));
+            cmd_pos = s * cmd_pos + (1.0 - s) * goal;
+        }
     }
     // ======================================================================
 
@@ -676,6 +712,309 @@ void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
     msg->pose.pose.position.x+0.000001,
     msg->pose.pose.position.y+0.000001,
     msg->pose.pose.position.z);
+    
+    if (!enable_circle_reference_test_ || !circle_reference_auto_start_ || circle_reference_auto_started_) {
+        return;
+    }
+    if (swarmParticlesManager.empty()) {
+        return;
+    }
+
+    Eigen::Vector3d start_pt(odom_.x(), odom_.y(), odom_.z());
+    Eigen::Vector3d center(circle_reference_center_x_, circle_reference_center_y_, circle_reference_center_z_);
+
+    progress_w_ = 0.0;
+    progress_initialized_ = false;
+    ref_pos = start_pt;
+    ref_initialized = false;
+    last_cmd_pos_ = start_pt;
+    cmd_pos_initialized_ = false;
+
+    if (reference_shape_ == "figure8" || reference_shape_ == "8" || reference_shape_ == "lemniscate") {
+        generateFigureEightReference(center);
+    } else {
+        generateCircleReference(center);
+    }
+
+    Eigen::Vector3d goal_pt = start_pt;
+    if (circle_reference_ready_) {
+        goal_pt = getCircleReferenceGoal(start_pt).first;
+    }
+
+    for (auto& manager : swarmParticlesManager) {
+        manager.receive_startpt = true;
+        manager.start_pt = start_pt;
+        manager.goal_pt = goal_pt;
+        manager.is_first_goal = true;
+        manager.receive_goal = true;
+    }
+
+    circle_reference_auto_started_ = true;
+    ROS_INFO("[GVF] auto start %s reference centered at (%.2f, %.2f, %.2f)",
+             reference_shape_.c_str(), center.x(), center.y(), center.z());
+}
+
+void gvf_manager::publishReferencePathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, ros::Publisher& pub)
+{
+    if (traj.rows() <= 0) return;
+    if (vel.rows() != traj.rows()) return;
+
+    nav_msgs::Path path_msg;
+    path_msg.header.frame_id = "world";
+    path_msg.header.stamp = ros::Time::now();
+
+    for (int i = 0; i < traj.rows(); ++i) {
+        geometry_msgs::PoseStamped pose;
+        pose.pose.position.x = traj(i, 0);
+        pose.pose.position.y = traj(i, 1);
+        pose.pose.position.z = traj(i, 2);
+        pose.pose.orientation.x = vel(i, 0);
+        pose.pose.orientation.y = vel(i, 1);
+        pose.pose.orientation.z = vel(i, 2);
+        pose.pose.orientation.w = 1.0;
+        path_msg.poses.push_back(pose);
+    }
+
+    pub.publish(path_msg);
+}
+
+void gvf_manager::generateCircleReference(const Eigen::Vector3d& center)
+{
+    const int N = std::max(24, circle_reference_points_);
+    const double radius = std::max(0.3, circle_reference_radius_);
+    circle_reference_center_ = Eigen::Vector3d(center.x(), center.y(), circle_reference_height_);
+    circle_reference_traj_.resize(N, 3);
+    circle_reference_vel_.resize(N, 3);
+
+    for (int i = 0; i < N; ++i) {
+        const double theta = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(N);
+        const double cth = std::cos(theta);
+        const double sth = std::sin(theta);
+        circle_reference_traj_.row(i) << circle_reference_center_.x() + radius * cth,
+                                          circle_reference_center_.y() + radius * sth,
+                                          circle_reference_center_.z();
+        circle_reference_vel_.row(i) << 0.0,
+                                          0.0,
+                                          0.0;
+    }
+
+    circle_reference_w_.assign(N, 0.0);
+    for (int i = 1; i < N; ++i) {
+        circle_reference_w_[i] = circle_reference_w_[i - 1]
+                               + (circle_reference_traj_.row(i) - circle_reference_traj_.row(i - 1)).norm();
+    }
+    circle_reference_total_w_ = circle_reference_w_.empty() ? 0.0 : circle_reference_w_.back();
+    circle_reference_progress_anchor_w_ = progress_w_;
+    circle_reference_index_ = 0;
+    figure8_join_mode_ = false;
+    figure8_join_idx_ = -1;
+    figure8_join_stable_count_ = 0;
+    circle_reference_ready_ = true;
+    publishReferencePathMsg(circle_reference_traj_, circle_reference_vel_, circle_ref_pub_);
+}
+
+
+void gvf_manager::generateFigureEightReference(const Eigen::Vector3d& center)
+{
+    const int N = std::max(48, circle_reference_points_);
+    const double radius = std::max(0.3, figure8_reference_radius_);
+    circle_reference_center_ = Eigen::Vector3d(center.x(), center.y(), circle_reference_height_);
+    circle_reference_traj_.resize(N, 3);
+    circle_reference_vel_.resize(N, 3);
+
+    for (int i = 0; i < N; ++i) {
+        const double theta = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(N);
+        const double sx = std::sin(theta);
+        const double cx = std::cos(theta);
+        const double s2 = std::sin(2.0 * theta);
+        const double c2 = std::cos(2.0 * theta);
+
+        Eigen::Vector3d pos(circle_reference_center_.x() + 0.5 * radius * s2,
+                            circle_reference_center_.y() + radius * sx,
+                            circle_reference_center_.z());
+        circle_reference_traj_.row(i) = pos.transpose();
+        circle_reference_vel_.row(i) << 0.0,
+                                          0.0,
+                                          0.0;
+    }
+
+    circle_reference_w_.assign(N, 0.0);
+    for (int i = 1; i < N; ++i) {
+        circle_reference_w_[i] = circle_reference_w_[i - 1]
+                               + (circle_reference_traj_.row(i) - circle_reference_traj_.row(i - 1)).norm();
+    }
+    circle_reference_total_w_ = circle_reference_w_.empty() ? 0.0 : circle_reference_w_.back();
+    circle_reference_progress_anchor_w_ = progress_w_;
+    circle_reference_index_ = 0;
+    figure8_join_mode_ = true;
+    figure8_join_idx_ = -1;
+    figure8_join_stable_count_ = 0;
+    circle_reference_ready_ = true;
+    publishReferencePathMsg(circle_reference_traj_, circle_reference_vel_, circle_ref_pub_);
+}
+
+std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(const Eigen::Vector3d& curr_pos)
+{
+    if (!circle_reference_ready_ || circle_reference_traj_.rows() <= 0 ||
+        circle_reference_traj_.rows() != circle_reference_vel_.rows()) {
+        return {curr_pos, Eigen::Vector3d::Zero()};
+    }
+
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    const int lookahead = std::max(1, circle_reference_lookahead_pts_);
+
+    auto wrappedIndex = [N](int idx) {
+        return ((idx % N) + N) % N;
+    };
+
+    int best_idx = 0;
+    int phase_idx_log = -1;
+    double w_phase_log = std::numeric_limits<double>::quiet_NaN();
+    double best_dist = std::numeric_limits<double>::infinity();
+    const bool is_figure8 = (reference_shape_ == "figure8" || reference_shape_ == "8" ||
+                             reference_shape_ == "lemniscate");
+
+    if (is_figure8 && figure8_join_mode_) {
+        const int join_window = std::max(5, figure8_join_search_window_);
+        const int join_lookahead = std::max(1, std::min(figure8_join_lookahead_pts_, lookahead));
+        if (figure8_join_idx_ < 0 || figure8_join_idx_ >= N) {
+            for (int i = 0; i < N; ++i) {
+                const Eigen::Vector3d pt = circle_reference_traj_.row(i).transpose();
+                const double dist = (pt - curr_pos).squaredNorm();
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_idx = i;
+                }
+            }
+        } else {
+            const int lo = std::max(0, figure8_join_idx_ - join_window);
+            const int hi = std::min(N - 1, figure8_join_idx_ + join_window);
+            best_idx = figure8_join_idx_;
+            for (int i = lo; i <= hi; ++i) {
+                const Eigen::Vector3d pt = circle_reference_traj_.row(i).transpose();
+                const double dist = (pt - curr_pos).squaredNorm();
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_idx = i;
+                }
+            }
+        }
+
+        figure8_join_idx_ = best_idx;
+        circle_reference_index_ = best_idx;
+        phase_idx_log = best_idx;
+        w_phase_log = circle_reference_w_[best_idx];
+
+        if (std::sqrt(std::max(0.0, best_dist)) <= figure8_join_exit_dist_) {
+            figure8_join_stable_count_ += 1;
+        } else {
+            figure8_join_stable_count_ = 0;
+        }
+
+        if (progress_initialized_ && figure8_join_stable_count_ >= std::max(1, figure8_join_exit_stable_needed_)) {
+            circle_reference_progress_anchor_w_ = progress_w_ - circle_reference_w_[best_idx];
+            figure8_join_mode_ = false;
+            ROS_WARN("[GVF][REF][JOIN->TRACK] w=%.3f idx=%d dist=%.3f stable=%d", progress_w_, best_idx,
+                     std::sqrt(std::max(0.0, best_dist)), figure8_join_stable_count_);
+        }
+
+        const int goal_idx = std::min(best_idx + join_lookahead, N - 1);
+        ROS_WARN_THROTTLE(0.2, "[GVF][REF][JOIN] idx=%d goal_idx=%d dist=%.3f stable=%d progress=%.3f", best_idx,
+                          goal_idx, std::sqrt(std::max(0.0, best_dist)), figure8_join_stable_count_, progress_w_);
+        return {
+            circle_reference_traj_.row(goal_idx).transpose(),
+            circle_reference_vel_.row(goal_idx).transpose()
+        };
+    }
+
+    if (progress_initialized_ && circle_reference_w_.size() == static_cast<size_t>(N) &&
+        circle_reference_total_w_ > 1e-6) {
+        double w_phase = std::fmod(progress_w_ - circle_reference_progress_anchor_w_, circle_reference_total_w_);
+        if (w_phase < 0.0) {
+            w_phase += circle_reference_total_w_;
+        }
+        w_phase_log = w_phase;
+
+        auto it = std::lower_bound(circle_reference_w_.begin(), circle_reference_w_.end(), w_phase);
+        int phase_idx = 0;
+        if (it == circle_reference_w_.end()) {
+            phase_idx = N - 1;
+        } else {
+            phase_idx = static_cast<int>(std::distance(circle_reference_w_.begin(), it));
+            if (phase_idx > 0) {
+                const double w_hi = circle_reference_w_[phase_idx];
+                const double w_lo = circle_reference_w_[phase_idx - 1];
+                if (std::abs(w_phase - w_lo) <= std::abs(w_hi - w_phase)) {
+                    phase_idx -= 1;
+                }
+            }
+        }
+
+        phase_idx_log = phase_idx;
+        const int search_window = std::min(std::max(1, N / 6), std::max(20, lookahead * 3));
+        best_idx = phase_idx;
+        for (int dk = -search_window; dk <= search_window; ++dk) {
+            const int idx = wrappedIndex(phase_idx + dk);
+            const Eigen::Vector3d pt = circle_reference_traj_.row(idx).transpose();
+            const double dist = (pt - curr_pos).squaredNorm();
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = idx;
+            }
+        }
+
+        if (is_figure8) {
+            int global_best_idx = 0;
+            double global_best_dist = std::numeric_limits<double>::infinity();
+            for (int i = 0; i < N; ++i) {
+                const Eigen::Vector3d pt = circle_reference_traj_.row(i).transpose();
+                const double dist = (pt - curr_pos).squaredNorm();
+                if (dist < global_best_dist) {
+                    global_best_dist = dist;
+                    global_best_idx = i;
+                }
+            }
+
+            const int idx_gap = std::min(std::abs(global_best_idx - phase_idx),
+                                         N - std::abs(global_best_idx - phase_idx));
+            const double dist_margin = std::max(0.35, 0.05 * std::max(circle_reference_radius_, figure8_reference_radius_));
+            const bool need_realign = progress_w_ >= circle_reference_realign_min_progress_ &&
+                                      idx_gap > std::max(lookahead, N / 10) &&
+                                      global_best_dist + dist_margin * dist_margin < best_dist;
+            if (need_realign) {
+                const double local_best_dist = best_dist;
+                circle_reference_progress_anchor_w_ = progress_w_ - circle_reference_w_[global_best_idx];
+                best_idx = global_best_idx;
+                best_dist = global_best_dist;
+                w_phase_log = circle_reference_w_[global_best_idx];
+                phase_idx_log = global_best_idx;
+                ROS_WARN("[GVF][REF][REALIGN] w=%.3f old_phase_idx=%d new_phase_idx=%d local_d=%.3f global_d=%.3f",
+                         progress_w_, phase_idx, global_best_idx, std::sqrt(std::max(0.0, local_best_dist)),
+                         std::sqrt(std::max(0.0, global_best_dist)));
+            }
+        }
+    } else {
+        const int start_idx = wrappedIndex(circle_reference_index_);
+        best_idx = start_idx;
+        for (int k = 0; k < N; ++k) {
+            const int idx = wrappedIndex(start_idx + k);
+            const Eigen::Vector3d pt = circle_reference_traj_.row(idx).transpose();
+            const double dist = (pt - curr_pos).squaredNorm();
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = idx;
+            }
+        }
+    }
+
+    circle_reference_index_ = best_idx;
+    const int goal_idx = progress_initialized_ ? wrappedIndex(best_idx + lookahead) : best_idx;
+    ROS_WARN_THROTTLE(0.2, "[GVF][REF] progress_init=%d w=%.3f phase=%.3f phase_idx=%d best_idx=%d goal_idx=%d",
+                      (int)progress_initialized_, progress_w_, w_phase_log, phase_idx_log, best_idx, goal_idx);
+    return {
+        circle_reference_traj_.row(goal_idx).transpose(),
+        circle_reference_vel_.row(goal_idx).transpose()
+    };
 }
 
 void gvf_manager::visualizePath(const std::vector<Eigen::Vector3d>& path_points, 
@@ -732,27 +1071,46 @@ void gvf_manager::visualizePath(const std::vector<Eigen::Vector3d>& path_points,
 bool gvf_manager::checkCollision()
 {
     if (swarmParticlesManager.empty()) return false;
-    
+
     auto& pm = swarmParticlesManager[0];
     if (pm.last_traj.rows() == 0) return false;  // 没有轨迹时不检查碰撞
-    
     if (collision_threshold_ <= 0.0) return false;
 
     const int traj_rows = static_cast<int>(pm.last_traj.rows());
     const int horizon_pts = std::max(1, collision_check_horizon_pts_);
-    const int end_idx = std::min(traj_rows - 1, current_traj_index_ + horizon_pts);
 
+    int start_idx = std::max(0, std::min(current_traj_index_, traj_rows - 1));
+    int progress_idx_log = -1;
+    if (pm.gvf_ && pm.gvf_->reparam_ready_ &&
+        pm.gvf_->sample_w_.size() == static_cast<size_t>(traj_rows)) {
+        auto it = std::lower_bound(pm.gvf_->sample_w_.begin(), pm.gvf_->sample_w_.end(), progress_w_);
+        int progress_idx = traj_rows - 1;
+        if (it != pm.gvf_->sample_w_.end()) {
+            progress_idx = static_cast<int>(std::distance(pm.gvf_->sample_w_.begin(), it));
+            if (progress_idx > 0) {
+                const double w_hi = pm.gvf_->sample_w_[progress_idx];
+                const double w_lo = pm.gvf_->sample_w_[progress_idx - 1];
+                if (std::abs(progress_w_ - w_lo) <= std::abs(w_hi - progress_w_)) {
+                    progress_idx -= 1;
+                }
+            }
+        }
+        progress_idx = std::max(0, std::min(progress_idx, traj_rows - 1));
+        progress_idx_log = progress_idx;
+        start_idx = std::max(start_idx, progress_idx);
+    }
+
+    const int end_idx = std::min(traj_rows - 1, start_idx + horizon_pts);
+    ROS_WARN_THROTTLE(0.5, "[GVF][COLL] curr_i=%d progress_i=%d start_i=%d end_i=%d progress=%.3f rows=%d",
+                      current_traj_index_, progress_idx_log, start_idx, end_idx, progress_w_, traj_rows);
     int consecutive_hits = 0;
 
-    // 只检查未来一小段轨迹，且要求连续命中，避免阈值附近抖动触发
-    for (int i = current_traj_index_; i <= end_idx; ++i) {
+    // 优先使用 lifted progress 对应的未来段做碰撞检查；若 progress 不可用则退化为当前索引。
+    for (int i = start_idx; i <= end_idx; ++i) {
         Eigen::Vector3d point(pm.last_traj(i, 0), pm.last_traj(i, 1), pm.last_traj(i, 2));
-        // 先用膨胀占据信息做硬判据：只看 ESDF 距离可能在边界/数值噪声下漏触发
-        // （例如距离略大于阈值但实际上已经擦到膨胀体）
         const int occ = pm.sdf_map_->getInflateOccupancy(point);
-        double distance = (occ != 0) ? 0.0 : pm.sdf_map_->getDistance(point);
-        
-        // 如果距离小于安全阈值，返回true表示有碰撞风险
+        const double distance = (occ != 0) ? 0.0 : pm.sdf_map_->getDistance(point);
+
         if (distance < collision_threshold_) {
             consecutive_hits++;
             if (consecutive_hits >= std::max(1, collision_consecutive_hits_)) {
@@ -762,7 +1120,7 @@ bool gvf_manager::checkCollision()
             consecutive_hits = 0;
         }
     }
-    return false;  // 无碰撞
+    return false;
 }
 
 void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
@@ -2196,9 +2554,11 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
     }
 
 
-    bool gvf_manager::shouldAcceptCandidate(const Eigen::MatrixXd& old_traj, const Eigen::MatrixXd& old_vel, int old_i0,
-                                            const Eigen::MatrixXd& new_traj, const Eigen::MatrixXd& new_vel, int new_i0,
-                                            const Eigen::Vector3d& goal_pt, std::string& reason_out, const Eigen::VectorXd& time)
+    bool gvf_manager::shouldAcceptCandidate(const Eigen::MatrixXd& old_traj, const Eigen::MatrixXd& old_vel,
+                                            const Eigen::VectorXd& old_time, int old_i0,
+                                            const Eigen::MatrixXd& new_traj, const Eigen::MatrixXd& new_vel,
+                                            const Eigen::VectorXd& new_time, int new_i0,
+                                            const Eigen::Vector3d& goal_pt, std::string& reason_out)
     {
         bool accept_new = true;
         std::string switch_reason = "accept_default";
@@ -2224,8 +2584,8 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
             accept_new = true;
         } else {
             //旧轨迹仍然安全，检查新旧轨迹代价
-            J_old = cul_score(old_traj, old_vel, goal_pt, old_i0, time);
-            J_new = cul_score(new_traj, new_vel, goal_pt, new_i0, time);
+            J_old = cul_score(old_traj, old_vel, goal_pt, old_i0, old_time);
+            J_new = cul_score(new_traj, new_vel, goal_pt, new_i0, new_time);
 
             const double eps = 1e-6;
             const double rel_improve = (J_old - J_new) / std::max(eps, std::abs(J_old));
@@ -2246,121 +2606,133 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         return accept_new;
     }
 
-    bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
-                              int& new_i0_out , Eigen::VectorXd& time)
-    {
-        auto& pm = swarmParticlesManager[0];
-        /*----------- ① Kino A* 搜索路径 + B 样条 -----------*/
+ bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
+                            int& new_i0_out , Eigen::VectorXd& time)
+{
+    auto& pm = swarmParticlesManager[0];
+    /*----------- ① Kino A* 搜索路径 + B 样条 -----------*/
 
-        Eigen::Vector3d start_pt, start_vel = Eigen::Vector3d::Zero(), start_acc = Eigen::Vector3d::Zero();
+    Eigen::Vector3d start_pt, start_vel = Eigen::Vector3d::Zero(), start_acc = Eigen::Vector3d::Zero();
 
-        if (pm.is_first_goal || pm.last_traj.rows() == 0) {
-            start_pt = Eigen::Vector3d(odom_.x() + 1e-6, odom_.y() + 1e-6, 1.0);
-            pm.is_first_goal = false;
-        } else {
+    if (pm.is_first_goal || pm.last_traj.rows() == 0) {
+        start_pt = Eigen::Vector3d(odom_.x() + 1e-6, odom_.y() + 1e-6, 1.0);
+        pm.is_first_goal = false;
+    } else {
 
-            int i0 = std::max(0, std::min(current_traj_index_, (int)pm.last_traj.rows() - 1));
+        int i0 = std::max(0, std::min(current_traj_index_, (int)pm.last_traj.rows() - 1));
 
-            start_pt = pm.last_traj.row(i0).transpose();
-            start_vel = pm.last_vel.row(i0).transpose();
+        start_pt = pm.last_traj.row(i0).transpose();
+        start_vel = pm.last_vel.row(i0).transpose();
 
-            double dt = 1.0 / std::max(1, pm.spline_->TrajSampleRate);
-            if (i0 + 1 < pm.last_vel.rows()) {
-                start_acc = (pm.last_vel.row(i0 + 1) - pm.last_vel.row(i0)).transpose() / dt;
-            }
-
+        double dt = 1.0 / std::max(1, pm.spline_->TrajSampleRate);
+        if (i0 + 1 < pm.last_vel.rows()) {
+            start_acc = (pm.last_vel.row(i0 + 1) - pm.last_vel.row(i0)).transpose() / dt;
         }
 
-        Eigen::Vector3d goal_pt = pm.goal_pt;
-        Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
-        
-        pm.kino_path_finder_->reset();
+    }
 
-        int status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc,
-                                    goal_pt, end_vel,
-                                    /*init=*/false, /*dynamic=*/false);
+    Eigen::Vector3d goal_pt = pm.goal_pt;
+    Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
+    if (enable_circle_reference_test_ && circle_reference_ready_) {
+        auto circle_goal = getCircleReferenceGoal(curr_pos);
+        goal_pt = circle_goal.first;
+        end_vel = circle_goal.second;
+        pm.goal_pt = goal_pt;
+    }
+    
+    pm.kino_path_finder_->reset();
+
+    int status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc,
+                                goal_pt, end_vel,
+                                /*init=*/false, /*dynamic=*/false);
+
+    if (status == KinodynamicAstar::NO_PATH) {
+        cout << "[kino replan]: kinodynamic search fail!" << endl;
+
+        //再次搜索
+        pm.kino_path_finder_->reset();
+        status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc, goal_pt, end_vel, false, false);
 
         if (status == KinodynamicAstar::NO_PATH) {
-            cout << "[kino replan]: kinodynamic search fail!" << endl;
-
-            //再次搜索
-            pm.kino_path_finder_->reset();
-            status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc, goal_pt, end_vel, false, false);
-
-            if (status == KinodynamicAstar::NO_PATH) {
-                cout << "[kino replan]: Can't find path." << endl;
-                return false;
-            } else {
-                cout << "[kino replan]: retry search success." << endl;
-            }
-
-        } else {
-            cout << "[kino replan]: kinodynamic search success." << endl;
-        }
-
-        double ts = 0.2; // 时间间隔 
-
-        vector<Eigen::Vector3d> point_set, start_end_derivatives; // 引导点,边界速度[v0,vT,a0,aT]
-        pm.kino_path_finder_->getSamples(ts, point_set, start_end_derivatives);
-
-        // 只用前 N 个点做 B 样条（像 topo A* 那版一样）
-        int N = std::min((int)point_set.size(), num_points_to_take_);
-        if (N >= 3 && N < (int)point_set.size()) {
-            point_set.resize(N);    
-        }
-
-
-        Eigen::MatrixXd initial_state(3, 3), terminal_state(3, 3);
-
-        Eigen::Vector3d end_pt_kino = point_set.back();
-        initial_state.row(0) = start_pt.transpose();
-        initial_state.row(1) = start_end_derivatives[0].transpose();  // v0
-        initial_state.row(2) = start_end_derivatives[2].transpose();  // a0
-
-        terminal_state.row(0) = end_pt_kino.transpose();
-        // terminal_state.row(1) = start_end_derivatives[1].transpose(); // vT
-        // terminal_state.row(2) = start_end_derivatives[3].transpose(); // aT
-        terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT
-        terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT
-
-
-        // B样条优化
-        pm.bspline_opt_->set3DPath2(point_set);
-        pm.spline_->setIniandTerandCpsnum(initial_state, terminal_state, pm.bspline_opt_->cps_num_);
-
-        if (pm.bspline_opt_->cps_num_ <= 2 * pm.spline_->p_) {
-            ROS_WARN("[gvf kino replan] cps_num too small: %d", pm.bspline_opt_->cps_num_);
+            cout << "[kino replan]: Can't find path." << endl;
             return false;
+        } else {
+            cout << "[kino replan]: retry search success." << endl;
         }
 
-        UniformBspline spline = *pm.spline_;
-        pm.bspline_opt_->setSplineParam(spline);
-        pm.bspline_opt_->optimize();
-
-        pm.spline_->setControlPoints(pm.bspline_opt_->control_points_);
-        pm.spline_->getT();
-
-        UniformBspline p = *pm.spline_;
-        UniformBspline v = p.getDerivative();
-
-        Eigen::MatrixXd p_ = p.getTrajectory(p.time_);
-        Eigen::MatrixXd v_ = v.getTrajectory(p.time_);
-
-        // 找候选轨迹上离当前 odom 最近的索引（用于后续切换/跟踪）
-        int best = 0;
-        double best_d = std::numeric_limits<double>::infinity();
-        for (int i = 0; i < p_.rows(); ++i) {
-            Eigen::Vector3d pt(p_(i, 0), p_(i, 1), p_(i, 2));
-            double d = (pt - curr_pos).squaredNorm();
-            if (d < best_d) { best_d = d; best = i; }
-        }
-
-        pos_out = p_;
-        vel_out = v_;
-        time = p.time_;
-        new_i0_out = std::max(0, std::min(best, (int)p_.rows() - 1));
-        return true;
+    } else {
+        cout << "[kino replan]: kinodynamic search success." << endl;
     }
+
+    double ts = 0.2; // 时间间隔 
+
+    vector<Eigen::Vector3d> point_set, start_end_derivatives; // 引导点,边界速度[v0,vT,a0,aT]
+    pm.kino_path_finder_->getSamples(ts, point_set, start_end_derivatives);
+
+    // 只用前 N 个点做 B 样条（像 topo A* 那版一样）
+    int N = std::min((int)point_set.size(), num_points_to_take_);
+    if (N >= 3 && N < (int)point_set.size()) {
+        point_set.resize(N);    
+    }
+
+
+    Eigen::MatrixXd initial_state(3, 3), terminal_state(3, 3);
+
+    Eigen::Vector3d end_pt_kino = point_set.back();
+    initial_state.row(0) = start_pt.transpose();
+    initial_state.row(1) = start_end_derivatives[0].transpose();  // v0
+    initial_state.row(2) = start_end_derivatives[2].transpose();  // a0
+
+    // terminal_state.row(0) = end_pt_kino.transpose();
+    // if (start_end_derivatives.size() >= 4) {
+    //     terminal_state.row(1) = start_end_derivatives[1].transpose();  // vT
+    //     terminal_state.row(2) = start_end_derivatives[3].transpose();  // aT
+    // } else {
+    //     terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT fallback
+    //     terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT fallback
+    // }
+    terminal_state.row(0) = end_pt_kino.transpose();
+    terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT
+    terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT
+
+
+    // B样条优化
+    pm.bspline_opt_->set3DPath2(point_set);
+    pm.spline_->setIniandTerandCpsnum(initial_state, terminal_state, pm.bspline_opt_->cps_num_);
+
+    if (pm.bspline_opt_->cps_num_ <= 2 * pm.spline_->p_) {
+        ROS_WARN("[gvf kino replan] cps_num too small: %d", pm.bspline_opt_->cps_num_);
+        return false;
+    }
+
+    UniformBspline spline = *pm.spline_;
+    pm.bspline_opt_->setSplineParam(spline);
+    pm.bspline_opt_->optimize();
+
+    pm.spline_->setControlPoints(pm.bspline_opt_->control_points_);
+    pm.spline_->getT();
+
+    UniformBspline p = *pm.spline_;
+    UniformBspline v = p.getDerivative();
+
+    Eigen::MatrixXd p_ = p.getTrajectory(p.time_);
+    Eigen::MatrixXd v_ = v.getTrajectory(p.time_);
+
+    // 找候选轨迹上离当前 odom 最近的索引（用于后续切换/跟踪）
+    int best = 0;
+    double best_d = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < p_.rows(); ++i) {
+        Eigen::Vector3d pt(p_(i, 0), p_(i, 1), p_(i, 2));
+        double d = (pt - curr_pos).squaredNorm();
+        if (d < best_d) { best_d = d; best = i; }
+    }
+
+    pos_out = p_;
+    vel_out = v_;
+    time = p.time_;
+    new_i0_out = std::max(0, std::min(best, (int)p_.rows() - 1));
+    return true;
+}
 
 
     void gvf_manager::changeFSMExecState(FSM_EXEC_STATE new_state, string pos_call) {
@@ -2370,54 +2742,57 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         cout << "[" + pos_call + "]: from " + state_str[pre_s] + " to " + state_str[int(new_state)] << endl;
     }
 
-    void gvf_manager::FSMCallback(const ros::TimerEvent& event)
+void gvf_manager::FSMCallback(const ros::TimerEvent& event)
+{
+    auto& pm = swarmParticlesManager[0];
+    Eigen::Vector3d current_pos(odom_.x(), odom_.y(), odom_.z());
+    ros::Time current_time = ros::Time::now();
+
+    switch (exec_state_)
     {
-        auto& pm = swarmParticlesManager[0];
-        Eigen::Vector3d current_pos(odom_.x(), odom_.y(), odom_.z());
-        ros::Time current_time = ros::Time::now();
-
-        switch (exec_state_)
-        {
-            case WAIT_TARGET:
-                if(pm.receive_goal || pm.is_first_goal)
-                {
-                    changeFSMExecState(GEN_NEW_TRAJ, "FSM");
-                }
-                else return;
-            break;
-
-            case GEN_NEW_TRAJ:{
-                Eigen::MatrixXd cand_traj, cand_vel;
-                Eigen::VectorXd cand_time;
-                int new_i0 = 0;
-                if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
-                    pm.last_traj = cand_traj;
-                    pm.last_vel = cand_vel;
-                    current_traj_index_ = new_i0;
-                    last_switch_time_ = current_time;
-                    publishPathMsg(pm.last_traj, pm.last_vel);
-                } else {
-                    ROS_WARN_THROTTLE(1.0, "[GVF] GEN_NEW_TRAJ: plan failed, keep old");
-                    publishPathMsg(pm.last_traj, pm.last_vel);
-                }
-                last_replan_time_ = current_time;
-                changeFSMExecState(EXEC_TRAJ, "FSM");
-                break;
+        case WAIT_TARGET:
+            if(pm.receive_goal || pm.is_first_goal)
+            {
+                changeFSMExecState(GEN_NEW_TRAJ, "FSM");
             }
+            else return;
+        break;
 
-            case EXEC_TRAJ:{
-                if (pm.last_traj.rows() > 0) {
-                    double min_dist = std::numeric_limits<double>::max();
-                    for (int i = current_traj_index_; i < pm.last_traj.rows(); ++i) {
-                        Eigen::Vector3d traj_point(pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
-                        double dist = (traj_point - current_pos).norm();
-                        if (dist < min_dist) {
-                            min_dist = dist;
-                            current_traj_index_ = i;
-                        }
+        case GEN_NEW_TRAJ:{
+            Eigen::MatrixXd cand_traj, cand_vel;
+            Eigen::VectorXd cand_time;
+            int new_i0 = 0;
+            if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
+                pm.last_traj = cand_traj;
+                pm.last_vel = cand_vel;
+                pm.last_traj_time_ = cand_time;
+                current_traj_index_ = new_i0;
+                last_switch_time_ = current_time;
+                publishPathMsg(pm.last_traj, pm.last_vel);
+            } else {
+                ROS_WARN_THROTTLE(1.0, "[GVF] GEN_NEW_TRAJ: plan failed, keep old");
+                publishPathMsg(pm.last_traj, pm.last_vel);
+            }
+            last_replan_time_ = current_time;
+            changeFSMExecState(EXEC_TRAJ, "FSM");
+            break;
+        }
+
+        case EXEC_TRAJ:{
+            if (pm.last_traj.rows() > 0) {
+                double min_dist = std::numeric_limits<double>::max();
+                for (int i = current_traj_index_; i < pm.last_traj.rows(); ++i) {
+                    Eigen::Vector3d traj_point(pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
+                    double dist = (traj_point - current_pos).norm();
+                    if (dist < min_dist) {
+                        min_dist = dist;
+                        current_traj_index_ = i;
                     }
                 }
+            }
 
+            const bool circle_mode_active = enable_circle_reference_test_ && circle_reference_ready_;
+            if (!circle_mode_active) {
                 const double dist_xy = (pm.goal_pt.head<2>() - current_pos.head<2>()).norm();
                 if (dist_xy < goal_reach_radius_) {
                     if(dist_xy < 0.2){
@@ -2427,111 +2802,119 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                     }
                     return;
                 }
-                else if((pm.start_pt - current_pos).norm() < start_pt_change_threshold_){
-                    return;
-                }
-                else if(checkCollision()){
-                    changeFSMExecState(REPLAN_TRAJ, "collision detection");
-                }
-                else if((current_time - last_replan_time_).toSec() >= planInterval){
-                    changeFSMExecState(REPLAN_TRAJ, "planInterval reached");
-                }
-
-                break;
             }
 
-            case REPLAN_TRAJ:{
-                const Eigen::MatrixXd old_traj = pm.last_traj;
-                const Eigen::MatrixXd old_vel  = pm.last_vel;
-                Eigen::MatrixXd cand_traj, cand_vel;
-                Eigen::VectorXd cand_time;
-                int new_i0 = 0;
+            if((pm.start_pt - current_pos).norm() < start_pt_change_threshold_){
+                return;
+            }
+            else if(checkCollision()){
+                changeFSMExecState(REPLAN_TRAJ, "collision detection");
+            }
+            else if((current_time - last_replan_time_).toSec() >= planInterval){
+                changeFSMExecState(REPLAN_TRAJ, "planInterval reached");
+            }
 
-                if (pm.last_traj.rows() > 0) {
-                    const int prev_i0 = std::max(0, std::min(current_traj_index_, (int)pm.last_traj.rows() - 1));
-                    int best = prev_i0;
-                    double best_d = std::numeric_limits<double>::infinity();
-                    for (int i = prev_i0; i < pm.last_traj.rows(); ++i) {
-                        Eigen::Vector3d traj_point(pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
-                        double d = (traj_point - current_pos).squaredNorm();
-                        if (d < best_d) { best_d = d; best = i; }
-                    }
-                    current_traj_index_ = best;
-                    new_i0 = best;
-                } else {
-                    current_traj_index_ = 0;
-                }
+            break;
+        }
 
-                auto computeOldPathAnchor = [&](double fallback_w) {
-                    std::pair<double, int> result(fallback_w, std::max(0, current_traj_index_));
-                    if (!(pm.gvf_ && pm.gvf_->reparam_ready_ &&
-                          pm.gvf_->sample_w_.size() == static_cast<size_t>(old_traj.rows()) &&
-                          old_traj.rows() > 0)) {
-                        return result;
-                    }
+        case REPLAN_TRAJ:{
+            const Eigen::MatrixXd old_traj = pm.last_traj;
+            const Eigen::MatrixXd old_vel  = pm.last_vel;
+            Eigen::MatrixXd cand_traj, cand_vel;
+            Eigen::VectorXd cand_time;
+            int new_i0 = 0;
 
-                    int anchor_idx = std::max(0, std::min(current_traj_index_, (int)old_traj.rows() - 1));
-                    double best_d = std::numeric_limits<double>::infinity();
-                    for (int i = anchor_idx; i < old_traj.rows(); ++i) {
-                        Eigen::Vector3d traj_point(old_traj(i,0), old_traj(i,1), old_traj(i,2));
-                        double d = (traj_point - current_pos).squaredNorm();
-                        if (d < best_d) {
-                            best_d = d;
-                            anchor_idx = i;
-                        }
-                    }
-                    result.first = pm.gvf_->sample_w_[anchor_idx];
-                    result.second = anchor_idx;
-                    return result;
-                };
-
-                auto computeKeepPathAnchor = [&]() {
-                    std::pair<double, int> result(0.0, std::max(0, current_traj_index_));
-                    if (!(pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty())) {
-                        return result;
-                    }
-                    result.first = pm.gvf_->sample_w_.front();
-                    return result;
-                };
-
-                bool switched_to_new = false;
-                if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
-                    bool accept_new = true;
-                    std::string reason;
-
-                    if (old_traj.rows() > 0 && old_vel.rows() == old_traj.rows()) {
-                        accept_new = shouldAcceptCandidate(old_traj, old_vel, current_traj_index_, cand_traj, cand_vel,
-                                                           new_i0, pm.goal_pt, reason, cand_time);
-                    }
-                    if (accept_new) {
-                        const auto anchor = computeOldPathAnchor(progress_w_);
-                        const double w_anchor = anchor.first;
-                        const int anchor_idx = anchor.second;
-
-                        ROS_WARN("[GVF][ANCHOR] curr_i0=%d anchor_idx=%d w_anchor=%.3f old_rows=%d new_i0=%d", 
-                                 current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows(), new_i0);
-
-                        pm.last_traj = cand_traj;
-                        pm.last_vel = cand_vel;
-                        current_traj_index_ = new_i0;
-                        last_switch_time_ = current_time;
-                        if (pm.gvf_) {
-                            pm.gvf_->setNextPathWAnchor(w_anchor);
-                        }
-                        switched_to_new = true;
+            if (pm.last_traj.rows() > 0) {
+                int progress_anchor_idx = std::max(0, std::min(current_traj_index_, (int)pm.last_traj.rows() - 1));
+                if (pm.gvf_ && pm.gvf_->reparam_ready_ &&
+                    pm.gvf_->sample_w_.size() == static_cast<size_t>(pm.last_traj.rows())) {
+                    auto it = std::lower_bound(pm.gvf_->sample_w_.begin(), pm.gvf_->sample_w_.end(), progress_w_);
+                    if (it == pm.gvf_->sample_w_.end()) {
+                        progress_anchor_idx = pm.last_traj.rows() - 1;
                     } else {
-                        const auto anchor = computeKeepPathAnchor();
-                        const double w_anchor = anchor.first;
-                        const int anchor_idx = anchor.second;
-                        if (pm.gvf_) {
-                            pm.gvf_->setNextPathWAnchor(w_anchor);
+                        progress_anchor_idx = std::distance(pm.gvf_->sample_w_.begin(), it);
+                        if (progress_anchor_idx > 0) {
+                            const double w_hi = pm.gvf_->sample_w_[progress_anchor_idx];
+                            const double w_lo = pm.gvf_->sample_w_[progress_anchor_idx - 1];
+                            if (std::abs(progress_w_ - w_lo) <= std::abs(w_hi - progress_w_)) {
+                                progress_anchor_idx -= 1;
+                            }
                         }
-                        ROS_WARN("[GVF][ANCHOR][KEEP] curr_i0=%d anchor_idx=%d start_w=%.3f old_rows=%d", 
-                                 current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows());
                     }
                 }
-                else {
-                    ROS_WARN_THROTTLE(1.0, "[GVF] REPLAN_TRAJ: plan failed, keep old");
+
+                int best = progress_anchor_idx;
+                double best_d = std::numeric_limits<double>::infinity();
+                for (int i = progress_anchor_idx; i < pm.last_traj.rows(); ++i) {
+                    Eigen::Vector3d traj_point(pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
+                    double d = (traj_point - current_pos).squaredNorm();
+                    if (d < best_d) { best_d = d; best = i; }
+                }
+                current_traj_index_ = best;
+                new_i0 = best;
+            } else {
+                current_traj_index_ = 0;
+            }
+
+            auto computeOldPathAnchor = [&](double fallback_w) {
+                std::pair<double, int> result(fallback_w, std::max(0, current_traj_index_));
+                if (!(pm.gvf_ && pm.gvf_->reparam_ready_ &&
+                      pm.gvf_->sample_w_.size() == static_cast<size_t>(old_traj.rows()) &&
+                      old_traj.rows() > 0)) {
+                    return result;
+                }
+
+                int anchor_idx = std::max(0, std::min(current_traj_index_, (int)old_traj.rows() - 1));
+                double best_d = std::numeric_limits<double>::infinity();
+                for (int i = anchor_idx; i < old_traj.rows(); ++i) {
+                    Eigen::Vector3d traj_point(old_traj(i,0), old_traj(i,1), old_traj(i,2));
+                    double d = (traj_point - current_pos).squaredNorm();
+                    if (d < best_d) {
+                        best_d = d;
+                        anchor_idx = i;
+                    }
+                }
+                result.first = pm.gvf_->sample_w_[anchor_idx];
+                result.second = anchor_idx;
+                return result;
+            };
+
+            auto computeKeepPathAnchor = [&]() {
+                std::pair<double, int> result(0.0, std::max(0, current_traj_index_));
+                if (!(pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty())) {
+                    return result;
+                }
+                result.first = pm.gvf_->sample_w_.front();
+                return result;
+            };
+
+            bool switched_to_new = false;
+            if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
+                bool accept_new = true;
+                std::string reason;
+
+                if (old_traj.rows() > 0 && old_vel.rows() == old_traj.rows()) {
+                    accept_new = shouldAcceptCandidate(old_traj, old_vel, pm.last_traj_time_, current_traj_index_, cand_traj, cand_vel,
+                                                       cand_time, new_i0, pm.goal_pt, reason);
+                }
+                if (accept_new) {
+                    const auto anchor = computeOldPathAnchor(progress_w_);
+                    const double w_anchor = anchor.first;
+                    const int anchor_idx = anchor.second;
+
+                    ROS_WARN("[GVF][ANCHOR] curr_i0=%d anchor_idx=%d w_anchor=%.3f old_rows=%d new_i0=%d", 
+                             current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows(), new_i0);
+
+                    pm.last_traj = cand_traj;
+                    pm.last_vel = cand_vel;
+                    pm.last_traj_time_ = cand_time;
+                    current_traj_index_ = new_i0;
+                    last_switch_time_ = current_time;
+                    if (pm.gvf_) {
+                        pm.gvf_->setNextPathWAnchor(w_anchor);
+                    }
+                    switched_to_new = true;
+                } else {
                     const auto anchor = computeKeepPathAnchor();
                     const double w_anchor = anchor.first;
                     const int anchor_idx = anchor.second;
@@ -2541,16 +2924,26 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                     ROS_WARN("[GVF][ANCHOR][KEEP] curr_i0=%d anchor_idx=%d start_w=%.3f old_rows=%d", 
                              current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows());
                 }
-
-                publishPathMsg(pm.last_traj, pm.last_vel);
-                last_replan_time_ = current_time;
-
-                changeFSMExecState(EXEC_TRAJ, "FSM");
-
-                break;
             }
+            else {
+                ROS_WARN_THROTTLE(1.0, "[GVF] REPLAN_TRAJ: plan failed, keep old");
+                const auto anchor = computeKeepPathAnchor();
+                const double w_anchor = anchor.first;
+                const int anchor_idx = anchor.second;
+                if (pm.gvf_) {
+                    pm.gvf_->setNextPathWAnchor(w_anchor);
+                }
+                ROS_WARN("[GVF][ANCHOR][KEEP] curr_i0=%d anchor_idx=%d start_w=%.3f old_rows=%d", 
+                         current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows());
+            }
+
+            publishPathMsg(pm.last_traj, pm.last_vel);
+            last_replan_time_ = current_time;
+
+            changeFSMExecState(EXEC_TRAJ, "FSM");
+
+            break;
         }
     }
-
-
+}
 }
