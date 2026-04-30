@@ -41,10 +41,10 @@
         <param name="gvf/circle_test/center_y" value="0.0" />
         <param name="gvf/circle_test/center_z" value="0.0" /> -->
 
-        <param name="gvf/circle_test/enable" value="false" />
-        <param name="gvf/circle_test/auto_start" value="false" />
+        <param name="gvf/circle_test/enable" value="true" />
+        <param name="gvf/circle_test/auto_start" value="true" />
         <!-- circle/figure8 -->
-        <param name="gvf/circle_test/shape" value="circle" />
+        <param name="gvf/circle_test/shape" value="figure8" />
         <param name="gvf/circle_test/radius" value="8.0" />
         <param name="gvf/circle_test/figure8_radius" value="10.0" />
         <param name="gvf/circle_test/height" value="1.0" />

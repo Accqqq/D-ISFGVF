@@ -326,7 +326,7 @@ Visualization Manager:
       Marker Topic: /particle0/gvf/vector_field
       Name: MarkerArray
       Namespaces:
-        {}
+        gvf_vectors: true
       Queue Size: 100
       Value: true
     - Angle Tolerance: 0.10000000149011612
@@ -533,4 +533,4 @@ Window Geometry:
     collapsed: true
   Width: 783
   X: 72
-  Y: 106
+  Y: 117

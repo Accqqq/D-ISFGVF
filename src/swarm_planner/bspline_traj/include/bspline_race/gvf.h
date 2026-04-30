@@ -164,6 +164,7 @@ class gvf
         Eigen::Vector3d estimateTangentViaQuadraticFit(const Eigen::Vector3d& pos);
         Eigen::Vector3d getTangentVector(const Eigen::Vector3d& pos);
 
+        void clearPathReparamState();
         void buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg);
         void setNextPathWAnchor(double w_anchor);
         Eigen::Vector3d evalPathByW(double w) const;

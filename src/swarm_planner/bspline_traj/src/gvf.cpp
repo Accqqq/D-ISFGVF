@@ -1026,6 +1026,19 @@ void gvf::setNextPathWAnchor(double w_anchor)
     has_next_path_w_anchor_ = true;
 }
 
+void gvf::clearPathReparamState()
+{
+    last_path_.poses.clear();
+    sample_w_.clear();
+    sample_p_.clear();
+    sample_dp_.clear();
+    sample_tangent_.clear();
+    total_w_ = 0.0;
+    reparam_ready_ = false;
+    next_path_w_anchor_ = 0.0;
+    has_next_path_w_anchor_ = false;
+}
+
 void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
 {
     sample_w_.clear();
@@ -1142,6 +1155,11 @@ double gvf::projectToPathLocal(const Eigen::Vector3d& x,
 
     double w_min = std::max(sample_w_.front(), w_prev - window);
     double w_max = std::min(sample_w_.back(),  w_prev + window);
+
+    if (w_min > w_max) {
+        ROS_INFO("[GVF][PROJ][EMPTY] w_prev=%.3f start_w=%.3f end_w=%.3f window=%.3f w_min=%.3f w_max=%.3f points=%zu",
+                 w_prev, sample_w_.front(), sample_w_.back(), window, w_min, w_max, sample_w_.size());
+    }
 
     double best_w = w_prev;
     double best_cost = std::numeric_limits<double>::infinity();

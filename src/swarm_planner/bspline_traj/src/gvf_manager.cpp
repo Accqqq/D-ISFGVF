@@ -171,6 +171,9 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
     }
 
     for (auto& manager : swarmParticlesManager) {
+        if (manager.gvf_) {
+            manager.gvf_->clearPathReparamState();
+        }
         manager.receive_startpt = true;
         manager.start_pt = start_pt;
         manager.goal_pt = goal_pt;
@@ -742,6 +745,9 @@ void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
     }
 
     for (auto& manager : swarmParticlesManager) {
+        if (manager.gvf_) {
+            manager.gvf_->clearPathReparamState();
+        }
         manager.receive_startpt = true;
         manager.start_pt = start_pt;
         manager.goal_pt = goal_pt;
@@ -1009,8 +1015,17 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(
 
     circle_reference_index_ = best_idx;
     const int goal_idx = progress_initialized_ ? wrappedIndex(best_idx + lookahead) : best_idx;
-    ROS_WARN_THROTTLE(0.2, "[GVF][REF] progress_init=%d w=%.3f phase=%.3f phase_idx=%d best_idx=%d goal_idx=%d",
-                      (int)progress_initialized_, progress_w_, w_phase_log, phase_idx_log, best_idx, goal_idx);
+    double exec_start_w_log = std::numeric_limits<double>::quiet_NaN();
+    if (!swarmParticlesManager.empty()) {
+        const auto& pm = swarmParticlesManager[0];
+        if (pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty()) {
+            exec_start_w_log = pm.gvf_->sample_w_.front();
+        }
+    }
+    ROS_WARN_THROTTLE(0.2,
+                      "[GVF][REF] progress_init=%d progress_w=%.3f phase=%.3f exec_start_w=%.3f phase_idx=%d best_idx=%d goal_idx=%d",
+                      (int)progress_initialized_, progress_w_, w_phase_log, exec_start_w_log,
+                      phase_idx_log, best_idx, goal_idx);
     return {
         circle_reference_traj_.row(goal_idx).transpose(),
         circle_reference_vel_.row(goal_idx).transpose()
@@ -2904,6 +2919,8 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
 
                     ROS_WARN("[GVF][ANCHOR] curr_i0=%d anchor_idx=%d w_anchor=%.3f old_rows=%d new_i0=%d", 
                              current_traj_index_, anchor_idx, w_anchor, (int)old_traj.rows(), new_i0);
+                    ROS_INFO("[GVF][SWITCH] progress_w=%.3f w_anchor=%.3f delta=%.3f curr_i0=%d anchor_idx=%d new_i0=%d",
+                             progress_w_, w_anchor, w_anchor - progress_w_, current_traj_index_, anchor_idx, new_i0);
 
                     pm.last_traj = cand_traj;
                     pm.last_vel = cand_vel;

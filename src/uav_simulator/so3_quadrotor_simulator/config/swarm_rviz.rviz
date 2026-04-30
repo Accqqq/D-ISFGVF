@@ -7,7 +7,7 @@ Panels:
         - /MarkerArray5
         - /Path4
       Splitter Ratio: 0.520588219165802
-    Tree Height: 460
+    Tree Height: 363
   - Class: rviz/Selection
     Name: Selection
   - Class: rviz/Tool Properties
@@ -528,7 +528,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/ThirdPersonFollower
-      Distance: 25.86713981628418
+      Distance: 25.79716682434082
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -536,9 +536,9 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -5.561081886291504
-        Y: -0.5637990832328796
-        Z: 6.368443337123608e-07
+        X: -5.004385948181152
+        Y: -0.08533847332000732
+        Z: -3.168299826938892e-07
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
@@ -565,4 +565,4 @@ Window Geometry:
     collapsed: false
   Width: 1063
   X: 842
-  Y: 141
+  Y: 104
