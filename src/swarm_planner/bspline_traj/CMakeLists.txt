@@ -55,3 +55,7 @@ bspline_gvf
  ${catkin_LIBRARIES}
  ${NLOPT_LIBRARIES}
 )
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(reference_join_test test/reference_join_test.cpp)
+endif()

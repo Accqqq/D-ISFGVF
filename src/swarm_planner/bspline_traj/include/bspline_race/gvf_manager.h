@@ -14,6 +14,9 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <deque>
+#include <sstream>
+#include <iomanip>
 #include <Eigen/Dense>
 //ros
 #include <ros/ros.h>
@@ -85,17 +88,59 @@ class gvf_manager
         double start_pt_change_threshold_ = 1.0; // m，起点变化阈值
 
         double cmd_vel_max_ = 1.25;          // m/s，GVF 输出速度限幅
-        double cmd_k_pull_ = 2.0;           // 回拉增益：ref_pos += k_pull*(pos-ref_pos)*dt（越大越贴身但更慢）
-        double cmd_lookahead_time_ = 0.2;   // s，小前视时间：cmd_pos = ref_pos + T*vel（越大越快但更“猛”）
-        double cmd_lookahead_dist_ = 0.4;   // m，cmd_pos 相对真实 pos 的最大水平前视距离
-        double cmd_max_step_ = 0.03;        // m/tick，单周期 cmd_pos 最大移动（抑制跳点/起步弹射） 
-        double cmd_speed_max_ = 1.25;        // m/s，cmd_pos 的最大速度
-        double cmd_vel_lpf_hz_ = 4.0;       // Hz，vel 低通截止频率
+        double cmd_acc_max_ = 1.5;           // m/s^2，命令速度状态的加速度上限
+        double cmd_jerk_max_ = 20.0;         // m/s^3，命令速度状态的 jerk 上限
+        double cmd_offset_rate_max_ = 2.5;   // m/s，位置偏置变化率上限
+        double cmd_vel_lpf_hz_ = 3.5;        // Hz，GVF 速度命令低通截止频率
+        double cmd_pos_gain_equiv_ = 1.65;   // 位置环等效增益：v_actual ≈ K * position_error
+        double cmd_lead_max_ = 1.5;          // m，速度转位置后的最大领先距离
+        bool cmd_use_vel_slew_limit_ = false;
+        bool cmd_use_vel_feedback_ = false;
+        bool cmd_use_pos_ff_ = false;
+        bool cmd_pos_ff_xy_only_ = false;
+        double cmd_pos_ff_time_ = 0.08;      // s，基于 GVF 速度变化率的位置前馈时间
+        double cmd_pos_ff_max_ = 0.20;       // m，位置前馈偏置限幅
+        bool cmd_use_switch_motion_limits_ = false;
+        bool cmd_skip_motion_limits_on_switch_ = false;
+        double cmd_switch_motion_limit_time_ = 0.25; // s，换轨后短时间启用运动学限幅
+        double cmd_switch_acc_max_ = 4.0;    // m/s^2，换轨窗口内 GVF 速度变化限幅
+        double cmd_switch_jerk_max_ = 30.0;  // m/s^3，换轨窗口内 GVF 加速度变化限幅
+        double cmd_switch_offset_rate_max_ = 3.0; // m/s，换轨窗口内位置偏置变化限幅
 
-        Eigen::Vector3d ref_pos;//前馈积分参考点
-        bool ref_initialized = false;//是否已经初始化参考点
+        double cmd_vel_fb_switch_time_ = 0.50;
+
+        bool cmd_gain_test_enable_ = false;
+        double cmd_gain_test_lead_ = 0.4;
+        int cmd_gain_test_axis_ = 0;  // 0 表示 x 方向，1 表示 y 方向
+
+        Eigen::Vector3d ref_pos;//上一条命令位置
+        Eigen::Vector3d cmd_vel_state_ = Eigen::Vector3d::Zero();//命令速度状态
+        bool ref_initialized = false;//是否已经初始化命令状态
         Eigen::Vector3d last_cmd_pos_ = Eigen::Vector3d::Zero();
-        bool cmd_pos_initialized_ = false;
+        Eigen::Vector3d last_curve_vel_ = Eigen::Vector3d::Zero();
+        bool has_last_curve_vel_ = false;
+        Eigen::Vector3d cmd_vel_lpf_state_ = Eigen::Vector3d::Zero();
+        Eigen::Vector3d last_v_cmd_ = Eigen::Vector3d::Zero();
+        bool cmd_vel_state_initialized_ = false;
+        Eigen::Vector3d last_v_gvf_for_pos_ff_ = Eigen::Vector3d::Zero();
+        bool has_last_v_gvf_for_pos_ff_ = false;
+        Eigen::Vector3d last_v_gvf_limited_ = Eigen::Vector3d::Zero();
+        Eigen::Vector3d last_a_gvf_limited_ = Eigen::Vector3d::Zero();
+        bool has_last_v_gvf_limited_ = false;
+        Eigen::Vector3d last_cmd_offset_ = Eigen::Vector3d::Zero();
+        bool has_last_cmd_offset_ = false;
+        ros::Time vel_fb_switch_until_;
+        ros::Time cmd_switch_motion_limit_until_;
+        struct OdomPosSample { ros::Time t; Eigen::Vector3d p; };
+        std::deque<OdomPosSample> odom_pos_history_;
+        Eigen::Vector3d odom_vel_est_ = Eigen::Vector3d::Zero();//由 odom 位置差分估计的真实速度
+        Eigen::Vector3d odom_vel_lpf_ = Eigen::Vector3d::Zero();
+        bool odom_vel_initialized_ = false;
+        double odom_vel_est_window_ = 0.3;
+        double odom_vel_lpf_hz_ = 2.0;
+        Eigen::Vector3d last_odom_pos_ = Eigen::Vector3d::Zero();
+        ros::Time last_odom_time_;
+        bool has_last_odom_ = false;
 
         // 碰撞触发重规划的去抖
         int collision_check_horizon_pts_ = 120;       // 只检查未来 N 个轨迹点
@@ -128,13 +173,7 @@ class gvf_manager
         int circle_reference_points_ = 240;
         int circle_reference_lookahead_pts_ = 30;
         double circle_reference_realign_min_progress_ = 3.0;
-        int figure8_join_search_window_ = 30;
-        int figure8_join_lookahead_pts_ = 8;
-        double figure8_join_exit_dist_ = 0.8;
-        int figure8_join_exit_stable_needed_ = 5;
-        bool figure8_join_mode_ = false;
-        int figure8_join_idx_ = -1;
-        int figure8_join_stable_count_ = 0;
+
         double circle_reference_center_x_ = 0.0;
         double circle_reference_center_y_ = 0.0;
         double circle_reference_center_z_ = 0.0;
@@ -145,6 +184,62 @@ class gvf_manager
         double circle_reference_total_w_ = 0.0;
         double circle_reference_progress_anchor_w_ = 0.0;
         int circle_reference_index_ = 0;
+        double closed_ref_w_ = 0.0;
+        bool closed_ref_initialized_ = false;
+        bool closed_ref_recover_ = false;
+        double closed_ref_search_back_w_ = 0.3;
+        double closed_ref_search_forward_w_ = 1.5;
+        double closed_ref_lookahead_w_ = 1.5;
+        double closed_ref_lookahead_min_w_ = 1.0;
+        double closed_ref_lookahead_max_w_ = 3.0;
+        double closed_ref_lookahead_step_w_ = 0.5;
+        bool closed_ref_enable_global_realign_ = false;
+        bool closed_ref_enable_recover_ = false;
+        double closed_ref_lost_radius_ = 1.5;
+        double closed_ref_recover_radius_ = 1.0;
+        double closed_ref_initial_phase_w_ = -1.0;
+        double ref_phase_k1_ = 2.0;
+        double ref_alpha_rho_ = 1.0;
+        double ref_sigma_scale_ = 1.0;
+        double ref_wdot_forward_max_ = 3.0;
+        double ref_wdot_backward_max_ = 1.5;
+        double ref_project_blend_ = 0.2;
+        double ref_project_snap_max_ = 0.5;
+        double ref_project_boundary_eps_ = 0.03;
+        double closed_goal_full_success_tol_ = 0.3;
+        ros::Time closed_ref_last_update_time_;
+        double closed_ref_dbg_e_parallel_ = 0.0;
+        double closed_ref_dbg_rho_ = 0.0;
+        double closed_ref_dbg_alpha_ = 0.0;
+        double closed_ref_dbg_sigma_ = 0.0;
+        double closed_ref_dbg_w_dot_ = 0.0;
+        double closed_ref_dbg_dt_ = 0.0;
+        double closed_ref_dbg_w_dyn_ = 0.0;
+        double closed_ref_dbg_w_proj_ = 0.0;
+        double closed_ref_dbg_project_delta_ = 0.0;
+        double closed_ref_dbg_phase_delta_ = 0.0;
+        bool closed_ref_dbg_used_project_blend_ = false;
+        bool closed_ref_dbg_projected_on_boundary_ = false;
+        double closed_ref_dbg_boundary_eps_ = 0.03;
+        std::string closed_ref_dbg_project_blend_skipped_reason_ = "none";
+        double last_selected_goal_w_ = 0.0;
+        double last_selected_lookahead_w_ = 0.0;
+        int last_selected_goal_idx_ = -1;
+        int last_failed_goal_idx_ = -1;
+        bool has_last_selected_goal_ = false;
+        bool last_closed_goal_plan_success_ = true;
+        double closed_ref_last_selected_goal_w_ = 0.0;
+        double closed_ref_last_selected_lookahead_w_ = 0.0;
+        bool closed_ref_has_selected_goal_ = false;
+        double closed_ref_pending_goal_w_ = 0.0;
+        double closed_ref_pending_lookahead_w_ = 0.0;
+        bool closed_ref_has_pending_goal_ = false;
+        double closed_ref_accepted_goal_w_ = 0.0;
+        double closed_ref_accepted_lookahead_w_ = 0.0;
+        bool closed_ref_has_accepted_goal_ = false;
+        Eigen::Vector3d closed_ref_last_goal_pos_ = Eigen::Vector3d::Zero();
+        double closed_ref_last_goal_dist_xy_ = 0.0;
+        int closed_ref_last_candidate_idx_ = -1;
 
         struct gvfManager {
             std::string index;
@@ -202,6 +297,27 @@ class gvf_manager
         enum FSM_EXEC_STATE { INIT, WAIT_TARGET, GEN_NEW_TRAJ, REPLAN_TRAJ, EXEC_TRAJ };
         FSM_EXEC_STATE exec_state_;
 
+        struct KinoPlanSamples {
+            double ts = 0.2;
+            std::vector<Eigen::Vector3d> point_set;
+            std::vector<Eigen::Vector3d> start_end_derivatives;
+        };
+
+        bool planKinoToGoal(gvfManager& pm,
+                            const Eigen::Vector3d& start_pt,
+                            const Eigen::Vector3d& start_vel,
+                            const Eigen::Vector3d& start_acc,
+                            const Eigen::Vector3d& goal_pt,
+                            const Eigen::Vector3d& end_vel,
+                            KinoPlanSamples& samples);
+        bool selectClosedGoalCandidate(gvfManager& pm,
+                                       const Eigen::Vector3d& curr_pos,
+                                       const Eigen::Vector3d& start_pt,
+                                       const Eigen::Vector3d& start_vel,
+                                       const Eigen::Vector3d& start_acc,
+                                       Eigen::Vector3d& goal_pt,
+                                       Eigen::Vector3d& end_vel,
+                                       KinoPlanSamples& samples);
 
     public:
         gvf_manager(){};  
@@ -242,6 +358,21 @@ class gvf_manager
         void generateCircleReference(const Eigen::Vector3d& center);
         void generateFigureEightReference(const Eigen::Vector3d& center);
         std::pair<Eigen::Vector3d, Eigen::Vector3d> getCircleReferenceGoal(const Eigen::Vector3d& curr_pos);
+        double wrapClosedW(double w) const;
+        int indexFromClosedW(double w) const;
+        Eigen::Vector3d pointFromClosedW(double w) const;
+        Eigen::Vector3d tangentFromClosedW(double w) const;
+        double findInitialClosedPhase(const Eigen::Vector3d& curr_pos) const;
+        double projectClosedLocal(const Eigen::Vector3d& curr_pos, double w_prev,
+                                  double back_window, double forward_window) const;
+        double closedRefAlpha(double rho) const;
+        double closedRefSigma(double e_parallel) const;
+        double updateClosedRefPhaseByDynamics(const Eigen::Vector3d& curr_pos, double dt);
+        std::vector<double> buildClosedLookaheadCandidates() const;
+        int selectDefaultClosedLookaheadIndex(const std::vector<double>& candidates) const;
+        void resetClosedGoalCandidateState();
+        void ensureProgressInCurrentPathRange(double start_w, double end_w);
+        void logReplanReason(const std::string& reason);
 
         //inline func 
         inline Eigen::Vector3d esdfGrad(const Eigen::Vector3d& p) const

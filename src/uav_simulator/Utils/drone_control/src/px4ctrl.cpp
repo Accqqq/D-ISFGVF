@@ -370,12 +370,12 @@ void PX4CTRL::main_state(const ros::TimerEvent &e)
 			is_reached = false;
 		}
 
-		des_vx = feedforward_x;
-		des_vy = feedforward_y;
-		des_vz = feedforward_z;
-		// des_vx = feed_gain * feedforward_x + px * vel_command(ego_pos_x, ego_pos_y, ego_pos_z).x - dx * currvx;
-		// des_vy = feed_gain * feedforward_y + py * vel_command(ego_pos_x, ego_pos_y, ego_pos_z).y - dy * currvy;
-		// des_vz = current_goal.velocity.z =  pz * vel_command(ego_pos_x, ego_pos_y, ego_pos_z).z;
+		// des_vx = feedforward_x;
+		// des_vy = feedforward_y;
+		// des_vz = feedforward_z;
+		des_vx = feed_gain * feedforward_x + px * vel_command(ego_pos_x, ego_pos_y, ego_pos_z).x - dx * currvx;
+		des_vy = feed_gain * feedforward_y + py * vel_command(ego_pos_x, ego_pos_y, ego_pos_z).y - dy * currvy;
+		des_vz = current_goal.velocity.z =  pz * vel_command(ego_pos_x, ego_pos_y, ego_pos_z).z;
 
 		current_goal.coordinate_frame = mavros_msgs::PositionTarget::FRAME_BODY_NED;
 		current_goal.header.stamp = ros::Time::now();

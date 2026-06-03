@@ -29,12 +29,28 @@ namespace FLAG_Race
         nh.param("gvf/circle_test/figure8_radius", figure8_reference_radius_, 4.0);
         nh.param("gvf/circle_test/height", circle_reference_height_, 1.0);
         nh.param("gvf/circle_test/points", circle_reference_points_, 240);
-        nh.param("gvf/circle_test/lookahead_pts", circle_reference_lookahead_pts_, 30);
-        nh.param("gvf/circle_test/realign_min_progress", circle_reference_realign_min_progress_, 3.0);
-        nh.param("gvf/circle_test/join_search_window", figure8_join_search_window_, 30);
-        nh.param("gvf/circle_test/join_lookahead_pts", figure8_join_lookahead_pts_, 8);
-        nh.param("gvf/circle_test/join_exit_dist", figure8_join_exit_dist_, 0.8);
-        nh.param("gvf/circle_test/join_exit_stable_needed", figure8_join_exit_stable_needed_, 5);
+
+        nh.param("gvf/circle_test/search_back_w", closed_ref_search_back_w_, 0.3);
+        nh.param("gvf/circle_test/search_forward_w", closed_ref_search_forward_w_, 1.5);
+        nh.param("gvf/circle_test/lookahead_w", closed_ref_lookahead_w_, 1.5);
+        nh.param("gvf/circle_test/lookahead_min_w", closed_ref_lookahead_min_w_, 1.0);
+        nh.param("gvf/circle_test/lookahead_max_w", closed_ref_lookahead_max_w_, 3.0);
+        nh.param("gvf/circle_test/lookahead_step_w", closed_ref_lookahead_step_w_, 0.5);
+        nh.param("gvf/circle_test/enable_global_realign", closed_ref_enable_global_realign_, false);
+        nh.param("gvf/circle_test/enable_recover", closed_ref_enable_recover_, false);
+        nh.param("gvf/circle_test/ref_lost_radius", closed_ref_lost_radius_, 1.5);
+        nh.param("gvf/circle_test/ref_recover_radius", closed_ref_recover_radius_, 1.0);
+        nh.param("gvf/circle_test/initial_phase_w", closed_ref_initial_phase_w_, -1.0);
+        nh.param("gvf/circle_test/ref_phase_k1", ref_phase_k1_, 2.0);
+        nh.param("gvf/circle_test/ref_alpha_rho", ref_alpha_rho_, 1.0);
+        nh.param("gvf/circle_test/ref_sigma_scale", ref_sigma_scale_, 1.0);
+        nh.param("gvf/circle_test/ref_wdot_forward_max", ref_wdot_forward_max_, 3.0);
+        nh.param("gvf/circle_test/ref_wdot_backward_max", ref_wdot_backward_max_, 1.5);
+        nh.param("gvf/circle_test/ref_project_blend", ref_project_blend_, 0.2);
+        nh.param("gvf/circle_test/ref_project_snap_max", ref_project_snap_max_, 0.5);
+        nh.param("gvf/circle_test/ref_project_boundary_eps", ref_project_boundary_eps_, 0.03);
+        nh.param("gvf/circle_test/goal_full_success_tol", closed_goal_full_success_tol_, 0.3);
+
         nh.param("gvf/circle_test/center_x", circle_reference_center_x_, 0.0);
         nh.param("gvf/circle_test/center_y", circle_reference_center_y_, 0.0);
         nh.param("gvf/circle_test/center_z", circle_reference_center_z_, 0.0);
@@ -43,12 +59,32 @@ namespace FLAG_Race
         nh.param("gvf/slow_radius", slow_radius, 1.0);
         nh.param("gvf/stop_radius", stop_radius, 0.3);
         nh.param("gvf/cmd/vel_max", cmd_vel_max_, 1.5);
-        nh.param("gvf/cmd/k_pull", cmd_k_pull_, 2.0);
-        nh.param("gvf/cmd/lookahead_time", cmd_lookahead_time_, 0.2);
-        nh.param("gvf/cmd/lookahead_dist", cmd_lookahead_dist_, 0.5);
-        nh.param("gvf/cmd/max_step", cmd_max_step_, 0.03);
-        nh.param("gvf/cmd/speed_max", cmd_speed_max_, 1.5);
+        nh.param("gvf/cmd/acc_max", cmd_acc_max_, 1.5);
+        nh.param("gvf/cmd/jerk_max", cmd_jerk_max_, 20.0);
+        nh.param("gvf/cmd/offset_rate_max", cmd_offset_rate_max_, 2.5);
         nh.param("gvf/cmd/vel_lpf_hz", cmd_vel_lpf_hz_, 3.5);
+        nh.param("gvf/cmd/pos_gain_equiv", cmd_pos_gain_equiv_, 1.65);
+        nh.param("gvf/cmd/lead_max", cmd_lead_max_, 1.5);
+        nh.param("gvf/cmd/use_vel_slew_limit", cmd_use_vel_slew_limit_, false);
+        nh.param("gvf/cmd/use_vel_feedback", cmd_use_vel_feedback_, false);
+        nh.param("gvf/cmd/use_pos_ff", cmd_use_pos_ff_, false);
+        nh.param("gvf/cmd/pos_ff_xy_only", cmd_pos_ff_xy_only_, false);
+        nh.param("gvf/cmd/pos_ff_time", cmd_pos_ff_time_, 0.08);
+        nh.param("gvf/cmd/pos_ff_max", cmd_pos_ff_max_, 0.20);
+        nh.param("gvf/cmd/use_switch_motion_limits", cmd_use_switch_motion_limits_, false);
+        nh.param("gvf/cmd/skip_motion_limits_on_switch", cmd_skip_motion_limits_on_switch_, false);
+        nh.param("gvf/cmd/switch_motion_limit_time", cmd_switch_motion_limit_time_, 0.25);
+        nh.param("gvf/cmd/switch_acc_max", cmd_switch_acc_max_, 4.0);
+        nh.param("gvf/cmd/switch_jerk_max", cmd_switch_jerk_max_, 30.0);
+        nh.param("gvf/cmd/switch_offset_rate_max", cmd_switch_offset_rate_max_, 3.0);
+
+        nh.param("gvf/cmd/vel_fb_switch_time", cmd_vel_fb_switch_time_, 0.50);
+
+        nh.param("gvf/cmd/gain_test_enable", cmd_gain_test_enable_, false);
+        nh.param("gvf/cmd/gain_test_lead", cmd_gain_test_lead_, 0.4);
+        nh.param("gvf/cmd/gain_test_axis", cmd_gain_test_axis_, 0);
+        nh.param("gvf/odom_vel_est_window", odom_vel_est_window_, 0.3);
+        nh.param("gvf/odom_vel_lpf_hz", odom_vel_lpf_hz_, 2.0);
 
 	        nh.param("gvf/collision_check_horizon_pts", collision_check_horizon_pts_, 120);
 	        nh.param("gvf/collision_consecutive_hits", collision_consecutive_hits_, 3);
@@ -59,6 +95,8 @@ namespace FLAG_Race
 
         // nh.param("gvf/flight_height", flight_height_, 1.0);  // 设定飞行高度
         last_replan_time_ = ros::Time(0);  // 初始化上次重规划时间
+        vel_fb_switch_until_ = ros::Time(0);
+        cmd_switch_motion_limit_until_ = ros::Time(0);
         current_traj_index_ = 0;  // 初始化当前轨迹索引
         test_traj_index_ = 0;  // 初始化测试轨迹索引
         last_yaw = 0.0;  // 初始化yaw角度
@@ -145,10 +183,28 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
 
     progress_w_ = 0.0;
     progress_initialized_ = false;
+    closed_ref_w_ = 0.0;
+    closed_ref_initialized_ = false;
+    closed_ref_recover_ = false;
+    resetClosedGoalCandidateState();
     ref_pos = start_pt;
+    cmd_vel_state_.setZero();
+    last_curve_vel_.setZero();
+    has_last_curve_vel_ = false;
+    cmd_vel_lpf_state_.setZero();
+    last_v_cmd_.setZero();
+    cmd_vel_state_initialized_ = false;
+    last_v_gvf_for_pos_ff_.setZero();
+    has_last_v_gvf_for_pos_ff_ = false;
+    last_v_gvf_limited_.setZero();
+    last_a_gvf_limited_.setZero();
+    has_last_v_gvf_limited_ = false;
+    last_cmd_offset_.setZero();
+    has_last_cmd_offset_ = false;
+    vel_fb_switch_until_ = ros::Time(0);
+    cmd_switch_motion_limit_until_ = ros::Time(0);
     ref_initialized = false;
     last_cmd_pos_ = start_pt;
-    cmd_pos_initialized_ = false;
 
     if (enable_circle_reference_test_) {
         if (reference_shape_ == "figure8" || reference_shape_ == "8" || reference_shape_ == "lemniscate") {
@@ -168,6 +224,10 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
         circle_reference_total_w_ = 0.0;
         circle_reference_progress_anchor_w_ = 0.0;
         circle_reference_index_ = 0;
+        closed_ref_w_ = 0.0;
+        closed_ref_initialized_ = false;
+        closed_ref_recover_ = false;
+        resetClosedGoalCandidateState();
     }
 
     for (auto& manager : swarmParticlesManager) {
@@ -189,6 +249,45 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
      if (use_test_cmd_) return;
     // if (!enable_gvfcmd_control) return;
 
+    if (cmd_gain_test_enable_)
+    {
+        const Eigen::Vector3d pos = odom_;
+        Eigen::Vector3d lead = Eigen::Vector3d::Zero();
+        if (cmd_gain_test_axis_ == 1)
+        {
+            lead.y() = cmd_gain_test_lead_;
+        }
+        else
+        {
+            lead.x() = cmd_gain_test_lead_;
+        }
+
+        const Eigen::Vector3d cmd_pos = pos + lead;
+
+        quadrotor_msgs::PositionCommand cmd;
+        cmd.header.stamp = ros::Time::now();
+        cmd.header.frame_id = "world";
+        cmd.position.x = cmd_pos.x();
+        cmd.position.y = cmd_pos.y();
+        cmd.position.z = cmd_pos.z();
+        cmd.velocity.x = 0.0;
+        cmd.velocity.y = 0.0;
+        cmd.velocity.z = 0.0;
+        cmd.yaw = last_yaw;
+        cmd.yaw_dot = 0.0f;
+        cmd_pub.publish(cmd);
+
+        const Eigen::Vector2d lead_xy = lead.head<2>();
+        const Eigen::Vector2d vel_xy = odom_vel_lpf_.head<2>();
+        const double lead_sq = lead_xy.squaredNorm();
+        const double k_meas = lead_sq > 1e-9 ? vel_xy.dot(lead_xy) / lead_sq : 0.0;
+
+        ROS_WARN_THROTTLE(0.5,
+                          "[GVF][GAIN_TEST] lead=%.3f vel_est_x=%.3f vel_est_y=%.3f k_meas=%.3f",
+                          lead_xy.norm(), odom_vel_lpf_.x(), odom_vel_lpf_.y(), k_meas);
+        return;
+    }
+
     if (swarmParticlesManager.empty()) return;
     if (!swarmParticlesManager[0].receive_goal)
     {
@@ -196,28 +295,9 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         return;
     }
 
-    ros::Time t_start = ros::Time::now();  // 记录开始时间
-
     const Eigen::Vector3d pos  = odom_;
     const Eigen::Vector3d goal = swarmParticlesManager[0].goal_pt;
-
-    // ===================== 参数区（通过 rosparam 调参） =====================
-    const double vel_max = cmd_vel_max_;        
-    const double k_pull  = cmd_k_pull_;         
-    const double T_cmd   = cmd_lookahead_time_; 
-    const double Lmax    = cmd_lookahead_dist_; 
-    const double cmd_speed_max = cmd_speed_max_; 
-    const double vel_lpf_hz = cmd_vel_lpf_hz_;
-
-    // 固定控制周期（你 timer 50Hz）
     const double dt = 0.02;
-
-    // 初始化 ref_pos（成员变量：ref_pos / ref_initialized）
-    if (!ref_initialized)
-    {
-        ref_pos = pos;
-        ref_initialized = true;
-    }
 
     // ===================== 1) 论文式闭环：用真实 pos 查 GVF =====================
     // Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(pos);
@@ -234,116 +314,230 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     progress_w_ = out.w_proj + out.w_dot * dt;
     progress_initialized_ = true;
 
-    Eigen::Vector3d vel = out.v_cmd;
-    double vel_mag = vel.norm();
+    const Eigen::Vector3d raw_v_gvf = out.v_cmd;
+    Eigen::Vector3d v_gvf = raw_v_gvf;
 
-    ROS_WARN_THROTTLE(1.0, "[GVF] vel: (%.2f)", vel.norm());
-
-    // 限幅到 vel_max
-    if (vel_mag > vel_max && vel_mag > 1e-6)
-    {
-        vel *= (vel_max / vel_mag);
-        vel_mag = vel_max;
-    }
-
-    // ===================== 1.5) vel 一阶低通（解决“抽动”核心） =====================
-    // static bool vel_init = false;
-    // static Eigen::Vector3d vel_f = Eigen::Vector3d::Zero();
-    // if (!vel_init)
-    // {
-    //     vel_f = vel;
-    //     vel_init = true;
-    // }
-
-    // // 一阶低通：beta = dt/(tau+dt), tau = 1/(2*pi*f)
-    // // f 越小越平滑，但响应越慢；建议 2~5Hz
-    // double f = std::max(0.1, vel_lpf_hz);
-    // double tau = 1.0 / (2.0 * M_PI * f);
-    // double beta = dt / (tau + dt);
-    // vel_f = (1.0 - beta) * vel_f + beta * vel;
-
-    // // 保险：滤波后也限幅一次
-    // double vel_f_mag = vel_f.norm();
-    // if (vel_f_mag > vel_max && vel_f_mag > 1e-6)
-    // {
-    //     vel_f *= (vel_max / vel_f_mag);
-    //     vel_f_mag = vel_max;
-    // }
-
-    Eigen::Vector3d vel_f = vel;
-
-    // ===================== 2) 丝滑底座：ref_pos 连续积分推进 =====================
-    ref_pos = ref_pos + vel_f * dt;
-
-    // 回拉：防漂移/让 ref_pos 不至于跑飞（保持闭环，因为 vel 来自 GVF(pos)）
-    ref_pos = ref_pos + k_pull * (pos - ref_pos) * dt;
-
-    // ===================== 3) 提速输出：cmd_pos = ref_pos + 小前视 =====================
-    Eigen::Vector3d cmd_pos = ref_pos + T_cmd * vel_f;
-
-    // 最大前视距离限制（相对真实 pos 的水平距离）
-    Eigen::Vector3d d = cmd_pos - pos;
-    double d_xy = d.head<2>().norm();
-    if (d_xy > Lmax && d_xy > 1e-6)
-    {
-        d *= (Lmax / d_xy);
-        cmd_pos = pos + d;
-    }
-
-    // ROS_WARN_THROTTLE(1.0, "[GVF] vel: (%.2f, %.2f, %.2f)", vel.x(), vel.y(), vel.z());
-    // ROS_WARN_THROTTLE(1.0, "[GVF] vel_f: (%.2f, %.2f, %.2f)", vel_f.x(), vel_f.y(), vel_f.z());
-
-    ROS_WARN_THROTTLE(1.0, "[GVF] vel_f: (%.2f)", vel_f.norm());
-    ROS_WARN_THROTTLE(1.0, "[GVF] cmd_pos: (%.2f, %.2f, %.2f)", cmd_pos.x(), cmd_pos.y(), cmd_pos.z());
-
-    // ===================== 4) 终点附近逻辑：完全按你原来的（不改） =====================
     double dx_real = goal.x() - pos.x();
     double dy_real = goal.y() - pos.y();
     double real_dis_to_goal = std::sqrt(dx_real*dx_real + dy_real*dy_real);
+    bool force_goal_position = false;
 
     const bool circle_mode_active = enable_circle_reference_test_ && circle_reference_ready_;
     if (!circle_mode_active)
     {
         if (real_dis_to_goal < stop_radius)
         {
-            cmd_pos = goal;
-            vel.setZero();
-            vel_f.setZero();
+            v_gvf.setZero();
+            force_goal_position = true;
         }
         else if (real_dis_to_goal < slow_radius)
         {
-            double s = (real_dis_to_goal - stop_radius) / (slow_radius - stop_radius);
+            double s = (real_dis_to_goal - stop_radius) / std::max(1e-6, slow_radius - stop_radius);
             s = std::max(0.0, std::min(1.0, s));
-            cmd_pos = s * cmd_pos + (1.0 - s) * goal;
+            v_gvf *= s;
         }
     }
-    // ======================================================================
 
-    // ===================== 5) cmd_pos 速率限制（用速度上限 * dt） =====================
-    if (!cmd_pos_initialized_)
+    double v_gvf_norm = v_gvf.norm();
+    const bool saturated_by_vel_max = v_gvf_norm > cmd_vel_max_ && v_gvf_norm > 1e-6;
+    if (saturated_by_vel_max)
     {
-        last_cmd_pos_ = pos;
-        cmd_pos_initialized_ = true;
+        v_gvf *= cmd_vel_max_ / v_gvf_norm;
+        v_gvf_norm = cmd_vel_max_;
     }
 
-    // 用“命令点速度上限”换算成每周期最大步长；再叠加单周期硬上限 cmd_max_step_
-    double max_step_from_speed = std::max(0.01, cmd_speed_max) * dt;
-    double max_step = max_step_from_speed;
-    if (cmd_max_step_ > 1e-6) {
-        max_step = std::min(max_step_from_speed, cmd_max_step_);
-    }
+    const ros::Time now = ros::Time::now();
+    const bool switch_motion_limit_active = cmd_use_switch_motion_limits_ &&
+                                            now < cmd_switch_motion_limit_until_;
+    const bool skip_motion_limit_for_switch = cmd_skip_motion_limits_on_switch_ &&
+                                              switch_motion_limit_active;
+    const bool motion_limit_active = (cmd_use_vel_slew_limit_ || switch_motion_limit_active) &&
+                                     !skip_motion_limit_for_switch;
+    const double active_acc_max = switch_motion_limit_active ? cmd_switch_acc_max_ : cmd_acc_max_;
+    const double active_jerk_max = switch_motion_limit_active ? cmd_switch_jerk_max_ : cmd_jerk_max_;
+    const double active_offset_rate_max = switch_motion_limit_active ?
+                                          cmd_switch_offset_rate_max_ :
+                                          cmd_offset_rate_max_;
+    bool limited_by_acc = false;
+    bool limited_by_jerk = false;
+    bool reclamped_by_vel_max_after_limit = false;
+    Eigen::Vector3d a_limited = Eigen::Vector3d::Zero();
 
-    Eigen::Vector3d step = cmd_pos - last_cmd_pos_;
-    double step_xy = step.head<2>().norm();
-    if (step_xy > max_step && step_xy > 1e-6)
+    if (motion_limit_active && has_last_v_gvf_limited_ && dt > 1e-6)
     {
-        step *= (max_step / step_xy);
-        cmd_pos = last_cmd_pos_ + step;
+        Eigen::Vector3d a_cmd = (v_gvf - last_v_gvf_limited_) / dt;
+
+        const double jerk_max = std::max(0.0, active_jerk_max);
+        if (jerk_max > 1e-6)
+        {
+            Eigen::Vector3d da = a_cmd - last_a_gvf_limited_;
+            const double max_da = jerk_max * dt;
+            if (da.norm() > max_da && da.norm() > 1e-6)
+            {
+                da *= max_da / da.norm();
+                a_cmd = last_a_gvf_limited_ + da;
+                limited_by_jerk = true;
+            }
+        }
+
+        const double acc_max = std::max(0.0, active_acc_max);
+        if (acc_max > 1e-6 && a_cmd.norm() > acc_max && a_cmd.norm() > 1e-6)
+        {
+            a_cmd *= acc_max / a_cmd.norm();
+            limited_by_acc = true;
+        }
+
+        v_gvf = last_v_gvf_limited_ + a_cmd * dt;
+        v_gvf_norm = v_gvf.norm();
+        if (cmd_vel_max_ > 1e-6 && v_gvf_norm > cmd_vel_max_ && v_gvf_norm > 1e-6)
+        {
+            v_gvf *= cmd_vel_max_ / v_gvf_norm;
+            v_gvf_norm = cmd_vel_max_;
+            reclamped_by_vel_max_after_limit = true;
+        }
     }
+
+    if (has_last_v_gvf_limited_ && dt > 1e-6)
+    {
+        a_limited = (v_gvf - last_v_gvf_limited_) / dt;
+    }
+    last_v_gvf_limited_ = v_gvf;
+    last_a_gvf_limited_ = a_limited;
+    has_last_v_gvf_limited_ = true;
+
+    Eigen::Vector3d v_smooth = v_gvf;
+    cmd_vel_state_initialized_ = true;
+    last_v_cmd_ = v_smooth;
+
+    double kp_equiv = std::max(0.1, cmd_pos_gain_equiv_);
+    const Eigen::Vector3d lead_from_gvf = v_gvf / kp_equiv;
+    Eigen::Vector3d pos_ff_offset = Eigen::Vector3d::Zero();
+    bool pos_ff_active = false;
+    bool saturated_by_pos_ff_max = false;
+    double pos_ff_z_raw = 0.0;
+    if (cmd_use_pos_ff_ && has_last_v_gvf_for_pos_ff_ && dt > 1e-6)
+    {
+        const Eigen::Vector3d a_gvf = (v_gvf - last_v_gvf_for_pos_ff_) / dt;
+        pos_ff_offset = std::max(0.0, cmd_pos_ff_time_) * a_gvf / kp_equiv;
+        pos_ff_z_raw = pos_ff_offset.z();
+        if (cmd_pos_ff_xy_only_)
+        {
+            pos_ff_offset.z() = 0.0;
+        }
+        const double pos_ff_len = pos_ff_offset.norm();
+        const double pos_ff_max = std::max(0.0, cmd_pos_ff_max_);
+        if (pos_ff_max > 1e-6 && pos_ff_len > pos_ff_max && pos_ff_len > 1e-6)
+        {
+            pos_ff_offset *= pos_ff_max / pos_ff_len;
+            saturated_by_pos_ff_max = true;
+        }
+        pos_ff_active = pos_ff_offset.norm() > 1e-6;
+    }
+    last_v_gvf_for_pos_ff_ = v_gvf;
+    has_last_v_gvf_for_pos_ff_ = true;
+
+    Eigen::Vector3d lead = lead_from_gvf + pos_ff_offset;
+    const double lead_len_before_limit = lead.norm();
+    const bool saturated_by_lead_max = lead_len_before_limit > cmd_lead_max_ && lead_len_before_limit > 1e-6;
+    if (saturated_by_lead_max)
+    {
+        lead *= cmd_lead_max_ / lead_len_before_limit;
+    }
+
+    bool limited_by_offset_rate = false;
+    if (motion_limit_active && has_last_cmd_offset_ && dt > 1e-6)
+    {
+        Eigen::Vector3d d_offset = lead - last_cmd_offset_;
+        const double offset_rate_max = std::max(0.0, active_offset_rate_max);
+        const double max_d_offset = offset_rate_max * dt;
+        if (offset_rate_max > 1e-6 &&
+            d_offset.norm() > max_d_offset &&
+            d_offset.norm() > 1e-6)
+        {
+            lead = last_cmd_offset_ + d_offset * (max_d_offset / d_offset.norm());
+            limited_by_offset_rate = true;
+        }
+    }
+    last_cmd_offset_ = lead;
+    has_last_cmd_offset_ = true;
+
+    Eigen::Vector3d cmd_pos = pos + lead;
+
+    if (force_goal_position)
+    {
+        cmd_pos = goal;
+        v_smooth.setZero();
+    }
+
     last_cmd_pos_ = cmd_pos;
 
-    ROS_WARN_THROTTLE(1.0, "[GVF] cmd_lastpos: (%.2f, %.2f, %.2f)", last_cmd_pos_.x(), last_cmd_pos_.y(), last_cmd_pos_.z());
+    auto angleBetween = [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+        const double an = a.norm();
+        const double bn = b.norm();
+        if (an <= 1e-6 || bn <= 1e-6) {
+            return 0.0;
+        }
+        const double c = std::max(-1.0, std::min(1.0, a.dot(b) / (an * bn)));
+        return std::acos(c);
+    };
+    const double angle_vcmd_odom = angleBetween(v_gvf.head<2>(), odom_vel_lpf_.head<2>());
+    const double angle_vsmooth_vcmd = angleBetween(v_smooth.head<2>(), v_gvf.head<2>());
 
+    ROS_WARN_THROTTLE(1.0,
+      "[GVF_CMD] raw=%.2f smooth=%.2f odom_v=%.2f lead=%.2f K=%.2f cmd=(%.2f %.2f %.2f) d_goal=%.2f",
+      raw_v_gvf.norm(), v_smooth.norm(), odom_vel_lpf_.head<2>().norm(), lead.norm(), cmd_pos_gain_equiv_,
+      cmd_pos.x(), cmd_pos.y(), cmd_pos.z(), real_dis_to_goal);
+
+    ROS_WARN_THROTTLE(
+        0.2,
+        "[GVF][CMD_DIRECT] raw_v_gvf=%.3f clamped_v_gvf=%.3f cmd_vel_max=%.3f lead_from_gvf=%.3f lead_len=%.3f K_eq=%.3f lead_max=%.3f saturated_by_vel_max=%d saturated_by_lead_max=%d odom_v=%.3f use_vel_slew_limit=%d use_vel_feedback=%d angle_vcmd_odom=%.3f angle_vsmooth_vcmd=%.3f",
+        raw_v_gvf.norm(),
+        v_gvf.norm(),
+        cmd_vel_max_,
+        lead_from_gvf.norm(),
+        lead.norm(),
+        kp_equiv,
+        cmd_lead_max_,
+        saturated_by_vel_max ? 1 : 0,
+        saturated_by_lead_max ? 1 : 0,
+        odom_vel_lpf_.head<2>().norm(),
+        cmd_use_vel_slew_limit_ ? 1 : 0,
+        cmd_use_vel_feedback_ ? 1 : 0,
+        angle_vcmd_odom,
+        angle_vsmooth_vcmd);
+
+    ROS_WARN_THROTTLE(
+        0.2,
+        "[GVF][CMD_POS_FF] enabled=%d active=%d xy_only=%d pos_ff_len=%.3f pos_ff_z=%.3f pos_ff_z_raw=%.3f pos_ff_time=%.3f pos_ff_max=%.3f saturated_by_pos_ff_max=%d lead_from_gvf=%.3f lead_total=%.3f",
+        cmd_use_pos_ff_ ? 1 : 0,
+        pos_ff_active ? 1 : 0,
+        cmd_pos_ff_xy_only_ ? 1 : 0,
+        pos_ff_offset.norm(),
+        pos_ff_offset.z(),
+        pos_ff_z_raw,
+        cmd_pos_ff_time_,
+        cmd_pos_ff_max_,
+        saturated_by_pos_ff_max ? 1 : 0,
+        lead_from_gvf.norm(),
+        lead.norm());
+
+    ROS_WARN_THROTTLE(
+        0.2,
+        "[GVF][CMD_MOTION_LIMIT] global_enabled=%d switch_enabled=%d active=%d switch_active=%d skipped_on_switch=%d acc_limited=%d jerk_limited=%d offset_rate_limited=%d vel_reclamped=%d acc=%.3f acc_max=%.3f jerk_max=%.3f offset_rate_max=%.3f switch_time_left=%.3f",
+        cmd_use_vel_slew_limit_ ? 1 : 0,
+        cmd_use_switch_motion_limits_ ? 1 : 0,
+        motion_limit_active ? 1 : 0,
+        switch_motion_limit_active ? 1 : 0,
+        skip_motion_limit_for_switch ? 1 : 0,
+        limited_by_acc ? 1 : 0,
+        limited_by_jerk ? 1 : 0,
+        limited_by_offset_rate ? 1 : 0,
+        reclamped_by_vel_max_after_limit ? 1 : 0,
+        a_limited.norm(),
+        active_acc_max,
+        active_jerk_max,
+        active_offset_rate_max,
+        std::max(0.0, (cmd_switch_motion_limit_until_ - now).toSec()));
 
     // ===================== 6) 发布 PositionCommand（只发位置+yaw） =====================
     quadrotor_msgs::PositionCommand cmd;
@@ -353,16 +547,20 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     cmd.position.x = cmd_pos.x();
     cmd.position.y = cmd_pos.y();
     cmd.position.z = cmd_pos.z();
+    cmd.velocity.x = 0.0;
+    cmd.velocity.y = 0.0;
+    cmd.velocity.z = 0.0;
+
 
     // cmd.yaw = PI/2.0;
     // cmd.yaw_dot = 0.0f;
-        double arg_    = atan2(-vel.x(), vel.y()) + (PI/2.0f);
-        double vel_len = std::sqrt(vel.x()*vel.x() + vel.y()*vel.y());
+        Eigen::Vector3d yaw_vel = v_smooth;
+        double arg_    = atan2(-yaw_vel.x(), yaw_vel.y()) + (PI/2.0f);
+        double vel_len = std::sqrt(yaw_vel.x()*yaw_vel.x() + yaw_vel.y()*yaw_vel.y());
         if(vel_len<=0.1) arg_ = last_yaw;
         std::pair<double, double> yaw_all = calculate_yaw(last_yaw,arg_);
     
         double yaw_now = yaw_all.first;
-        double yaw_rate = yaw_all.second;
     
         last_yaw = yaw_now;
     
@@ -370,9 +568,6 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         cmd.yaw_dot = 0.0f;
 
     cmd_pub.publish(cmd);
-
-    ros::Time t_end = ros::Time::now();  // 记录结束时间
-    double exec_time_ms = (t_end - t_start).toSec() * 1000.0;  // 转换为毫秒
 
 
   // ===================== 7) 调试（可选） =====================
@@ -711,10 +906,74 @@ void gvf_manager::test_cmdCallback(const ros::TimerEvent& event)
 
 void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
 {
-    this->odom_ = Eigen::Vector3d(
-    msg->pose.pose.position.x+0.000001,
-    msg->pose.pose.position.y+0.000001,
-    msg->pose.pose.position.z);
+    Eigen::Vector3d curr_pos(
+        msg->pose.pose.position.x + 0.000001,
+        msg->pose.pose.position.y + 0.000001,
+        msg->pose.pose.position.z);
+
+    ros::Time curr_time = msg->header.stamp;
+    if (curr_time.isZero()) {
+        curr_time = ros::Time::now();
+    }
+
+    odom_pos_history_.push_back({curr_time, curr_pos});
+    const double history_keep_time = std::max(odom_vel_est_window_ + 1.0, 1.0);
+    while (odom_pos_history_.size() > 2 &&
+           (curr_time - odom_pos_history_.front().t).toSec() > history_keep_time)
+    {
+        odom_pos_history_.pop_front();
+    }
+
+    if (odom_pos_history_.size() >= 2)
+    {
+        const double target_window = std::max(0.0, odom_vel_est_window_);
+        const OdomPosSample* old_sample = &odom_pos_history_.front();
+        for (const auto& sample : odom_pos_history_)
+        {
+            if ((curr_time - sample.t).toSec() >= target_window)
+            {
+                old_sample = &sample;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        const double dt = (curr_time - old_sample->t).toSec();
+        if (dt > 1e-3 && dt < 2.0)
+        {
+            const Eigen::Vector3d raw_vel = (curr_pos - old_sample->p) / dt;
+            if (raw_vel.norm() <= 5.0)
+            {
+                odom_vel_est_ = raw_vel;
+
+                if (!odom_vel_initialized_)
+                {
+                    odom_vel_lpf_ = raw_vel;
+                    odom_vel_initialized_ = true;
+                }
+                else
+                {
+                    const double lpf_hz = std::max(0.0, odom_vel_lpf_hz_);
+                    double alpha = 1.0;
+                    if (lpf_hz > 1e-6)
+                    {
+                        const double tau = 1.0 / (2.0 * PI * lpf_hz);
+                        alpha = dt / (tau + dt);
+                    }
+                    odom_vel_lpf_ = odom_vel_lpf_ + alpha * (raw_vel - odom_vel_lpf_);
+                }
+
+                odom_vel_est_ = odom_vel_lpf_;
+            }
+        }
+    }
+
+    last_odom_pos_ = curr_pos;
+    last_odom_time_ = curr_time;
+    has_last_odom_ = true;
+    this->odom_ = curr_pos;
     
     if (!enable_circle_reference_test_ || !circle_reference_auto_start_ || circle_reference_auto_started_) {
         return;
@@ -728,10 +987,20 @@ void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
 
     progress_w_ = 0.0;
     progress_initialized_ = false;
+    closed_ref_w_ = 0.0;
+    closed_ref_initialized_ = false;
+    closed_ref_recover_ = false;
+    resetClosedGoalCandidateState();
     ref_pos = start_pt;
+    cmd_vel_state_.setZero();
+    last_curve_vel_.setZero();
+    has_last_curve_vel_ = false;
+    cmd_vel_lpf_state_.setZero();
+    last_v_cmd_.setZero();
+    cmd_vel_state_initialized_ = false;
+    vel_fb_switch_until_ = ros::Time(0);
     ref_initialized = false;
     last_cmd_pos_ = start_pt;
-    cmd_pos_initialized_ = false;
 
     if (reference_shape_ == "figure8" || reference_shape_ == "8" || reference_shape_ == "lemniscate") {
         generateFigureEightReference(center);
@@ -809,12 +1078,17 @@ void gvf_manager::generateCircleReference(const Eigen::Vector3d& center)
         circle_reference_w_[i] = circle_reference_w_[i - 1]
                                + (circle_reference_traj_.row(i) - circle_reference_traj_.row(i - 1)).norm();
     }
-    circle_reference_total_w_ = circle_reference_w_.empty() ? 0.0 : circle_reference_w_.back();
+    circle_reference_total_w_ = 0.0;
+    for (int i = 0; i < N; ++i) {
+        const int j = (i + 1) % N;
+        circle_reference_total_w_ += (circle_reference_traj_.row(j) - circle_reference_traj_.row(i)).norm();
+    }
     circle_reference_progress_anchor_w_ = progress_w_;
     circle_reference_index_ = 0;
-    figure8_join_mode_ = false;
-    figure8_join_idx_ = -1;
-    figure8_join_stable_count_ = 0;
+    closed_ref_w_ = 0.0;
+    closed_ref_initialized_ = false;
+    closed_ref_recover_ = false;
+    resetClosedGoalCandidateState();
     circle_reference_ready_ = true;
     publishReferencePathMsg(circle_reference_traj_, circle_reference_vel_, circle_ref_pub_);
 }
@@ -831,9 +1105,7 @@ void gvf_manager::generateFigureEightReference(const Eigen::Vector3d& center)
     for (int i = 0; i < N; ++i) {
         const double theta = 2.0 * M_PI * static_cast<double>(i) / static_cast<double>(N);
         const double sx = std::sin(theta);
-        const double cx = std::cos(theta);
         const double s2 = std::sin(2.0 * theta);
-        const double c2 = std::cos(2.0 * theta);
 
         Eigen::Vector3d pos(circle_reference_center_.x() + 0.5 * radius * s2,
                             circle_reference_center_.y() + radius * sx,
@@ -849,14 +1121,406 @@ void gvf_manager::generateFigureEightReference(const Eigen::Vector3d& center)
         circle_reference_w_[i] = circle_reference_w_[i - 1]
                                + (circle_reference_traj_.row(i) - circle_reference_traj_.row(i - 1)).norm();
     }
-    circle_reference_total_w_ = circle_reference_w_.empty() ? 0.0 : circle_reference_w_.back();
+    circle_reference_total_w_ = 0.0;
+    for (int i = 0; i < N; ++i) {
+        const int j = (i + 1) % N;
+        circle_reference_total_w_ += (circle_reference_traj_.row(j) - circle_reference_traj_.row(i)).norm();
+    }
     circle_reference_progress_anchor_w_ = progress_w_;
     circle_reference_index_ = 0;
-    figure8_join_mode_ = true;
-    figure8_join_idx_ = -1;
-    figure8_join_stable_count_ = 0;
+    closed_ref_w_ = 0.0;
+    closed_ref_initialized_ = false;
+    closed_ref_recover_ = false;
+    resetClosedGoalCandidateState();
     circle_reference_ready_ = true;
     publishReferencePathMsg(circle_reference_traj_, circle_reference_vel_, circle_ref_pub_);
+}
+
+double gvf_manager::wrapClosedW(double w) const
+{
+    if (circle_reference_total_w_ <= 1e-9) {
+        return 0.0;
+    }
+
+    double s = std::fmod(w, circle_reference_total_w_);
+    if (s < 0.0) {
+        s += circle_reference_total_w_;
+    }
+    return s;
+}
+
+int gvf_manager::indexFromClosedW(double w) const
+{
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    if (N <= 0 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return 0;
+    }
+
+    const double s = wrapClosedW(w);
+    auto it = std::upper_bound(circle_reference_w_.begin(), circle_reference_w_.end(), s);
+    if (it == circle_reference_w_.begin()) {
+        return 0;
+    }
+    if (it == circle_reference_w_.end()) {
+        return N - 1;
+    }
+    return static_cast<int>(std::distance(circle_reference_w_.begin(), it)) - 1;
+}
+
+Eigen::Vector3d gvf_manager::pointFromClosedW(double w) const
+{
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    if (N <= 0 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return Eigen::Vector3d::Zero();
+    }
+
+    const double s = wrapClosedW(w);
+    const int i = indexFromClosedW(w);
+    const int j = (i + 1) % N;
+    const double w0 = circle_reference_w_[i];
+    const double w1 = (i == N - 1) ? circle_reference_total_w_ : circle_reference_w_[j];
+    const double denom = std::max(1e-9, w1 - w0);
+    const double u = std::max(0.0, std::min(1.0, (s - w0) / denom));
+    const Eigen::Vector3d p0 = circle_reference_traj_.row(i).transpose();
+    const Eigen::Vector3d p1 = circle_reference_traj_.row(j).transpose();
+    return (1.0 - u) * p0 + u * p1;
+}
+
+Eigen::Vector3d gvf_manager::tangentFromClosedW(double w) const
+{
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    if (N <= 1 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return Eigen::Vector3d::Zero();
+    }
+
+    const int i = indexFromClosedW(w);
+    const int j = (i + 1) % N;
+    Eigen::Vector3d tangent = circle_reference_traj_.row(j).transpose() -
+                              circle_reference_traj_.row(i).transpose();
+    const double norm = tangent.norm();
+    if (norm <= 1e-9) {
+        return Eigen::Vector3d::Zero();
+    }
+    return tangent / norm;
+}
+
+double gvf_manager::findInitialClosedPhase(const Eigen::Vector3d& curr_pos) const
+{
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    if (N <= 1 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return 0.0;
+    }
+
+    if (closed_ref_initial_phase_w_ >= 0.0) {
+        return closed_ref_initial_phase_w_;
+    }
+
+    const Eigen::Vector2d odom_v_xy = odom_vel_lpf_.head<2>();
+    const double odom_v_norm = odom_v_xy.norm();
+    const bool use_odom_direction = odom_v_norm > 0.2;
+    Eigen::Vector2d odom_dir = Eigen::Vector2d::Zero();
+    if (use_odom_direction) {
+        odom_dir = odom_v_xy / odom_v_norm;
+    }
+    const double dir_weight = 0.25;
+
+    double best_w = 0.0;
+    double best_score = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < N; ++i) {
+        const int j = (i + 1) % N;
+        const Eigen::Vector3d p0 = circle_reference_traj_.row(i).transpose();
+        const Eigen::Vector3d p1 = circle_reference_traj_.row(j).transpose();
+        const Eigen::Vector3d seg = p1 - p0;
+        const double seg_len_sq = seg.squaredNorm();
+        if (seg_len_sq <= 1e-12) {
+            continue;
+        }
+
+        const double u = std::max(0.0, std::min(1.0, (curr_pos - p0).dot(seg) / seg_len_sq));
+        const Eigen::Vector3d proj = p0 + u * seg;
+        const double dist_sq = (curr_pos - proj).squaredNorm();
+        const double w0 = circle_reference_w_[i];
+        const double w1 = (i == N - 1) ? circle_reference_total_w_ : circle_reference_w_[j];
+        const double cand_w = w0 + u * (w1 - w0);
+
+        double tangent_dot_odom = 0.0;
+        if (use_odom_direction) {
+            const Eigen::Vector2d tangent_xy = seg.head<2>();
+            const double tangent_norm = tangent_xy.norm();
+            if (tangent_norm > 1e-9) {
+                tangent_dot_odom = (tangent_xy / tangent_norm).dot(odom_dir);
+            }
+        }
+
+        const double score = dist_sq + (use_odom_direction ? dir_weight * (1.0 - tangent_dot_odom) : 0.0);
+        if (score < best_score) {
+            best_score = score;
+            best_w = cand_w;
+        }
+    }
+
+    return best_w;
+}
+
+double gvf_manager::projectClosedLocal(const Eigen::Vector3d& curr_pos,
+                                       double w_prev,
+                                       double back_window,
+                                       double forward_window) const
+{
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    if (N <= 1 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return w_prev;
+    }
+
+    const double w_min = w_prev - std::max(0.0, back_window);
+    const double w_max = w_prev + std::max(0.0, forward_window);
+    const double step = std::max(0.02, circle_reference_total_w_ / static_cast<double>(std::max(200, 4 * N)));
+
+    double best_w = w_prev;
+    double best_dist_sq = std::numeric_limits<double>::infinity();
+    for (double cand_w = w_min; cand_w <= w_max + 1e-9; cand_w += step) {
+        const Eigen::Vector3d p = pointFromClosedW(cand_w);
+        const double dist_sq = (curr_pos - p).squaredNorm();
+        if (dist_sq < best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best_w = cand_w;
+        }
+    }
+
+    return best_w;
+}
+
+double gvf_manager::closedRefAlpha(double rho) const
+{
+    const double r = std::max(1e-6, ref_alpha_rho_);
+    const double s = rho / r;
+    return 1.0 / (1.0 + s * s);
+}
+
+double gvf_manager::closedRefSigma(double e_parallel) const
+{
+    const double scale = std::max(1e-6, ref_sigma_scale_);
+    return std::tanh(e_parallel / scale);
+}
+
+double gvf_manager::updateClosedRefPhaseByDynamics(const Eigen::Vector3d& curr_pos, double dt)
+{
+    const double old_w = closed_ref_w_;
+    const Eigen::Vector3d p = pointFromClosedW(old_w);
+    Eigen::Vector3d tau = tangentFromClosedW(old_w);
+    if (tau.norm() > 1e-6) {
+        tau.normalize();
+    } else {
+        tau.setZero();
+    }
+
+    const Eigen::Vector3d e = curr_pos - p;
+    const double e_parallel = tau.dot(e);
+    const Eigen::Vector3d e_perp = e - e_parallel * tau;
+    const double rho = e_perp.head<2>().norm();
+    const double alpha = closedRefAlpha(rho);
+    const double sigma = closedRefSigma(e_parallel);
+
+    double w_dot = ref_phase_k1_ * (alpha + sigma);
+    w_dot = std::max(-std::max(0.0, ref_wdot_backward_max_),
+                     std::min(w_dot, std::max(0.0, ref_wdot_forward_max_)));
+
+    const double safe_dt = std::max(0.0, dt);
+    const double w_dyn = old_w + w_dot * safe_dt;
+
+    double effective_forward_w = closed_ref_search_forward_w_;
+    if (closed_ref_has_accepted_goal_) {
+        effective_forward_w = std::max(effective_forward_w,
+                                       closed_ref_accepted_lookahead_w_ + 0.5);
+    }
+
+    const double w_proj = projectClosedLocal(curr_pos, w_dyn,
+                                             closed_ref_search_back_w_,
+                                             effective_forward_w);
+    const double project_delta = w_proj - w_dyn;
+    const double blend = std::max(0.0, std::min(1.0, ref_project_blend_));
+    const double boundary_eps = std::max(0.0, ref_project_boundary_eps_);
+    const bool projected_on_boundary =
+        std::abs(project_delta + std::max(0.0, closed_ref_search_back_w_)) < boundary_eps ||
+        std::abs(project_delta - std::max(0.0, effective_forward_w)) < boundary_eps;
+    const bool used_project_blend =
+        !projected_on_boundary &&
+        std::abs(project_delta) < std::max(0.0, ref_project_snap_max_);
+    const double new_w = used_project_blend ? (1.0 - blend) * w_dyn + blend * w_proj : w_dyn;
+
+    closed_ref_w_ = new_w;
+    closed_ref_dbg_e_parallel_ = e_parallel;
+    closed_ref_dbg_rho_ = rho;
+    closed_ref_dbg_alpha_ = alpha;
+    closed_ref_dbg_sigma_ = sigma;
+    closed_ref_dbg_w_dot_ = w_dot;
+    closed_ref_dbg_dt_ = safe_dt;
+    closed_ref_dbg_w_dyn_ = w_dyn;
+    closed_ref_dbg_w_proj_ = w_proj;
+    closed_ref_dbg_project_delta_ = project_delta;
+    closed_ref_dbg_used_project_blend_ = used_project_blend;
+    closed_ref_dbg_projected_on_boundary_ = projected_on_boundary;
+    closed_ref_dbg_boundary_eps_ = boundary_eps;
+    if (used_project_blend) {
+        closed_ref_dbg_project_blend_skipped_reason_ = "none";
+    } else if (projected_on_boundary) {
+        closed_ref_dbg_project_blend_skipped_reason_ = "boundary";
+    } else {
+        closed_ref_dbg_project_blend_skipped_reason_ = "snap_limit";
+    }
+    closed_ref_dbg_phase_delta_ = new_w - old_w;
+
+    return closed_ref_w_;
+}
+
+std::vector<double> gvf_manager::buildClosedLookaheadCandidates() const
+{
+    std::vector<double> candidates;
+    const double min_w = std::max(0.0, std::min(closed_ref_lookahead_min_w_, closed_ref_lookahead_max_w_));
+    const double max_w = std::max(min_w, std::max(closed_ref_lookahead_min_w_, closed_ref_lookahead_max_w_));
+    const double step_w = closed_ref_lookahead_step_w_ > 1e-6 ? closed_ref_lookahead_step_w_ : 0.5;
+
+    for (double lookahead = min_w; lookahead <= max_w + 1e-9; lookahead += step_w) {
+        candidates.push_back(lookahead);
+    }
+
+    if (candidates.empty() || std::abs(candidates.back() - max_w) > 1e-6) {
+        candidates.push_back(max_w);
+    }
+
+    if (candidates.empty()) {
+        candidates.push_back(2.0);
+    }
+
+    return candidates;
+}
+
+int gvf_manager::selectDefaultClosedLookaheadIndex(const std::vector<double>& candidates) const
+{
+    if (candidates.empty()) {
+        return -1;
+    }
+
+    const double default_lookahead = std::min(std::max(2.0, candidates.front()), candidates.back());
+    int best_idx = 0;
+    double best_diff = std::abs(candidates[0] - default_lookahead);
+    for (int i = 1; i < static_cast<int>(candidates.size()); ++i) {
+        const double diff = std::abs(candidates[i] - default_lookahead);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+void gvf_manager::resetClosedGoalCandidateState()
+{
+    last_selected_goal_w_ = 0.0;
+    last_selected_lookahead_w_ = 0.0;
+    last_selected_goal_idx_ = -1;
+    last_failed_goal_idx_ = -1;
+    has_last_selected_goal_ = false;
+    last_closed_goal_plan_success_ = true;
+    closed_ref_last_selected_goal_w_ = 0.0;
+    closed_ref_last_selected_lookahead_w_ = 0.0;
+    closed_ref_has_selected_goal_ = false;
+    closed_ref_pending_goal_w_ = 0.0;
+    closed_ref_pending_lookahead_w_ = 0.0;
+    closed_ref_has_pending_goal_ = false;
+    closed_ref_accepted_goal_w_ = 0.0;
+    closed_ref_accepted_lookahead_w_ = 0.0;
+    closed_ref_has_accepted_goal_ = false;
+    closed_ref_last_goal_pos_.setZero();
+    closed_ref_last_goal_dist_xy_ = 0.0;
+    closed_ref_last_candidate_idx_ = -1;
+    closed_ref_last_update_time_ = ros::Time(0);
+    closed_ref_dbg_e_parallel_ = 0.0;
+    closed_ref_dbg_rho_ = 0.0;
+    closed_ref_dbg_alpha_ = 0.0;
+    closed_ref_dbg_sigma_ = 0.0;
+    closed_ref_dbg_w_dot_ = 0.0;
+    closed_ref_dbg_dt_ = 0.0;
+    closed_ref_dbg_w_dyn_ = closed_ref_w_;
+    closed_ref_dbg_w_proj_ = closed_ref_w_;
+    closed_ref_dbg_project_delta_ = 0.0;
+    closed_ref_dbg_phase_delta_ = 0.0;
+    closed_ref_dbg_used_project_blend_ = false;
+    closed_ref_dbg_projected_on_boundary_ = false;
+    closed_ref_dbg_boundary_eps_ = ref_project_boundary_eps_;
+    closed_ref_dbg_project_blend_skipped_reason_ = "none";
+}
+
+void gvf_manager::ensureProgressInCurrentPathRange(double start_w, double end_w)
+{
+    if (end_w < start_w) {
+        std::swap(start_w, end_w);
+    }
+
+    double window = 1.0;
+    if (!swarmParticlesManager.empty() && swarmParticlesManager[0].gvf_) {
+        window = swarmParticlesManager[0].gvf_->progress_window_;
+    }
+
+    const bool out_of_range =
+        progress_w_ < start_w - window ||
+        progress_w_ > end_w + window;
+
+    if (!out_of_range) {
+        return;
+    }
+
+    const double old_progress = progress_w_;
+    progress_w_ = start_w;
+    progress_initialized_ = true;
+    ROS_WARN("[GVF][PROGRESS_RESET] old_progress=%.3f new_progress=%.3f start_w=%.3f end_w=%.3f window=%.3f reason=out_of_new_path_range",
+             old_progress, progress_w_, start_w, end_w, window);
+}
+
+void gvf_manager::logReplanReason(const std::string& reason)
+{
+    if (swarmParticlesManager.empty()) {
+        return;
+    }
+
+    const auto& pm = swarmParticlesManager[0];
+    const int rows = static_cast<int>(pm.last_traj.rows());
+    int curr_i = rows > 0 ? std::max(0, std::min(current_traj_index_, rows - 1)) : -1;
+    int progress_i = -1;
+    int start_i = curr_i;
+    int end_i = curr_i;
+    double remaining_w = 0.0;
+
+    if (pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty()) {
+        remaining_w = pm.gvf_->sample_w_.back() - progress_w_;
+
+        if (rows > 0 && pm.gvf_->sample_w_.size() == static_cast<size_t>(rows)) {
+            auto it = std::lower_bound(pm.gvf_->sample_w_.begin(), pm.gvf_->sample_w_.end(), progress_w_);
+            if (it == pm.gvf_->sample_w_.end()) {
+                progress_i = rows - 1;
+            } else {
+                progress_i = static_cast<int>(std::distance(pm.gvf_->sample_w_.begin(), it));
+                if (progress_i > 0) {
+                    const double w_hi = pm.gvf_->sample_w_[progress_i];
+                    const double w_lo = pm.gvf_->sample_w_[progress_i - 1];
+                    if (std::abs(progress_w_ - w_lo) <= std::abs(w_hi - progress_w_)) {
+                        progress_i -= 1;
+                    }
+                }
+            }
+            progress_i = std::max(0, std::min(progress_i, rows - 1));
+            start_i = std::max(curr_i, progress_i);
+            end_i = std::min(rows - 1, start_i + std::max(1, collision_check_horizon_pts_));
+        }
+    }
+
+    ROS_WARN("[GVF][REPLAN_REASON] reason=%s curr_i=%d progress_i=%d start_i=%d end_i=%d rows=%d remaining_w=%.3f",
+             reason.c_str(), curr_i, progress_i, start_i, end_i, rows, remaining_w);
 }
 
 std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(const Eigen::Vector3d& curr_pos)
@@ -867,169 +1531,142 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(
     }
 
     const int N = static_cast<int>(circle_reference_traj_.rows());
-    const int lookahead = std::max(1, circle_reference_lookahead_pts_);
-
-    auto wrappedIndex = [N](int idx) {
-        return ((idx % N) + N) % N;
-    };
-
-    int best_idx = 0;
-    int phase_idx_log = -1;
-    double w_phase_log = std::numeric_limits<double>::quiet_NaN();
-    double best_dist = std::numeric_limits<double>::infinity();
-    const bool is_figure8 = (reference_shape_ == "figure8" || reference_shape_ == "8" ||
-                             reference_shape_ == "lemniscate");
-
-    if (is_figure8 && figure8_join_mode_) {
-        const int join_window = std::max(5, figure8_join_search_window_);
-        const int join_lookahead = std::max(1, std::min(figure8_join_lookahead_pts_, lookahead));
-        if (figure8_join_idx_ < 0 || figure8_join_idx_ >= N) {
-            for (int i = 0; i < N; ++i) {
-                const Eigen::Vector3d pt = circle_reference_traj_.row(i).transpose();
-                const double dist = (pt - curr_pos).squaredNorm();
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best_idx = i;
-                }
-            }
-        } else {
-            const int lo = std::max(0, figure8_join_idx_ - join_window);
-            const int hi = std::min(N - 1, figure8_join_idx_ + join_window);
-            best_idx = figure8_join_idx_;
-            for (int i = lo; i <= hi; ++i) {
-                const Eigen::Vector3d pt = circle_reference_traj_.row(i).transpose();
-                const double dist = (pt - curr_pos).squaredNorm();
-                if (dist < best_dist) {
-                    best_dist = dist;
-                    best_idx = i;
-                }
-            }
-        }
-
-        figure8_join_idx_ = best_idx;
-        circle_reference_index_ = best_idx;
-        phase_idx_log = best_idx;
-        w_phase_log = circle_reference_w_[best_idx];
-
-        if (std::sqrt(std::max(0.0, best_dist)) <= figure8_join_exit_dist_) {
-            figure8_join_stable_count_ += 1;
-        } else {
-            figure8_join_stable_count_ = 0;
-        }
-
-        if (progress_initialized_ && figure8_join_stable_count_ >= std::max(1, figure8_join_exit_stable_needed_)) {
-            circle_reference_progress_anchor_w_ = progress_w_ - circle_reference_w_[best_idx];
-            figure8_join_mode_ = false;
-            ROS_WARN("[GVF][REF][JOIN->TRACK] w=%.3f idx=%d dist=%.3f stable=%d", progress_w_, best_idx,
-                     std::sqrt(std::max(0.0, best_dist)), figure8_join_stable_count_);
-        }
-
-        const int goal_idx = std::min(best_idx + join_lookahead, N - 1);
-        ROS_WARN_THROTTLE(0.2, "[GVF][REF][JOIN] idx=%d goal_idx=%d dist=%.3f stable=%d progress=%.3f", best_idx,
-                          goal_idx, std::sqrt(std::max(0.0, best_dist)), figure8_join_stable_count_, progress_w_);
-        return {
-            circle_reference_traj_.row(goal_idx).transpose(),
-            circle_reference_vel_.row(goal_idx).transpose()
-        };
+    if (N <= 1 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return {curr_pos, Eigen::Vector3d::Zero()};
     }
 
-    if (progress_initialized_ && circle_reference_w_.size() == static_cast<size_t>(N) &&
-        circle_reference_total_w_ > 1e-6) {
-        double w_phase = std::fmod(progress_w_ - circle_reference_progress_anchor_w_, circle_reference_total_w_);
-        if (w_phase < 0.0) {
-            w_phase += circle_reference_total_w_;
-        }
-        w_phase_log = w_phase;
+    std::string mode = "TRACK";
+    const ros::Time now = ros::Time::now();
+    double dt = 0.0;
+    if (!closed_ref_last_update_time_.isZero()) {
+        dt = std::max(0.0, (now - closed_ref_last_update_time_).toSec());
+    }
+    closed_ref_last_update_time_ = now;
 
-        auto it = std::lower_bound(circle_reference_w_.begin(), circle_reference_w_.end(), w_phase);
-        int phase_idx = 0;
-        if (it == circle_reference_w_.end()) {
-            phase_idx = N - 1;
+    if (!closed_ref_initialized_) {
+        closed_ref_w_ = findInitialClosedPhase(curr_pos);
+        closed_ref_initialized_ = true;
+        closed_ref_recover_ = false;
+        mode = "INIT";
+        closed_ref_dbg_e_parallel_ = 0.0;
+        closed_ref_dbg_rho_ = 0.0;
+        closed_ref_dbg_alpha_ = 0.0;
+        closed_ref_dbg_sigma_ = 0.0;
+        closed_ref_dbg_w_dot_ = 0.0;
+        closed_ref_dbg_dt_ = 0.0;
+        closed_ref_dbg_w_dyn_ = closed_ref_w_;
+        closed_ref_dbg_w_proj_ = closed_ref_w_;
+        closed_ref_dbg_project_delta_ = 0.0;
+        closed_ref_dbg_phase_delta_ = 0.0;
+        closed_ref_dbg_used_project_blend_ = false;
+        closed_ref_dbg_projected_on_boundary_ = false;
+        closed_ref_dbg_boundary_eps_ = ref_project_boundary_eps_;
+        closed_ref_dbg_project_blend_skipped_reason_ = "none";
+    }
+
+    double effective_forward_w = closed_ref_search_forward_w_;
+    std::string effective_forward_source = "default";
+    if (closed_ref_has_accepted_goal_) {
+        effective_forward_w = std::max(effective_forward_w,
+                                       closed_ref_accepted_lookahead_w_ + 0.5);
+        effective_forward_source = "accepted";
+    }
+
+    double candidate_w = closed_ref_w_;
+    double local_d = (curr_pos - pointFromClosedW(closed_ref_w_)).head<2>().norm();
+    double local_d_project = local_d;
+    if (!closed_ref_enable_recover_) {
+        closed_ref_recover_ = false;
+    } else if (local_d > closed_ref_lost_radius_) {
+        closed_ref_recover_ = true;
+        mode = "RECOVER";
+    }
+
+    if (closed_ref_enable_recover_ && closed_ref_recover_ && mode != "INIT") {
+        updateClosedRefPhaseByDynamics(curr_pos, dt);
+        const double w_after_dyn = closed_ref_w_;
+        const double phase_delta_after_dyn = closed_ref_dbg_phase_delta_;
+        candidate_w = projectClosedLocal(curr_pos, closed_ref_w_,
+                                         closed_ref_search_back_w_,
+                                         effective_forward_w);
+        local_d_project = (curr_pos - pointFromClosedW(candidate_w)).head<2>().norm();
+        if (local_d_project < closed_ref_recover_radius_) {
+            closed_ref_w_ = candidate_w;
+            closed_ref_dbg_phase_delta_ = phase_delta_after_dyn + (candidate_w - w_after_dyn);
+            closed_ref_dbg_w_proj_ = candidate_w;
+            closed_ref_dbg_project_delta_ = candidate_w - closed_ref_dbg_w_dyn_;
+            closed_ref_dbg_used_project_blend_ = true;
+            closed_ref_recover_ = false;
+            mode = "TRACK";
+            local_d = local_d_project;
         } else {
-            phase_idx = static_cast<int>(std::distance(circle_reference_w_.begin(), it));
-            if (phase_idx > 0) {
-                const double w_hi = circle_reference_w_[phase_idx];
-                const double w_lo = circle_reference_w_[phase_idx - 1];
-                if (std::abs(w_phase - w_lo) <= std::abs(w_hi - w_phase)) {
-                    phase_idx -= 1;
-                }
-            }
+            mode = "RECOVER";
         }
+    } else if (mode != "INIT") {
+        updateClosedRefPhaseByDynamics(curr_pos, dt);
+        candidate_w = closed_ref_dbg_w_proj_;
+        mode = "TRACK";
+        local_d = (curr_pos - pointFromClosedW(closed_ref_w_)).head<2>().norm();
+        local_d_project = (curr_pos - pointFromClosedW(candidate_w)).head<2>().norm();
+    }
 
-        phase_idx_log = phase_idx;
-        const int search_window = std::min(std::max(1, N / 6), std::max(20, lookahead * 3));
-        best_idx = phase_idx;
-        for (int dk = -search_window; dk <= search_window; ++dk) {
-            const int idx = wrappedIndex(phase_idx + dk);
-            const Eigen::Vector3d pt = circle_reference_traj_.row(idx).transpose();
-            const double dist = (pt - curr_pos).squaredNorm();
-            if (dist < best_dist) {
-                best_dist = dist;
-                best_idx = idx;
-            }
-        }
-
-        if (is_figure8) {
-            int global_best_idx = 0;
-            double global_best_dist = std::numeric_limits<double>::infinity();
-            for (int i = 0; i < N; ++i) {
-                const Eigen::Vector3d pt = circle_reference_traj_.row(i).transpose();
-                const double dist = (pt - curr_pos).squaredNorm();
-                if (dist < global_best_dist) {
-                    global_best_dist = dist;
-                    global_best_idx = i;
-                }
-            }
-
-            const int idx_gap = std::min(std::abs(global_best_idx - phase_idx),
-                                         N - std::abs(global_best_idx - phase_idx));
-            const double dist_margin = std::max(0.35, 0.05 * std::max(circle_reference_radius_, figure8_reference_radius_));
-            const bool need_realign = progress_w_ >= circle_reference_realign_min_progress_ &&
-                                      idx_gap > std::max(lookahead, N / 10) &&
-                                      global_best_dist + dist_margin * dist_margin < best_dist;
-            if (need_realign) {
-                const double local_best_dist = best_dist;
-                circle_reference_progress_anchor_w_ = progress_w_ - circle_reference_w_[global_best_idx];
-                best_idx = global_best_idx;
-                best_dist = global_best_dist;
-                w_phase_log = circle_reference_w_[global_best_idx];
-                phase_idx_log = global_best_idx;
-                ROS_WARN("[GVF][REF][REALIGN] w=%.3f old_phase_idx=%d new_phase_idx=%d local_d=%.3f global_d=%.3f",
-                         progress_w_, phase_idx, global_best_idx, std::sqrt(std::max(0.0, local_best_dist)),
-                         std::sqrt(std::max(0.0, global_best_dist)));
-            }
-        }
-    } else {
-        const int start_idx = wrappedIndex(circle_reference_index_);
-        best_idx = start_idx;
-        for (int k = 0; k < N; ++k) {
-            const int idx = wrappedIndex(start_idx + k);
-            const Eigen::Vector3d pt = circle_reference_traj_.row(idx).transpose();
-            const double dist = (pt - curr_pos).squaredNorm();
-            if (dist < best_dist) {
-                best_dist = dist;
-                best_idx = idx;
+    const std::vector<double> candidates = buildClosedLookaheadCandidates();
+    int selected_idx = selectDefaultClosedLookaheadIndex(candidates);
+    if (closed_ref_has_accepted_goal_) {
+        double best_diff = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+            const double diff = std::abs(candidates[i] - closed_ref_accepted_lookahead_w_);
+            if (diff < best_diff) {
+                best_diff = diff;
+                selected_idx = i;
             }
         }
     }
+    if (selected_idx < 0 || selected_idx >= static_cast<int>(candidates.size())) {
+        selected_idx = selectDefaultClosedLookaheadIndex(candidates);
+    }
+    const double selected_lookahead = candidates.empty() ? 0.0 : candidates[selected_idx];
+    const double goal_w = closed_ref_w_ + selected_lookahead;
+    const Eigen::Vector3d goal_pt = pointFromClosedW(goal_w);
+    const int idx = indexFromClosedW(closed_ref_w_);
+    const int goal_idx = indexFromClosedW(goal_w);
+    circle_reference_index_ = idx;
 
-    circle_reference_index_ = best_idx;
-    const int goal_idx = progress_initialized_ ? wrappedIndex(best_idx + lookahead) : best_idx;
-    double exec_start_w_log = std::numeric_limits<double>::quiet_NaN();
-    if (!swarmParticlesManager.empty()) {
-        const auto& pm = swarmParticlesManager[0];
-        if (pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty()) {
-            exec_start_w_log = pm.gvf_->sample_w_.front();
+    double tangent_dot_odom = 0.0;
+    const Eigen::Vector2d odom_v_xy = odom_vel_lpf_.head<2>();
+    const double odom_v_norm = odom_v_xy.norm();
+    if (odom_v_norm > 1e-6) {
+        const Eigen::Vector2d tangent_xy = tangentFromClosedW(closed_ref_w_).head<2>();
+        const double tangent_norm = tangent_xy.norm();
+        if (tangent_norm > 1e-6) {
+            tangent_dot_odom = (tangent_xy / tangent_norm).dot(odom_v_xy / odom_v_norm);
         }
     }
+
     ROS_WARN_THROTTLE(0.2,
-                      "[GVF][REF] progress_init=%d progress_w=%.3f phase=%.3f exec_start_w=%.3f phase_idx=%d best_idx=%d goal_idx=%d",
-                      (int)progress_initialized_, progress_w_, w_phase_log, exec_start_w_log,
-                      phase_idx_log, best_idx, goal_idx);
-    return {
-        circle_reference_traj_.row(goal_idx).transpose(),
-        circle_reference_vel_.row(goal_idx).transpose()
-    };
+                      "[GVF][CLOSED_REF] mode=%s closed_ref_w=%.3f w_mod=%.3f total_w=%.3f goal_w=%.3f idx=%d goal_idx=%d local_d=%.3f tangent_dot_odom=%.3f search_back_w=%.3f search_forward_w=%.3f effective_forward_w=%.3f effective_forward_source=%s pending_goal_w=%.3f pending_lookahead_w=%.3f accepted_goal_w=%.3f accepted_lookahead_w=%.3f has_pending_goal=%d has_accepted_goal=%d candidate_w=%.3f local_d_project=%.3f e_parallel=%.3f rho=%.3f alpha=%.3f sigma=%.3f w_dot=%.3f dt=%.3f w_dyn=%.3f w_proj=%.3f project_delta=%.3f used_project_blend=%d projected_on_boundary=%d boundary_eps=%.3f project_blend_skipped_reason=%s phase_delta=%.3f initialized=%d recover=%d recover_enabled=%d lost_radius=%.3f recover_radius=%.3f",
+                      mode.c_str(), closed_ref_w_, wrapClosedW(closed_ref_w_), circle_reference_total_w_, goal_w,
+                      idx, goal_idx, local_d, tangent_dot_odom, closed_ref_search_back_w_,
+                      closed_ref_search_forward_w_, effective_forward_w, effective_forward_source.c_str(),
+                      closed_ref_pending_goal_w_, closed_ref_pending_lookahead_w_,
+                      closed_ref_accepted_goal_w_, closed_ref_accepted_lookahead_w_,
+                      closed_ref_has_pending_goal_ ? 1 : 0,
+                      closed_ref_has_accepted_goal_ ? 1 : 0,
+                      candidate_w, local_d_project,
+                      closed_ref_dbg_e_parallel_, closed_ref_dbg_rho_,
+                      closed_ref_dbg_alpha_, closed_ref_dbg_sigma_, closed_ref_dbg_w_dot_,
+                      closed_ref_dbg_dt_, closed_ref_dbg_w_dyn_, closed_ref_dbg_w_proj_,
+                      closed_ref_dbg_project_delta_, closed_ref_dbg_used_project_blend_ ? 1 : 0,
+                      closed_ref_dbg_projected_on_boundary_ ? 1 : 0,
+                      closed_ref_dbg_boundary_eps_,
+                      closed_ref_dbg_project_blend_skipped_reason_.c_str(),
+                      closed_ref_dbg_phase_delta_,
+                      closed_ref_initialized_ ? 1 : 0, closed_ref_recover_ ? 1 : 0,
+                      closed_ref_enable_recover_ ? 1 : 0,
+                      closed_ref_lost_radius_, closed_ref_recover_radius_);
+
+    return {goal_pt, Eigen::Vector3d::Zero()};
 }
 
 void gvf_manager::visualizePath(const std::vector<Eigen::Vector3d>& path_points, 
@@ -2515,6 +3152,33 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
             path_msg.poses.push_back(pose);
         }
 
+        if (!swarmParticlesManager.empty() && swarmParticlesManager[0].gvf_) {
+            nav_msgs::Path::ConstPtr path_ptr(new nav_msgs::Path(path_msg));
+            swarmParticlesManager[0].gvf_->pathCallback(path_ptr);
+            if (swarmParticlesManager[0].gvf_->reparam_ready_ &&
+                !swarmParticlesManager[0].gvf_->sample_w_.empty()) {
+                const double start_w = swarmParticlesManager[0].gvf_->sample_w_.front();
+                const double end_w = swarmParticlesManager[0].gvf_->sample_w_.back();
+                const Eigen::Vector3d path_end = traj.row(traj.rows() - 1).transpose();
+                const double pending_end_to_goal_dist = closed_ref_has_pending_goal_ ?
+                    (path_end - pointFromClosedW(closed_ref_pending_goal_w_)).norm() : -1.0;
+                const double accepted_end_to_goal_dist = closed_ref_has_accepted_goal_ ?
+                    (path_end - pointFromClosedW(closed_ref_accepted_goal_w_)).norm() : -1.0;
+                ROS_WARN("[GVF][REPARAM] start_w=%.3f end_w=%.3f path_w_len=%.3f path_points=%zu pending_goal_w=%.3f pending_lookahead_w=%.3f accepted_goal_w=%.3f accepted_lookahead_w=%.3f has_pending_goal=%d has_accepted_goal=%d pending_end_to_goal_dist=%.3f accepted_end_to_goal_dist=%.3f",
+                         start_w, end_w, end_w - start_w,
+                         swarmParticlesManager[0].gvf_->sample_w_.size(),
+                         closed_ref_pending_goal_w_,
+                         closed_ref_pending_lookahead_w_,
+                         closed_ref_accepted_goal_w_,
+                         closed_ref_accepted_lookahead_w_,
+                         closed_ref_has_pending_goal_ ? 1 : 0,
+                         closed_ref_has_accepted_goal_ ? 1 : 0,
+                         pending_end_to_goal_dist,
+                         accepted_end_to_goal_dist);
+                ensureProgressInCurrentPathRange(start_w, end_w);
+            }
+        }
+
         path_pub.publish(path_msg);
     }
 
@@ -2593,8 +3257,11 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         }
 
         //检查旧轨迹是否发生碰撞，或者旧轨迹快结束
-        if (checkCollision() || ((old_traj.rows() - 1 - old_i0) <= (old_traj.rows() - 1) / 2))
+        const bool old_collision = checkCollision();
+        const bool old_near_end = ((old_traj.rows() - 1 - old_i0) <= (old_traj.rows() - 1) / 2);
+        if (old_collision || old_near_end)
         {
+            logReplanReason(old_collision ? "collision" : "near_end");
             switch_reason = "accept_collision&timout";
             accept_new = true;
         } else {
@@ -2621,8 +3288,234 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         return accept_new;
     }
 
- bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
-                            int& new_i0_out , Eigen::VectorXd& time)
+bool gvf_manager::planKinoToGoal(gvfManager& pm,
+                                 const Eigen::Vector3d& start_pt,
+                                 const Eigen::Vector3d& start_vel,
+                                 const Eigen::Vector3d& start_acc,
+                                 const Eigen::Vector3d& goal_pt,
+                                 const Eigen::Vector3d& end_vel,
+                                 KinoPlanSamples& samples)
+{
+    pm.kino_path_finder_->reset();
+    int status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc,
+                                              goal_pt, end_vel,
+                                              /*init=*/false, /*dynamic=*/false);
+    if (status != KinodynamicAstar::NO_PATH) {
+        cout << "[kino replan]: kinodynamic search success." << endl;
+        samples.ts = 0.2;
+        pm.kino_path_finder_->getSamples(samples.ts, samples.point_set, samples.start_end_derivatives);
+        return true;
+    }
+
+    cout << "[kino replan]: kinodynamic search fail!" << endl;
+    pm.kino_path_finder_->reset();
+    status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc,
+                                          goal_pt, end_vel,
+                                          false, false);
+    if (status == KinodynamicAstar::NO_PATH) {
+        cout << "[kino replan]: Can't find path." << endl;
+        return false;
+    }
+
+    cout << "[kino replan]: retry search success." << endl;
+    samples.ts = 0.2;
+    pm.kino_path_finder_->getSamples(samples.ts, samples.point_set, samples.start_end_derivatives);
+    return true;
+}
+
+bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
+                                            const Eigen::Vector3d& curr_pos,
+                                            const Eigen::Vector3d& start_pt,
+                                            const Eigen::Vector3d& start_vel,
+                                            const Eigen::Vector3d& start_acc,
+                                            Eigen::Vector3d& goal_pt,
+                                            Eigen::Vector3d& end_vel,
+                                            KinoPlanSamples& samples)
+{
+    getCircleReferenceGoal(curr_pos);
+    end_vel = Eigen::Vector3d::Zero();
+
+    const std::vector<double> candidates = buildClosedLookaheadCandidates();
+    const int candidate_count = static_cast<int>(candidates.size());
+
+    const double local_d_for_goal = (curr_pos - pointFromClosedW(closed_ref_w_)).head<2>().norm();
+    double tangent_dot_odom_for_goal = 0.0;
+    const Eigen::Vector2d odom_v_xy = odom_vel_lpf_.head<2>();
+    const double odom_v_norm = odom_v_xy.norm();
+    if (odom_v_norm > 1e-6) {
+        const Eigen::Vector2d tangent_xy = tangentFromClosedW(closed_ref_w_).head<2>();
+        const double tangent_norm = tangent_xy.norm();
+        if (tangent_norm > 1e-6) {
+            tangent_dot_odom_for_goal = (tangent_xy / tangent_norm).dot(odom_v_xy / odom_v_norm);
+        }
+    }
+
+    const bool goal_recover_mode = closed_ref_enable_recover_ && closed_ref_recover_;
+    const std::string mode_for_goal = goal_recover_mode ? "RECOVER" : "TRACK";
+    std::string candidate_order_reason = "track_far_first";
+    std::vector<int> order;
+    if (goal_recover_mode) {
+        candidate_order_reason = "recover_mid_first";
+    } else if (local_d_for_goal >= 1.2) {
+        candidate_order_reason = "track_local_error_large_mid_first";
+    } else if (tangent_dot_odom_for_goal <= 0.3) {
+        candidate_order_reason = "track_direction_bad_mid_first";
+    }
+
+    if (candidate_order_reason == "track_far_first") {
+        for (int i = candidate_count - 1; i >= 0; --i) {
+            order.push_back(i);
+        }
+    } else {
+        const int mid_idx = selectDefaultClosedLookaheadIndex(candidates);
+        for (int i = mid_idx; i >= 0; --i) {
+            order.push_back(i);
+        }
+        for (int i = mid_idx + 1; i < candidate_count; ++i) {
+            order.push_back(i);
+        }
+    }
+
+    std::ostringstream candidate_order_ss;
+    candidate_order_ss << std::fixed << std::setprecision(3);
+    for (size_t i = 0; i < order.size(); ++i) {
+        if (i > 0) candidate_order_ss << ",";
+        candidate_order_ss << candidates[order[i]];
+    }
+
+    if (order.empty()) {
+        const Eigen::Vector3d failed_goal_pos = pointFromClosedW(closed_ref_w_);
+        const double failed_goal_dist_xy = (failed_goal_pos.head<2>() - curr_pos.head<2>()).norm();
+        ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=0 selected_idx=-1 planner_success=0 reason=no_candidates mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"\" full_success_tol=%.3f accepted_full_goal=0 accepted_partial_goal=0 selected_end_to_goal_dist=-1.000 tried_lookaheads=\"\" tried_end_to_goal_dists=\"\"",
+                 curr_pos.x(), curr_pos.y(), curr_pos.z(),
+                 failed_goal_pos.x(), failed_goal_pos.y(), failed_goal_pos.z(),
+                 failed_goal_dist_xy, 0.0, 0.0, closed_ref_w_, closed_ref_w_,
+                 mode_for_goal.c_str(), candidate_order_reason.c_str(),
+                 local_d_for_goal, tangent_dot_odom_for_goal,
+                 closed_goal_full_success_tol_);
+        last_closed_goal_plan_success_ = false;
+        return false;
+    }
+
+    bool planner_success = false;
+    int selected_idx = order.front();
+    double selected_lookahead = candidates[selected_idx];
+    double selected_goal_w = closed_ref_w_ + selected_lookahead;
+    double selected_end_to_goal_dist = std::numeric_limits<double>::infinity();
+    bool accepted_full_goal = false;
+    bool accepted_partial_goal = false;
+    std::string selected_reason = "all_failed";
+
+    bool has_partial_backup = false;
+    int partial_idx = -1;
+    double partial_lookahead = 0.0;
+    double partial_goal_w = closed_ref_w_;
+    double partial_end_to_goal_dist = std::numeric_limits<double>::infinity();
+    Eigen::Vector3d partial_goal = pointFromClosedW(partial_goal_w);
+    KinoPlanSamples partial_samples;
+
+    std::ostringstream tried_lookaheads_ss;
+    std::ostringstream tried_end_dists_ss;
+    tried_lookaheads_ss << std::fixed << std::setprecision(3);
+    tried_end_dists_ss << std::fixed << std::setprecision(3);
+
+    for (int idx : order) {
+        const double lookahead = candidates[idx];
+        const double goal_w = closed_ref_w_ + lookahead;
+        const Eigen::Vector3d candidate_goal = pointFromClosedW(goal_w);
+        if (tried_lookaheads_ss.tellp() > 0) tried_lookaheads_ss << ",";
+        tried_lookaheads_ss << lookahead;
+
+        KinoPlanSamples candidate_samples;
+        if (!planKinoToGoal(pm, start_pt, start_vel, start_acc, candidate_goal, end_vel, candidate_samples)) {
+            if (tried_end_dists_ss.tellp() > 0) tried_end_dists_ss << ",";
+            tried_end_dists_ss << "fail";
+            continue;
+        }
+
+        const bool sample_valid = !candidate_samples.point_set.empty() &&
+                                  candidate_samples.start_end_derivatives.size() >= 3;
+        const double end_to_goal_dist = sample_valid ?
+            (candidate_samples.point_set.back() - candidate_goal).norm() :
+            std::numeric_limits<double>::infinity();
+
+        if (tried_end_dists_ss.tellp() > 0) tried_end_dists_ss << ",";
+        tried_end_dists_ss << end_to_goal_dist;
+
+        if (sample_valid && end_to_goal_dist < closed_goal_full_success_tol_) {
+            planner_success = true;
+            selected_idx = idx;
+            selected_lookahead = lookahead;
+            selected_goal_w = goal_w;
+            goal_pt = candidate_goal;
+            pm.goal_pt = goal_pt;
+            samples = candidate_samples;
+            selected_end_to_goal_dist = end_to_goal_dist;
+            accepted_full_goal = true;
+            selected_reason = "farthest_full_success";
+            break;
+        }
+
+        if (sample_valid && end_to_goal_dist < partial_end_to_goal_dist) {
+            has_partial_backup = true;
+            partial_idx = idx;
+            partial_lookahead = lookahead;
+            partial_goal_w = goal_w;
+            partial_goal = candidate_goal;
+            partial_end_to_goal_dist = end_to_goal_dist;
+            partial_samples = candidate_samples;
+        }
+    }
+
+    if (!planner_success && has_partial_backup) {
+        planner_success = true;
+        selected_idx = partial_idx;
+        selected_lookahead = partial_lookahead;
+        selected_goal_w = partial_goal_w;
+        goal_pt = partial_goal;
+        pm.goal_pt = goal_pt;
+        samples = partial_samples;
+        selected_end_to_goal_dist = partial_end_to_goal_dist;
+        accepted_partial_goal = true;
+        selected_reason = "partial_best_end_dist";
+    }
+
+    const Eigen::Vector3d selected_goal_pos = pointFromClosedW(selected_goal_w);
+    const double goal_dist_xy = (selected_goal_pos.head<2>() - curr_pos.head<2>()).norm();
+    ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=%d selected_idx=%d planner_success=%d reason=%s mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"%s\" full_success_tol=%.3f accepted_full_goal=%d accepted_partial_goal=%d selected_end_to_goal_dist=%.3f tried_lookaheads=\"%s\" tried_end_to_goal_dists=\"%s\"",
+             curr_pos.x(), curr_pos.y(), curr_pos.z(),
+             selected_goal_pos.x(), selected_goal_pos.y(), selected_goal_pos.z(),
+             goal_dist_xy, selected_lookahead, selected_goal_w - closed_ref_w_,
+             closed_ref_w_, selected_goal_w, candidate_count,
+             selected_idx, planner_success ? 1 : 0, selected_reason.c_str(),
+             mode_for_goal.c_str(), candidate_order_reason.c_str(),
+             local_d_for_goal, tangent_dot_odom_for_goal,
+             candidate_order_ss.str().c_str(), closed_goal_full_success_tol_,
+             accepted_full_goal ? 1 : 0, accepted_partial_goal ? 1 : 0,
+             selected_end_to_goal_dist,
+             tried_lookaheads_ss.str().c_str(), tried_end_dists_ss.str().c_str());
+
+    if (!planner_success) {
+        last_failed_goal_idx_ = selected_idx;
+        last_closed_goal_plan_success_ = false;
+        return false;
+    }
+
+    closed_ref_pending_goal_w_ = selected_goal_w;
+    closed_ref_pending_lookahead_w_ = selected_lookahead;
+    closed_ref_has_pending_goal_ = true;
+    closed_ref_last_goal_pos_ = selected_goal_pos;
+    closed_ref_last_goal_dist_xy_ = goal_dist_xy;
+    closed_ref_last_candidate_idx_ = selected_idx;
+
+    last_selected_goal_idx_ = selected_idx;
+    last_failed_goal_idx_ = -1;
+    last_closed_goal_plan_success_ = true;
+    return true;
+}
+
+bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
+                           int& new_i0_out , Eigen::VectorXd& time)
 {
     auto& pm = swarmParticlesManager[0];
     /*----------- ① Kino A* 搜索路径 + B 样条 -----------*/
@@ -2648,41 +3541,38 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
 
     Eigen::Vector3d goal_pt = pm.goal_pt;
     Eigen::Vector3d end_vel = Eigen::Vector3d::Zero();
-    if (enable_circle_reference_test_ && circle_reference_ready_) {
-        auto circle_goal = getCircleReferenceGoal(curr_pos);
-        goal_pt = circle_goal.first;
-        end_vel = circle_goal.second;
+    const bool use_closed_goal_candidates = enable_circle_reference_test_ && circle_reference_ready_;
+    KinoPlanSamples plan_samples;
+
+    if (use_closed_goal_candidates) {
+        if (!selectClosedGoalCandidate(pm, curr_pos, start_pt, start_vel, start_acc,
+                                       goal_pt, end_vel, plan_samples)) {
+            return false;
+        }
+    } else {
+        if (!planKinoToGoal(pm, start_pt, start_vel, start_acc, goal_pt, end_vel, plan_samples)) {
+            return false;
+        }
         pm.goal_pt = goal_pt;
     }
-    
-    pm.kino_path_finder_->reset();
 
-    int status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc,
-                                goal_pt, end_vel,
-                                /*init=*/false, /*dynamic=*/false);
+    vector<Eigen::Vector3d> point_set = plan_samples.point_set;
+    vector<Eigen::Vector3d> start_end_derivatives = plan_samples.start_end_derivatives;
+    double ts = plan_samples.ts;
 
-    if (status == KinodynamicAstar::NO_PATH) {
-        cout << "[kino replan]: kinodynamic search fail!" << endl;
-
-        //再次搜索
-        pm.kino_path_finder_->reset();
-        status = pm.kino_path_finder_->search(start_pt, start_vel, start_acc, goal_pt, end_vel, false, false);
-
-        if (status == KinodynamicAstar::NO_PATH) {
-            cout << "[kino replan]: Can't find path." << endl;
-            return false;
-        } else {
-            cout << "[kino replan]: retry search success." << endl;
-        }
-
-    } else {
-        cout << "[kino replan]: kinodynamic search success." << endl;
+    if (use_closed_goal_candidates && !point_set.empty()) {
+        const Eigen::Vector3d kino_end_pos = point_set.back();
+        const double kino_duration = ts * static_cast<double>(std::max(0, static_cast<int>(point_set.size()) - 1));
+        const double kino_end_to_goal_dist = (kino_end_pos - closed_ref_last_goal_pos_).norm();
+        ROS_WARN("[GVF][KINO_RESULT] pending_goal_w=%.3f pending_lookahead=%.3f accepted_goal_w=%.3f accepted_lookahead=%.3f goal_dist_xy=%.3f kino_start_pos=(%.3f,%.3f,%.3f) kino_end_pos=(%.3f,%.3f,%.3f) kino_end_to_goal_dist=%.3f kino_duration=%.3f kino_success=1 candidate_idx=%d",
+                 closed_ref_pending_goal_w_, closed_ref_pending_lookahead_w_,
+                 closed_ref_accepted_goal_w_, closed_ref_accepted_lookahead_w_,
+                 closed_ref_last_goal_dist_xy_,
+                 start_pt.x(), start_pt.y(), start_pt.z(),
+                 kino_end_pos.x(), kino_end_pos.y(), kino_end_pos.z(),
+                 kino_end_to_goal_dist, kino_duration,
+                 closed_ref_last_candidate_idx_);
     }
-
-    double ts = 0.2; // 时间间隔 
-
-    vector<Eigen::Vector3d> point_set, start_end_derivatives; // 引导点,边界速度[v0,vT,a0,aT]
-    pm.kino_path_finder_->getSamples(ts, point_set, start_end_derivatives);
 
     // 只用前 N 个点做 B 样条（像 topo A* 那版一样）
     int N = std::min((int)point_set.size(), num_points_to_take_);
@@ -2778,11 +3668,33 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
             Eigen::VectorXd cand_time;
             int new_i0 = 0;
             if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
+                Eigen::Vector3d v_ref_start = Eigen::Vector3d::Zero();
+                if (cand_vel.rows() > 0) {
+                    const int v_idx = std::max(0, std::min(new_i0, (int)cand_vel.rows() - 1));
+                    v_ref_start = cand_vel.row(v_idx).transpose();
+                }
+                const Eigen::Vector3d v_odom = odom_vel_est_;
+                double cos_start_odom = 0.0;
+                if (v_ref_start.norm() > 1e-6 && v_odom.norm() > 1e-6) {
+                    cos_start_odom = v_ref_start.normalized().dot(v_odom.normalized());
+                }
+                if (enable_circle_reference_test_ && circle_reference_ready_ && closed_ref_has_pending_goal_) {
+                    closed_ref_accepted_goal_w_ = closed_ref_pending_goal_w_;
+                    closed_ref_accepted_lookahead_w_ = closed_ref_pending_lookahead_w_;
+                    closed_ref_has_accepted_goal_ = true;
+                }
+                ROS_WARN("[GVF][SWITCH_OBS] accept_reason=gen_new_traj accepted_new=1 pending_goal_w=%.3f accepted_goal_w=%.3f pending_lookahead=%.3f accepted_lookahead=%.3f v_ref_start=(%.3f,%.3f,%.3f) v_odom=(%.3f,%.3f,%.3f) cos_start_odom=%.3f",
+                         closed_ref_pending_goal_w_, closed_ref_accepted_goal_w_,
+                         closed_ref_pending_lookahead_w_, closed_ref_accepted_lookahead_w_,
+                         v_ref_start.x(), v_ref_start.y(), v_ref_start.z(),
+                         v_odom.x(), v_odom.y(), v_odom.z(), cos_start_odom);
                 pm.last_traj = cand_traj;
                 pm.last_vel = cand_vel;
                 pm.last_traj_time_ = cand_time;
                 current_traj_index_ = new_i0;
                 last_switch_time_ = current_time;
+                vel_fb_switch_until_ = ros::Time::now() + ros::Duration(cmd_vel_fb_switch_time_);
+                cmd_switch_motion_limit_until_ = ros::Time::now() + ros::Duration(std::max(0.0, cmd_switch_motion_limit_time_));
                 publishPathMsg(pm.last_traj, pm.last_vel);
             } else {
                 ROS_WARN_THROTTLE(1.0, "[GVF] GEN_NEW_TRAJ: plan failed, keep old");
@@ -2823,9 +3735,11 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 return;
             }
             else if(checkCollision()){
+                logReplanReason("collision");
                 changeFSMExecState(REPLAN_TRAJ, "collision detection");
             }
             else if((current_time - last_replan_time_).toSec() >= planInterval){
+                logReplanReason("plan_interval");
                 changeFSMExecState(REPLAN_TRAJ, "planInterval reached");
             }
 
@@ -2903,15 +3817,35 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 return result;
             };
 
-            bool switched_to_new = false;
             if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time)) {
                 bool accept_new = true;
-                std::string reason;
+                std::string reason = "accept_default";
 
                 if (old_traj.rows() > 0 && old_vel.rows() == old_traj.rows()) {
                     accept_new = shouldAcceptCandidate(old_traj, old_vel, pm.last_traj_time_, current_traj_index_, cand_traj, cand_vel,
                                                        cand_time, new_i0, pm.goal_pt, reason);
                 }
+                Eigen::Vector3d v_ref_start = Eigen::Vector3d::Zero();
+                if (cand_vel.rows() > 0) {
+                    const int v_idx = std::max(0, std::min(new_i0, (int)cand_vel.rows() - 1));
+                    v_ref_start = cand_vel.row(v_idx).transpose();
+                }
+                const Eigen::Vector3d v_odom = odom_vel_est_;
+                double cos_start_odom = 0.0;
+                if (v_ref_start.norm() > 1e-6 && v_odom.norm() > 1e-6) {
+                    cos_start_odom = v_ref_start.normalized().dot(v_odom.normalized());
+                }
+                if (accept_new && enable_circle_reference_test_ && circle_reference_ready_ && closed_ref_has_pending_goal_) {
+                    closed_ref_accepted_goal_w_ = closed_ref_pending_goal_w_;
+                    closed_ref_accepted_lookahead_w_ = closed_ref_pending_lookahead_w_;
+                    closed_ref_has_accepted_goal_ = true;
+                }
+                ROS_WARN("[GVF][SWITCH_OBS] accept_reason=%s accepted_new=%d pending_goal_w=%.3f accepted_goal_w=%.3f pending_lookahead=%.3f accepted_lookahead=%.3f v_ref_start=(%.3f,%.3f,%.3f) v_odom=(%.3f,%.3f,%.3f) cos_start_odom=%.3f",
+                         reason.c_str(), accept_new ? 1 : 0,
+                         closed_ref_pending_goal_w_, closed_ref_accepted_goal_w_,
+                         closed_ref_pending_lookahead_w_, closed_ref_accepted_lookahead_w_,
+                         v_ref_start.x(), v_ref_start.y(), v_ref_start.z(),
+                         v_odom.x(), v_odom.y(), v_odom.z(), cos_start_odom);
                 if (accept_new) {
                     const auto anchor = computeOldPathAnchor(progress_w_);
                     const double w_anchor = anchor.first;
@@ -2927,10 +3861,11 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                     pm.last_traj_time_ = cand_time;
                     current_traj_index_ = new_i0;
                     last_switch_time_ = current_time;
+                    vel_fb_switch_until_ = ros::Time::now() + ros::Duration(cmd_vel_fb_switch_time_);
+                    cmd_switch_motion_limit_until_ = ros::Time::now() + ros::Duration(std::max(0.0, cmd_switch_motion_limit_time_));
                     if (pm.gvf_) {
                         pm.gvf_->setNextPathWAnchor(w_anchor);
                     }
-                    switched_to_new = true;
                 } else {
                     const auto anchor = computeKeepPathAnchor();
                     const double w_anchor = anchor.first;

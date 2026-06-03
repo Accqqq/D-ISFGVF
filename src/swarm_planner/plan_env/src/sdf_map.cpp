@@ -146,7 +146,7 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   map_inf_pub_ = nh.advertise<sensor_msgs::PointCloud2>(particle +"sdf_map/occupancy_inflate", 10);
   esdf_pub_ = nh.advertise<sensor_msgs::PointCloud2>(particle +"sdf_map/esdf", 10);
   update_range_pub_ = nh.advertise<visualization_msgs::Marker>(particle +"sdf_map/update_range", 10);
-  map_boundary_pub_ = nh.advertise<visualization_msgs::MarkerArray>(particle +"sdf_map/map_boundary", 10);
+  //map_boundary_pub_ = nh.advertise<visualization_msgs::MarkerArray>(particle +"sdf_map/map_boundary", 10);
 
   unknown_pub_ = nh.advertise<sensor_msgs::PointCloud2>(particle +"sdf_map/unknown", 10);
   depth_pub_ = nh.advertise<sensor_msgs::PointCloud2>(particle +"sdf_map/depth_cloud", 10);
@@ -1097,7 +1097,7 @@ void SDFMap::visCallback(const ros::TimerEvent& /*event*/) {
   publishMap();
   publishMapInflate(false);
   publishUpdateRange();
-  publishMapBoundary();
+  //publishMapBoundary();
   publishESDF();
 
   // publishUnknown();

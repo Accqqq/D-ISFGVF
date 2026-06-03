@@ -6,7 +6,7 @@
 - Primary long-term goal: 在现有规划框架上稳定验证 `lifted progress / closed reference` 的闭合轨迹跟踪能力，尤其是 circle / figure8。
 - Current long-term direction:
   - 保留现有 `KinoA* + B-spline` 主体
-  - 在此之上逐步稳定闭合轨迹、`w` 连续性与切换逻辑
+  - 在此之上逐步稳定闭合轨迹、`closed_ref_w_` 相位推进、`w` 连续性与切换逻辑
 - Non-goals:
   - 当前不整体重构规划架构
   - 当前不优先引入新依赖
@@ -29,11 +29,12 @@
 
 ## Architecture Snapshot
 - Main flow:
-  - `goal/auto-start -> gvf_manager FSM -> KinoA* -> B-spline -> gvf reparam(sample_w_) -> cmdCallback lifted guidance`
+  - `goal/auto-start -> closed reference goal candidate -> gvf_manager FSM -> KinoA* -> B-spline -> gvf reparam(sample_w_) -> cmdCallback lifted guidance`
 - Persistent state:
   - `pm.last_traj / pm.last_vel / pm.last_traj_time_`
   - `pm.gvf_->sample_w_`
-  - `circle_reference_traj_ / circle_reference_vel_ / circle_reference_w_`
+  - `circle_reference_traj_ / circle_reference_vel_ / circle_reference_w_ / circle_reference_total_w_`
+  - `closed_ref_w_`
 - Boundaries:
   - `gvf_manager.cpp` 决定何时规划、切不切轨、闭合参考如何选点
   - `gvf.cpp` 决定当前执行轨迹如何转成连续 `w`
@@ -47,11 +48,17 @@
 - `gvf_manager.cpp -> odomCallback()`
   - `circle_test + auto_start` 入口
 - `gvf_manager.cpp -> generateCircleReference()`
-  - circle nominal reference 生成
+  - circle nominal reference 生成，并累计弧长表 `circle_reference_w_`
 - `gvf_manager.cpp -> generateFigureEightReference()`
-  - figure8 nominal reference 生成
+  - figure8 nominal reference 生成，并累计弧长表 `circle_reference_w_`
+- `gvf_manager.cpp -> pointFromClosedW() / tangentFromClosedW()`
+  - 把连续闭合相位 `closed_ref_w_` 映射回闭合曲线上的插值点和切向
 - `gvf_manager.cpp -> getCircleReferenceGoal()`
-  - `JOIN / progress / REALIGN` 目标点选择核心
+  - 更新 `closed_ref_w_`，根据当前位置、切向误差和局部投影维护闭合曲线相位
+- `gvf_manager.cpp -> selectClosedGoalCandidate()`
+  - 基于 `lookahead_min_w / max_w / step_w` 构建候选目标，并用 KinoA* 选择可达闭合目标
+- `gvf_manager.cpp -> buildClosedLookaheadCandidates()`
+  - 构建闭合曲线弧长前视候选，不再使用旧 `lookahead_pts`
 - `gvf_manager.cpp -> checkCollision()`
   - 执行轨迹未来段碰撞检查
 - `gvf_manager.cpp -> shouldAcceptCandidate()`
@@ -64,17 +71,27 @@
   - 构建 `sample_w_`，延续 `w`
 
 ## Long-Term Truths
-- 闭合轨迹的核心不是“按时间播点”，而是“按 progress 选参考点”。
+- 闭合轨迹的核心不是“按时间播点”，而是先把闭合点列参数化成弧长 `w`，再用 `closed_ref_w_` 维护闭合曲线相位，并按弧长前视候选选目标。
+- `closed_ref_w_` 是连续相位，允许超过一圈；访问闭合曲线点时再通过 `wrapClosedW()` 回绕到当前圈。
 - `w` 连续性来自：
   - 旧轨迹锚点提取
   - 新轨迹 `sample_w_` 的续接
 - figure8 的难点不是生成轨迹，而是：
-  - 接轨
+  - 闭合相位稳定
   - 交叉点支路选择
   - 重规划切换时的分支稳定性
 - 这个项目里需要明确区分：
   - `lifted GVF` 核心能力
-  - `join / realign / switch` 工程稳定化
+  - `closed_ref_w_ / candidate lookahead / switch` 工程稳定化
+- 当前飞控命令层是 position-only：
+  - `PositionCommand.velocity` 保持 0
+  - GVF 输出是内部速度意图，不直接发给飞控速度接口
+  - `v_gvf / K_eq` 是速度意图到位置领先的接口转换，不叫前馈
+  - 可选 `pos_ff = pos_ff_time * d(v_gvf)/dt / K_eq` 才是额外前馈位置补偿；当前倾向 XY-only，避免 z 轴抽动
+- `gain_test` 模式用于测位置环等效增益：
+  - 打开后 `cmdCallback()` 直接发布 `odom + fixed lead`
+  - 用 `odom_vel_lpf dot lead / |lead|^2` 估计 `K_eq`
+  - 该模式不走正常 GVF 控制链路
 
 ## Effective Parameters
 - Closed reference:
@@ -85,13 +102,37 @@
   - `gvf/circle_test/figure8_radius`
   - `gvf/circle_test/height`
   - `gvf/circle_test/points`
-  - `gvf/circle_test/lookahead_pts`
-  - `gvf/circle_test/realign_min_progress`
-  - `gvf/circle_test/join_search_window`
-  - `gvf/circle_test/join_lookahead_pts`
-  - `gvf/circle_test/join_exit_dist`
-  - `gvf/circle_test/join_exit_stable_needed`
+  - `gvf/circle_test/lookahead_min_w`
+  - `gvf/circle_test/lookahead_max_w`
+  - `gvf/circle_test/lookahead_step_w`
+  - `gvf/circle_test/search_back_w`
+  - `gvf/circle_test/search_forward_w`
+  - `gvf/circle_test/ref_phase_k1`
+  - `gvf/circle_test/ref_alpha_rho`
+  - `gvf/circle_test/ref_sigma_scale`
+  - `gvf/circle_test/ref_wdot_forward_max`
+  - `gvf/circle_test/ref_wdot_backward_max`
+  - `gvf/circle_test/ref_project_blend`
+  - `gvf/circle_test/ref_project_snap_max`
+  - `gvf/circle_test/ref_project_boundary_eps`
+  - `gvf/circle_test/goal_full_success_tol`
   - `gvf/circle_test/center_x/y/z`
+- Control layer:
+  - `gvf/cmd/vel_max`
+  - `gvf/cmd/pos_gain_equiv`
+  - `gvf/cmd/lead_max`
+  - `gvf/cmd/use_pos_ff`
+  - `gvf/cmd/pos_ff_xy_only`
+  - `gvf/cmd/pos_ff_time`
+  - `gvf/cmd/pos_ff_max`
+  - `gvf/cmd/use_vel_slew_limit`
+  - `gvf/cmd/acc_max`
+  - `gvf/cmd/jerk_max`
+  - `gvf/cmd/offset_rate_max`
+  - `gvf/cmd/skip_motion_limits_on_switch`
+  - `gvf/cmd/gain_test_enable`
+  - `gvf/cmd/gain_test_lead`
+  - `gvf/cmd/gain_test_axis`
 - Replan / collision:
   - `gvf/collision_threshold`
   - `gvf/collision_check_horizon_pts`
@@ -104,6 +145,19 @@
   - `circle_reference_speed_`
   - `collision_replan_cooldown_`
   - `last_collision_replan_time_`
+- 当前废弃/旧版残留，不应再作为有效调参：
+  - `gvf/circle_test/lookahead_pts`
+  - `gvf/circle_test/realign_min_progress`
+  - `gvf/circle_test/join_*`
+  - `figure8_join_*`
+  - `gvf/kino_sample_ts`
+  - `gvf/kino_sample_ts_min`
+  - `gvf/kino_max_guide_pts`
+  - `gvf/path_pub_from_current`
+  - `gvf/path_pub_future_pts`
+  - `gvf/replan_stop_radius`
+  - `gvf/replan_stop_vel`
+  - `gvf/debug_gate`
 
 ## Working Conventions
 - Preserve existing architecture unless explicitly asked otherwise.
@@ -124,7 +178,7 @@
 - Manual verification focus:
   1. `goalCallback()` / `auto_start` 是否触发
   2. `FSM` 是否进入 `GEN_NEW_TRAJ / REPLAN_TRAJ / EXEC_TRAJ`
-  3. `[GVF][REF] / [GVF][REF][JOIN] / [GVF][SWITCH] / [GVF][W]`
+  3. `[GVF][CLOSED_REF] / [GVF][CLOSED_GOAL] / [GVF][KINO_RESULT] / [GVF][SWITCH] / [GVF][CMD_POS_FF]`
 
 ## Git Notes
 - 当前项目一旦有可运行版本，应尽快 commit。

@@ -285,6 +285,11 @@ void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
         total_w_ = 0.0;
         return;
     }
+    if (!last_path_.poses.empty() &&
+        last_path_.header.stamp == msg->header.stamp &&
+        last_path_.poses.size() == msg->poses.size()) {
+        return;
+    }
     if (std::isnan(gvf_.camera_pos_(0)) || 
         std::isnan(gvf_.camera_pos_(1)) || 
         std::isnan(gvf_.camera_pos_(2))) return;

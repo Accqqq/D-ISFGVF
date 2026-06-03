@@ -32,6 +32,9 @@
         <param name="gvf/circle_test/height" value="1.0" />
         <param name="gvf/circle_test/points" value="480" />
         <param name="gvf/circle_test/lookahead_pts" value="40" />
+        <param name="gvf/circle_test/lookahead_min_w" value="1.0" />
+        <param name="gvf/circle_test/lookahead_max_w" value="3.0" />
+        <param name="gvf/circle_test/lookahead_step_w" value="0.5" />
         <param name="gvf/circle_test/realign_min_progress" value="3.0" />
         <param name="gvf/circle_test/join_search_window" value="30" />
         <param name="gvf/circle_test/join_lookahead_pts" value="8" />
@@ -48,13 +51,10 @@
         <param name="gvf/circle_test/radius" value="8.0" />
         <param name="gvf/circle_test/figure8_radius" value="10.0" />
         <param name="gvf/circle_test/height" value="1.0" />
-        <param name="gvf/circle_test/points" value="480" />
-        <param name="gvf/circle_test/lookahead_pts" value="40" />
-        <param name="gvf/circle_test/realign_min_progress" value="3.0" />
-        <param name="gvf/circle_test/join_search_window" value="30" />
-        <param name="gvf/circle_test/join_lookahead_pts" value="8" />
-        <param name="gvf/circle_test/join_exit_dist" value="0.8" />
-        <param name="gvf/circle_test/join_exit_stable_needed" value="5" />
+        <param name="gvf/circle_test/points" value="960" />
+        <param name="gvf/circle_test/lookahead_min_w" value="2.0" />
+        <param name="gvf/circle_test/lookahead_max_w" value="4.5" />
+        <param name="gvf/circle_test/lookahead_step_w" value="0.5" />
         <param name="gvf/circle_test/center_x" value="0.0" />
         <param name="gvf/circle_test/center_y" value="0.0" />
         <param name="gvf/circle_test/center_z" value="0.0" />
@@ -65,19 +65,12 @@
         <param name="gvf/kino_sample_ts_min" value="0.05" />
         <param name="gvf/kino_max_guide_pts" value="60" />
 
-        <!-- 发布给 GVF / RViz 的路径长度（只发布当前位置之后一段，避免“永远很长”） -->
-        <param name="gvf/path_pub_from_current" value="true" />
-        <param name="gvf/path_pub_future_pts" value="200" />
-
-        <!-- 到达目标附近并且速度很小就停止重规划（避免 start≈goal 时反复出圈/长轨迹） -->
-        <param name="gvf/replan_stop_radius" value="0.35" />
-        <param name="gvf/replan_stop_vel" value="0.20" />
         <!-- 该参数决定前向跟踪速度 -->
         <!-- <param name="gvf/gvf_gain1"       value="2.5"/> -->
-        <param name="gvf/gvf_gain1"       value="2.0"/>
+        <param name="gvf/gvf_gain1"       value="1.5"/>
         <!-- 该参数决定后退/回拉速度 -->
         <!-- <param name="gvf/gvf_gain2"       value="-2.0"/> -->
-        <param name="gvf/gvf_gain2"       value="-1.2"/>
+        <param name="gvf/gvf_gain2"       value="-1.5"/>
         <param name="gvf/gvf_k3"          value="1.0"/>
         <param name="gvf/gvf_k4"          value="1.0"/>
         <param name="gvf/gvf_inflation"  value="0.099" /> 
@@ -101,20 +94,37 @@
 
        <param name="gvf/debug_gate" value="true"/>
 
-        <!-- vel_max: GVF 速度限幅（越大越快，但也更容易超调/抖动） -->
+        <!-- vel_max/speed_max: GVF 与 cmd_pos 的速度上限 -->
         <param name="gvf/cmd/vel_max" value="2.0" />
-        <!-- k_pull: 回拉增益，越大 ref_pos 越贴着飞机（更稳但更慢） -->
-        <param name="gvf/cmd/k_pull" value="2.0" />
-        <!-- lookahead_time: 前视时间 T，cmd_pos = pos + T*vel（越大越快，但更“猛”） -->
-        <param name="gvf/cmd/lookahead_time" value="0.3" />
-        <!-- lookahead_dist: 前视点最大水平距离 Lmax（越大越快，但更“猛”） -->
-        <param name="gvf/cmd/lookahead_dist" value="0.6" />
-        <!-- max_step: 单周期 cmd_pos 最大移动（防跳点/起步弹射/一卡一卡） -->
-        <param name="gvf/cmd/max_step" value="0.05" />
-        <!-- speed_max: cmd_pos 的最大速度 -->
-        <param name="gvf/cmd/speed_max" value="2.0" />
-        <!-- vel_lpf_hz: vel 低通截止频率 -->
-        <param name="gvf/cmd/vel_lpf_hz" value="4.0" />
+
+        <!-- acc_max: 命令速度状态的加速度上限 -->
+        <param name="gvf/cmd/acc_max" value="8.0" />
+        <param name="gvf/cmd/jerk_max" value="300.0" />
+        <param name="gvf/cmd/offset_rate_max" value="6.0" />
+
+        <param name="gvf/cmd/pos_gain_equiv" value="1.65" />
+        <param name="gvf/cmd/lead_max" value="1.5" />
+
+        <param name="gvf/cmd/use_pos_ff" value="true" />
+        <param name="gvf/cmd/pos_ff_xy_only" value="true" />
+        <param name="gvf/cmd/pos_ff_time" value="0.08" />
+        <param name="gvf/cmd/pos_ff_max" value="0.20" />
+
+        <param name="gvf/cmd/use_vel_slew_limit" value="false" />
+        <param name="gvf/cmd/use_switch_motion_limits" value="true" />
+        <param name="gvf/cmd/skip_motion_limits_on_switch" value="true" />
+        <param name="gvf/cmd/switch_motion_limit_time" value="0.25" />
+        <param name="gvf/cmd/switch_acc_max" value="8.0" />
+        <param name="gvf/cmd/switch_jerk_max" value="300.0" />
+        <param name="gvf/cmd/switch_offset_rate_max" value="6.0" />
+
+
+        <!-- Gain test: 固定位置领先距离测量位置环等效增益，测完改回 false -->
+        <param name="gvf/cmd/gain_test_enable" value="false" />
+        <param name="gvf/cmd/gain_test_lead" value="1.21" />
+        <param name="gvf/cmd/gain_test_axis" value="0" />
+        <param name="gvf/odom_vel_est_window" value="0.3" />
+        <param name="gvf/odom_vel_lpf_hz" value="2.0" />
         
 
         <!-- SDF Map -->
