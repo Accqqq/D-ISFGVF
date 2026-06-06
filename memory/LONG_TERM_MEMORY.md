@@ -23,6 +23,8 @@
     - GVF / lifted guidance / `sample_w_` 重参数化
   - `src/swarm_planner/path_searching/src/kinodynamic_astar.cpp`
     - KinoA* 搜索与引导点采样
+  - `src/swarm_planner/plan_env/src/sdf_map.cpp`
+    - 实时感知地图、ESDF、手动地图层、碰撞/边界查询底层实现
 - Runtime config:
   - `src/swarm_planner/bspline_traj/launch/test_gvf.launch`
   - `src/uav_simulator/so3_quadrotor_simulator/launch/simulator.launch`
@@ -61,6 +63,12 @@
   - 构建闭合曲线弧长前视候选，不再使用旧 `lookahead_pts`
 - `gvf_manager.cpp -> checkCollision()`
   - 执行轨迹未来段碰撞检查
+- `sdf_map.cpp -> manualObstacleCallback()`
+  - 手动障碍物入口，接收 `/manual_map/add_obstacle_center` 或仿真直接接收 `/clicked_point`
+- `sdf_map.cpp -> applyManualLayer()`
+  - 将 `manual_occupancy_buffer_` OR 回实时 occupancy / inflated occupancy，保证手动障碍物不被 raycast 或 buffer refresh 清掉
+- `sdf_map.cpp -> loadManualMapFile() / saveManualMapFile()`
+  - 手动障碍物中心的持久化读写，文件格式为每行 `x y z`
 - `gvf_manager.cpp -> shouldAcceptCandidate()`
   - 新旧轨迹切换规则
 - `gvf_manager.cpp -> FSMCallback()`
@@ -83,15 +91,30 @@
 - 这个项目里需要明确区分：
   - `lifted GVF` 核心能力
   - `closed_ref_w_ / candidate lookahead / switch` 工程稳定化
-- 当前飞控命令层是 position-only：
-  - `PositionCommand.velocity` 保持 0
+- 当前飞控命令层是 governor-only position control：
+  - 不再使用旧 `CMD_DIRECT / CMD_SPLIT / CMD_POS_FF / CMD_MOTION_LIMIT` fallback
+  - `PositionCommand.velocity` 显式保持 0
   - GVF 输出是内部速度意图，不直接发给飞控速度接口
-  - `v_gvf / K_eq` 是速度意图到位置领先的接口转换，不叫前馈
-  - 可选 `pos_ff = pos_ff_time * d(v_gvf)/dt / K_eq` 才是额外前馈位置补偿；当前倾向 XY-only，避免 z 轴抽动
+  - governor 从当前执行轨迹的 `sample_w_` 上选前瞻点，把速度意图转换为位置命令
+  - 速度转位置关系为 `v_actual ~= K_eq * cmd_dist`
+  - 仿真常用 `K_eq ~= 1.65`；实机测得/采用 `K_eq ~= 1.10`
+  - 实机若目标速度为 `2.0 m/s`，需要位置前瞻约 `2.0 / 1.10 = 1.82 m`
+  - 实机 2m/s 初始 governor 参数应围绕 `governor_l_max / governor_lead_max ~= 1.7~1.9` 调整，而不是使用仿真 `K_eq=1.65` 下的较小前瞻
 - `gain_test` 模式用于测位置环等效增益：
   - 打开后 `cmdCallback()` 直接发布 `odom + fixed lead`
   - 用 `odom_vel_lpf dot lead / |lead|^2` 估计 `K_eq`
   - 该模式不走正常 GVF 控制链路
+- 手动地图层是 SDFMap 层能力，不属于 GVF 核心算法：
+  - 手动障碍物进入 `manual_occupancy_buffer_`
+  - 再 OR 到 `occupancy_buffer_ / occupancy_buffer_inflate_`
+  - 规划器继续通过 `getInflateOccupancy()`、`getDistance()`、`isInMap()` 感知障碍物和边界
+  - 不需要重写 GVF、KinoA* 或 B-spline
+- 手动地图层的持久化只保存障碍物中心：
+  - `manual_map_file` 是文本文件
+  - `#` 开头为注释
+  - 每个非注释行是一个障碍物中心 `x y z`
+  - 加载时重新按当前 `manual_obstacle_radius / height / inflate` 生成圆柱
+  - 该坐标依赖固定 `world` 原点；实机 VIO/map 原点变化时不能直接复用旧文件坐标
 
 ## Effective Parameters
 - Closed reference:
@@ -120,16 +143,26 @@
 - Control layer:
   - `gvf/cmd/vel_max`
   - `gvf/cmd/pos_gain_equiv`
-  - `gvf/cmd/lead_max`
-  - `gvf/cmd/use_pos_ff`
-  - `gvf/cmd/pos_ff_xy_only`
-  - `gvf/cmd/pos_ff_time`
-  - `gvf/cmd/pos_ff_max`
-  - `gvf/cmd/use_vel_slew_limit`
+  - `gvf/cmd/tangent_vel_max`
   - `gvf/cmd/acc_max`
-  - `gvf/cmd/jerk_max`
-  - `gvf/cmd/offset_rate_max`
-  - `gvf/cmd/skip_motion_limits_on_switch`
+  - `gvf/cmd/governor_l_min`
+  - `gvf/cmd/governor_l_max`
+  - `gvf/cmd/governor_l_step`
+  - `gvf/cmd/governor_l_rate_max`
+  - `gvf/cmd/governor_l_ff_weight`
+  - `gvf/cmd/governor_lead_max`
+  - `gvf/cmd/governor_normal_cross_max`
+  - `gvf/cmd/governor_normal_deadband`
+  - `gvf/cmd/governor_normal_full_error`
+  - `gvf/cmd/governor_normal_max`
+  - `gvf/cmd/governor_normal_rate_max`
+  - `gvf/cmd/governor_l_rate_weight`
+  - `gvf/cmd/governor_normal_weight`
+  - `gvf/cmd/governor_normal_rate_weight`
+  - `gvf/cmd/governor_tau_vel_weight`
+  - `gvf/cmd/governor_normal_vel_weight`
+  - `gvf/cmd/governor_normal_vel_error_cap`
+  - `gvf/switch/governor_path_margin_w`
   - `gvf/cmd/gain_test_enable`
   - `gvf/cmd/gain_test_lead`
   - `gvf/cmd/gain_test_axis`
@@ -138,6 +171,32 @@
   - `gvf/collision_check_horizon_pts`
   - `gvf/collision_consecutive_hits`
   - `gvf/planInterval`
+- Manual map:
+  - `sdf_map/enable_manual_map`
+  - `sdf_map/manual_click_direct`
+  - `sdf_map/manual_obstacle_radius`
+  - `sdf_map/manual_obstacle_height`
+  - `sdf_map/manual_obstacle_inflate`
+  - `sdf_map/manual_boundary_padding`
+  - `sdf_map/manual_boundary_z_min`
+  - `sdf_map/manual_boundary_z_max`
+  - `sdf_map/manual_map_file`
+  - `sdf_map/manual_map_auto_load`
+  - `sdf_map/manual_map_auto_save`
+
+## Manual Map Runtime Notes
+- 仿真 `test_gvf.launch`：
+  - `manual_click_direct=true`
+  - RViz `Publish Point` 可直接生成障碍物
+  - 当前默认保存文件为 `src/swarm_planner/bspline_traj/config/manual_obstacles_test_gvf.txt`
+- 实机建议：
+  - `manual_click_direct=false`
+  - `uav_server` 只在 `MANUAL_MAP` 状态下转发 `/clicked_point` 到 `/manual_map/add_obstacle_center`
+  - 保存文件建议放在实机 workspace 的 `bspline_traj/config/manual_maps/realflight_obstacles.txt`
+- 当前默认圆柱占据半径等于：
+  - `manual_obstacle_radius + manual_obstacle_inflate`
+  - 仿真示例为 `0.35 + 0.10 = 0.45 m`
+- 若局部深度图暂时看不到障碍物，手动障碍物仍会保留在 SDFMap 查询结果里；但如果实机坐标系或 RViz Fixed Frame 不一致，手动点和真实感知点会在 RViz 上错位。
 
 ## Removed / Deprecated Items
 - 已移除：
@@ -146,6 +205,16 @@
   - `collision_replan_cooldown_`
   - `last_collision_replan_time_`
 - 当前废弃/旧版残留，不应再作为有效调参：
+  - `gvf/cmd/lead_max`
+  - `gvf/cmd/use_pos_ff`
+  - `gvf/cmd/pos_ff_xy_only`
+  - `gvf/cmd/pos_ff_time`
+  - `gvf/cmd/pos_ff_max`
+  - `gvf/cmd/use_vel_slew_limit`
+  - `gvf/cmd/use_switch_tangent_vel_limit`
+  - `gvf/cmd/use_split_normal_lead`
+  - `gvf/cmd/normal_lead_*`
+  - `gvf/cmd/normal_des_boost_*`
   - `gvf/circle_test/lookahead_pts`
   - `gvf/circle_test/realign_min_progress`
   - `gvf/circle_test/join_*`

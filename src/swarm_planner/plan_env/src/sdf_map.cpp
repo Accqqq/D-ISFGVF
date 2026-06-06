@@ -28,6 +28,33 @@
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
 
+namespace {
+
+void loadManualMapParams(ros::NodeHandle& nh, MappingParameters& mp) {
+  nh.param("sdf_map/enable_manual_map", mp.enable_manual_map_, true);
+  nh.param("sdf_map/manual_click_direct", mp.manual_click_direct_, false);
+  nh.param("sdf_map/manual_obstacle_radius", mp.manual_obstacle_radius_, 0.35);
+  nh.param("sdf_map/manual_obstacle_height", mp.manual_obstacle_height_, 2.5);
+  nh.param("sdf_map/manual_obstacle_inflate", mp.manual_obstacle_inflate_, 0.10);
+  nh.param("sdf_map/manual_boundary_padding", mp.manual_boundary_padding_, 0.10);
+  nh.param("sdf_map/manual_boundary_z_min", mp.manual_boundary_z_min_, mp.ground_height_);
+  nh.param("sdf_map/manual_boundary_z_max", mp.manual_boundary_z_max_, mp.virtual_ceil_height_);
+  nh.param("sdf_map/manual_map_file", mp.manual_map_file_, std::string(""));
+  nh.param("sdf_map/manual_map_auto_load", mp.manual_map_auto_load_, false);
+  nh.param("sdf_map/manual_map_auto_save", mp.manual_map_auto_save_, false);
+}
+
+bool isInBaseMapBounds(const MappingParameters& mp, const Eigen::Vector3d& pos) {
+  return pos(0) >= mp.map_min_boundary_(0) + 1e-4 &&
+         pos(1) >= mp.map_min_boundary_(1) + 1e-4 &&
+         pos(2) >= mp.map_min_boundary_(2) + 1e-4 &&
+         pos(0) <= mp.map_max_boundary_(0) - 1e-4 &&
+         pos(1) <= mp.map_max_boundary_(1) - 1e-4 &&
+         pos(2) <= mp.map_max_boundary_(2) - 1e-4;
+}
+
+}  // namespace
+
 void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std::string& odom, const std::string& cloud) {
 
   /* get parameter */
@@ -75,6 +102,7 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   nh.param("sdf_map/local_map_margin", mp_.local_map_margin_, 1);
   nh.param("sdf_map/ground_height", mp_.ground_height_, 1.0);
   nh.param("sdf_map/buffer_refresh_period", mp_.buffer_refresh_period_, 0.0);
+  loadManualMapParams(nh, mp_);
 
   mp_.local_bound_inflate_ = max(mp_.resolution_, mp_.local_bound_inflate_);
   mp_.resolution_inv_ = 1 / mp_.resolution_;
@@ -111,6 +139,10 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
 
   md_.occupancy_buffer_neg = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+  md_.manual_occupancy_buffer_ = vector<char>(buffer_size, 0);
+  md_.manual_boundary_enabled_ = false;
+  md_.manual_obstacle_centers_.clear();
+  md_.manual_boundary_points_.clear();
 
   md_.distance_buffer_ = vector<double>(buffer_size, 10000);
   md_.distance_buffer_neg_ = vector<double>(buffer_size, 10000);
@@ -150,6 +182,17 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
 
   unknown_pub_ = nh.advertise<sensor_msgs::PointCloud2>(particle +"sdf_map/unknown", 10);
   depth_pub_ = nh.advertise<sensor_msgs::PointCloud2>(particle +"sdf_map/depth_cloud", 10);
+  if (mp_.enable_manual_map_) {
+    manual_obstacle_sub_ = nh.subscribe<geometry_msgs::PointStamped>(
+        "/manual_map/add_obstacle_center", 10, &SDFMap::manualObstacleCallback, this);
+    manual_boundary_sub_ = nh.subscribe<geometry_msgs::PointStamped>(
+        "/manual_map/add_boundary_point", 10, &SDFMap::manualBoundaryCallback, this);
+    if (mp_.manual_click_direct_) {
+      manual_click_sub_ = nh.subscribe<geometry_msgs::PointStamped>(
+          "/clicked_point", 10, &SDFMap::manualObstacleCallback, this);
+    }
+  }
+  manual_map_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/manual_map/occupancy", 1, true);
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
@@ -164,6 +207,8 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   md_.update_num_ = 0;
   md_.max_esdf_time_ = 0.0;
   md_.max_fuse_time_ = 0.0;
+
+  loadManualMapFile();
 
   rand_noise_ = uniform_real_distribution<double>(-0.2, 0.2);
   rand_noise2_ = normal_distribution<double>(0, 0.2);
@@ -219,6 +264,8 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   nh.param("sdf_map/local_bound_inflate", mp_.local_bound_inflate_, 1.0);
   nh.param("sdf_map/local_map_margin", mp_.local_map_margin_, 1);
   nh.param("sdf_map/ground_height", mp_.ground_height_, 1.0);
+  nh.param("sdf_map/buffer_refresh_period", mp_.buffer_refresh_period_, 0.0);
+  loadManualMapParams(nh, mp_);
 
   mp_.local_bound_inflate_ = max(mp_.resolution_, mp_.local_bound_inflate_);
   mp_.resolution_inv_ = 1 / mp_.resolution_;
@@ -254,6 +301,10 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_neg = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+  md_.manual_occupancy_buffer_ = vector<char>(buffer_size, 0);
+  md_.manual_boundary_enabled_ = false;
+  md_.manual_obstacle_centers_.clear();
+  md_.manual_boundary_points_.clear();
 
   md_.distance_buffer_ = vector<double>(buffer_size, 10000);
   md_.distance_buffer_neg_ = vector<double>(buffer_size, 10000);
@@ -294,6 +345,17 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
 
   unknown_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/sdf_map/unknown", 10);
   depth_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/sdf_map/depth_cloud", 10);
+  if (mp_.enable_manual_map_) {
+    manual_obstacle_sub_ = nh.subscribe<geometry_msgs::PointStamped>(
+        "/manual_map/add_obstacle_center", 10, &SDFMap::manualObstacleCallback, this);
+    manual_boundary_sub_ = nh.subscribe<geometry_msgs::PointStamped>(
+        "/manual_map/add_boundary_point", 10, &SDFMap::manualBoundaryCallback, this);
+    if (mp_.manual_click_direct_) {
+      manual_click_sub_ = nh.subscribe<geometry_msgs::PointStamped>(
+          "/clicked_point", 10, &SDFMap::manualObstacleCallback, this);
+    }
+  }
+  manual_map_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/manual_map/occupancy", 1, true);
 
   md_.occ_need_update_ = false;
   md_.local_updated_ = false;
@@ -308,6 +370,8 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   md_.update_num_ = 0;
   md_.max_esdf_time_ = 0.0;
   md_.max_fuse_time_ = 0.0;
+
+  loadManualMapFile();
 
   rand_noise_ = uniform_real_distribution<double>(-0.2, 0.2);
   rand_noise2_ = normal_distribution<double>(0, 0.2);
@@ -422,6 +486,260 @@ void SDFMap::gradualResetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos
   if (cleared_count == 0 && !is_clearing) {
     resetBuffer(min_pos, max_pos);
   }
+}
+
+void SDFMap::manualObstacleCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
+  if (!mp_.enable_manual_map_) return;
+
+  Eigen::Vector3d center(msg->point.x, msg->point.y, msg->point.z);
+  if (!isInBaseMapBounds(mp_, center)) {
+    ROS_WARN("[MANUAL_MAP] ignore obstacle outside base map: %.3f %.3f %.3f",
+             center(0), center(1), center(2));
+    return;
+  }
+
+  md_.manual_obstacle_centers_.push_back(center);
+  addManualCylinder(center);
+  md_.local_bound_min_ = Eigen::Vector3i::Zero();
+  md_.local_bound_max_ = mp_.map_max_idx_;
+  applyManualLayer();
+  md_.esdf_need_update_ = true;
+  publishManualMap();
+  saveManualMapFile();
+
+  ROS_WARN("[MANUAL_MAP] add obstacle center: %.3f %.3f %.3f",
+           center(0), center(1), center(2));
+}
+
+void SDFMap::manualBoundaryCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
+  if (!mp_.enable_manual_map_) return;
+
+  Eigen::Vector3d point(msg->point.x, msg->point.y, msg->point.z);
+  if (!isInBaseMapBounds(mp_, point)) {
+    ROS_WARN("[MANUAL_MAP] ignore boundary point outside base map: %.3f %.3f %.3f",
+             point(0), point(1), point(2));
+    return;
+  }
+
+  for (size_t i = 0; i < md_.manual_occupancy_buffer_.size(); ++i) {
+    if (md_.manual_occupancy_buffer_[i] == 0) continue;
+    md_.occupancy_buffer_inflate_[i] = 0;
+    if (md_.occupancy_buffer_[i] >= mp_.clamp_max_log_) {
+      md_.occupancy_buffer_[i] = mp_.clamp_min_log_ - mp_.unknown_flag_;
+    }
+  }
+  std::fill(md_.manual_occupancy_buffer_.begin(), md_.manual_occupancy_buffer_.end(), 0);
+
+  md_.manual_boundary_points_.push_back(point);
+  md_.manual_boundary_enabled_ = md_.manual_boundary_points_.size() >= 2;
+
+  if (md_.manual_boundary_enabled_) {
+    Eigen::Vector3d min_pt = md_.manual_boundary_points_.front();
+    Eigen::Vector3d max_pt = md_.manual_boundary_points_.front();
+    for (const auto& p : md_.manual_boundary_points_) {
+      min_pt = min_pt.cwiseMin(p);
+      max_pt = max_pt.cwiseMax(p);
+    }
+
+    md_.manual_boundary_min_ = Eigen::Vector3d(
+        std::max(mp_.map_min_boundary_(0), min_pt(0) - mp_.manual_boundary_padding_),
+        std::max(mp_.map_min_boundary_(1), min_pt(1) - mp_.manual_boundary_padding_),
+        std::max(mp_.map_min_boundary_(2), mp_.manual_boundary_z_min_));
+    md_.manual_boundary_max_ = Eigen::Vector3d(
+        std::min(mp_.map_max_boundary_(0), max_pt(0) + mp_.manual_boundary_padding_),
+        std::min(mp_.map_max_boundary_(1), max_pt(1) + mp_.manual_boundary_padding_),
+        std::min(mp_.map_max_boundary_(2), mp_.manual_boundary_z_max_));
+  }
+
+  for (const auto& center : md_.manual_obstacle_centers_) {
+    addManualCylinder(center);
+  }
+  addManualBoundaryWalls();
+
+  md_.local_bound_min_ = Eigen::Vector3i::Zero();
+  md_.local_bound_max_ = mp_.map_max_idx_;
+  applyManualLayer();
+  md_.esdf_need_update_ = true;
+  publishManualMap();
+
+  ROS_WARN("[MANUAL_MAP] add boundary point: %.3f %.3f %.3f, count: %zu",
+           point(0), point(1), point(2), md_.manual_boundary_points_.size());
+}
+
+void SDFMap::addManualCylinder(const Eigen::Vector3d& center) {
+  if (md_.manual_occupancy_buffer_.empty()) return;
+
+  const double radius = std::max(0.0, mp_.manual_obstacle_radius_ + mp_.manual_obstacle_inflate_);
+  const double z_min = std::max(mp_.map_min_boundary_(2), mp_.manual_boundary_z_min_);
+  const double ceil_limit = mp_.virtual_ceil_height_ > -0.5 ? mp_.virtual_ceil_height_ : mp_.map_max_boundary_(2);
+  const double z_max = std::min(std::min(mp_.manual_obstacle_height_, ceil_limit), mp_.map_max_boundary_(2));
+  if (radius <= 0.0 || z_max < z_min) return;
+
+  Eigen::Vector3i min_id, max_id;
+  posToIndex(Eigen::Vector3d(center(0) - radius, center(1) - radius, z_min), min_id);
+  posToIndex(Eigen::Vector3d(center(0) + radius, center(1) + radius, z_max), max_id);
+  boundIndex(min_id);
+  boundIndex(max_id);
+
+  const double radius_sq = radius * radius;
+  for (int x = min_id(0); x <= max_id(0); ++x)
+    for (int y = min_id(1); y <= max_id(1); ++y)
+      for (int z = min_id(2); z <= max_id(2); ++z) {
+        Eigen::Vector3d pos;
+        indexToPos(Eigen::Vector3i(x, y, z), pos);
+        const double dx = pos(0) - center(0);
+        const double dy = pos(1) - center(1);
+        if (dx * dx + dy * dy <= radius_sq) {
+          md_.manual_occupancy_buffer_[toAddress(x, y, z)] = 1;
+        }
+      }
+}
+
+void SDFMap::addManualBoundaryWalls() {
+  if (!md_.manual_boundary_enabled_ || md_.manual_occupancy_buffer_.empty()) return;
+
+  const double thickness = std::max(mp_.resolution_, mp_.manual_obstacle_inflate_);
+  Eigen::Vector3i min_id, max_id;
+  posToIndex(md_.manual_boundary_min_, min_id);
+  posToIndex(md_.manual_boundary_max_, max_id);
+  boundIndex(min_id);
+  boundIndex(max_id);
+
+  for (int x = min_id(0); x <= max_id(0); ++x)
+    for (int y = min_id(1); y <= max_id(1); ++y)
+      for (int z = min_id(2); z <= max_id(2); ++z) {
+        Eigen::Vector3d pos;
+        indexToPos(Eigen::Vector3i(x, y, z), pos);
+        const bool on_x_wall = pos(0) <= md_.manual_boundary_min_(0) + thickness ||
+                               pos(0) >= md_.manual_boundary_max_(0) - thickness;
+        const bool on_y_wall = pos(1) <= md_.manual_boundary_min_(1) + thickness ||
+                               pos(1) >= md_.manual_boundary_max_(1) - thickness;
+        if (on_x_wall || on_y_wall) {
+          md_.manual_occupancy_buffer_[toAddress(x, y, z)] = 1;
+        }
+      }
+}
+
+void SDFMap::applyManualLayer() {
+  if (!mp_.enable_manual_map_ || md_.manual_occupancy_buffer_.empty()) return;
+
+  bool has_manual_voxel = false;
+  const size_t buffer_size = md_.manual_occupancy_buffer_.size();
+  for (size_t addr = 0; addr < buffer_size; ++addr) {
+    if (md_.manual_occupancy_buffer_[addr] == 0) continue;
+    md_.occupancy_buffer_[addr] = mp_.clamp_max_log_;
+    md_.occupancy_buffer_inflate_[addr] = 1;
+    has_manual_voxel = true;
+  }
+
+  if (has_manual_voxel) md_.esdf_need_update_ = true;
+}
+
+void SDFMap::publishManualMap() {
+  if (!manual_map_pub_) return;
+
+  pcl::PointXYZ pt;
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+
+  for (int x = 0; x < mp_.map_voxel_num_(0); ++x)
+    for (int y = 0; y < mp_.map_voxel_num_(1); ++y)
+      for (int z = 0; z < mp_.map_voxel_num_(2); ++z) {
+        if (md_.manual_occupancy_buffer_.empty() ||
+            md_.manual_occupancy_buffer_[toAddress(x, y, z)] == 0) {
+          continue;
+        }
+
+        Eigen::Vector3d pos;
+        indexToPos(Eigen::Vector3i(x, y, z), pos);
+        if (mp_.visualization_truncate_height_ > -0.5 &&
+            pos(2) > mp_.visualization_truncate_height_) {
+          continue;
+        }
+
+        pt.x = pos(0);
+        pt.y = pos(1);
+        pt.z = pos(2);
+        cloud.push_back(pt);
+      }
+
+  cloud.width = cloud.points.size();
+  cloud.height = 1;
+  cloud.is_dense = true;
+  cloud.header.frame_id = mp_.frame_id_;
+
+  sensor_msgs::PointCloud2 cloud_msg;
+  pcl::toROSMsg(cloud, cloud_msg);
+  manual_map_pub_.publish(cloud_msg);
+}
+
+void SDFMap::loadManualMapFile() {
+  if (!mp_.enable_manual_map_ || !mp_.manual_map_auto_load_) return;
+  if (mp_.manual_map_file_.empty()) return;
+
+  std::ifstream file(mp_.manual_map_file_);
+  if (!file.good()) {
+    ROS_WARN("[MANUAL_MAP] manual map file not found, skip load: %s",
+             mp_.manual_map_file_.c_str());
+    return;
+  }
+
+  size_t loaded_count = 0;
+  size_t skipped_count = 0;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') continue;
+
+    std::istringstream iss(line);
+    double x, y, z;
+    if (!(iss >> x >> y >> z)) {
+      ++skipped_count;
+      continue;
+    }
+
+    Eigen::Vector3d center(x, y, z);
+    if (!isInBaseMapBounds(mp_, center)) {
+      ++skipped_count;
+      ROS_WARN("[MANUAL_MAP] skip saved obstacle outside base map: %.3f %.3f %.3f",
+               center(0), center(1), center(2));
+      continue;
+    }
+
+    md_.manual_obstacle_centers_.push_back(center);
+    addManualCylinder(center);
+    ++loaded_count;
+  }
+
+  if (loaded_count > 0) {
+    md_.local_bound_min_ = Eigen::Vector3i::Zero();
+    md_.local_bound_max_ = mp_.map_max_idx_;
+    applyManualLayer();
+    md_.esdf_need_update_ = true;
+    publishManualMap();
+  }
+
+  ROS_WARN("[MANUAL_MAP] loaded %zu obstacle centers from %s, skipped %zu",
+           loaded_count, mp_.manual_map_file_.c_str(), skipped_count);
+}
+
+void SDFMap::saveManualMapFile() {
+  if (!mp_.enable_manual_map_ || !mp_.manual_map_auto_save_) return;
+  if (mp_.manual_map_file_.empty()) return;
+
+  std::ofstream file(mp_.manual_map_file_);
+  if (!file.good()) {
+    ROS_WARN("[MANUAL_MAP] failed to save manual map file: %s",
+             mp_.manual_map_file_.c_str());
+    return;
+  }
+
+  file << "# manual obstacle centers: x y z\n";
+  file << std::setprecision(17);
+  for (const auto& center : md_.manual_obstacle_centers_) {
+    file << center(0) << " " << center(1) << " " << center(2) << "\n";
+  }
+
+  ROS_WARN("[MANUAL_MAP] saved %zu obstacle centers to %s",
+           md_.manual_obstacle_centers_.size(), mp_.manual_map_file_.c_str());
 }
 
 template <typename F_get_val, typename F_set_val>
@@ -1099,6 +1417,7 @@ void SDFMap::visCallback(const ros::TimerEvent& /*event*/) {
   publishUpdateRange();
   //publishMapBoundary();
   publishESDF();
+  publishManualMap();
 
   // publishUnknown();
   // publishDepth();
@@ -1132,32 +1451,36 @@ void SDFMap::bufferRefreshCallback(const ros::TimerEvent& /*event*/){
   // 渐进式清空缓冲区，避免突然清空造成闪烁
   this->gradualResetBuffer(md_.camera_pos_ - mp_.local_update_range_,
                           md_.camera_pos_ + mp_.local_update_range_);
+  applyManualLayer();
 }
 
 void SDFMap::updateOccupancyCallback(const ros::TimerEvent& /*event*/) {
-  // if (!md_.occ_need_update_) return;
+  if (!md_.occ_need_update_) return;
 
-  // /* update occupancy */
-  // ros::Time t1, t2;
-  // t1 = ros::Time::now();
+  /* update occupancy */
+  ros::Time t1, t2;
+  t1 = ros::Time::now();
 
-  // projectDepthImage();
-  // raycastProcess();
+  projectDepthImage();
+  raycastProcess();
 
-  // if (md_.local_updated_) clearAndInflateLocalMap();
+  if (md_.local_updated_) {
+    clearAndInflateLocalMap();
+    applyManualLayer();
+  }
 
-  // t2 = ros::Time::now();
+  t2 = ros::Time::now();
 
-  // md_.fuse_time_ += (t2 - t1).toSec();
-  // md_.max_fuse_time_ = max(md_.max_fuse_time_, (t2 - t1).toSec());
+  md_.fuse_time_ += (t2 - t1).toSec();
+  md_.max_fuse_time_ = max(md_.max_fuse_time_, (t2 - t1).toSec());
 
-  // if (mp_.show_occ_time_)
-  //   ROS_WARN("Fusion: cur t = %lf, avg t = %lf, max t = %lf", (t2 - t1).toSec(),
-  //            md_.fuse_time_ / md_.update_num_, md_.max_fuse_time_);
+  if (mp_.show_occ_time_)
+    ROS_WARN("Fusion: cur t = %lf, avg t = %lf, max t = %lf", (t2 - t1).toSec(),
+             md_.fuse_time_ / md_.update_num_, md_.max_fuse_time_);
 
-  // md_.occ_need_update_ = false;
-  // if (md_.local_updated_) md_.esdf_need_update_ = true;
-  // md_.local_updated_ = false;
+  md_.occ_need_update_ = false;
+  if (md_.local_updated_) md_.esdf_need_update_ = true;
+  md_.local_updated_ = false;
 }
 
 void SDFMap::updateESDFCallback(const ros::TimerEvent& /*event*/) {
@@ -1308,6 +1631,7 @@ void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
   boundIndex(md_.local_bound_min_);
   boundIndex(md_.local_bound_max_);
 
+  applyManualLayer();
   md_.esdf_need_update_ = true;
 }
 

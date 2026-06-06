@@ -10,6 +10,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   std_msgs
+  geometry_msgs
   visualization_msgs
   cv_bridge
   message_filters
@@ -23,7 +24,7 @@ find_package(PCL 1.7 REQUIRED)
 catkin_package(
  INCLUDE_DIRS include
  LIBRARIES plan_env
- CATKIN_DEPENDS roscpp std_msgs common_msgs
+ CATKIN_DEPENDS roscpp std_msgs geometry_msgs common_msgs
  DEPENDS message_generation
 )
 
@@ -55,3 +56,15 @@ add_executable(obj_generator
 )
 target_link_libraries(obj_generator 
     ${catkin_LIBRARIES})
+
+if(CATKIN_ENABLE_TESTING)
+    catkin_add_gtest(manual_map_layer_test test/manual_map_layer_test.cpp)
+    if(TARGET manual_map_layer_test)
+        target_link_libraries(manual_map_layer_test
+            plan_env
+            ${catkin_LIBRARIES}
+            ${PCL_LIBRARIES}
+            ${OpenCV_LIBS}
+        )
+    endif()
+endif()

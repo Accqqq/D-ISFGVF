@@ -28,13 +28,18 @@
 
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
+#include <algorithm>
 #include <cv_bridge/cv_bridge.h>
+#include <fstream>
+#include <geometry_msgs/PointStamped.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <iomanip>
 #include <iostream>
 #include <random>
 #include <nav_msgs/Odometry.h>
 #include <queue>
 #include <ros/ros.h>
+#include <sstream>
 #include <tuple>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -112,6 +117,19 @@ struct MappingParameters {
 
   /* buffer refresh */
   double buffer_refresh_period_;
+
+  /* manual map layer */
+  bool enable_manual_map_;
+  bool manual_click_direct_;
+  double manual_obstacle_radius_;
+  double manual_obstacle_height_;
+  double manual_obstacle_inflate_;
+  double manual_boundary_padding_;
+  double manual_boundary_z_min_;
+  double manual_boundary_z_max_;
+  string manual_map_file_;
+  bool manual_map_auto_load_;
+  bool manual_map_auto_save_;
 };
 
 // intermediate mapping data for fusion, esdf
@@ -127,6 +145,13 @@ struct MappingData {
   std::vector<double> distance_buffer_all_;
   std::vector<double> tmp_buffer1_;
   std::vector<double> tmp_buffer2_;  
+
+  std::vector<char> manual_occupancy_buffer_;
+  bool manual_boundary_enabled_ = false;
+  Eigen::Vector3d manual_boundary_min_;
+  Eigen::Vector3d manual_boundary_max_;
+  std::vector<Eigen::Vector3d> manual_obstacle_centers_;
+  std::vector<Eigen::Vector3d> manual_boundary_points_;
 
   // camera position and pose data
 
@@ -257,6 +282,14 @@ private:
   void updateESDFCallback(const ros::TimerEvent& /*event*/);
   void visCallback(const ros::TimerEvent& /*event*/);
   void bufferRefreshCallback(const ros::TimerEvent& /*event*/);
+  void manualObstacleCallback(const geometry_msgs::PointStamped::ConstPtr& msg);
+  void manualBoundaryCallback(const geometry_msgs::PointStamped::ConstPtr& msg);
+  void addManualCylinder(const Eigen::Vector3d& center);
+  void addManualBoundaryWalls();
+  void applyManualLayer();
+  void publishManualMap();
+  void loadManualMapFile();
+  void saveManualMapFile();
 
   // main update process
   void projectDepthImage();
@@ -286,7 +319,9 @@ private:
   SynchronizerImageOdom sync_image_odom_;
 
   ros::Subscriber indep_depth_sub_, indep_odom_sub_, indep_pose_sub_, indep_cloud_sub_;
+  ros::Subscriber manual_obstacle_sub_, manual_boundary_sub_, manual_click_sub_;
   ros::Publisher map_pub_, esdf_pub_, map_inf_pub_, update_range_pub_, map_boundary_pub_;
+  ros::Publisher manual_map_pub_;
   ros::Publisher unknown_pub_, depth_pub_;
   ros::Timer occ_timer_, esdf_timer_, vis_timer_;
   ros::Timer buffer_timer_;
@@ -465,7 +500,8 @@ inline bool SDFMap::getNearestFreePoint(const Eigen::Vector3d& pos, Eigen::Vecto
             }
 
             int addr = toAddress(candidate_id);
-            if (md_.occupancy_buffer_inflate_[addr] == 0) {
+            if (md_.occupancy_buffer_inflate_[addr] == 0 &&
+                (md_.manual_occupancy_buffer_.empty() || md_.manual_occupancy_buffer_[addr] == 0)) {
               // 找到未被占据的点，转为坐标返回
               indexToPos(candidate_id, near_pos);
               return true;
@@ -485,7 +521,9 @@ inline int SDFMap::getInflateOccupancy(Eigen::Vector3d pos) {
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
-  return int(md_.occupancy_buffer_inflate_[toAddress(id)]);
+  int addr = toAddress(id);
+  if (!md_.manual_occupancy_buffer_.empty() && md_.manual_occupancy_buffer_[addr] == 1) return 1;
+  return int(md_.occupancy_buffer_inflate_[addr]);
 }
 
 inline int SDFMap::getOccupancy(Eigen::Vector3i id) {
@@ -505,6 +543,18 @@ inline bool SDFMap::isInMap(const Eigen::Vector3d& pos) {
   if (pos(0) > mp_.map_max_boundary_(0) - 1e-4 || pos(1) > mp_.map_max_boundary_(1) - 1e-4 ||
       pos(2) > mp_.map_max_boundary_(2) - 1e-4) {
     return false;
+  }
+  if (md_.manual_boundary_enabled_) {
+    if (pos(0) < md_.manual_boundary_min_(0) - 1e-4 ||
+        pos(1) < md_.manual_boundary_min_(1) - 1e-4 ||
+        pos(2) < md_.manual_boundary_min_(2) - 1e-4) {
+      return false;
+    }
+    if (pos(0) > md_.manual_boundary_max_(0) + 1e-4 ||
+        pos(1) > md_.manual_boundary_max_(1) + 1e-4 ||
+        pos(2) > md_.manual_boundary_max_(2) + 1e-4) {
+      return false;
+    }
   }
   return true;
 }

@@ -58,4 +58,5 @@ bspline_gvf
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(reference_join_test test/reference_join_test.cpp)
+  catkin_add_gtest(gvf_switch_policy_test test/gvf_switch_policy_test.cpp)
 endif()

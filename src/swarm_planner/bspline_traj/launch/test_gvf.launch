@@ -70,7 +70,7 @@
         <param name="gvf/gvf_gain1"       value="1.5"/>
         <!-- 该参数决定后退/回拉速度 -->
         <!-- <param name="gvf/gvf_gain2"       value="-2.0"/> -->
-        <param name="gvf/gvf_gain2"       value="-1.5"/>
+        <param name="gvf/gvf_gain2"       value="-2.2"/>
         <param name="gvf/gvf_k3"          value="1.0"/>
         <param name="gvf/gvf_k4"          value="1.0"/>
         <param name="gvf/gvf_inflation"  value="0.099" /> 
@@ -97,26 +97,29 @@
         <!-- vel_max/speed_max: GVF 与 cmd_pos 的速度上限 -->
         <param name="gvf/cmd/vel_max" value="2.0" />
 
-        <!-- acc_max: 命令速度状态的加速度上限 -->
+        <!-- acc_max: governor 输出诊断用加速度阈值 -->
         <param name="gvf/cmd/acc_max" value="8.0" />
-        <param name="gvf/cmd/jerk_max" value="300.0" />
-        <param name="gvf/cmd/offset_rate_max" value="6.0" />
 
         <param name="gvf/cmd/pos_gain_equiv" value="1.65" />
-        <param name="gvf/cmd/lead_max" value="1.5" />
-
-        <param name="gvf/cmd/use_pos_ff" value="true" />
-        <param name="gvf/cmd/pos_ff_xy_only" value="true" />
-        <param name="gvf/cmd/pos_ff_time" value="0.08" />
-        <param name="gvf/cmd/pos_ff_max" value="0.20" />
-
-        <param name="gvf/cmd/use_vel_slew_limit" value="false" />
-        <param name="gvf/cmd/use_switch_motion_limits" value="true" />
-        <param name="gvf/cmd/skip_motion_limits_on_switch" value="true" />
         <param name="gvf/cmd/switch_motion_limit_time" value="0.25" />
-        <param name="gvf/cmd/switch_acc_max" value="8.0" />
-        <param name="gvf/cmd/switch_jerk_max" value="300.0" />
-        <param name="gvf/cmd/switch_offset_rate_max" value="6.0" />
+        <param name="gvf/cmd/tangent_vel_max" value="2.0" />
+        <param name="gvf/cmd/governor_l_min" value="0.0" />
+        <param name="gvf/cmd/governor_l_max" value="1.6" />
+        <param name="gvf/cmd/governor_l_step" value="0.05" />
+        <param name="gvf/cmd/governor_l_rate_max" value="4.0" />
+        <param name="gvf/cmd/governor_l_ff_weight" value="0.8" />
+        <param name="gvf/cmd/governor_lead_max" value="1.6" />
+        <param name="gvf/cmd/governor_normal_cross_max" value="0.08" />
+        <param name="gvf/cmd/governor_normal_deadband" value="0.05" />
+        <param name="gvf/cmd/governor_normal_full_error" value="0.20" />
+        <param name="gvf/cmd/governor_normal_max" value="0.25" />
+        <param name="gvf/cmd/governor_normal_rate_max" value="0.5" />
+        <param name="gvf/cmd/governor_l_rate_weight" value="0.005" />
+        <param name="gvf/cmd/governor_normal_weight" value="0.60" />
+        <param name="gvf/cmd/governor_normal_rate_weight" value="0.10" />
+        <param name="gvf/cmd/governor_tau_vel_weight" value="1.0" />
+        <param name="gvf/cmd/governor_normal_vel_weight" value="1.0" />
+        <param name="gvf/cmd/governor_normal_vel_error_cap" value="2.0" />
 
 
         <!-- Gain test: 固定位置领先距离测量位置环等效增益，测完改回 false -->
@@ -141,6 +144,17 @@
         <param name="sdf_map/local_bound_inflate"    value="0.0"/>
         <param name="sdf_map/local_map_margin" value="50"/>
         <param name="sdf_map/ground_height"        value="-0.01"/>
+        <param name="sdf_map/enable_manual_map" value="true" />
+        <param name="sdf_map/manual_click_direct" value="true" />
+        <param name="sdf_map/manual_obstacle_radius" value="0.35" />
+        <param name="sdf_map/manual_obstacle_height" value="2.5" />
+        <param name="sdf_map/manual_obstacle_inflate" value="0.10" />
+        <param name="sdf_map/manual_boundary_padding" value="0.10" />
+        <param name="sdf_map/manual_boundary_z_min" value="0.0" />
+        <param name="sdf_map/manual_boundary_z_max" value="2.5" />
+        <param name="sdf_map/manual_map_file" value="$(find bspline_race)/config/manual_obstacles_test_gvf.txt" />
+        <param name="sdf_map/manual_map_auto_load" value="true" />
+        <param name="sdf_map/manual_map_auto_save" value="true" />
 
         <!-- depth filter -->
         <param name="sdf_map/use_depth_filter" value="true"/>

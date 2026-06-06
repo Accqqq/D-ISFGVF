@@ -71,53 +71,68 @@
   - `gvf/circle_test/join_exit_stable_needed`
 
 ## Control Layer Current State
-- 当前真实执行的 `cmdCallback()` 已经改成“GVF 速度意图转换为位置命令接口”的版本，不是直接给速度接口：
-  - `cmd.velocity.x/y/z = 0`
-  - 飞控只吃 `cmd.position` 和 yaw
-  - `raw_v_gvf / v_gvf` 只作为内部速度意图，用来算位置领先量
+- 当前真实执行的 `cmdCallback()` 已改为 governor-only position control：
+  - 不再使用旧 `CMD_DIRECT / CMD_SPLIT / CMD_POS_FF / CMD_MOTION_LIMIT` fallback
+  - 飞控只吃 `PositionCommand.position` 和 yaw
+  - `PositionCommand.velocity.x/y/z` 必须显式置 0
+  - GVF 输出是内部速度意图，不直接发给飞控速度接口
 - 当前主控制链路：
-  1. `calcLiftedGuidance3D(pos, progress_w_)` 得到 `raw_v_gvf`
-  2. 用 `gvf/cmd/vel_max` 做 GVF 速度意图幅值限幅
-  3. 可选用 `gvf/cmd/use_vel_slew_limit` 做 acc / jerk / offset-rate 限制
-  4. `lead_from_gvf = v_gvf / gvf/cmd/pos_gain_equiv`，这是速度意图到位置领先的接口转换
-  5. 可选 `pos_ff = pos_ff_time * d(v_gvf)/dt / K_eq`，这是额外前馈位置补偿
-  6. 当前 `gvf/cmd/pos_ff_xy_only=true`，所以 `pos_ff.z = 0`
-  7. `lead = lead_from_gvf + pos_ff`
-  8. `cmd_pos = odom + lead`
-  9. 发布 `PositionCommand.position = cmd_pos`，`PositionCommand.velocity = 0`
-- `v_gvf / K_eq` 不应再叫前馈；它是位置控制接口所需的速度到位置转换。
-- `pos_ff` 才是这次新增/保留的前馈控制项，来源是 `v_gvf` 的差分加速度估计。
-- 当前默认测试倾向：
-  - `gvf/cmd/use_vel_slew_limit=false`
-  - 保留 `vel_max + v/K_eq + pos_ff`
-  - `gvf/cmd/use_pos_ff=true`
-  - `gvf/cmd/pos_ff_xy_only=true`
-- 经验结论：
-  - acc/jerk 限幅在换轨时容易导致跟不上。
-  - 如果开启 `use_vel_slew_limit`，换轨窗口建议保留：
-    - `gvf/cmd/skip_motion_limits_on_switch=true`
-  - `pos_ff` 使用 3D 差分时可能导致 z 轴上下抽动，因此当前采用 XY-only 前馈。
+  1. `calcLiftedGuidance3D(pos, progress_w_)` 得到 `out.v_cmd / out.tangent / out.e_perp`
+  2. governor 用 `v_tau_intent / v_n_intent` 表示切向与法向速度意图
+  3. 在当前执行路径 `pm.gvf_->sample_w_` 上搜索候选前瞻 `L`
+  4. 候选点不能越过 `path_w_end`，否则计入 `path_end_clamped_count`
+  5. 每个候选用 `K_eq * (cmd_pos - pos)` 估计模型速度，并以速度误差、前瞻偏差、法向偏置、变化率作为代价
+  6. 选出 `VEL_MATCH_GOVERNOR` 命令点；无有效候选时进入 `GOVERNOR_INVALID_HOLD`
+  7. 发布 `PositionCommand.position = cmd_pos`，`PositionCommand.velocity = 0`
+- 速度转位置关系：
+  - `v_actual ~= K_eq * cmd_dist`
+  - 仿真常用 `K_eq ~= 1.65`
+  - 实机测得/采用 `K_eq ~= 1.10`
+  - 实机目标速度 `2.0 m/s` 时，理论需要 `L_ff ~= 2.0 / 1.10 = 1.82 m`
+- 实机 2m/s 初始建议：
+  - `gvf/cmd/vel_max = 2.0`
+  - `gvf/cmd/tangent_vel_max = 2.0`
+  - `gvf/cmd/pos_gain_equiv = 1.10`
+  - `gvf/cmd/governor_l_max = 1.7~1.9`
+  - `gvf/cmd/governor_lead_max = 1.7~1.9`
+  - `gvf/cmd/governor_l_rate_max ~= 3.0`
+  - `gvf/switch/governor_path_margin_w ~= 0.6`
+- 实机法向先保守：
+  - `gvf/cmd/governor_normal_deadband = 0.06~0.08`
+  - `gvf/cmd/governor_normal_full_error ~= 0.30`
+  - `gvf/cmd/governor_normal_max ~= 0.15`
+  - `gvf/cmd/governor_normal_rate_max ~= 0.3`
+- 调参判断：
+  - 速度跟不上：若 `tau_vel_error` 长期为负，且 `best_L/cmd_dist` 接近上限，优先加 `governor_l_max / governor_lead_max / governor_l_rate_max`
+  - 左右晃：增大 `governor_normal_deadband / governor_normal_full_error`，减小 `governor_normal_max / governor_normal_rate_max`，或增大 `governor_normal_weight / governor_normal_rate_weight`
+  - 大弯跟不上：先加 `governor_normal_max / governor_normal_rate_max`；仍外扩再降 `governor_l_max / governor_lead_max`；还不行说明 2m/s 弯里物理半径不够，需要弯里降 `tangent_vel_max`
+  - 改 GVF 的 `k1/k2` 后 governor 参数通常不用大改，但要复查 `raw_v_normal_norm / e_perp_norm / normal_state_norm / tau_vel_error`
 
 ## Control Layer Effective Params
 - 当前直接有效：
   - `gvf/cmd/vel_max`
   - `gvf/cmd/pos_gain_equiv`
-  - `gvf/cmd/lead_max`
-  - `gvf/cmd/use_pos_ff`
-  - `gvf/cmd/pos_ff_xy_only`
-  - `gvf/cmd/pos_ff_time`
-  - `gvf/cmd/pos_ff_max`
-- 当前可选限幅：
-  - `gvf/cmd/use_vel_slew_limit`
+  - `gvf/cmd/tangent_vel_max`
   - `gvf/cmd/acc_max`
-  - `gvf/cmd/jerk_max`
-  - `gvf/cmd/offset_rate_max`
-  - `gvf/cmd/use_switch_motion_limits`
-  - `gvf/cmd/skip_motion_limits_on_switch`
   - `gvf/cmd/switch_motion_limit_time`
-  - `gvf/cmd/switch_acc_max`
-  - `gvf/cmd/switch_jerk_max`
-  - `gvf/cmd/switch_offset_rate_max`
+  - `gvf/cmd/governor_l_min`
+  - `gvf/cmd/governor_l_max`
+  - `gvf/cmd/governor_l_step`
+  - `gvf/cmd/governor_l_rate_max`
+  - `gvf/cmd/governor_l_ff_weight`
+  - `gvf/cmd/governor_lead_max`
+  - `gvf/cmd/governor_normal_cross_max`
+  - `gvf/cmd/governor_normal_deadband`
+  - `gvf/cmd/governor_normal_full_error`
+  - `gvf/cmd/governor_normal_max`
+  - `gvf/cmd/governor_normal_rate_max`
+  - `gvf/cmd/governor_l_rate_weight`
+  - `gvf/cmd/governor_normal_weight`
+  - `gvf/cmd/governor_normal_rate_weight`
+  - `gvf/cmd/governor_tau_vel_weight`
+  - `gvf/cmd/governor_normal_vel_weight`
+  - `gvf/cmd/governor_normal_vel_error_cap`
+  - `gvf/switch/governor_path_margin_w`
 - 当前增益测试模式：
   - `gvf/cmd/gain_test_enable`
   - `gvf/cmd/gain_test_lead`
@@ -131,15 +146,47 @@
   - `gvf/cmd/max_track_error`
 
 ## Recent Changes In This Iteration
-- 加过 acc / jerk / offset-rate 限制，并发现换轨时容易跟不上。
-- 增加 `skip_motion_limits_on_switch`，允许换轨窗口跳过这些限幅。
-- 当前控制链路确定为：`GVF速度意图 -> vel_max限幅 -> v/K_eq位置领先 -> 可选pos_ff -> PositionCommand.position`。
-- 将 position-only 前馈改成可选 XY-only，当前 `test_gvf.launch` 打开。
+- 已将控制链路从旧位置领先 / split-normal / pos_ff 版本迁移到 governor-only。
+- 当前控制链路确定为：`GVF速度意图 -> governor候选前瞻点搜索 -> PositionCommand.position`。
+- governor 失败时只允许 `GOVERNOR_INVALID_HOLD`，不回退旧控制算法。
+- 已加入 `governor_path_short` 强制切换逻辑，避免规划成功但旧路径被拒切后耗尽。
 - 增加/保留 `GAIN_TEST` 模式，用固定位置领先测位置环等效增益 `K_eq`。
+- 已在当前仿真 workspace 实现 `SDFMap` 手动地图层：
+  - RViz `Publish Point` 或 `/manual_map/add_obstacle_center` 可添加静态圆柱障碍物。
+  - 手动障碍物写入 `manual_occupancy_buffer_`，再 OR 到 `occupancy_buffer_ / occupancy_buffer_inflate_`。
+  - `getInflateOccupancy()`、`getNearestFreePoint()`、`isInMap()` 已接入手动层。
+  - 地图更新、局部清理和 buffer refresh 后会重新 `applyManualLayer()`，手动障碍物不会被实时感知清掉。
+- 已加入手动障碍物保存/加载：
+  - `sdf_map/manual_map_file`
+  - `sdf_map/manual_map_auto_load`
+  - `sdf_map/manual_map_auto_save`
+  - `test_gvf.launch` 当前保存到 `src/swarm_planner/bspline_traj/config/manual_obstacles_test_gvf.txt`。
+  - 文件格式为每行一个障碍物中心：`x y z`，`#` 开头为注释。
+  - 当前只持久化手动障碍物中心，不持久化边界点。
 - 审计旧参数和旧代码残留：
   - `figure8_join_*` 已从 header 删除
   - cpp 中对应 reset 引用已删除
   - `lookahead_pts / realign_min_progress / join_*` 目前不应再作为有效调参
+
+## Manual Map Layer Notes
+- 当前仿真 `test_gvf.launch` 中：
+  - `sdf_map/enable_manual_map = true`
+  - `sdf_map/manual_click_direct = true`
+  - RViz `Fixed Frame=world` 时，`Publish Point` 会直接进入 `SDFMap::manualObstacleCallback()`。
+- 当前障碍物尺寸：
+  - 实际写入圆柱半径为 `manual_obstacle_radius + manual_obstacle_inflate`
+  - `test_gvf.launch` 当前为 `0.35 + 0.10 = 0.45 m`
+  - 圆柱高度范围由 `manual_boundary_z_min` 到 `min(manual_obstacle_height, virtual_ceil_height, map_max_boundary.z)`。
+- 规划器不需要改 GVF 核心：
+  - 碰撞/边界仍通过 `SDFMap::getInflateOccupancy()`、`getDistance()`、`isInMap()` 查询。
+  - 手动障碍物进入 SDFMap 后，即使局部感知暂时没有看到，也会被规划查询当作 occupied。
+- 手动地图保存/加载：
+  - `manual_map_auto_save=true` 时，每次添加障碍物后会重写 `manual_map_file`。
+  - `manual_map_auto_load=true` 时，`initMap()` 会读取文件并生成手动圆柱。
+  - 依赖固定 `world` 原点；如果实机 VIO/map 原点变化，旧文件里的坐标会整体偏移。
+- 实机迁移建议：
+  - `manual_click_direct=false`，由 `uav_server` 在 `MANUAL_MAP` 状态下转发 `/clicked_point` 到 `/manual_map/add_obstacle_center`。
+  - 实机保存文件建议放在实机 workspace 的 `bspline_traj/config/manual_maps/realflight_obstacles.txt`，并在 launch 中使用绝对路径。
 
 ## Active Concerns
 - `cmdCallback()` 里还有一些旧控制状态/未调用函数可继续清理：
@@ -176,9 +223,9 @@
   - `gvf/debug_gate`
 
 ## Immediate Next Tasks
-1. 继续清理未调用的 `computePositionCmdOffset()` 及其参数成员。
-2. 清理 `test_gvf.launch` 中无效参数，保持 launch 与当前代码事实一致。
-3. 处理剩余两个 warning。
+1. 将 Realflight 代码同步为 governor-only 控制层，并保留实机 topic / yaw 约束。
+2. Realflight 首飞使用 `K_eq=1.10` 下的 2m/s 保守参数：`l_max/lead_max=1.7~1.9`，法向 deadband `0.06~0.08`。
+3. 清理 `test_gvf.launch / gvf.launch` 中旧控制参数，保持 launch 与当前代码事实一致。
 4. 清理完成后跑 `catkin_make --pkg bspline_race`。
 
 ## Short Validation Checklist
@@ -187,6 +234,8 @@
 - 看 `[GVF][CLOSED_REF]`
 - 看 `[GVF][CLOSED_GOAL]`
 - 看 `[GVF][KINO_RESULT]`
-- 看 `[GVF][CMD_DIRECT]`
-- 看 `[GVF][CMD_POS_FF] xy_only=1 pos_ff_z=0`
-- 若打开限幅，看 `[GVF][CMD_MOTION_LIMIT]`
+- 看 `[GVF][SWITCH]`
+- 看 `[GVF][CMD_VEL_MATCH_GOV]`
+- 看 `final_cmd_source=VEL_MATCH_GOVERNOR`
+- 看 `fallback_reason=none`
+- 看 `path_end_clamped_count / lead_limit_violation / normal_rate_limited / tau_vel_error`

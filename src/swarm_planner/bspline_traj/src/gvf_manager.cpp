@@ -60,25 +60,27 @@ namespace FLAG_Race
         nh.param("gvf/stop_radius", stop_radius, 0.3);
         nh.param("gvf/cmd/vel_max", cmd_vel_max_, 1.5);
         nh.param("gvf/cmd/acc_max", cmd_acc_max_, 1.5);
-        nh.param("gvf/cmd/jerk_max", cmd_jerk_max_, 20.0);
-        nh.param("gvf/cmd/offset_rate_max", cmd_offset_rate_max_, 2.5);
-        nh.param("gvf/cmd/vel_lpf_hz", cmd_vel_lpf_hz_, 3.5);
-        nh.param("gvf/cmd/pos_gain_equiv", cmd_pos_gain_equiv_, 1.65);
-        nh.param("gvf/cmd/lead_max", cmd_lead_max_, 1.5);
-        nh.param("gvf/cmd/use_vel_slew_limit", cmd_use_vel_slew_limit_, false);
-        nh.param("gvf/cmd/use_vel_feedback", cmd_use_vel_feedback_, false);
-        nh.param("gvf/cmd/use_pos_ff", cmd_use_pos_ff_, false);
-        nh.param("gvf/cmd/pos_ff_xy_only", cmd_pos_ff_xy_only_, false);
-        nh.param("gvf/cmd/pos_ff_time", cmd_pos_ff_time_, 0.08);
-        nh.param("gvf/cmd/pos_ff_max", cmd_pos_ff_max_, 0.20);
-        nh.param("gvf/cmd/use_switch_motion_limits", cmd_use_switch_motion_limits_, false);
-        nh.param("gvf/cmd/skip_motion_limits_on_switch", cmd_skip_motion_limits_on_switch_, false);
+        nh.param("gvf/cmd/pos_gain_equiv", cmd_pos_gain_equiv_, 1.10);
         nh.param("gvf/cmd/switch_motion_limit_time", cmd_switch_motion_limit_time_, 0.25);
-        nh.param("gvf/cmd/switch_acc_max", cmd_switch_acc_max_, 4.0);
-        nh.param("gvf/cmd/switch_jerk_max", cmd_switch_jerk_max_, 30.0);
-        nh.param("gvf/cmd/switch_offset_rate_max", cmd_switch_offset_rate_max_, 3.0);
-
-        nh.param("gvf/cmd/vel_fb_switch_time", cmd_vel_fb_switch_time_, 0.50);
+        nh.param("gvf/cmd/tangent_vel_max", cmd_tangent_vel_max_, 2.0);
+        nh.param("gvf/cmd/governor_l_min", cmd_governor_l_min_, 0.0);
+        nh.param("gvf/cmd/governor_l_max", cmd_governor_l_max_, 1.6);
+        nh.param("gvf/cmd/governor_l_step", cmd_governor_l_step_, 0.05);
+        nh.param("gvf/cmd/governor_l_rate_max", cmd_governor_l_rate_max_, 4.0);
+        nh.param("gvf/cmd/governor_l_ff_weight", cmd_governor_l_ff_weight_, 0.8);
+        nh.param("gvf/cmd/governor_lead_max", cmd_governor_lead_max_, 1.6);
+        nh.param("gvf/cmd/governor_normal_cross_max", cmd_governor_normal_cross_max_, 0.08);
+        nh.param("gvf/cmd/governor_normal_deadband", cmd_governor_normal_deadband_, 0.05);
+        nh.param("gvf/cmd/governor_normal_full_error", cmd_governor_normal_full_error_, 0.35);
+        nh.param("gvf/cmd/governor_normal_max", cmd_governor_normal_max_, 0.0);
+        nh.param("gvf/cmd/governor_normal_rate_max", cmd_governor_normal_rate_max_, 0.6);
+        nh.param("gvf/cmd/governor_l_rate_weight", cmd_governor_l_rate_weight_, 0.005);
+        nh.param("gvf/cmd/governor_normal_weight", cmd_governor_normal_weight_, 0.60);
+        nh.param("gvf/cmd/governor_normal_rate_weight", cmd_governor_normal_rate_weight_, 0.10);
+        nh.param("gvf/cmd/governor_tau_vel_weight", cmd_governor_tau_vel_weight_, 1.0);
+        nh.param("gvf/cmd/governor_normal_vel_weight", cmd_governor_normal_vel_weight_, 1.0);
+        nh.param("gvf/cmd/governor_normal_vel_error_cap", cmd_governor_normal_vel_error_cap_, 2.0);
+        nh.param("gvf/switch/governor_path_margin_w", switch_governor_path_margin_w_, 0.2);
 
         nh.param("gvf/cmd/gain_test_enable", cmd_gain_test_enable_, false);
         nh.param("gvf/cmd/gain_test_lead", cmd_gain_test_lead_, 0.4);
@@ -95,7 +97,6 @@ namespace FLAG_Race
 
         // nh.param("gvf/flight_height", flight_height_, 1.0);  // 设定飞行高度
         last_replan_time_ = ros::Time(0);  // 初始化上次重规划时间
-        vel_fb_switch_until_ = ros::Time(0);
         cmd_switch_motion_limit_until_ = ros::Time(0);
         current_traj_index_ = 0;  // 初始化当前轨迹索引
         test_traj_index_ = 0;  // 初始化测试轨迹索引
@@ -188,21 +189,15 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
     closed_ref_recover_ = false;
     resetClosedGoalCandidateState();
     ref_pos = start_pt;
-    cmd_vel_state_.setZero();
     last_curve_vel_.setZero();
     has_last_curve_vel_ = false;
-    cmd_vel_lpf_state_.setZero();
-    last_v_cmd_.setZero();
-    cmd_vel_state_initialized_ = false;
-    last_v_gvf_for_pos_ff_.setZero();
-    has_last_v_gvf_for_pos_ff_ = false;
-    last_v_gvf_limited_.setZero();
-    last_a_gvf_limited_.setZero();
-    has_last_v_gvf_limited_ = false;
-    last_cmd_offset_.setZero();
-    has_last_cmd_offset_ = false;
-    vel_fb_switch_until_ = ros::Time(0);
     cmd_switch_motion_limit_until_ = ros::Time(0);
+    last_governor_cmd_pos_ = start_pt;
+    last_governor_cmd_vel_.setZero();
+    has_last_governor_cmd_ = false;
+    cmd_governor_normal_state_.setZero();
+    cmd_governor_initialized_ = false;
+    cmd_governor_last_l_ = 0.0;
     ref_initialized = false;
     last_cmd_pos_ = start_pt;
 
@@ -243,11 +238,500 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
 
 }
 
+bool gvf_manager::pathPointAtW(const std::shared_ptr<gvf>& g,
+                               double query_w,
+                               Eigen::Vector3d& point,
+                               bool& clamped_to_end,
+                               double& path_w_start,
+                               double& path_w_end) const
+{
+    point.setZero();
+    clamped_to_end = false;
+    path_w_start = 0.0;
+    path_w_end = 0.0;
+
+    if (!g || !g->reparam_ready_ || g->sample_w_.size() < 2)
+    {
+        return false;
+    }
+
+    path_w_start = g->sample_w_.front();
+    path_w_end = g->sample_w_.back();
+    const double clamped_w = std::max(path_w_start, std::min(query_w, path_w_end));
+    clamped_to_end = query_w > path_w_end;
+    point = g->evalPathByW(clamped_w);
+    return true;
+}
+
+bool gvf_manager::pathTangentAtW(const std::shared_ptr<gvf>& g,
+                                 double query_w,
+                                 Eigen::Vector3d& tangent) const
+{
+    tangent.setZero();
+    if (!g || !g->reparam_ready_ || g->sample_w_.size() < 2)
+    {
+        return false;
+    }
+
+    const double path_w_start = g->sample_w_.front();
+    const double path_w_end = g->sample_w_.back();
+    const double clamped_w = std::max(path_w_start, std::min(query_w, path_w_end));
+    tangent = g->evalTangentByW(clamped_w);
+    return tangent.norm() > 1e-6;
+}
+
+void gvf_manager::resetGovernorState()
+{
+    cmd_governor_normal_state_.setZero();
+    cmd_governor_initialized_ = false;
+    cmd_governor_last_l_ = 0.0;
+}
+
+gvf_manager::GovernorCommandResult
+gvf_manager::makeGovernorInvalidHold(const Eigen::Vector3d& pos,
+                                     const std::string& reason,
+                                     GovernorCommandDebug& dbg)
+{
+    GovernorCommandResult result;
+    result.cmd_pos = pos;
+    result.yaw_cmd_vec.setZero();
+    result.final_cmd_source = "GOVERNOR_INVALID_HOLD";
+    result.fallback_reason = reason;
+    dbg.fallback_hold_pos = true;
+    resetGovernorState();
+    dbg.normal_state_norm = 0.0;
+    return result;
+}
+
+gvf_manager::GovernorCommandResult
+gvf_manager::runVelocityMatchingGovernor(gvfManager& pm,
+                                         const gvf::LiftedGuidanceResult& out,
+                                         const Eigen::Vector3d& pos,
+                                         double progress_w_after,
+                                         double dt,
+                                         double kp_equiv,
+                                         GovernorCommandDebug& dbg)
+{
+    GovernorCommandResult result;
+    result.cmd_pos = pos;
+    result.yaw_cmd_vec.setZero();
+    dbg.guidance_valid = true;
+    dbg.e_perp_norm = out.e_perp.norm();
+
+    const Eigen::Vector3d raw_v = out.v_cmd;
+    dbg.raw_v_norm = raw_v.norm();
+    const double tangent_norm = out.tangent.norm();
+    const bool path_ready = pm.gvf_ && pm.gvf_->reparam_ready_ && pm.gvf_->sample_w_.size() >= 2;
+    if (!path_ready)
+    {
+        return makeGovernorInvalidHold(pos, "path_invalid", dbg);
+    }
+    if (tangent_norm <= 1e-6)
+    {
+        return makeGovernorInvalidHold(pos, "tangent_invalid", dbg);
+    }
+
+    const Eigen::Vector3d t_current = out.tangent / tangent_norm;
+    dbg.raw_v_tau = raw_v.dot(t_current);
+    const Eigen::Vector3d raw_v_t = dbg.raw_v_tau * t_current;
+    const Eigen::Vector3d v_n_intent = raw_v - raw_v_t;
+    dbg.raw_v_normal_norm = v_n_intent.norm();
+    dbg.v_tau_intent = std::max(0.0, dbg.raw_v_tau);
+    const double tangent_vel_limit = std::max(0.0, cmd_tangent_vel_max_);
+    if (tangent_vel_limit > 1e-6)
+    {
+        dbg.v_tau_intent = std::min(dbg.v_tau_intent, tangent_vel_limit);
+    }
+    dbg.v_n_intent_norm = v_n_intent.norm();
+
+    auto projectNormal = [](const Eigen::Vector3d& v, const Eigen::Vector3d& t) {
+        return v - v.dot(t) * t;
+    };
+    auto limitNormalMagnitude = [](Eigen::Vector3d v, double max_norm) {
+        const double n = v.norm();
+        if (max_norm <= 1e-6)
+        {
+            v.setZero();
+        }
+        else if (n > max_norm && n > 1e-6)
+        {
+            v *= max_norm / n;
+        }
+        return v;
+    };
+    auto enforceCrossInPlane = [&](Eigen::Vector3d v,
+                                   const Eigen::Vector3d& t,
+                                   const Eigen::Vector3d& e_hat,
+                                   bool has_e_hat,
+                                   double cross_max) {
+        if (has_e_hat)
+        {
+            const double min_dot = -std::max(0.0, cross_max);
+            const double d = v.dot(e_hat);
+            if (d < min_dot)
+            {
+                const Eigen::Vector3d e_hat_plane = projectNormal(e_hat, t);
+                const double denom = e_hat_plane.dot(e_hat);
+                if (denom > 1e-6)
+                {
+                    v += ((min_dot - d) / denom) * e_hat_plane;
+                }
+            }
+        }
+        return v;
+    };
+    auto constrainNormal = [&](Eigen::Vector3d n,
+                               const Eigen::Vector3d& t,
+                               const Eigen::Vector3d& e_hat,
+                               bool has_e_hat,
+                               double normal_max) {
+        n = projectNormal(n, t);
+        n = limitNormalMagnitude(n, normal_max);
+        n = enforceCrossInPlane(n, t, e_hat, has_e_hat, cmd_governor_normal_cross_max_);
+        n = projectNormal(n, t);
+        n = limitNormalMagnitude(n, normal_max);
+        return n;
+    };
+
+    const double l_min = std::max(0.0, cmd_governor_l_min_);
+    const double l_max = std::max(l_min, cmd_governor_l_max_);
+    const double l_step = std::max(1e-3, cmd_governor_l_step_);
+    dbg.l_ff = std::max(l_min, std::min(dbg.v_tau_intent / kp_equiv, l_max));
+
+    const bool was_initialized = cmd_governor_initialized_;
+    if (!cmd_governor_initialized_)
+    {
+        cmd_governor_last_l_ = dbg.l_ff;
+        cmd_governor_normal_state_.setZero();
+        cmd_governor_initialized_ = true;
+    }
+
+    const double l_rate_max = std::max(0.0, cmd_governor_l_rate_max_);
+    const double rate_lower = std::max(l_min, cmd_governor_last_l_ - l_rate_max * dt);
+    const double rate_upper = std::min(l_max, cmd_governor_last_l_ + l_rate_max * dt);
+    std::vector<double> l_candidates;
+    for (double l = l_min; l <= l_max + 0.5 * l_step; l += l_step)
+    {
+        l_candidates.push_back(std::max(l_min, std::min(l, l_max)));
+    }
+    l_candidates.push_back(dbg.l_ff);
+    l_candidates.push_back(cmd_governor_last_l_);
+    l_candidates.push_back(rate_lower);
+    l_candidates.push_back(rate_upper);
+    for (double& l : l_candidates)
+    {
+        l = std::max(l_min, std::min(l, l_max));
+    }
+    std::sort(l_candidates.begin(), l_candidates.end());
+    l_candidates.erase(std::unique(l_candidates.begin(), l_candidates.end(),
+                                   [](double a, double b) {
+                                       return std::abs(a - b) < 1e-4;
+                                   }),
+                       l_candidates.end());
+
+    const Eigen::Vector3d delta_des = raw_v / kp_equiv;
+    const double rho = out.e_perp.norm();
+    const bool has_e_hat = rho > 1e-6;
+    Eigen::Vector3d e_hat = Eigen::Vector3d::Zero();
+    if (has_e_hat)
+    {
+        e_hat = out.e_perp / rho;
+    }
+    const double normal_deadband = std::max(0.0, cmd_governor_normal_deadband_);
+    const double normal_full_error = std::max(normal_deadband + 1e-6,
+                                              cmd_governor_normal_full_error_);
+    const double normal_max_cfg = std::max(0.0, cmd_governor_normal_max_);
+    if (rho <= normal_deadband)
+    {
+        dbg.active_normal_max = 0.0;
+    }
+    else if (rho < normal_full_error)
+    {
+        dbg.active_normal_max = normal_max_cfg *
+            (rho - normal_deadband) / (normal_full_error - normal_deadband);
+    }
+    else
+    {
+        dbg.active_normal_max = normal_max_cfg;
+    }
+
+    GovernorCandidate best;
+    const double lead_max = std::max(0.0, cmd_governor_lead_max_);
+    const double normal_rate_max = std::max(0.0, cmd_governor_normal_rate_max_);
+    const double path_end_eps = 1e-6;
+
+    for (double l : l_candidates)
+    {
+        if (was_initialized &&
+            (l < rate_lower - 1e-6 || l > rate_upper + 1e-6))
+        {
+            continue;
+        }
+
+        ++dbg.candidate_count;
+        Eigen::Vector3d p_l = Eigen::Vector3d::Zero();
+        bool clamped_to_end = false;
+        double candidate_path_w_start = 0.0;
+        double candidate_path_w_end = 0.0;
+        const double query_w = progress_w_after + l;
+        if (!pathPointAtW(pm.gvf_, query_w, p_l, clamped_to_end,
+                          candidate_path_w_start, candidate_path_w_end))
+        {
+            continue;
+        }
+        dbg.path_w_start = candidate_path_w_start;
+        dbg.path_w_end = candidate_path_w_end;
+        if (clamped_to_end || query_w > candidate_path_w_end - path_end_eps)
+        {
+            ++dbg.path_end_clamped_count;
+            continue;
+        }
+
+        Eigen::Vector3d t_l = t_current;
+        Eigen::Vector3d target_tangent = Eigen::Vector3d::Zero();
+        if (pathTangentAtW(pm.gvf_, query_w, target_tangent))
+        {
+            t_l = target_tangent.normalized();
+        }
+
+        GovernorCandidate c;
+        c.have = true;
+        c.l = l;
+        c.query_w = query_w;
+        c.path_w_start = candidate_path_w_start;
+        c.path_w_end = candidate_path_w_end;
+        c.base_delta = p_l - pos;
+        c.n_raw = delta_des - c.base_delta;
+        c.n = constrainNormal(c.n_raw, t_l, e_hat, has_e_hat, dbg.active_normal_max);
+
+        if (was_initialized && normal_rate_max > 1e-6 && dt > 1e-6)
+        {
+            Eigen::Vector3d d_n = c.n - cmd_governor_normal_state_;
+            const double max_dn = normal_rate_max * dt;
+            const double dn_norm = d_n.norm();
+            if (dn_norm > max_dn && dn_norm > 1e-6)
+            {
+                c.n = cmd_governor_normal_state_ + d_n * (max_dn / dn_norm);
+                c.normal_rate_limited = true;
+            }
+        }
+        c.n = projectNormal(c.n, t_l);
+        c.n = enforceCrossInPlane(c.n, t_l, e_hat, has_e_hat, cmd_governor_normal_cross_max_);
+        c.n = projectNormal(c.n, t_l);
+        c.n = limitNormalMagnitude(c.n, dbg.active_normal_max);
+
+        c.cmd = p_l + c.n;
+        const double candidate_lead = (c.cmd - pos).norm();
+        if (lead_max > 1e-6 && candidate_lead > lead_max && candidate_lead > 1e-6)
+        {
+            dbg.lead_limit_violation = true;
+            ++dbg.skipped_lead_count;
+            continue;
+        }
+
+        c.v_model = kp_equiv * (c.cmd - pos);
+        const double v_model_tau = c.v_model.dot(t_current);
+        const Eigen::Vector3d v_model_n = c.v_model - v_model_tau * t_current;
+        c.tau_vel_error = v_model_tau - dbg.v_tau_intent;
+        const Eigen::Vector3d n_err = v_model_n - v_n_intent;
+        c.normal_vel_error_norm = n_err.norm();
+        const double normal_vel_error_cap = std::max(0.0, cmd_governor_normal_vel_error_cap_);
+        double normal_vel_error_for_cost = c.normal_vel_error_norm;
+        if (normal_vel_error_cap > 1e-6 &&
+            normal_vel_error_for_cost > normal_vel_error_cap)
+        {
+            normal_vel_error_for_cost = normal_vel_error_cap;
+            c.normal_vel_error_capped = true;
+        }
+        c.vel_cost = std::max(0.0, cmd_governor_tau_vel_weight_) *
+                         c.tau_vel_error * c.tau_vel_error +
+                     std::max(0.0, cmd_governor_normal_vel_weight_) *
+                         normal_vel_error_for_cost * normal_vel_error_for_cost;
+        c.normal_cost = std::max(0.0, cmd_governor_normal_weight_) *
+                        (kp_equiv * c.n).squaredNorm();
+        c.l_ff_cost = std::max(0.0, cmd_governor_l_ff_weight_) *
+                      std::pow(kp_equiv * (l - dbg.l_ff), 2);
+        if (was_initialized)
+        {
+            c.normal_rate_cost = std::max(0.0, cmd_governor_normal_rate_weight_) *
+                                 (kp_equiv * (c.n - cmd_governor_normal_state_)).squaredNorm();
+            c.l_rate_cost = std::max(0.0, cmd_governor_l_rate_weight_) *
+                            std::pow(kp_equiv * (l - cmd_governor_last_l_), 2);
+        }
+        c.cost = c.vel_cost + c.normal_cost + c.l_ff_cost +
+                 c.normal_rate_cost + c.l_rate_cost;
+
+        ++dbg.valid_count;
+        if (!best.have || c.cost < best.cost)
+        {
+            best = c;
+        }
+    }
+
+    if (!best.have)
+    {
+        if (dbg.candidate_count > 0 &&
+            dbg.path_end_clamped_count == dbg.candidate_count)
+        {
+            return makeGovernorInvalidHold(pos, "all_candidates_path_end_clamped", dbg);
+        }
+        return makeGovernorInvalidHold(pos, "no_valid_candidate", dbg);
+    }
+
+    result.cmd_pos = best.cmd;
+    result.yaw_cmd_vec = best.cmd - pos;
+    result.final_cmd_source = "VEL_MATCH_GOVERNOR";
+    result.fallback_reason = "none";
+    result.command_valid = true;
+    result.selected_valid_for_state = true;
+    result.selected_l = best.l;
+    result.selected_n = best.n;
+
+    dbg.fallback_hold_pos = false;
+    dbg.best_l = best.l;
+    dbg.best_query_w = best.query_w;
+    dbg.best_cost = best.cost;
+    dbg.base_delta_norm = best.base_delta.norm();
+    dbg.normal_raw_norm = best.n_raw.norm();
+    dbg.normal_state_norm = best.n.norm();
+    dbg.normal_rate_limited = best.normal_rate_limited;
+    dbg.selected_v_model_norm = best.v_model.norm();
+    dbg.tau_vel_error = best.tau_vel_error;
+    dbg.normal_vel_error_norm = best.normal_vel_error_norm;
+    dbg.normal_vel_error_capped = best.normal_vel_error_capped;
+    dbg.vel_error_norm = std::sqrt(best.tau_vel_error * best.tau_vel_error +
+                                   best.normal_vel_error_norm * best.normal_vel_error_norm);
+    dbg.vel_cost = best.vel_cost;
+    dbg.l_ff_cost = best.l_ff_cost;
+    dbg.l_rate_cost = best.l_rate_cost;
+    dbg.normal_cost = best.normal_cost;
+    dbg.normal_rate_cost = best.normal_rate_cost;
+    dbg.cmd_dist = (result.cmd_pos - pos).norm();
+    dbg.path_w_start = best.path_w_start;
+    dbg.path_w_end = best.path_w_end;
+    dbg.best_clamped_to_end = false;
+    return result;
+}
+
+void gvf_manager::updateGovernorCommandHistory(const Eigen::Vector3d& pos,
+                                               const Eigen::Vector3d& cmd_pos,
+                                               double dt,
+                                               GovernorCommandDebug& dbg)
+{
+    dbg.cmd_dist = (cmd_pos - pos).norm();
+    if (has_last_governor_cmd_ && dt > 1e-6)
+    {
+        const Eigen::Vector3d cmd_vel_est = (cmd_pos - last_governor_cmd_pos_) / dt;
+        dbg.cmd_delta_rate = cmd_vel_est.norm();
+        dbg.estimated_acc = (cmd_vel_est - last_governor_cmd_vel_).norm() / dt;
+        last_governor_cmd_vel_ = cmd_vel_est;
+    }
+    else
+    {
+        last_governor_cmd_vel_.setZero();
+    }
+    last_governor_cmd_pos_ = cmd_pos;
+    has_last_governor_cmd_ = true;
+    last_cmd_pos_ = cmd_pos;
+}
+
+void gvf_manager::logGovernorCommand(const GovernorCommandResult& result,
+                                     const GovernorCommandDebug& dbg,
+                                     const Eigen::Vector3d& cmd_pos,
+                                     double real_dis_to_goal,
+                                     double kp_equiv,
+                                     bool switch_active) const
+{
+    ROS_WARN_THROTTLE(1.0,
+      "[GVF_CMD] source=%s reason=%s raw=%.2f odom_v=%.2f cmd_dist=%.2f K=%.2f cmd=(%.2f %.2f %.2f) d_goal=%.2f",
+      result.final_cmd_source.c_str(), result.fallback_reason.c_str(), dbg.raw_v_norm,
+      odom_vel_lpf_.head<2>().norm(), dbg.cmd_dist, kp_equiv,
+      cmd_pos.x(), cmd_pos.y(), cmd_pos.z(), real_dis_to_goal);
+
+    ROS_WARN_THROTTLE(
+        0.2,
+        "[GVF][CMD_VEL_MATCH_GOV] final_cmd_source=%s fallback_reason=%s raw_v_norm=%.3f raw_v_tau=%.3f raw_v_normal_norm=%.3f v_tau_intent=%.3f v_n_intent_norm=%.3f cmd_vel_max=%.3f tangent_vel_max=%.3f L_ff=%.3f best_L=%.3f best_query_w=%.3f path_w_start=%.3f path_w_end=%.3f best_clamped_to_end=%d best_cost=%.3f candidate_count=%d valid_count=%d path_end_clamped_count=%d skipped_lead_count=%d base_delta_norm=%.3f normal_raw_norm=%.3f normal_state_norm=%.3f normal_max=%.3f normal_cross_max=%.3f normal_rate_limited=%d lead_limit_violation=%d selected_v_model_norm=%.3f vel_error_norm=%.3f tau_vel_error=%.3f normal_vel_error_norm=%.3f normal_vel_error_capped=%d vel_cost=%.3f l_ff_cost=%.3f l_rate_cost=%.3f normal_cost=%.3f normal_rate_cost=%.3f cmd_dist=%.3f cmd_delta_rate=%.3f estimated_acc=%.3f acc_max=%.3f switch_active=%d K_eq=%.3f e_perp_norm=%.3f fallback_hold_pos=%d initialized=%d final_cmd_overridden=%d state_reset_due_to_override=%d state_reset_due_to_lead_limit=%d actual_stored_normal_norm=%.3f",
+        result.final_cmd_source.c_str(),
+        result.fallback_reason.c_str(),
+        dbg.raw_v_norm,
+        dbg.raw_v_tau,
+        dbg.raw_v_normal_norm,
+        dbg.v_tau_intent,
+        dbg.v_n_intent_norm,
+        cmd_vel_max_,
+        cmd_tangent_vel_max_,
+        dbg.l_ff,
+        dbg.best_l,
+        dbg.best_query_w,
+        dbg.path_w_start,
+        dbg.path_w_end,
+        dbg.best_clamped_to_end ? 1 : 0,
+        dbg.best_cost,
+        dbg.candidate_count,
+        dbg.valid_count,
+        dbg.path_end_clamped_count,
+        dbg.skipped_lead_count,
+        dbg.base_delta_norm,
+        dbg.normal_raw_norm,
+        dbg.normal_state_norm,
+        dbg.active_normal_max,
+        std::max(0.0, cmd_governor_normal_cross_max_),
+        dbg.normal_rate_limited ? 1 : 0,
+        dbg.lead_limit_violation ? 1 : 0,
+        dbg.selected_v_model_norm,
+        dbg.vel_error_norm,
+        dbg.tau_vel_error,
+        dbg.normal_vel_error_norm,
+        dbg.normal_vel_error_capped ? 1 : 0,
+        dbg.vel_cost,
+        dbg.l_ff_cost,
+        dbg.l_rate_cost,
+        dbg.normal_cost,
+        dbg.normal_rate_cost,
+        dbg.cmd_dist,
+        dbg.cmd_delta_rate,
+        dbg.estimated_acc,
+        std::max(0.0, cmd_acc_max_),
+        switch_active ? 1 : 0,
+        kp_equiv,
+        dbg.e_perp_norm,
+        dbg.fallback_hold_pos ? 1 : 0,
+        cmd_governor_initialized_ ? 1 : 0,
+        dbg.final_cmd_overridden ? 1 : 0,
+        dbg.state_reset_due_to_override ? 1 : 0,
+        dbg.state_reset_due_to_lead_limit ? 1 : 0,
+        cmd_governor_normal_state_.norm());
+}
+
+void gvf_manager::publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
+                                                 const Eigen::Vector3d& yaw_cmd_vec)
+{
+    quadrotor_msgs::PositionCommand cmd;
+    cmd.header.stamp = ros::Time::now();
+    cmd.header.frame_id = "world";
+    cmd.position.x = cmd_pos.x();
+    cmd.position.y = cmd_pos.y();
+    cmd.position.z = cmd_pos.z();
+    cmd.velocity.x = 0.0;
+    cmd.velocity.y = 0.0;
+    cmd.velocity.z = 0.0;
+
+    double arg_ = last_yaw;
+    if (yaw_cmd_vec.norm() > 0.1)
+    {
+        arg_ = atan2(-yaw_cmd_vec.x(), yaw_cmd_vec.y()) + (PI/2.0f);
+    }
+    std::pair<double, double> yaw_all = calculate_yaw(last_yaw, arg_);
+    last_yaw = yaw_all.first;
+    cmd.yaw = yaw_all.first;
+    cmd.yaw_dot = 0.0f;
+
+    cmd_pub.publish(cmd);
+}
+
 void gvf_manager::cmdCallback(const ros::TimerEvent& event)
 {
-
-     if (use_test_cmd_) return;
-    // if (!enable_gvfcmd_control) return;
+    if (use_test_cmd_) return;
 
     if (cmd_gain_test_enable_)
     {
@@ -295,496 +779,74 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         return;
     }
 
-    const Eigen::Vector3d pos  = odom_;
-    const Eigen::Vector3d goal = swarmParticlesManager[0].goal_pt;
-    const double dt = 0.02;
-
-    // ===================== 1) 论文式闭环：用真实 pos 查 GVF =====================
-    // Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(pos);
-    // double vel_mag = vel.norm();
-
     auto& pm = swarmParticlesManager[0];
+    const Eigen::Vector3d pos = odom_;
+    const Eigen::Vector3d goal = pm.goal_pt;
+    const double dt = 0.02;
+    const ros::Time now = ros::Time::now();
+    const double kp_equiv = std::max(0.1, cmd_pos_gain_equiv_);
+    const double real_dis_to_goal = (goal - pos).head<2>().norm();
 
-    auto out = pm.gvf_->calcLiftedGuidance3D(pos, progress_w_);
-    if (!out.valid) {
-        ROS_WARN_THROTTLE(1.0, "[GVF] lifted guidance invalid");
-        return;
+    GovernorCommandDebug dbg;
+    dbg.normal_state_norm = cmd_governor_normal_state_.norm();
+    dbg.best_query_w = progress_w_;
+
+    GovernorCommandResult result;
+    result.cmd_pos = pos;
+    result.yaw_cmd_vec.setZero();
+
+    gvf::LiftedGuidanceResult out;
+    if (!pm.gvf_)
+    {
+        result = makeGovernorInvalidHold(pos, "missing_gvf", dbg);
     }
-
-    progress_w_ = out.w_proj + out.w_dot * dt;
-    progress_initialized_ = true;
-
-    const Eigen::Vector3d raw_v_gvf = out.v_cmd;
-    Eigen::Vector3d v_gvf = raw_v_gvf;
-
-    double dx_real = goal.x() - pos.x();
-    double dy_real = goal.y() - pos.y();
-    double real_dis_to_goal = std::sqrt(dx_real*dx_real + dy_real*dy_real);
-    bool force_goal_position = false;
+    else
+    {
+        out = pm.gvf_->calcLiftedGuidance3D(pos, progress_w_);
+        if (!out.valid)
+        {
+            result = makeGovernorInvalidHold(pos, "guidance_invalid", dbg);
+        }
+        else
+        {
+            progress_w_ = out.w_proj + out.w_dot * dt;
+            progress_initialized_ = true;
+            result = runVelocityMatchingGovernor(pm, out, pos, progress_w_, dt, kp_equiv, dbg);
+        }
+    }
 
     const bool circle_mode_active = enable_circle_reference_test_ && circle_reference_ready_;
-    if (!circle_mode_active)
-    {
-        if (real_dis_to_goal < stop_radius)
-        {
-            v_gvf.setZero();
-            force_goal_position = true;
-        }
-        else if (real_dis_to_goal < slow_radius)
-        {
-            double s = (real_dis_to_goal - stop_radius) / std::max(1e-6, slow_radius - stop_radius);
-            s = std::max(0.0, std::min(1.0, s));
-            v_gvf *= s;
-        }
-    }
-
-    double v_gvf_norm = v_gvf.norm();
-    const bool saturated_by_vel_max = v_gvf_norm > cmd_vel_max_ && v_gvf_norm > 1e-6;
-    if (saturated_by_vel_max)
-    {
-        v_gvf *= cmd_vel_max_ / v_gvf_norm;
-        v_gvf_norm = cmd_vel_max_;
-    }
-
-    const ros::Time now = ros::Time::now();
-    const bool switch_motion_limit_active = cmd_use_switch_motion_limits_ &&
-                                            now < cmd_switch_motion_limit_until_;
-    const bool skip_motion_limit_for_switch = cmd_skip_motion_limits_on_switch_ &&
-                                              switch_motion_limit_active;
-    const bool motion_limit_active = (cmd_use_vel_slew_limit_ || switch_motion_limit_active) &&
-                                     !skip_motion_limit_for_switch;
-    const double active_acc_max = switch_motion_limit_active ? cmd_switch_acc_max_ : cmd_acc_max_;
-    const double active_jerk_max = switch_motion_limit_active ? cmd_switch_jerk_max_ : cmd_jerk_max_;
-    const double active_offset_rate_max = switch_motion_limit_active ?
-                                          cmd_switch_offset_rate_max_ :
-                                          cmd_offset_rate_max_;
-    bool limited_by_acc = false;
-    bool limited_by_jerk = false;
-    bool reclamped_by_vel_max_after_limit = false;
-    Eigen::Vector3d a_limited = Eigen::Vector3d::Zero();
-
-    if (motion_limit_active && has_last_v_gvf_limited_ && dt > 1e-6)
-    {
-        Eigen::Vector3d a_cmd = (v_gvf - last_v_gvf_limited_) / dt;
-
-        const double jerk_max = std::max(0.0, active_jerk_max);
-        if (jerk_max > 1e-6)
-        {
-            Eigen::Vector3d da = a_cmd - last_a_gvf_limited_;
-            const double max_da = jerk_max * dt;
-            if (da.norm() > max_da && da.norm() > 1e-6)
-            {
-                da *= max_da / da.norm();
-                a_cmd = last_a_gvf_limited_ + da;
-                limited_by_jerk = true;
-            }
-        }
-
-        const double acc_max = std::max(0.0, active_acc_max);
-        if (acc_max > 1e-6 && a_cmd.norm() > acc_max && a_cmd.norm() > 1e-6)
-        {
-            a_cmd *= acc_max / a_cmd.norm();
-            limited_by_acc = true;
-        }
-
-        v_gvf = last_v_gvf_limited_ + a_cmd * dt;
-        v_gvf_norm = v_gvf.norm();
-        if (cmd_vel_max_ > 1e-6 && v_gvf_norm > cmd_vel_max_ && v_gvf_norm > 1e-6)
-        {
-            v_gvf *= cmd_vel_max_ / v_gvf_norm;
-            v_gvf_norm = cmd_vel_max_;
-            reclamped_by_vel_max_after_limit = true;
-        }
-    }
-
-    if (has_last_v_gvf_limited_ && dt > 1e-6)
-    {
-        a_limited = (v_gvf - last_v_gvf_limited_) / dt;
-    }
-    last_v_gvf_limited_ = v_gvf;
-    last_a_gvf_limited_ = a_limited;
-    has_last_v_gvf_limited_ = true;
-
-    Eigen::Vector3d v_smooth = v_gvf;
-    cmd_vel_state_initialized_ = true;
-    last_v_cmd_ = v_smooth;
-
-    double kp_equiv = std::max(0.1, cmd_pos_gain_equiv_);
-    const Eigen::Vector3d lead_from_gvf = v_gvf / kp_equiv;
-    Eigen::Vector3d pos_ff_offset = Eigen::Vector3d::Zero();
-    bool pos_ff_active = false;
-    bool saturated_by_pos_ff_max = false;
-    double pos_ff_z_raw = 0.0;
-    if (cmd_use_pos_ff_ && has_last_v_gvf_for_pos_ff_ && dt > 1e-6)
-    {
-        const Eigen::Vector3d a_gvf = (v_gvf - last_v_gvf_for_pos_ff_) / dt;
-        pos_ff_offset = std::max(0.0, cmd_pos_ff_time_) * a_gvf / kp_equiv;
-        pos_ff_z_raw = pos_ff_offset.z();
-        if (cmd_pos_ff_xy_only_)
-        {
-            pos_ff_offset.z() = 0.0;
-        }
-        const double pos_ff_len = pos_ff_offset.norm();
-        const double pos_ff_max = std::max(0.0, cmd_pos_ff_max_);
-        if (pos_ff_max > 1e-6 && pos_ff_len > pos_ff_max && pos_ff_len > 1e-6)
-        {
-            pos_ff_offset *= pos_ff_max / pos_ff_len;
-            saturated_by_pos_ff_max = true;
-        }
-        pos_ff_active = pos_ff_offset.norm() > 1e-6;
-    }
-    last_v_gvf_for_pos_ff_ = v_gvf;
-    has_last_v_gvf_for_pos_ff_ = true;
-
-    Eigen::Vector3d lead = lead_from_gvf + pos_ff_offset;
-    const double lead_len_before_limit = lead.norm();
-    const bool saturated_by_lead_max = lead_len_before_limit > cmd_lead_max_ && lead_len_before_limit > 1e-6;
-    if (saturated_by_lead_max)
-    {
-        lead *= cmd_lead_max_ / lead_len_before_limit;
-    }
-
-    bool limited_by_offset_rate = false;
-    if (motion_limit_active && has_last_cmd_offset_ && dt > 1e-6)
-    {
-        Eigen::Vector3d d_offset = lead - last_cmd_offset_;
-        const double offset_rate_max = std::max(0.0, active_offset_rate_max);
-        const double max_d_offset = offset_rate_max * dt;
-        if (offset_rate_max > 1e-6 &&
-            d_offset.norm() > max_d_offset &&
-            d_offset.norm() > 1e-6)
-        {
-            lead = last_cmd_offset_ + d_offset * (max_d_offset / d_offset.norm());
-            limited_by_offset_rate = true;
-        }
-    }
-    last_cmd_offset_ = lead;
-    has_last_cmd_offset_ = true;
-
-    Eigen::Vector3d cmd_pos = pos + lead;
-
+    const bool force_goal_position = !circle_mode_active && real_dis_to_goal < stop_radius;
     if (force_goal_position)
     {
-        cmd_pos = goal;
-        v_smooth.setZero();
+        dbg.final_cmd_overridden = result.command_valid;
+        dbg.state_reset_due_to_override = true;
+        resetGovernorState();
+        result.selected_valid_for_state = false;
+        result.cmd_pos = goal;
+        result.yaw_cmd_vec.setZero();
+        dbg.cmd_dist = (result.cmd_pos - pos).norm();
+        if (!result.command_valid)
+        {
+            result.final_cmd_source = "GOVERNOR_INVALID_HOLD";
+            result.fallback_reason = "goal_override_after_invalid_governor";
+            dbg.fallback_hold_pos = true;
+        }
     }
 
-    last_cmd_pos_ = cmd_pos;
+    if (result.selected_valid_for_state)
+    {
+        cmd_governor_normal_state_ = result.selected_n;
+        cmd_governor_last_l_ = result.selected_l;
+        cmd_governor_initialized_ = true;
+        dbg.normal_state_norm = cmd_governor_normal_state_.norm();
+    }
 
-    auto angleBetween = [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
-        const double an = a.norm();
-        const double bn = b.norm();
-        if (an <= 1e-6 || bn <= 1e-6) {
-            return 0.0;
-        }
-        const double c = std::max(-1.0, std::min(1.0, a.dot(b) / (an * bn)));
-        return std::acos(c);
-    };
-    const double angle_vcmd_odom = angleBetween(v_gvf.head<2>(), odom_vel_lpf_.head<2>());
-    const double angle_vsmooth_vcmd = angleBetween(v_smooth.head<2>(), v_gvf.head<2>());
-
-    ROS_WARN_THROTTLE(1.0,
-      "[GVF_CMD] raw=%.2f smooth=%.2f odom_v=%.2f lead=%.2f K=%.2f cmd=(%.2f %.2f %.2f) d_goal=%.2f",
-      raw_v_gvf.norm(), v_smooth.norm(), odom_vel_lpf_.head<2>().norm(), lead.norm(), cmd_pos_gain_equiv_,
-      cmd_pos.x(), cmd_pos.y(), cmd_pos.z(), real_dis_to_goal);
-
-    ROS_WARN_THROTTLE(
-        0.2,
-        "[GVF][CMD_DIRECT] raw_v_gvf=%.3f clamped_v_gvf=%.3f cmd_vel_max=%.3f lead_from_gvf=%.3f lead_len=%.3f K_eq=%.3f lead_max=%.3f saturated_by_vel_max=%d saturated_by_lead_max=%d odom_v=%.3f use_vel_slew_limit=%d use_vel_feedback=%d angle_vcmd_odom=%.3f angle_vsmooth_vcmd=%.3f",
-        raw_v_gvf.norm(),
-        v_gvf.norm(),
-        cmd_vel_max_,
-        lead_from_gvf.norm(),
-        lead.norm(),
-        kp_equiv,
-        cmd_lead_max_,
-        saturated_by_vel_max ? 1 : 0,
-        saturated_by_lead_max ? 1 : 0,
-        odom_vel_lpf_.head<2>().norm(),
-        cmd_use_vel_slew_limit_ ? 1 : 0,
-        cmd_use_vel_feedback_ ? 1 : 0,
-        angle_vcmd_odom,
-        angle_vsmooth_vcmd);
-
-    ROS_WARN_THROTTLE(
-        0.2,
-        "[GVF][CMD_POS_FF] enabled=%d active=%d xy_only=%d pos_ff_len=%.3f pos_ff_z=%.3f pos_ff_z_raw=%.3f pos_ff_time=%.3f pos_ff_max=%.3f saturated_by_pos_ff_max=%d lead_from_gvf=%.3f lead_total=%.3f",
-        cmd_use_pos_ff_ ? 1 : 0,
-        pos_ff_active ? 1 : 0,
-        cmd_pos_ff_xy_only_ ? 1 : 0,
-        pos_ff_offset.norm(),
-        pos_ff_offset.z(),
-        pos_ff_z_raw,
-        cmd_pos_ff_time_,
-        cmd_pos_ff_max_,
-        saturated_by_pos_ff_max ? 1 : 0,
-        lead_from_gvf.norm(),
-        lead.norm());
-
-    ROS_WARN_THROTTLE(
-        0.2,
-        "[GVF][CMD_MOTION_LIMIT] global_enabled=%d switch_enabled=%d active=%d switch_active=%d skipped_on_switch=%d acc_limited=%d jerk_limited=%d offset_rate_limited=%d vel_reclamped=%d acc=%.3f acc_max=%.3f jerk_max=%.3f offset_rate_max=%.3f switch_time_left=%.3f",
-        cmd_use_vel_slew_limit_ ? 1 : 0,
-        cmd_use_switch_motion_limits_ ? 1 : 0,
-        motion_limit_active ? 1 : 0,
-        switch_motion_limit_active ? 1 : 0,
-        skip_motion_limit_for_switch ? 1 : 0,
-        limited_by_acc ? 1 : 0,
-        limited_by_jerk ? 1 : 0,
-        limited_by_offset_rate ? 1 : 0,
-        reclamped_by_vel_max_after_limit ? 1 : 0,
-        a_limited.norm(),
-        active_acc_max,
-        active_jerk_max,
-        active_offset_rate_max,
-        std::max(0.0, (cmd_switch_motion_limit_until_ - now).toSec()));
-
-    // ===================== 6) 发布 PositionCommand（只发位置+yaw） =====================
-    quadrotor_msgs::PositionCommand cmd;
-    cmd.header.stamp = ros::Time::now();
-    cmd.header.frame_id = "world";
-
-    cmd.position.x = cmd_pos.x();
-    cmd.position.y = cmd_pos.y();
-    cmd.position.z = cmd_pos.z();
-    cmd.velocity.x = 0.0;
-    cmd.velocity.y = 0.0;
-    cmd.velocity.z = 0.0;
-
-
-    // cmd.yaw = PI/2.0;
-    // cmd.yaw_dot = 0.0f;
-        Eigen::Vector3d yaw_vel = v_smooth;
-        double arg_    = atan2(-yaw_vel.x(), yaw_vel.y()) + (PI/2.0f);
-        double vel_len = std::sqrt(yaw_vel.x()*yaw_vel.x() + yaw_vel.y()*yaw_vel.y());
-        if(vel_len<=0.1) arg_ = last_yaw;
-        std::pair<double, double> yaw_all = calculate_yaw(last_yaw,arg_);
-    
-        double yaw_now = yaw_all.first;
-    
-        last_yaw = yaw_now;
-    
-        cmd.yaw = yaw_now;
-        cmd.yaw_dot = 0.0f;
-
-    cmd_pub.publish(cmd);
-
-
-  // ===================== 7) 调试（可选） =====================
-//   double err = (cmd_pos - pos).head<2>().norm();
-//   ROS_INFO_THROTTLE(0.2, "err=%.2f step=%.3f vel=%.2f vel_f=%.2f d_goal=%.2f",
-//                     err, step_xy, vel_mag, vel_f_mag, real_dis_to_goal);
-
-    // if (use_test_cmd_) return;  // 如果使用测试命令模式，则跳过原来的cmdCallback
-    
-    // ros::Time t_start = ros::Time::now();  // 记录开始时间
-    
-    // if (swarmParticlesManager.empty()) return;
-    // if (!swarmParticlesManager[0].receive_goal) 
-    // {
-    //     ROS_WARN_THROTTLE(1.0, "[GVF] DO NOT RECEIVE GOAL");
-    //     return;
-    // }
-    
-    //     const Eigen::Vector3d& pos = odom_;
-
-    //     Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(pos);
-    //     double vel_mag = vel.norm();
-
-    //     double vel_max_ref = 2.0;
-    //     if(vel_mag > vel_max_ref && vel_mag > 1e-3)
-    //     {
-    //         vel *= (vel_max_ref / vel_mag);
-    //     }
-
-    //     Eigen::Vector3d goal = swarmParticlesManager[0].goal_pt;
-
-    //     double dx_real = goal.x() - pos.x();
-    //     double dy_real = goal.y() - pos.y();
-    //     double real_dis_to_goal = std::sqrt(dx_real*dx_real + dy_real*dy_real);
-
-    //     double ref_T = 0.6;//前视时间
-    //     Eigen::Vector3d ref_pos = pos + ref_T * vel;
-
-    //     double Max_ref_pos = 1.5;//最大前馈距离 
-    //     Eigen::Vector3d diff_sp = ref_pos - pos;
-    //     double dif_dis = diff_sp.head<2>().norm();
-    //     if(dif_dis > Max_ref_pos)
-    //     {
-    //         diff_sp *= (Max_ref_pos / dif_dis);
-    //         ref_pos = pos + diff_sp;
-    //     }
-
-    //     if(real_dis_to_goal < stop_radius)
-    //     {
-    //         ref_pos = goal;
-    //         vel.setZero();
-    //     }
-    //     else if(real_dis_to_goal < slow_radius)
-    //     {
-    //         double s = (real_dis_to_goal - stop_radius) / (slow_radius - stop_radius);
-    //         s = std::max(0.0,std::min(1.0, s));
-    //         ref_pos = s * ref_pos + (1.0 - s) * goal;
-    //     }
-
-    //     // 构造 PositionCommand 消息
-    //     quadrotor_msgs::PositionCommand cmd;
-    //     cmd.header.stamp = ros::Time::now();
-    //     cmd.header.frame_id = "world";
-
-    //     cmd.position.x = ref_pos.x();
-    //     cmd.position.y = ref_pos.y();
-    //     cmd.position.z = ref_pos.z();
-
-    //     double arg_    = atan2(-vel.x(), vel.y()) + (PI/2.0f);
-    //     double vel_len = std::sqrt(vel.x()*vel.x() + vel.y()*vel.y());
-    //     if(vel_len<=0.1) arg_ = last_yaw;
-    //     std::pair<double, double> yaw_all = calculate_yaw(last_yaw,arg_);
-    
-    //     double yaw_now = yaw_all.first;
-    //     double yaw_rate = yaw_all.second;
-    
-    //     last_yaw = yaw_now;
-    
-    //     cmd.yaw = yaw_now;
-    //     cmd.yaw_dot = 0.0f;
-
-    //     cmd_pub.publish(cmd);
-        
-    //     ros::Time t_end = ros::Time::now();  // 记录结束时间
-    //     double exec_time_ms = (t_end - t_start).toSec() * 1000.0;  // 转换为毫秒
-
-    /***********位置前馈版本************/
-    //     // 使用第一个粒子的位置信息
-    //     const Eigen::Vector3d& pos = odom_;
-
-    //     if(!ref_initialized)
-    //     {
-    //         ref_pos = pos;
-    //         ref_initialized = true;
-    //     }
-    
-    //     // 构造 PositionCommand 消息
-    //     quadrotor_msgs::PositionCommand cmd;
-    //     cmd.header.stamp = ros::Time::now();
-    //     cmd.header.frame_id = "world";
-    
-    //     // 基于GVF速度计算期望位置
-    //     double dt = 0.02;  // 控制周期50Hz
-    
-    //     // 计算 GVF 速度
-    //     Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(ref_pos);
-    //     double vel_mag = vel.norm();
-    
-    //     Eigen::Vector3d goal = swarmParticlesManager[0].goal_pt;
-
-    //     // double dist_to_goal = (goal - ref_pos).head<2>().norm();
-    
-    //     //真实无人机到目标点距离
-    //     double dx_real = goal.x() - pos.x();
-    //     double dy_real = goal.y() - pos.y();
-    //     double real_dist_to_goal = std::sqrt(dx_real*dx_real + dy_real*dy_real);
-
-    //     //前馈点到目标点距离
-    //     double dx_ref = goal.x() - ref_pos.x();
-    //     double dy_ref = goal.y() - ref_pos.y();
-    //     double ref_dist_to_goal = std::sqrt(dx_ref*dx_ref + dy_ref*dy_ref);
-
-    //     Eigen::Vector3d vel_dir = (vel_mag > 1e-6) ? vel.normalized() : Eigen::Vector3d::Zero();
-        
-    //     double feedforward_gain = std::min(1.0, vel_mag / 1.0);
-    //     double alpha = 0.8 + 0.2 * feedforward_gain;
-    
-    //     if(real_dist_to_goal < stop_radius || ref_dist_to_goal < stop_radius)
-    //     {
-    //         ref_pos = goal;
-    //         vel.setZero();
-    //     }
-    //     else if(real_dist_to_goal < slow_radius && ref_dist_to_goal < slow_radius)
-    //     {
-    //         double dis_use = std::max(real_dist_to_goal, ref_dist_to_goal);
-
-    //         double s = (dis_use - stop_radius) / (slow_radius - stop_radius);
-    //         s = std::max(0.01,std::min(1.0, s));
-    //         alpha *= s;
-    //     }
-    
-    //     ref_pos = ref_pos + alpha * vel * dt;
-    
-    //     cmd.position.x = ref_pos.x();
-    //     cmd.position.y = ref_pos.y();
-    //     cmd.position.z = ref_pos.z();
-
-    //     double arg_    = atan2(-vel.x(), vel.y()) + (PI/2.0f);
-    //     double vel_len = std::sqrt(vel.x()*vel.x() + vel.y()*vel.y());
-    //     if(vel_len<=0.1) arg_ = last_yaw;
-    //     std::pair<double, double> yaw_all = calculate_yaw(last_yaw,arg_);
-    
-    //     double yaw_now = yaw_all.first;
-    //     double yaw_rate = yaw_all.second;
-    
-    //     last_yaw = yaw_now;
-    
-    //     cmd.yaw = yaw_now;
-    //     cmd.yaw_dot = 0.0f;
-    // // ROS_INFO("[GVF] Velocity Command: x = %.3f, y = %.3f, z = %.3f",
-    // //          cmd.velocity.x, cmd.velocity.y, cmd.velocity.z);
-    // // ROS_INFO("[GVF] Position Command: z = %.3f",cmd.position.z);
-    //     // 发布控制指令
-    //     cmd_pub.publish(cmd);
-        
-    //     ros::Time t_end = ros::Time::now();  // 记录结束时间
-    //     double exec_time_ms = (t_end - t_start).toSec() * 1000.0;  // 转换为毫秒
-
-         /***********位置前馈版本************/
-
-
-        // ROS_INFO("[GVF] Control execution time: %.3f ms", exec_time_ms);
-//     // 使用第一个粒子的位置信息
-//     const Eigen::Vector3d& pos = odom_;
-//     // 计算 GVF 速度
-//     Eigen::Vector3d vel = swarmParticlesManager[0].gvf_->calcGuidingVectorField3D(pos);
-
-//     // 构造 PositionCommand 消息
-//     quadrotor_msgs::PositionCommand cmd;
-//     cmd.header.stamp = ros::Time::now();
-//     cmd.header.frame_id = "world";
-
-//     // 基于GVF速度计算期望位置
-//     double dt = 0.01;  // 控制周期50Hz，与定时器频率一致
-//     Eigen::Vector3d desired_pos = pos + vel * dt;
-
-//     // 设置位置控制
-//     cmd.position.x = desired_pos.x();
-//     cmd.position.y = desired_pos.y();
-//     cmd.position.z = desired_pos.z();
-
-//     // 同时提供速度前馈（提升动态响应和平滑性）
-//     cmd.velocity.x = vel.x();
-//     cmd.velocity.y = vel.y();
-//     cmd.velocity.z = vel.z();
-
-//     // 计算yaw角度（使用GVF速度方向计算yaw）
-//     double arg_    = atan2(-vel.x(), vel.y()) + (PI/2.0f);
-//     double vel_len = sqrt(pow(vel.x(), 2) + pow(vel.y(), 2));
-//     if(vel_len <= 0.1) arg_ = last_yaw;
-//     std::pair<double, double> yaw_all = calculate_yaw(last_yaw,arg_);
-
-//     // 使用角速度进行角度前馈补偿，提高yaw跟踪性能
-//     double feedforward_angle = yaw_all.first + yaw_all.second * dt * 0.5; // 前馈补偿
-//     cmd.yaw = feedforward_angle;
-//     cmd.yaw_dot = yaw_all.second;  // 飞控不支持角速度输入，设为0
-// // ROS_INFO("[GVF] Velocity Command: x = %.3f, y = %.3f, z = %.3f",
-// //          cmd.velocity.x, cmd.velocity.y, cmd.velocity.z);
-// // ROS_INFO("[GVF] Position Command: z = %.3f",cmd.position.z);
-//     // 发布控制指令
-//     cmd_pub.publish(cmd);
-    
-//     ros::Time t_end = ros::Time::now();  // 记录结束时间
-//     double exec_time_ms = (t_end - t_start).toSec() * 1000.0;  // 转换为毫秒
-//     // ROS_INFO("[GVF] Control execution time: %.3f ms", exec_time_ms);
+    updateGovernorCommandHistory(pos, result.cmd_pos, dt, dbg);
+    const bool switch_active = now < cmd_switch_motion_limit_until_;
+    logGovernorCommand(result, dbg, result.cmd_pos, real_dis_to_goal, kp_equiv, switch_active);
+    publishGovernorPositionCommand(result.cmd_pos, result.yaw_cmd_vec);
 }
-
 
 void gvf_manager::test_cmdCallback(const ros::TimerEvent& event)
 {
@@ -992,13 +1054,15 @@ void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
     closed_ref_recover_ = false;
     resetClosedGoalCandidateState();
     ref_pos = start_pt;
-    cmd_vel_state_.setZero();
     last_curve_vel_.setZero();
     has_last_curve_vel_ = false;
-    cmd_vel_lpf_state_.setZero();
-    last_v_cmd_.setZero();
-    cmd_vel_state_initialized_ = false;
-    vel_fb_switch_until_ = ros::Time(0);
+    cmd_switch_motion_limit_until_ = ros::Time(0);
+    last_governor_cmd_pos_ = start_pt;
+    last_governor_cmd_vel_.setZero();
+    has_last_governor_cmd_ = false;
+    cmd_governor_normal_state_.setZero();
+    cmd_governor_initialized_ = false;
+    cmd_governor_last_l_ = 0.0;
     ref_initialized = false;
     last_cmd_pos_ = start_pt;
 
@@ -3237,7 +3301,8 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                                             const Eigen::VectorXd& old_time, int old_i0,
                                             const Eigen::MatrixXd& new_traj, const Eigen::MatrixXd& new_vel,
                                             const Eigen::VectorXd& new_time, int new_i0,
-                                            const Eigen::Vector3d& goal_pt, std::string& reason_out)
+                                            const Eigen::Vector3d& goal_pt, std::string& reason_out,
+                                            double accepted_progress_w, double accepted_path_w_end)
     {
         bool accept_new = true;
         std::string switch_reason = "accept_default";
@@ -3259,10 +3324,16 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         //检查旧轨迹是否发生碰撞，或者旧轨迹快结束
         const bool old_collision = checkCollision();
         const bool old_near_end = ((old_traj.rows() - 1 - old_i0) <= (old_traj.rows() - 1) / 2);
+        const bool old_governor_path_short = shouldForceAcceptForGovernorPathShort(
+            accepted_progress_w, accepted_path_w_end, cmd_governor_l_max_, switch_governor_path_margin_w_);
         if (old_collision || old_near_end)
         {
             logReplanReason(old_collision ? "collision" : "near_end");
             switch_reason = "accept_collision&timout";
+            accept_new = true;
+        } else if (old_governor_path_short) {
+            logReplanReason("governor_path_short");
+            switch_reason = "accept_governor_path_short";
             accept_new = true;
         } else {
             //旧轨迹仍然安全，检查新旧轨迹代价
@@ -3693,8 +3764,10 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 pm.last_traj_time_ = cand_time;
                 current_traj_index_ = new_i0;
                 last_switch_time_ = current_time;
-                vel_fb_switch_until_ = ros::Time::now() + ros::Duration(cmd_vel_fb_switch_time_);
                 cmd_switch_motion_limit_until_ = ros::Time::now() + ros::Duration(std::max(0.0, cmd_switch_motion_limit_time_));
+                cmd_governor_normal_state_.setZero();
+                cmd_governor_initialized_ = false;
+                cmd_governor_last_l_ = 0.0;
                 publishPathMsg(pm.last_traj, pm.last_vel);
             } else {
                 ROS_WARN_THROTTLE(1.0, "[GVF] GEN_NEW_TRAJ: plan failed, keep old");
@@ -3731,10 +3804,7 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 }
             }
 
-            if((pm.start_pt - current_pos).norm() < start_pt_change_threshold_){
-                return;
-            }
-            else if(checkCollision()){
+            if(checkCollision()){
                 logReplanReason("collision");
                 changeFSMExecState(REPLAN_TRAJ, "collision detection");
             }
@@ -3822,8 +3892,13 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 std::string reason = "accept_default";
 
                 if (old_traj.rows() > 0 && old_vel.rows() == old_traj.rows()) {
+                    double accepted_path_w_end = std::numeric_limits<double>::quiet_NaN();
+                    if (pm.gvf_ && pm.gvf_->reparam_ready_ && !pm.gvf_->sample_w_.empty()) {
+                        accepted_path_w_end = pm.gvf_->sample_w_.back();
+                    }
                     accept_new = shouldAcceptCandidate(old_traj, old_vel, pm.last_traj_time_, current_traj_index_, cand_traj, cand_vel,
-                                                       cand_time, new_i0, pm.goal_pt, reason);
+                                                       cand_time, new_i0, pm.goal_pt, reason,
+                                                       progress_w_, accepted_path_w_end);
                 }
                 Eigen::Vector3d v_ref_start = Eigen::Vector3d::Zero();
                 if (cand_vel.rows() > 0) {
@@ -3861,11 +3936,13 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                     pm.last_traj_time_ = cand_time;
                     current_traj_index_ = new_i0;
                     last_switch_time_ = current_time;
-                    vel_fb_switch_until_ = ros::Time::now() + ros::Duration(cmd_vel_fb_switch_time_);
                     cmd_switch_motion_limit_until_ = ros::Time::now() + ros::Duration(std::max(0.0, cmd_switch_motion_limit_time_));
                     if (pm.gvf_) {
                         pm.gvf_->setNextPathWAnchor(w_anchor);
                     }
+                    cmd_governor_normal_state_.setZero();
+                    cmd_governor_initialized_ = false;
+                    cmd_governor_last_l_ = 0.0;
                 } else {
                     const auto anchor = computeKeepPathAnchor();
                     const double w_anchor = anchor.first;
