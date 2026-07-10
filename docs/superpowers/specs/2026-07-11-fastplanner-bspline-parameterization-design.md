@@ -29,6 +29,7 @@ Fast-Planner instead solves one least-squares system containing the sampled posi
 - Apply one Fast-Planner-style parameterization pipeline to both point-to-point and closed-reference calls to `astaropt()`.
 - Read the initial Kino sampling interval from `gvf/kino_sample_ts` and clamp it by `gvf/kino_sample_ts_min`.
 - Preserve the actual interval returned by `KinodynamicAstar::getSamples()`.
+- Parameterize the complete Kino sample set; do not truncate it before constructing the spline.
 - Generate `K+2` cubic B-spline control points by solving the Fast-Planner position/PVA parameterization system.
 - Initialize the existing optimizer directly from those parameterized control points and the actual interval.
 - Keep the first and last three control points fixed during the existing normal optimization, preserving the parameterized boundary state.
@@ -156,6 +157,8 @@ point_set + actual ts + four boundary derivatives
 
 Point-to-point and closed-reference branches merge before this pipeline, so both modes receive the same parameterization.
 
+The legacy `num_points_to_take_` cap is not applied inside the new Fast-Planner-style path because truncating positions while retaining derivatives from the untruncated Kino trajectory creates inconsistent terminal constraints. The parameter remains available to legacy code paths.
+
 ### `KinodynamicAstar::getSamples`
 
 For a path without a successful shot trajectory, use the terminal search node's velocity:
@@ -172,6 +175,7 @@ The current code walks a local pointer back to the root while accumulating durat
 - `getSamples()` may change `samples.ts` so the total Kino duration is divided into an integer number of segments.
 - The returned interval is passed unchanged into parameterization and optimizer initialization.
 - For `K` Kino samples, the parameterized cubic spline has `K+2` control points and nominal duration `(K-1) * ts`.
+- `K` refers to the complete sample set returned by Kino A*.
 - If uniform feasibility scaling is required, the final interval and duration increase by the same factor while the spatial curve remains unchanged.
 - `planning/dist_p` will no longer define the active `astaropt()` B-spline interval. It remains available for legacy APIs and unrelated code paths.
 
@@ -209,6 +213,7 @@ Simulation verification will use the existing `test_gvf.launch` and compare `/pa
 ## Success Criteria
 
 - Both point-to-point and closed-reference `astaropt()` calls use the same Fast-Planner-style parameterization.
+- The complete Kino sample set is parameterized without position-only truncation.
 - `K` Kino samples yield `K+2` control points.
 - The actual Kino sampling interval is used through parameterization and optimization.
 - Optimized spline geometry is preserved when timing is enlarged for feasibility.
