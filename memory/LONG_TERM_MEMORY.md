@@ -58,7 +58,7 @@
 - `gvf_manager.cpp -> getCircleReferenceGoal()`
   - 更新 `closed_ref_w_`，根据当前位置、切向误差和局部投影维护闭合曲线相位
 - `gvf_manager.cpp -> selectClosedGoalCandidate()`
-  - 基于 `lookahead_min_w / max_w / step_w` 构建候选目标，并用 KinoA* 选择可达闭合目标
+  - 基于 `lookahead_min_w / max_w / step_w` 构建候选目标；正常时围绕期望前瞻评分选择，参考线前方有障碍物时可将期望目标推到障碍物后方，再用 KinoA* 选择最低分的完整可达目标
 - `gvf_manager.cpp -> buildClosedLookaheadCandidates()`
   - 构建闭合曲线弧长前视候选，不再使用旧 `lookahead_pts`
 - `gvf_manager.cpp -> checkCollision()`
@@ -80,6 +80,7 @@
 
 ## Long-Term Truths
 - 闭合轨迹的核心不是“按时间播点”，而是先把闭合点列参数化成弧长 `w`，再用 `closed_ref_w_` 维护闭合曲线相位，并按弧长前视候选选目标。
+- 闭合目标候选不能使用“最远完整成功即接受”：当前规则是延续已接受前瞻或使用 `goal_prefer_lookahead_w`，必要时跨过参考线上的障碍物，再综合前瞻偏差和 Kino 终点误差选最低分候选。这样避免目标过近停在障碍物前，也避免无条件选择远点造成闭合轨迹走捷径。
 - `closed_ref_w_` 是连续相位，允许超过一圈；访问闭合曲线点时再通过 `wrapClosedW()` 回绕到当前圈。
 - `w` 连续性来自：
   - 旧轨迹锚点提取

@@ -204,6 +204,12 @@ class gvf_manager
         double ref_project_snap_max_ = 0.5;
         double ref_project_boundary_eps_ = 0.03;
         double closed_goal_full_success_tol_ = 0.3;
+        double closed_goal_prefer_lookahead_w_ = 2.0;
+        double closed_goal_lookahead_weight_ = 5.0;
+        double closed_goal_end_dist_weight_ = 20.0;
+        bool closed_goal_push_past_obstacle_ = false;
+        double closed_goal_obstacle_check_step_w_ = 0.1;
+        double closed_goal_obstacle_pass_margin_w_ = 0.8;
         ros::Time closed_ref_last_update_time_;
         double closed_ref_dbg_e_parallel_ = 0.0;
         double closed_ref_dbg_rho_ = 0.0;
@@ -472,6 +478,38 @@ class gvf_manager
             const double remaining_w = path_w_end - progress_w;
             const double required_w = std::max(0.0, governor_l_max) + std::max(0.0, margin_w);
             return remaining_w <= required_w;
+        }
+        static double closedGoalCandidateScore(double lookahead,
+                                               double desired_lookahead,
+                                               double end_to_goal_dist,
+                                               double lookahead_weight,
+                                               double end_dist_weight)
+        {
+            if (!std::isfinite(lookahead) ||
+                !std::isfinite(desired_lookahead) ||
+                !std::isfinite(end_to_goal_dist)) {
+                return std::numeric_limits<double>::infinity();
+            }
+            return std::max(0.0, lookahead_weight) * std::abs(lookahead - desired_lookahead) +
+                   std::max(0.0, end_dist_weight) * std::max(0.0, end_to_goal_dist);
+        }
+        static double closedGoalObstaclePushedLookahead(double desired_lookahead,
+                                                        double obstacle_delta_w,
+                                                        double min_lookahead,
+                                                        double max_lookahead,
+                                                        double pass_margin_w)
+        {
+            const double lo = std::max(0.0, std::min(min_lookahead, max_lookahead));
+            const double hi = std::max(lo, std::max(min_lookahead, max_lookahead));
+            double desired = std::isfinite(desired_lookahead) ? desired_lookahead : lo;
+            desired = std::max(lo, std::min(desired, hi));
+
+            if (!std::isfinite(obstacle_delta_w)) {
+                return desired;
+            }
+
+            const double pushed = std::max(desired, obstacle_delta_w + std::max(0.0, pass_margin_w));
+            return std::max(lo, std::min(pushed, hi));
         }
         void publishPathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel);
         void publishReferencePathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, ros::Publisher& pub);

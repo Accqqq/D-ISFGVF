@@ -37,7 +37,21 @@
   3. `closed_ref_w_` 是连续相位，可以超过一圈；访问点时用 `wrapClosedW()` 回绕到 `[0, total_w)`。
   4. `pointFromClosedW()` 在线段上插值，`tangentFromClosedW()` 给相位推进和日志用。
   5. `getCircleReferenceGoal()` 每次根据真实 odom 更新 `closed_ref_w_`，再取 `closed_ref_w_ + lookahead_w` 作为 nominal 目标。
-  6. `selectClosedGoalCandidate()` 会对多个 `lookahead_w` 试 KinoA*，优先选完整到达的候选，失败时可用 end distance 最小的 partial 备选。
+  6. `selectClosedGoalCandidate()` 会对多个 `lookahead_w` 试 KinoA*，围绕期望前瞻距离对完整成功候选评分，失败时可用 end distance 最小的 partial 备选。
+
+### Closed Goal Candidate Scoring Update (`2026-07-10`)
+- `selectClosedGoalCandidate()` 已不再使用旧的 `track_far_first` 策略，也不再找到第一个完整成功候选后立即 `break`。
+- 当前闭合轨迹目标选择流程：
+  1. 用 `goal_prefer_lookahead_w` 给出正常情况下的期望前瞻距离；已有已接受目标时优先延续上次 `closed_ref_accepted_lookahead_w_`，减少重规划目标跳变。
+  2. 将期望前瞻限制在 `lookahead_min_w ~ lookahead_max_w` 候选范围内。
+  3. `goal_push_past_obstacle=true` 时，沿闭合参考线向前查询 `SDFMap::getInflateOccupancy()`；若遇到障碍物，将期望前瞻推进到 `obstacle_delta_w + goal_obstacle_pass_margin_w`，但不超过 `lookahead_max_w`。
+  4. 候选点按与 `desired_lookahead` 的距离从近到远排序，所有候选都执行 KinoA* 尝试。
+  5. 对所有完整成功候选计算：`score = goal_lookahead_weight * abs(lookahead - desired_lookahead) + goal_end_dist_weight * end_to_goal_dist`，选择最低分，而不是最远候选。
+  6. 若没有完整成功候选，仍保留 Kino 终点距离目标最近的 partial fallback。
+- 新增有效参数：`goal_prefer_lookahead_w / goal_lookahead_weight / goal_end_dist_weight / goal_push_past_obstacle / goal_obstacle_check_step_w / goal_obstacle_pass_margin_w`。
+- 当前仿真值：`lookahead_min/max/step = 0.5/3.0/0.25`，`goal_prefer_lookahead_w=1.0`，score 权重为 `5.0/20.0`，障碍物后推开启，检测步长 `0.1 m`，越障碍裕量 `0.8 m`。
+- `[GVF][CLOSED_GOAL]` 日志新增 `desired_lookahead / obstacle_delta_w / desired_pushed / selected_score`。
+- 该修改只影响闭合轨迹 `selectClosedGoalCandidate()`，不影响普通点到点导航，也不改变 KinoA*、B-spline 或 lifted GVF 核心算法。
 - 当前有效闭合曲线参数：
   - `gvf/circle_test/enable`
   - `gvf/circle_test/auto_start`

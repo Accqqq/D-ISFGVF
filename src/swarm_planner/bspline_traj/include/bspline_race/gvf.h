@@ -126,6 +126,8 @@ class gvf
         double progress_rho0_ = 0.2;     // alpha(rho)
         double progress_delta_ = 0.2;    // sigma(e_parallel)
         double alpha_min_ = 0.05;        // 保证alpha始终>0，避免切向项退化
+        double visualization_progress_w_ = 0.0;
+        bool visualization_progress_initialized_ = false;
 
         struct LiftedGuidanceResult {
           Eigen::Vector3d v_cmd = Eigen::Vector3d::Zero();   // 前3维物理速度
@@ -177,6 +179,9 @@ class gvf
 
         LiftedGuidanceResult calcLiftedGuidance3D(const Eigen::Vector3d& pos,
                                                   double w_prev) const;
+        void setVisualizationProgressW(double w);
+        bool calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
+                                           Eigen::Vector3d& vec) const;
         
         inline void posToIndex(const Eigen::Vector3d& pos, Eigen::Vector3i& id);
         inline void indexToPos(const Eigen::Vector3i& id, Eigen::Vector3d& pos);

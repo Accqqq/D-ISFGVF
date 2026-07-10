@@ -655,6 +655,11 @@ void gvf::publishGVF()
     delete_marker.action = visualization_msgs::Marker::DELETEALL;
     marker_array.markers.push_back(delete_marker);
 
+    if (!reparam_ready_ || sample_w_.size() < 2) {
+        vector_field_pub_.publish(marker_array);
+        return;
+    }
+
     // 计算采样点的范围
     Eigen::Vector3d min_pos = gvf_.camera_pos_ - gvf_.local_update_range_ * 0.8;
     Eigen::Vector3d max_pos = gvf_.camera_pos_ + gvf_.local_update_range_ * 0.8;
@@ -668,14 +673,10 @@ void gvf::publishGVF()
             // 使用当前高度作为采样点的高度
             Eigen::Vector3d sample_pos(x, y, gvf_.camera_pos_(2));
             
-            // 计算该点的引导向量
-            Eigen::Vector3d guiding_vec = calcGuidingVectorField3D(sample_pos);
-            
-            // 检查是否在边界上且向量值过大
-            bool is_boundary = (std::abs(x - min_pos(0)) < sample_resolution || 
-                              std::abs(x - max_pos(0)) < sample_resolution ||
-                              std::abs(y - min_pos(1)) < sample_resolution || 
-                              std::abs(y - max_pos(1)) < sample_resolution);
+            Eigen::Vector3d guiding_vec;
+            if (!calcLiftedVisualizationVector(sample_pos, guiding_vec)) {
+                continue;
+            }
             
             if ( guiding_vec.norm() > 50.0) {  
                 guiding_vec = Eigen::Vector3d::Zero();
@@ -1042,6 +1043,8 @@ void gvf::clearPathReparamState()
     reparam_ready_ = false;
     next_path_w_anchor_ = 0.0;
     has_next_path_w_anchor_ = false;
+    visualization_progress_w_ = 0.0;
+    visualization_progress_initialized_ = false;
 }
 
 void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
@@ -1078,6 +1081,12 @@ void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
         sample_w_[i] = sample_w_[i - 1] + ds;
     }
     total_w_ = sample_w_.back();
+    if (!visualization_progress_initialized_ ||
+        visualization_progress_w_ < sample_w_.front() - progress_window_ ||
+        visualization_progress_w_ > sample_w_.back() + progress_window_) {
+        visualization_progress_w_ = sample_w_.front();
+        visualization_progress_initialized_ = true;
+    }
 
     // 3) 用真实 w 间隔做标准差分，得到 dp/dw
     for (size_t i = 0; i < N; ++i) {
@@ -1236,6 +1245,32 @@ gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
     out.tangent = t;
     out.valid = true;
     return out;
+}
+
+void gvf::setVisualizationProgressW(double w)
+{
+    visualization_progress_w_ = w;
+    visualization_progress_initialized_ = true;
+}
+
+bool gvf::calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
+                                        Eigen::Vector3d& vec) const
+{
+    vec.setZero();
+    if (!reparam_ready_ || sample_w_.size() < 2) return false;
+
+    double w_prev = visualization_progress_initialized_ ?
+        visualization_progress_w_ : sample_w_.front();
+    if (w_prev < sample_w_.front() - progress_window_ ||
+        w_prev > sample_w_.back() + progress_window_) {
+        w_prev = sample_w_.front();
+    }
+
+    const auto out = calcLiftedGuidance3D(pos, w_prev);
+    if (!out.valid) return false;
+
+    vec = out.v_cmd;
+    return true;
 }
 
 }

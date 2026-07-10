@@ -59,4 +59,12 @@ bspline_gvf
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(reference_join_test test/reference_join_test.cpp)
   catkin_add_gtest(gvf_switch_policy_test test/gvf_switch_policy_test.cpp)
+  catkin_add_gtest(gvf_lifted_visualization_test test/gvf_lifted_visualization_test.cpp)
+  if(TARGET gvf_lifted_visualization_test)
+    target_link_libraries(gvf_lifted_visualization_test
+      bspline_gvf
+      ${catkin_LIBRARIES}
+      ${NLOPT_LIBRARIES}
+    )
+  endif()
 endif()

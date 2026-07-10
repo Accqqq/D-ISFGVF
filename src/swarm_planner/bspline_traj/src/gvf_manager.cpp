@@ -50,6 +50,12 @@ namespace FLAG_Race
         nh.param("gvf/circle_test/ref_project_snap_max", ref_project_snap_max_, 0.5);
         nh.param("gvf/circle_test/ref_project_boundary_eps", ref_project_boundary_eps_, 0.03);
         nh.param("gvf/circle_test/goal_full_success_tol", closed_goal_full_success_tol_, 0.3);
+        nh.param("gvf/circle_test/goal_prefer_lookahead_w", closed_goal_prefer_lookahead_w_, 2.0);
+        nh.param("gvf/circle_test/goal_lookahead_weight", closed_goal_lookahead_weight_, 5.0);
+        nh.param("gvf/circle_test/goal_end_dist_weight", closed_goal_end_dist_weight_, 20.0);
+        nh.param("gvf/circle_test/goal_push_past_obstacle", closed_goal_push_past_obstacle_, false);
+        nh.param("gvf/circle_test/goal_obstacle_check_step_w", closed_goal_obstacle_check_step_w_, 0.1);
+        nh.param("gvf/circle_test/goal_obstacle_pass_margin_w", closed_goal_obstacle_pass_margin_w_, 0.8);
 
         nh.param("gvf/circle_test/center_x", circle_reference_center_x_, 0.0);
         nh.param("gvf/circle_test/center_y", circle_reference_center_y_, 0.0);
@@ -811,6 +817,7 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         {
             progress_w_ = out.w_proj + out.w_dot * dt;
             progress_initialized_ = true;
+            pm.gvf_->setVisualizationProgressW(progress_w_);
             result = runVelocityMatchingGovernor(pm, out, pos, progress_w_, dt, kp_equiv, dbg);
         }
     }
@@ -1542,6 +1549,9 @@ void gvf_manager::ensureProgressInCurrentPathRange(double start_w, double end_w)
     const double old_progress = progress_w_;
     progress_w_ = start_w;
     progress_initialized_ = true;
+    if (!swarmParticlesManager.empty() && swarmParticlesManager[0].gvf_) {
+        swarmParticlesManager[0].gvf_->setVisualizationProgressW(progress_w_);
+    }
     ROS_WARN("[GVF][PROGRESS_RESET] old_progress=%.3f new_progress=%.3f start_w=%.3f end_w=%.3f window=%.3f reason=out_of_new_path_range",
              old_progress, progress_w_, start_w, end_w, window);
 }
@@ -3423,29 +3433,64 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 
     const bool goal_recover_mode = closed_ref_enable_recover_ && closed_ref_recover_;
     const std::string mode_for_goal = goal_recover_mode ? "RECOVER" : "TRACK";
-    std::string candidate_order_reason = "track_far_first";
+    double desired_lookahead = closed_goal_prefer_lookahead_w_;
+    if (closed_ref_has_accepted_goal_) {
+        desired_lookahead = closed_ref_accepted_lookahead_w_;
+    }
+    if (!candidates.empty()) {
+        desired_lookahead = std::max(candidates.front(), std::min(desired_lookahead, candidates.back()));
+    }
+    const double desired_before_obstacle_push = desired_lookahead;
+    double first_obstacle_delta_w = std::numeric_limits<double>::infinity();
+
+    if (closed_goal_push_past_obstacle_ && pm.sdf_map_ && !candidates.empty()) {
+        const double check_step = std::max(1e-3, closed_goal_obstacle_check_step_w_);
+        const double max_check_w = candidates.back();
+        for (double delta_w = check_step; delta_w <= max_check_w + 1e-9; delta_w += check_step) {
+            const Eigen::Vector3d ref_pt = pointFromClosedW(closed_ref_w_ + delta_w);
+            if (!pm.sdf_map_->isInMap(ref_pt)) {
+                continue;
+            }
+            if (pm.sdf_map_->getInflateOccupancy(ref_pt) != 0) {
+                first_obstacle_delta_w = delta_w;
+                break;
+            }
+        }
+
+        desired_lookahead = closedGoalObstaclePushedLookahead(
+            desired_lookahead, first_obstacle_delta_w,
+            candidates.front(), candidates.back(),
+            closed_goal_obstacle_pass_margin_w_);
+    }
+    const bool desired_pushed_by_obstacle =
+        std::isfinite(first_obstacle_delta_w) &&
+        std::abs(desired_lookahead - desired_before_obstacle_push) > 1e-6;
+
+    std::string candidate_order_reason = "score_near_desired_all";
     std::vector<int> order;
     if (goal_recover_mode) {
-        candidate_order_reason = "recover_mid_first";
+        candidate_order_reason = "recover_score_all";
     } else if (local_d_for_goal >= 1.2) {
-        candidate_order_reason = "track_local_error_large_mid_first";
+        candidate_order_reason = "track_local_error_large_score_all";
     } else if (tangent_dot_odom_for_goal <= 0.3) {
-        candidate_order_reason = "track_direction_bad_mid_first";
+        candidate_order_reason = "track_direction_bad_score_all";
+    }
+    if (desired_pushed_by_obstacle) {
+        candidate_order_reason += "_push_obstacle";
     }
 
-    if (candidate_order_reason == "track_far_first") {
-        for (int i = candidate_count - 1; i >= 0; --i) {
-            order.push_back(i);
-        }
-    } else {
-        const int mid_idx = selectDefaultClosedLookaheadIndex(candidates);
-        for (int i = mid_idx; i >= 0; --i) {
-            order.push_back(i);
-        }
-        for (int i = mid_idx + 1; i < candidate_count; ++i) {
-            order.push_back(i);
-        }
+    order.reserve(candidate_count);
+    for (int i = 0; i < candidate_count; ++i) {
+        order.push_back(i);
     }
+    std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+        const double lhs_diff = std::abs(candidates[lhs] - desired_lookahead);
+        const double rhs_diff = std::abs(candidates[rhs] - desired_lookahead);
+        if (std::abs(lhs_diff - rhs_diff) > 1e-6) {
+            return lhs_diff < rhs_diff;
+        }
+        return candidates[lhs] < candidates[rhs];
+    });
 
     std::ostringstream candidate_order_ss;
     candidate_order_ss << std::fixed << std::setprecision(3);
@@ -3457,10 +3502,13 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     if (order.empty()) {
         const Eigen::Vector3d failed_goal_pos = pointFromClosedW(closed_ref_w_);
         const double failed_goal_dist_xy = (failed_goal_pos.head<2>() - curr_pos.head<2>()).norm();
-        ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=0 selected_idx=-1 planner_success=0 reason=no_candidates mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"\" full_success_tol=%.3f accepted_full_goal=0 accepted_partial_goal=0 selected_end_to_goal_dist=-1.000 tried_lookaheads=\"\" tried_end_to_goal_dists=\"\"",
+        ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f desired_lookahead=%.3f obstacle_delta_w=%.3f desired_pushed=%d selected_score=-1.000 closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=0 selected_idx=-1 planner_success=0 reason=no_candidates mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"\" full_success_tol=%.3f accepted_full_goal=0 accepted_partial_goal=0 selected_end_to_goal_dist=-1.000 tried_lookaheads=\"\" tried_end_to_goal_dists=\"\"",
                  curr_pos.x(), curr_pos.y(), curr_pos.z(),
                  failed_goal_pos.x(), failed_goal_pos.y(), failed_goal_pos.z(),
-                 failed_goal_dist_xy, 0.0, 0.0, closed_ref_w_, closed_ref_w_,
+                 failed_goal_dist_xy, 0.0, 0.0, desired_lookahead,
+                 std::isfinite(first_obstacle_delta_w) ? first_obstacle_delta_w : -1.0,
+                 desired_pushed_by_obstacle ? 1 : 0,
+                 closed_ref_w_, closed_ref_w_,
                  mode_for_goal.c_str(), candidate_order_reason.c_str(),
                  local_d_for_goal, tangent_dot_odom_for_goal,
                  closed_goal_full_success_tol_);
@@ -3476,6 +3524,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     bool accepted_full_goal = false;
     bool accepted_partial_goal = false;
     std::string selected_reason = "all_failed";
+    double selected_full_score = std::numeric_limits<double>::infinity();
 
     bool has_partial_backup = false;
     int partial_idx = -1;
@@ -3514,6 +3563,13 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
         tried_end_dists_ss << end_to_goal_dist;
 
         if (sample_valid && end_to_goal_dist < closed_goal_full_success_tol_) {
+            const double candidate_score = closedGoalCandidateScore(
+                lookahead, desired_lookahead, end_to_goal_dist,
+                closed_goal_lookahead_weight_, closed_goal_end_dist_weight_);
+            if (accepted_full_goal && candidate_score >= selected_full_score) {
+                continue;
+            }
+
             planner_success = true;
             selected_idx = idx;
             selected_lookahead = lookahead;
@@ -3523,8 +3579,9 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
             samples = candidate_samples;
             selected_end_to_goal_dist = end_to_goal_dist;
             accepted_full_goal = true;
-            selected_reason = "farthest_full_success";
-            break;
+            selected_full_score = candidate_score;
+            selected_reason = "score_full_success";
+            continue;
         }
 
         if (sample_valid && end_to_goal_dist < partial_end_to_goal_dist) {
@@ -3553,10 +3610,18 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 
     const Eigen::Vector3d selected_goal_pos = pointFromClosedW(selected_goal_w);
     const double goal_dist_xy = (selected_goal_pos.head<2>() - curr_pos.head<2>()).norm();
-    ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=%d selected_idx=%d planner_success=%d reason=%s mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"%s\" full_success_tol=%.3f accepted_full_goal=%d accepted_partial_goal=%d selected_end_to_goal_dist=%.3f tried_lookaheads=\"%s\" tried_end_to_goal_dists=\"%s\"",
+    const double selected_score = planner_success ?
+        closedGoalCandidateScore(selected_lookahead, desired_lookahead, selected_end_to_goal_dist,
+                                 closed_goal_lookahead_weight_, closed_goal_end_dist_weight_) :
+        -1.0;
+    ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f desired_lookahead=%.3f obstacle_delta_w=%.3f desired_pushed=%d selected_score=%.3f closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=%d selected_idx=%d planner_success=%d reason=%s mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"%s\" full_success_tol=%.3f accepted_full_goal=%d accepted_partial_goal=%d selected_end_to_goal_dist=%.3f tried_lookaheads=\"%s\" tried_end_to_goal_dists=\"%s\"",
              curr_pos.x(), curr_pos.y(), curr_pos.z(),
              selected_goal_pos.x(), selected_goal_pos.y(), selected_goal_pos.z(),
              goal_dist_xy, selected_lookahead, selected_goal_w - closed_ref_w_,
+             desired_lookahead,
+             std::isfinite(first_obstacle_delta_w) ? first_obstacle_delta_w : -1.0,
+             desired_pushed_by_obstacle ? 1 : 0,
+             selected_score,
              closed_ref_w_, selected_goal_w, candidate_count,
              selected_idx, planner_success ? 1 : 0, selected_reason.c_str(),
              mode_for_goal.c_str(), candidate_order_reason.c_str(),
@@ -3659,17 +3724,17 @@ bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos
     initial_state.row(1) = start_end_derivatives[0].transpose();  // v0
     initial_state.row(2) = start_end_derivatives[2].transpose();  // a0
 
-    // terminal_state.row(0) = end_pt_kino.transpose();
-    // if (start_end_derivatives.size() >= 4) {
-    //     terminal_state.row(1) = start_end_derivatives[1].transpose();  // vT
-    //     terminal_state.row(2) = start_end_derivatives[3].transpose();  // aT
-    // } else {
-    //     terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT fallback
-    //     terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT fallback
-    // }
     terminal_state.row(0) = end_pt_kino.transpose();
-    terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT
-    terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT
+    if (start_end_derivatives.size() >= 4) {
+        terminal_state.row(1) = start_end_derivatives[1].transpose();  // vT
+        terminal_state.row(2) = start_end_derivatives[3].transpose();  // aT
+    } else {
+        terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT fallback
+        terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT fallback
+    }
+    // terminal_state.row(0) = end_pt_kino.transpose();
+    // terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT
+    // terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT
 
 
     // B样条优化

@@ -13,8 +13,10 @@
     <arg name="local_update_range_y" value="6.0"/>
     <arg name="local_update_range_z" value="2.5"/>
     
-    <arg name="v_max" value="2.0"/>     
-    <arg name="a_max" value="2.5"/>     
+    <arg name="v_max" value="2.0"/>
+    <arg name="a_max" value="2.5"/>
+    <!-- <arg name="v_max" value="0.8"/>
+    <arg name="a_max" value="1.2"/>    -->
     
   <node name="formation_planning" pkg="bspline_race" type="formation_planning" output="screen">
         <!-- Plan Manager -->
@@ -52,9 +54,15 @@
         <param name="gvf/circle_test/figure8_radius" value="10.0" />
         <param name="gvf/circle_test/height" value="1.0" />
         <param name="gvf/circle_test/points" value="960" />
-        <param name="gvf/circle_test/lookahead_min_w" value="2.0" />
-        <param name="gvf/circle_test/lookahead_max_w" value="4.5" />
-        <param name="gvf/circle_test/lookahead_step_w" value="0.5" />
+        <param name="gvf/circle_test/lookahead_min_w" value="0.5" />
+        <param name="gvf/circle_test/lookahead_max_w" value="3.0" />
+        <param name="gvf/circle_test/lookahead_step_w" value="0.25" />
+        <param name="gvf/circle_test/goal_prefer_lookahead_w" value="1.0" />
+        <param name="gvf/circle_test/goal_lookahead_weight" value="5.0" />
+        <param name="gvf/circle_test/goal_end_dist_weight" value="20.0" />
+        <param name="gvf/circle_test/goal_push_past_obstacle" value="true" />
+        <param name="gvf/circle_test/goal_obstacle_check_step_w" value="0.1" />
+        <param name="gvf/circle_test/goal_obstacle_pass_margin_w" value="0.8" />
         <param name="gvf/circle_test/center_x" value="0.0" />
         <param name="gvf/circle_test/center_y" value="0.0" />
         <param name="gvf/circle_test/center_z" value="0.0" />
@@ -66,11 +74,11 @@
         <param name="gvf/kino_max_guide_pts" value="60" />
 
         <!-- 该参数决定前向跟踪速度 -->
-        <!-- <param name="gvf/gvf_gain1"       value="2.5"/> -->
-        <param name="gvf/gvf_gain1"       value="1.5"/>
+        <param name="gvf/gvf_gain1"       value="2.0"/>
+        <!-- <param name="gvf/gvf_gain1"       value="0.8"/> -->
         <!-- 该参数决定后退/回拉速度 -->
-        <!-- <param name="gvf/gvf_gain2"       value="-2.0"/> -->
         <param name="gvf/gvf_gain2"       value="-2.2"/>
+        <!-- <param name="gvf/gvf_gain2"       value="-1.2"/> -->
         <param name="gvf/gvf_k3"          value="1.0"/>
         <param name="gvf/gvf_k4"          value="1.0"/>
         <param name="gvf/gvf_inflation"  value="0.099" /> 
