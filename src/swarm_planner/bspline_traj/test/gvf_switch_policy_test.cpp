@@ -92,6 +92,26 @@ TEST(GvfClosedGoalBypassPolicy, DisabledModeDoesNotOverrideNormalSelection)
       lhs, rhs, false));
 }
 
+TEST(GvfClosedGoalBypassPolicy, FindsObstacleEndAfterThreeFreeSamples)
+{
+  const std::vector<int> occupancy{0, 1, 1, 0, 0, 0, 0};
+  const auto interval = FLAG_Race::gvf_manager::detectClosedGoalObstacleInterval(
+      occupancy, 0.1, 3);
+  ASSERT_TRUE(interval.found_start);
+  ASSERT_TRUE(interval.found_end);
+  EXPECT_NEAR(0.2, interval.start_delta_w, 1e-6);
+  EXPECT_NEAR(0.4, interval.end_delta_w, 1e-6);
+}
+
+TEST(GvfClosedGoalBypassPolicy, OutsideMapDoesNotProveObstacleExit)
+{
+  const std::vector<int> occupancy{1, 0, -1, 0, -1};
+  const auto interval = FLAG_Race::gvf_manager::detectClosedGoalObstacleInterval(
+      occupancy, 0.1, 3);
+  EXPECT_TRUE(interval.found_start);
+  EXPECT_FALSE(interval.found_end);
+}
+
 TEST(GvfPointGoalPolicy, ContinuesReplanningInsideLegacyReachRadius)
 {
   EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(

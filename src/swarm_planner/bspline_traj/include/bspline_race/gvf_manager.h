@@ -501,6 +501,56 @@ class gvf_manager
             double lookahead = 0.0;
         };
 
+        struct ClosedGoalObstacleInterval
+        {
+            bool found_start = false;
+            bool found_end = false;
+            double start_delta_w = std::numeric_limits<double>::infinity();
+            double end_delta_w = std::numeric_limits<double>::infinity();
+        };
+
+        static ClosedGoalObstacleInterval detectClosedGoalObstacleInterval(
+            const std::vector<int>& occupancy,
+            double step_w,
+            int required_free_samples = 3)
+        {
+            ClosedGoalObstacleInterval result;
+            if (!std::isfinite(step_w) || step_w <= 0.0 || required_free_samples <= 0) {
+                return result;
+            }
+
+            int free_count = 0;
+            double free_run_start = std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < occupancy.size(); ++i) {
+                const double delta_w = (static_cast<double>(i) + 1.0) * step_w;
+                if (occupancy[i] < 0) {
+                    continue;
+                }
+                if (!result.found_start) {
+                    if (occupancy[i] != 0) {
+                        result.found_start = true;
+                        result.start_delta_w = delta_w;
+                    }
+                    continue;
+                }
+                if (occupancy[i] != 0) {
+                    free_count = 0;
+                    free_run_start = std::numeric_limits<double>::infinity();
+                    continue;
+                }
+                if (free_count == 0) {
+                    free_run_start = delta_w;
+                }
+                ++free_count;
+                if (free_count >= required_free_samples) {
+                    result.found_end = true;
+                    result.end_delta_w = free_run_start;
+                    break;
+                }
+            }
+            return result;
+        }
+
         static bool preferClosedGoalBypassCandidate(
             const ClosedGoalCandidateProgress& lhs,
             const ClosedGoalCandidateProgress& rhs,
