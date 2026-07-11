@@ -4,6 +4,20 @@
 
 #include <bspline_race/gvf_manager.h>
 
+namespace {
+FLAG_Race::gvf_manager::ClosedGoalCandidateProgress candidate(
+    bool passed, double end_delta_w, double end_to_goal_dist, double lookahead)
+{
+  FLAG_Race::gvf_manager::ClosedGoalCandidateProgress value;
+  value.valid = true;
+  value.passed_obstacle = passed;
+  value.end_delta_w = end_delta_w;
+  value.end_to_goal_dist = end_to_goal_dist;
+  value.lookahead = lookahead;
+  return value;
+}
+}
+
 TEST(GvfSwitchPolicy, ForcesAcceptWhenAcceptedPathCannotSupportGovernorLookahead)
 {
   EXPECT_TRUE(FLAG_Race::gvf_manager::shouldForceAcceptForGovernorPathShort(
@@ -32,6 +46,50 @@ TEST(GvfClosedGoalPolicy, PushesDesiredLookaheadPastDetectedObstacle)
       1.5, 1.4, 1.2, 2.5, 0.8);
 
   EXPECT_NEAR(2.2, desired, 1e-6);
+}
+
+TEST(GvfClosedGoalBypassPolicy, PassedCandidateBeatsUnpassedCandidate)
+{
+  const auto passed = candidate(true, 1.2, 0.4, 1.5);
+  const auto unpassed = candidate(false, 1.1, 0.01, 1.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
+      passed, unpassed, true));
+}
+
+TEST(GvfClosedGoalBypassPolicy, ChoosesLeastOvershootWhenBothPassed)
+{
+  const auto just_passed = candidate(true, 1.2, 0.3, 1.5);
+  const auto far_passed = candidate(true, 2.4, 0.01, 3.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
+      just_passed, far_passed, true));
+}
+
+TEST(GvfClosedGoalBypassPolicy, ChoosesMostProgressWhenNeitherPassed)
+{
+  const auto farther = candidate(false, 0.9, 0.5, 1.5);
+  const auto nearer = candidate(false, 0.4, 0.01, 0.5);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
+      farther, nearer, true));
+}
+
+TEST(GvfClosedGoalBypassPolicy, UsesGoalErrorThenLookaheadAsTieBreakers)
+{
+  const auto lower_error = candidate(false, 0.9, 0.1, 1.5);
+  const auto higher_error = candidate(false, 0.9, 0.2, 1.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
+      lower_error, higher_error, true));
+
+  const auto shorter_target = candidate(false, 0.9, 0.1, 1.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
+      shorter_target, lower_error, true));
+}
+
+TEST(GvfClosedGoalBypassPolicy, DisabledModeDoesNotOverrideNormalSelection)
+{
+  const auto lhs = candidate(true, 1.2, 0.1, 1.5);
+  const auto rhs = candidate(false, 0.4, 0.1, 0.5);
+  EXPECT_FALSE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
+      lhs, rhs, false));
 }
 
 TEST(GvfPointGoalPolicy, ContinuesReplanningInsideLegacyReachRadius)

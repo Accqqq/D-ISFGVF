@@ -492,6 +492,43 @@ class gvf_manager
             }
             return dist_xy < final_tolerance;
         }
+        struct ClosedGoalCandidateProgress
+        {
+            bool valid = false;
+            bool passed_obstacle = false;
+            double end_delta_w = 0.0;
+            double end_to_goal_dist = std::numeric_limits<double>::infinity();
+            double lookahead = 0.0;
+        };
+
+        static bool preferClosedGoalBypassCandidate(
+            const ClosedGoalCandidateProgress& lhs,
+            const ClosedGoalCandidateProgress& rhs,
+            bool bypass_mode)
+        {
+            if (!bypass_mode) {
+                return false;
+            }
+            if (lhs.valid != rhs.valid) {
+                return lhs.valid;
+            }
+            if (!lhs.valid) {
+                return false;
+            }
+            if (lhs.passed_obstacle != rhs.passed_obstacle) {
+                return lhs.passed_obstacle;
+            }
+
+            constexpr double eps = 1e-6;
+            if (std::abs(lhs.end_delta_w - rhs.end_delta_w) > eps) {
+                return lhs.passed_obstacle ? lhs.end_delta_w < rhs.end_delta_w
+                                           : lhs.end_delta_w > rhs.end_delta_w;
+            }
+            if (std::abs(lhs.end_to_goal_dist - rhs.end_to_goal_dist) > eps) {
+                return lhs.end_to_goal_dist < rhs.end_to_goal_dist;
+            }
+            return lhs.lookahead < rhs.lookahead - eps;
+        }
         static double closedGoalCandidateScore(double lookahead,
                                                double desired_lookahead,
                                                double end_to_goal_dist,
