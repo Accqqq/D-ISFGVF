@@ -98,6 +98,8 @@ namespace FLAG_Race
             void setSmoothParam(const double lambda1,const double lambda2,
                                                             const double vel, const double acc);
             void setSplineParam(const UniformBspline &u);
+            bool setInitialControlPoints(const Eigen::MatrixXd& control_points,
+                                         double interval);
             void setEnvironment(const EDTEnvironment::Ptr& env);
             //从mapping读入
             void setEsdfMap(const Eigen::MatrixXd &esdf_map);

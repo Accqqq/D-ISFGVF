@@ -1,5 +1,7 @@
 #include <bspline_race/bspline_opt_3d.h>
 
+#include <cmath>
+
 namespace FLAG_Race
 
 {
@@ -104,6 +106,21 @@ namespace FLAG_Race
 
         }
         // std::cout << "control_points_: \n" << control_points_ << std::endl;
+    }
+
+    bool bspline_optimizer::setInitialControlPoints(
+        const Eigen::MatrixXd& control_points, double interval) {
+        if (control_points.cols() != Dim_ ||
+            control_points.rows() <= 2 * p_order_ ||
+            !control_points.allFinite() ||
+            !std::isfinite(interval) || interval <= 0.0) {
+            return false;
+        }
+        control_points_ = control_points;
+        cps_num_ = static_cast<int>(control_points.rows());
+        bspline_interval_ = interval;
+        beta_ = 1.0 / interval;
+        return true;
     }
 
     void bspline_optimizer::initialControlPoints(UniformBspline u)

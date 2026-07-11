@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <bspline_race/UniformBspline_3d.h>
+#include <bspline_race/bspline_opt_3d.h>
 
 #include <cmath>
 #include <vector>
@@ -112,6 +113,21 @@ TEST(FastPlannerParameterization, RejectsInvalidInputs) {
       0.0, one_point, four_derivatives, control_points));
   EXPECT_FALSE(FLAG_Race::UniformBspline::parameterizeToBspline(
       0.2, one_point, four_derivatives, control_points));
+}
+
+TEST(FastPlannerParameterization, OptimizerAcceptsParameterizedControlPoints) {
+  Eigen::MatrixXd control_points(11, 3);
+  for (int i = 0; i < control_points.rows(); ++i) {
+    control_points.row(i) << 0.1 * i, -0.05 * i, 1.0;
+  }
+
+  FLAG_Race::bspline_optimizer optimizer;
+  optimizer.setDimandOrder(3, 3);
+  ASSERT_TRUE(optimizer.setInitialControlPoints(control_points, 0.2));
+  EXPECT_EQ(optimizer.cps_num_, 11);
+  EXPECT_NEAR(optimizer.bspline_interval_, 0.2, 1e-12);
+  EXPECT_NEAR(optimizer.beta_, 5.0, 1e-12);
+  EXPECT_NEAR((optimizer.control_points_ - control_points).norm(), 0.0, 1e-12);
 }
 
 }  // namespace
