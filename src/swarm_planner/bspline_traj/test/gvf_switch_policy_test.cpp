@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <initializer_list>
 #include <limits>
 
 #include <bspline_race/gvf_manager.h>
@@ -29,6 +30,20 @@ FLAG_Race::gvf_manager::ClosedGoalProgressiveCandidate progressiveCandidate(
   value.kino_path_length = kino_path_length;
   value.end_to_goal_dist = end_to_goal_dist;
   return value;
+}
+
+int selectProgressiveCandidateIndex(
+    std::initializer_list<FLAG_Race::gvf_manager::ClosedGoalProgressiveCandidate> candidates,
+    double required_progress, double desired_lookahead)
+{
+  FLAG_Race::gvf_manager::ClosedGoalProgressiveCandidate best;
+  for (const auto& value : candidates) {
+    if (FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+            value, best, required_progress, desired_lookahead)) {
+      best = value;
+    }
+  }
+  return best.idx;
 }
 }
 
@@ -110,6 +125,112 @@ TEST(GvfClosedGoalProgressivePolicy, UsesKinoLengthAfterEqualDesiredError)
   const auto long_path = progressiveCandidate(3, 1.25, 0.8, 4.0, 0.0);
   EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
       short_path, long_path, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, UsesExactDesiredError)
+{
+  const auto closer = progressiveCandidate(9, 1.0000005, 0.8, 1.0, 0.0);
+  const auto farther = progressiveCandidate(1, 1.0000009, 0.8, 1.0, 0.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      closer, farther, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, BetterCandidateIsNotPreferredInReverse)
+{
+  const auto closer = progressiveCandidate(9, 1.0000005, 0.8, 1.0, 0.0);
+  const auto farther = progressiveCandidate(1, 1.0000009, 0.8, 1.0, 0.0);
+  EXPECT_FALSE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      farther, closer, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, MaintainsTransitivityAcrossThreeCloseErrors)
+{
+  const auto a = progressiveCandidate(0, 1.0000015, 0.8, 1.0, 0.0);
+  const auto b = progressiveCandidate(1, 1.00000075, 0.8, 1.0, 0.0);
+  const auto c = progressiveCandidate(2, 1.0, 0.8, 1.0, 0.0);
+  const bool a_before_b =
+      FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(a, b, 0.8, 1.0);
+  const bool b_before_c =
+      FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(b, c, 0.8, 1.0);
+  const bool a_before_c =
+      FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(a, c, 0.8, 1.0);
+  EXPECT_FALSE(a_before_b && b_before_c && !a_before_c);
+}
+
+TEST(GvfClosedGoalProgressivePolicy, SelectsSameWinnerAcrossInputPermutations)
+{
+  const auto a = progressiveCandidate(0, 1.0000015, 0.8, 1.0, 0.0);
+  const auto b = progressiveCandidate(1, 1.00000075, 0.8, 1.0, 0.0);
+  const auto c = progressiveCandidate(2, 1.0, 0.8, 1.0, 0.0);
+  EXPECT_EQ(2, selectProgressiveCandidateIndex({a, b, c}, 0.8, 1.0));
+  EXPECT_EQ(2, selectProgressiveCandidateIndex({a, c, b}, 0.8, 1.0));
+  EXPECT_EQ(2, selectProgressiveCandidateIndex({b, a, c}, 0.8, 1.0));
+  EXPECT_EQ(2, selectProgressiveCandidateIndex({b, c, a}, 0.8, 1.0));
+  EXPECT_EQ(2, selectProgressiveCandidateIndex({c, a, b}, 0.8, 1.0));
+  EXPECT_EQ(2, selectProgressiveCandidateIndex({c, b, a}, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, ValidCandidateBeatsInvalidCandidate)
+{
+  const auto valid = progressiveCandidate(2, 1.0, 0.8, 1.0, 0.0);
+  auto invalid = progressiveCandidate(1, 1.0, 0.8, 1.0, 0.0);
+  invalid.valid = false;
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      valid, invalid, 0.8, 1.0));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      invalid, valid, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, UsesIndexForExactTie)
+{
+  const auto lower_idx = progressiveCandidate(1, 1.0, 0.8, 1.0, 0.0);
+  const auto higher_idx = progressiveCandidate(2, 1.0, 0.8, 1.0, 0.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      lower_idx, higher_idx, 0.8, 1.0));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      higher_idx, lower_idx, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, RejectsNonFiniteCandidateMetrics)
+{
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double infinity_value = std::numeric_limits<double>::infinity();
+  const auto good = progressiveCandidate(10, 1.0, 0.8, 1.0, 0.0);
+
+  auto nonfinite_lookahead = progressiveCandidate(0, 1.0, 0.8, 1.0, 0.0);
+  nonfinite_lookahead.lookahead = nan;
+  auto nonfinite_progress = progressiveCandidate(0, 1.0, 0.8, 1.0, 0.0);
+  nonfinite_progress.end_delta_w = infinity_value;
+  auto nonfinite_length = progressiveCandidate(0, 1.0, 0.8, 1.0, 0.0);
+  nonfinite_length.kino_path_length = nan;
+  auto nonfinite_goal_error = progressiveCandidate(0, 1.0, 0.8, 1.0, 0.0);
+  nonfinite_goal_error.end_to_goal_dist = nan;
+
+  for (const auto& bad : {nonfinite_lookahead, nonfinite_progress,
+                          nonfinite_length, nonfinite_goal_error}) {
+    EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+        good, bad, 0.8, 1.0));
+    EXPECT_FALSE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+        bad, good, 0.8, 1.0));
+  }
+}
+
+TEST(GvfClosedGoalProgressivePolicy, TreatsNonFiniteRequiredProgressAsUnsatisfied)
+{
+  const double negative_infinity = -std::numeric_limits<double>::infinity();
+  const auto farther = progressiveCandidate(2, 2.0, 0.9, 1.0, 0.0);
+  const auto near_desired = progressiveCandidate(1, 1.0, 0.2, 1.0, 0.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      farther, near_desired, negative_infinity, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, UsesZeroDesiredLookaheadWhenDesiredIsNonFinite)
+{
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const auto near_zero = progressiveCandidate(2, 1.0, 0.8, 1.0, 0.0);
+  const auto negative_far = progressiveCandidate(1, -2.0, 0.8, 1.0, 0.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      near_zero, negative_far, 0.8, nan));
 }
 
 TEST(GvfClosedGoalPolicy, NormalAcceptedLookaheadRemainsPreferred)

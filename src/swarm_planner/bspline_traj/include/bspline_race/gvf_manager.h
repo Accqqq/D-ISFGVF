@@ -540,32 +540,45 @@ class gvf_manager
             double required_progress,
             double desired_lookahead)
         {
-            if (lhs.valid != rhs.valid) return lhs.valid;
-            if (!lhs.valid) return false;
+            const auto is_valid_candidate = [](const ClosedGoalProgressiveCandidate& value) {
+                return value.valid && std::isfinite(value.lookahead) &&
+                       std::isfinite(value.end_delta_w) &&
+                       std::isfinite(value.kino_path_length) &&
+                       std::isfinite(value.end_to_goal_dist);
+            };
+            const bool lhs_valid = is_valid_candidate(lhs);
+            const bool rhs_valid = is_valid_candidate(rhs);
+            if (lhs_valid != rhs_valid) return lhs_valid;
+            if (!lhs_valid) return false;
 
-            constexpr double eps = 1e-6;
-            const bool lhs_sufficient = lhs.end_delta_w + eps >= required_progress;
-            const bool rhs_sufficient = rhs.end_delta_w + eps >= required_progress;
+            const double safe_required_progress = std::isfinite(required_progress)
+                ? required_progress
+                : std::numeric_limits<double>::infinity();
+            const double safe_desired_lookahead = std::isfinite(desired_lookahead)
+                ? desired_lookahead
+                : 0.0;
+            const bool lhs_sufficient = lhs.end_delta_w >= safe_required_progress;
+            const bool rhs_sufficient = rhs.end_delta_w >= safe_required_progress;
             if (lhs_sufficient != rhs_sufficient) return lhs_sufficient;
 
             if (lhs_sufficient) {
-                const double lhs_error = std::abs(lhs.lookahead - desired_lookahead);
-                const double rhs_error = std::abs(rhs.lookahead - desired_lookahead);
-                if (std::abs(lhs_error - rhs_error) > eps) return lhs_error < rhs_error;
-                if (std::abs(lhs.kino_path_length - rhs.kino_path_length) > eps)
+                const double lhs_error = std::abs(lhs.lookahead - safe_desired_lookahead);
+                const double rhs_error = std::abs(rhs.lookahead - safe_desired_lookahead);
+                if (lhs_error != rhs_error) return lhs_error < rhs_error;
+                if (lhs.kino_path_length != rhs.kino_path_length)
                     return lhs.kino_path_length < rhs.kino_path_length;
-                if (std::abs(lhs.lookahead - rhs.lookahead) > eps)
+                if (lhs.lookahead != rhs.lookahead)
                     return lhs.lookahead < rhs.lookahead;
             } else {
-                if (std::abs(lhs.end_delta_w - rhs.end_delta_w) > eps)
+                if (lhs.end_delta_w != rhs.end_delta_w)
                     return lhs.end_delta_w > rhs.end_delta_w;
-                if (std::abs(lhs.kino_path_length - rhs.kino_path_length) > eps)
+                if (lhs.kino_path_length != rhs.kino_path_length)
                     return lhs.kino_path_length < rhs.kino_path_length;
-                if (std::abs(lhs.lookahead - rhs.lookahead) > eps)
+                if (lhs.lookahead != rhs.lookahead)
                     return lhs.lookahead < rhs.lookahead;
             }
 
-            if (std::abs(lhs.end_to_goal_dist - rhs.end_to_goal_dist) > eps)
+            if (lhs.end_to_goal_dist != rhs.end_to_goal_dist)
                 return lhs.end_to_goal_dist < rhs.end_to_goal_dist;
             return lhs.idx < rhs.idx;
         }
