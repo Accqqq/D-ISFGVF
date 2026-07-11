@@ -16,6 +16,20 @@ FLAG_Race::gvf_manager::ClosedGoalCandidateProgress candidate(
   value.lookahead = lookahead;
   return value;
 }
+
+FLAG_Race::gvf_manager::ClosedGoalProgressiveCandidate progressiveCandidate(
+    int idx, double lookahead, double end_delta_w,
+    double kino_path_length, double end_to_goal_dist)
+{
+  FLAG_Race::gvf_manager::ClosedGoalProgressiveCandidate value;
+  value.valid = true;
+  value.idx = idx;
+  value.lookahead = lookahead;
+  value.end_delta_w = end_delta_w;
+  value.kino_path_length = kino_path_length;
+  value.end_to_goal_dist = end_to_goal_dist;
+  return value;
+}
 }
 
 TEST(GvfSwitchPolicy, ForcesAcceptWhenAcceptedPathCannotSupportGovernorLookahead)
@@ -46,6 +60,56 @@ TEST(GvfClosedGoalPolicy, PushesDesiredLookaheadPastDetectedObstacle)
       1.5, 1.4, 1.2, 2.5, 0.8);
 
   EXPECT_NEAR(2.2, desired, 1e-6);
+}
+
+TEST(GvfClosedGoalProgressivePolicy, ComputesBoundedRequiredProgress)
+{
+  EXPECT_NEAR(0.6, FLAG_Race::gvf_manager::closedGoalRequiredProgress(
+      0.0, 1.0, 0.6, 0.8), 1e-6);
+  EXPECT_NEAR(0.7, FLAG_Race::gvf_manager::closedGoalRequiredProgress(
+      0.7, 1.0, 0.6, 0.8), 1e-6);
+  EXPECT_NEAR(0.8, FLAG_Race::gvf_manager::closedGoalRequiredProgress(
+      1.2, 1.0, 0.6, 0.8), 1e-6);
+}
+
+TEST(GvfClosedGoalProgressivePolicy, BoundsTrackButNotRecoverLookahead)
+{
+  EXPECT_NEAR(1.75, FLAG_Race::gvf_manager::closedGoalProgressiveMaxLookahead(
+      1.0, 3.0, 0.75, false), 1e-6);
+  EXPECT_NEAR(3.0, FLAG_Race::gvf_manager::closedGoalProgressiveMaxLookahead(
+      1.0, 3.0, 0.75, true), 1e-6);
+}
+
+TEST(GvfClosedGoalProgressivePolicy, KeepsDesiredLookaheadWhenProgressIsSufficient)
+{
+  const auto desired = progressiveCandidate(2, 1.0, 1.0, 1.2, 0.0);
+  const auto shorter = progressiveCandidate(1, 0.75, 0.75, 0.8, 0.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      desired, shorter, 0.6, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, ChoosesUsefulPartialOverTinyNearGoalPartial)
+{
+  const auto useful = progressiveCandidate(4, 1.5, 0.82, 1.1, 0.68);
+  const auto tiny = progressiveCandidate(0, 0.5, 0.15, 0.2, 0.35);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      useful, tiny, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, ChoosesFarthestWhenNoneIsSufficient)
+{
+  const auto farther = progressiveCandidate(4, 1.5, 0.55, 0.9, 0.95);
+  const auto nearer = progressiveCandidate(2, 1.0, 0.20, 0.3, 0.80);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      farther, nearer, 0.8, 1.0));
+}
+
+TEST(GvfClosedGoalProgressivePolicy, UsesKinoLengthAfterEqualDesiredError)
+{
+  const auto short_path = progressiveCandidate(1, 0.75, 0.8, 1.0, 0.0);
+  const auto long_path = progressiveCandidate(3, 1.25, 0.8, 4.0, 0.0);
+  EXPECT_TRUE(FLAG_Race::gvf_manager::preferClosedGoalProgressiveCandidate(
+      short_path, long_path, 0.8, 1.0));
 }
 
 TEST(GvfClosedGoalPolicy, NormalAcceptedLookaheadRemainsPreferred)

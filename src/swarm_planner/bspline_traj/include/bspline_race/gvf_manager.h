@@ -503,6 +503,73 @@ class gvf_manager
             double lookahead = 0.0;
         };
 
+        struct ClosedGoalProgressiveCandidate
+        {
+            bool valid = false;
+            int idx = -1;
+            double lookahead = 0.0;
+            double end_delta_w = 0.0;
+            double kino_path_length = std::numeric_limits<double>::infinity();
+            double end_to_goal_dist = std::numeric_limits<double>::infinity();
+        };
+
+        static double closedGoalRequiredProgress(double speed_xy,
+                                                 double progress_time,
+                                                 double min_progress,
+                                                 double max_progress)
+        {
+            const double lo = std::max(0.0, std::min(min_progress, max_progress));
+            const double hi = std::max(lo, std::max(min_progress, max_progress));
+            const double raw = std::max(0.0, speed_xy) * std::max(0.0, progress_time);
+            return std::max(lo, std::min(raw, hi));
+        }
+
+        static double closedGoalProgressiveMaxLookahead(double preferred,
+                                                        double configured_max,
+                                                        double extra,
+                                                        bool recover_mode)
+        {
+            const double hi = std::max(0.0, configured_max);
+            if (recover_mode) return hi;
+            return std::min(hi, std::max(0.0, preferred) + std::max(0.0, extra));
+        }
+
+        static bool preferClosedGoalProgressiveCandidate(
+            const ClosedGoalProgressiveCandidate& lhs,
+            const ClosedGoalProgressiveCandidate& rhs,
+            double required_progress,
+            double desired_lookahead)
+        {
+            if (lhs.valid != rhs.valid) return lhs.valid;
+            if (!lhs.valid) return false;
+
+            constexpr double eps = 1e-6;
+            const bool lhs_sufficient = lhs.end_delta_w + eps >= required_progress;
+            const bool rhs_sufficient = rhs.end_delta_w + eps >= required_progress;
+            if (lhs_sufficient != rhs_sufficient) return lhs_sufficient;
+
+            if (lhs_sufficient) {
+                const double lhs_error = std::abs(lhs.lookahead - desired_lookahead);
+                const double rhs_error = std::abs(rhs.lookahead - desired_lookahead);
+                if (std::abs(lhs_error - rhs_error) > eps) return lhs_error < rhs_error;
+                if (std::abs(lhs.kino_path_length - rhs.kino_path_length) > eps)
+                    return lhs.kino_path_length < rhs.kino_path_length;
+                if (std::abs(lhs.lookahead - rhs.lookahead) > eps)
+                    return lhs.lookahead < rhs.lookahead;
+            } else {
+                if (std::abs(lhs.end_delta_w - rhs.end_delta_w) > eps)
+                    return lhs.end_delta_w > rhs.end_delta_w;
+                if (std::abs(lhs.kino_path_length - rhs.kino_path_length) > eps)
+                    return lhs.kino_path_length < rhs.kino_path_length;
+                if (std::abs(lhs.lookahead - rhs.lookahead) > eps)
+                    return lhs.lookahead < rhs.lookahead;
+            }
+
+            if (std::abs(lhs.end_to_goal_dist - rhs.end_to_goal_dist) > eps)
+                return lhs.end_to_goal_dist < rhs.end_to_goal_dist;
+            return lhs.idx < rhs.idx;
+        }
+
         struct ClosedGoalObstacleInterval
         {
             bool found_start = false;
