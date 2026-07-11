@@ -94,6 +94,8 @@ gvf/circle_test/progressive_progress_time = 1.0
 
 正常 TRACK 和障碍边缘漏检场景使用同一规则，不再以 `bypass_mode` 决定是否按实际进度比较。
 
+每个规划周期都从配置的 `goal_prefer_lookahead_w` 重新建立 `desired_lookahead`，并夹在候选范围内。上一周期为获得足够进度而选择的 `1.25–1.75 m` 前视不作为下一周期的新期望值，保证障碍约束消失后能恢复约 `1.0 m` 的正常前视。
+
 先筛选 `end_delta_w >= required_progress_w` 的“进度充足”候选：
 
 1. 与未被障碍强推的 `desired_lookahead` 更接近者优先；无遮挡时继续稳定选择约 `1.0 m`。

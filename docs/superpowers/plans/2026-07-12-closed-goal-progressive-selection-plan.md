@@ -243,7 +243,7 @@ Keep `first_obstacle_delta_w`, `obstacle_end_delta_w`, `bypass_delta_w`, and `by
 const bool desired_pushed_by_obstacle = false;
 ```
 
-`desired_lookahead` must remain the value from `closedGoalDesiredLookahead()` clamped to the configured candidate range.
+Each planning cycle must initialize `desired_lookahead` directly from `closed_goal_prefer_lookahead_w_` and clamp it to the configured candidate range. Accepted lookahead and accepted bypass state must not become the next progressive-selection target; this lets TRACK return to the configured `1.0 m` preference after a temporary `1.25–1.75 m` progressive choice.
 
 - [ ] **Step 3: Restrict TRACK candidates to the progressive window**
 
