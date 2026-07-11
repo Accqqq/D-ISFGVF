@@ -3865,16 +3865,12 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
             }
 
             const bool circle_mode_active = enable_circle_reference_test_ && circle_reference_ready_;
-            if (!circle_mode_active) {
-                const double dist_xy = (pm.goal_pt.head<2>() - current_pos.head<2>()).norm();
-                if (dist_xy < goal_reach_radius_) {
-                    if(dist_xy < 0.2){
-                        changeFSMExecState(WAIT_TARGET, "reach_goal");
-                        pm.receive_goal = false;
-                        pm.is_first_goal = false;
-                    }
-                    return;
-                }
+            const double dist_xy = (pm.goal_pt.head<2>() - current_pos.head<2>()).norm();
+            if (shouldDeclarePointGoalReached(circle_mode_active, dist_xy, 0.2)) {
+                changeFSMExecState(WAIT_TARGET, "reach_goal");
+                pm.receive_goal = false;
+                pm.is_first_goal = false;
+                return;
             }
 
             if(checkCollision()){

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <bspline_race/gvf_manager.h>
 
 TEST(GvfSwitchPolicy, ForcesAcceptWhenAcceptedPathCannotSupportGovernorLookahead)
@@ -30,6 +32,36 @@ TEST(GvfClosedGoalPolicy, PushesDesiredLookaheadPastDetectedObstacle)
       1.5, 1.4, 1.2, 2.5, 0.8);
 
   EXPECT_NEAR(2.2, desired, 1e-6);
+}
+
+TEST(GvfPointGoalPolicy, ContinuesReplanningInsideLegacyReachRadius)
+{
+  EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      false, 1.0, 0.2));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      false, 0.2, 0.2));
+}
+
+TEST(GvfPointGoalPolicy, DeclaresCompletionOnlyBelowFinalTolerance)
+{
+  EXPECT_TRUE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      false, 0.19, 0.2));
+}
+
+TEST(GvfPointGoalPolicy, ClosedReferenceNeverDeclaresPointGoalCompletion)
+{
+  EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      true, 0.05, 0.2));
+}
+
+TEST(GvfPointGoalPolicy, RejectsInvalidDistancesAndTolerance)
+{
+  EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      false, -0.1, 0.2));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      false, std::numeric_limits<double>::infinity(), 0.2));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
+      false, 0.1, 0.0));
 }
 
 int main(int argc, char** argv)

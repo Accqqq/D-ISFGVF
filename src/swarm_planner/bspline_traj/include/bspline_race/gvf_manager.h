@@ -481,6 +481,17 @@ class gvf_manager
             const double required_w = std::max(0.0, governor_l_max) + std::max(0.0, margin_w);
             return remaining_w <= required_w;
         }
+        static bool shouldDeclarePointGoalReached(bool circle_mode_active,
+                                                  double dist_xy,
+                                                  double final_tolerance = 0.2)
+        {
+            if (circle_mode_active || !std::isfinite(dist_xy) ||
+                !std::isfinite(final_tolerance) || dist_xy < 0.0 ||
+                final_tolerance <= 0.0) {
+                return false;
+            }
+            return dist_xy < final_tolerance;
+        }
         static double closedGoalCandidateScore(double lookahead,
                                                double desired_lookahead,
                                                double end_to_goal_dist,
