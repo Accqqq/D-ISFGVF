@@ -48,6 +48,16 @@ namespace FLAG_Race
             void init(ros::NodeHandle& nh);
             void initUniformBspline(const int &p,  const int &n, const double &beta, const int &D, 
                                                             const Eigen::MatrixXd &s_ini, const Eigen::MatrixXd &s_ter); 
+            static bool parameterizeToBspline(
+                double ts,
+                const std::vector<Eigen::Vector3d>& point_set,
+                const std::vector<Eigen::Vector3d>& start_end_derivatives,
+                Eigen::MatrixXd& control_points);
+            bool setControlPointsAndInterval(const Eigen::MatrixXd& control_points,
+                                             int order,
+                                             double interval);
+            double getFeasibilityRatio(double max_vel, double max_acc) const;
+            bool scaleTime(double ratio);
             void setControlPoints(const Eigen::MatrixXd &ctrl_points);
             void setIniTerMatrix();
             inline void setOrderandBetaandDim(const int &p,const double &beta, const int &D)

@@ -1,5 +1,8 @@
 #include <bspline_race/UniformBspline_3d.h>
 
+#include <cmath>
+#include <limits>
+
 namespace FLAG_Race
 
 {
@@ -45,6 +48,104 @@ namespace FLAG_Race
         getAvailableSrange();
         getAvailableTrange();
         getInterval();
+    }
+
+    bool UniformBspline::parameterizeToBspline(
+        double ts,
+        const std::vector<Eigen::Vector3d>& point_set,
+        const std::vector<Eigen::Vector3d>& start_end_derivatives,
+        Eigen::MatrixXd& control_points) {
+      if (!std::isfinite(ts) || ts <= 0.0 || point_set.size() < 2 ||
+          start_end_derivatives.size() != 4) {
+        return false;
+      }
+
+      const int k = static_cast<int>(point_set.size());
+      Eigen::MatrixXd a = Eigen::MatrixXd::Zero(k + 4, k + 2);
+      const Eigen::RowVector3d position_row(1.0, 4.0, 1.0);
+      const Eigen::RowVector3d velocity_row(-1.0, 0.0, 1.0);
+      const Eigen::RowVector3d acceleration_row(1.0, -2.0, 1.0);
+
+      for (int i = 0; i < k; ++i) {
+        a.block<1, 3>(i, i) = position_row / 6.0;
+      }
+      a.block<1, 3>(k, 0) = velocity_row / (2.0 * ts);
+      a.block<1, 3>(k + 1, k - 1) = velocity_row / (2.0 * ts);
+      a.block<1, 3>(k + 2, 0) = acceleration_row / (ts * ts);
+      a.block<1, 3>(k + 3, k - 1) = acceleration_row / (ts * ts);
+
+      Eigen::MatrixXd b(k + 4, 3);
+      for (int i = 0; i < k; ++i) b.row(i) = point_set[i].transpose();
+      for (int i = 0; i < 4; ++i) {
+        b.row(k + i) = start_end_derivatives[i].transpose();
+      }
+
+      control_points = a.colPivHouseholderQr().solve(b);
+      return control_points.rows() == k + 2 && control_points.cols() == 3 &&
+             control_points.allFinite();
+    }
+
+    bool UniformBspline::setControlPointsAndInterval(
+        const Eigen::MatrixXd& control_points, int order, double interval) {
+      if (order < 1 || control_points.cols() != 3 ||
+          control_points.rows() < order + 1 || !control_points.allFinite() ||
+          !std::isfinite(interval) || interval <= 0.0) {
+        return false;
+      }
+
+      p_ = order;
+      D_ = static_cast<int>(control_points.cols());
+      n_ = static_cast<int>(control_points.rows()) - 1;
+      m_ = p_ + n_ + 1;
+      beta_ = 1.0 / interval;
+      control_points_ = control_points;
+      u_ = Eigen::VectorXd::Zero(m_ + 1);
+      for (int i = 0; i <= m_; ++i) u_(i) = static_cast<double>(i);
+      setIniTerMatrix();
+      getAvailableSrange();
+      getAvailableTrange();
+      getInterval();
+      time_.resize(0);
+      return true;
+    }
+
+    double UniformBspline::getFeasibilityRatio(double max_vel, double max_acc) const {
+      if (!std::isfinite(max_vel) || !std::isfinite(max_acc) ||
+          max_vel <= 0.0 || max_acc <= 0.0 || control_points_.rows() < 2) {
+        return std::numeric_limits<double>::infinity();
+      }
+
+      double velocity_max = 0.0;
+      for (int i = 0; i + 1 < control_points_.rows(); ++i) {
+        const Eigen::RowVectorXd velocity =
+            beta_ * (control_points_.row(i + 1) - control_points_.row(i));
+        velocity_max = std::max(velocity_max, velocity.cwiseAbs().maxCoeff());
+      }
+
+      double acceleration_max = 0.0;
+      for (int i = 0; i + 2 < control_points_.rows(); ++i) {
+        const Eigen::RowVectorXd acceleration = beta_ * beta_ *
+            (control_points_.row(i + 2) - 2.0 * control_points_.row(i + 1) +
+             control_points_.row(i));
+        acceleration_max =
+            std::max(acceleration_max, acceleration.cwiseAbs().maxCoeff());
+      }
+
+      return std::max(velocity_max / max_vel,
+                      std::sqrt(acceleration_max / max_acc));
+    }
+
+    bool UniformBspline::scaleTime(double ratio) {
+      if (!std::isfinite(ratio) || ratio <= 0.0 ||
+          !std::isfinite(beta_) || beta_ <= 0.0) {
+        return false;
+      }
+      beta_ /= ratio;
+      setIniTerMatrix();
+      getAvailableTrange();
+      getInterval();
+      time_.resize(0);
+      return true;
     }
 
     void UniformBspline::setIniTerMatrix()
