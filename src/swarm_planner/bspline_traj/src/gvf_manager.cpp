@@ -3430,9 +3430,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 
     const bool goal_recover_mode = closed_ref_enable_recover_ && closed_ref_recover_;
     const std::string mode_for_goal = goal_recover_mode ? "RECOVER" : "TRACK";
-    double desired_lookahead = closedGoalDesiredLookahead(
-        closed_goal_prefer_lookahead_w_, closed_ref_has_accepted_goal_,
-        closed_ref_accepted_lookahead_w_, closed_ref_accepted_from_bypass_);
+    double desired_lookahead = closed_goal_prefer_lookahead_w_;
     if (!candidates.empty()) {
         desired_lookahead = std::max(candidates.front(), std::min(desired_lookahead, candidates.back()));
     }
@@ -3512,13 +3510,14 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     if (order.empty()) {
         const Eigen::Vector3d failed_goal_pos = pointFromClosedW(closed_ref_w_);
         const double failed_goal_dist_xy = (failed_goal_pos.head<2>() - curr_pos.head<2>()).norm();
-        ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f desired_lookahead=%.3f obstacle_delta_w=%.3f desired_pushed=%d selected_score=-1.000 closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=0 selected_idx=-1 planner_success=0 reason=no_candidates mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"\" full_success_tol=%.3f accepted_full_goal=0 accepted_partial_goal=0 selected_end_to_goal_dist=-1.000 tried_lookaheads=\"\" tried_end_to_goal_dists=\"\" obstacle_end_delta_w=%.3f bypass_delta_w=%.3f bypass_mode=%d selected_end_delta_w=-1.000 selected_passed_obstacle=0 tried_end_delta_ws=\"\" selection_mode=progressive progressive_max_lookahead_w=%.3f required_progress_w=%.3f selected_kino_path_length=-1.000 selected_progress_sufficient=0 tried_kino_path_lengths=\"\"",
+        ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f desired_lookahead=%.3f obstacle_delta_w=%.3f desired_pushed=%d selected_score=-1.000 closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=%d selected_idx=-1 planner_success=0 reason=no_candidates mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"\" full_success_tol=%.3f accepted_full_goal=0 accepted_partial_goal=0 selected_end_to_goal_dist=-1.000 tried_lookaheads=\"\" tried_end_to_goal_dists=\"\" obstacle_end_delta_w=%.3f bypass_delta_w=%.3f bypass_mode=%d selected_end_delta_w=-1.000 selected_passed_obstacle=0 tried_end_delta_ws=\"\" selection_mode=progressive progressive_max_lookahead_w=%.3f required_progress_w=%.3f selected_kino_path_length=-1.000 selected_progress_sufficient=0 tried_kino_path_lengths=\"\"",
                  curr_pos.x(), curr_pos.y(), curr_pos.z(),
                  failed_goal_pos.x(), failed_goal_pos.y(), failed_goal_pos.z(),
                  failed_goal_dist_xy, 0.0, 0.0, desired_lookahead,
                  std::isfinite(first_obstacle_delta_w) ? first_obstacle_delta_w : -1.0,
                  desired_pushed_by_obstacle ? 1 : 0,
                  closed_ref_w_, closed_ref_w_,
+                 candidate_count,
                  mode_for_goal.c_str(), candidate_order_reason.c_str(),
                  local_d_for_goal, tangent_dot_odom_for_goal,
                  closed_goal_full_success_tol_,
@@ -3736,7 +3735,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     closed_ref_pending_goal_w_ = selected_goal_w;
     closed_ref_pending_lookahead_w_ = selected_lookahead;
     closed_ref_has_pending_goal_ = true;
-    closed_ref_pending_from_bypass_ = bypass_mode;
+    closed_ref_pending_from_bypass_ = false;
     closed_ref_last_goal_pos_ = selected_goal_pos;
     closed_ref_last_goal_dist_xy_ = goal_dist_xy;
     closed_ref_last_candidate_idx_ = selected_idx;
