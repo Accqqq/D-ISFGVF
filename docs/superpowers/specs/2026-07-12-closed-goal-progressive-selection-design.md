@@ -96,9 +96,9 @@ gvf/circle_test/progressive_progress_time = 1.0
 
 先筛选 `end_delta_w >= required_progress_w` 的“进度充足”候选：
 
-1. 前视距离更小者优先，确保逐段推进。
-2. 前视距离相同时，`kino_path_length` 更短者优先。
-3. 再以 `end_to_goal_dist` 和候选索引稳定打破平局。
+1. 与未被障碍强推的 `desired_lookahead` 更接近者优先；无遮挡时继续稳定选择约 `1.0 m`。
+2. 期望前视偏差相同时，`kino_path_length` 更短者优先。
+3. 再以较小前视、较小 `end_to_goal_dist` 和候选索引稳定打破平局。
 
 如果没有候选达到最低进度：
 
@@ -157,7 +157,7 @@ tried_kino_path_lengths
 ### 单元测试
 
 - `bypass_mode=false` 且所有结果为 partial 时，`0.8 m` 实际进度候选优先于 `0.15 m` 近目标候选。
-- 进度均充足时，较小前视优先，防止 `3.0 m` 候选压过 `1.5 m` 渐进候选。
+- 进度均充足时，选择最接近未强推期望前视的候选；无遮挡时保持 `1.0 m`，受阻时不因越障标志跳到 `3.0 m`。
 - 前视相同时，较短 Kino 几何路径优先。
 - 无候选达到最低进度时，选择实际进度最大者。
 - TRACK 只允许渐进窗口；RECOVER 保留完整候选窗口。
@@ -178,4 +178,3 @@ catkin_make --pkg bspline_race
 - 不再出现由障碍末端强推导致的 `4–6 m` 瞬时轨迹。
 - 正常无遮挡时继续选择 `goal_prefer_lookahead_w≈1.0 m`。
 - 点到点导航、碰撞重规划与现有换轨理由保持不变。
-
