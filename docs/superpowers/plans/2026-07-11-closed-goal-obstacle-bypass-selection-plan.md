@@ -341,7 +341,7 @@ Run:
 catkin_make --pkg bspline_race --make-args gvf_switch_policy_test
 ./devel/lib/bspline_race/gvf_switch_policy_test
 catkin_make --pkg bspline_race --make-args run_tests_bspline_race
-catkin_test_results build/bspline_race
+catkin_test_results build/test_results/bspline_race
 ```
 
 Expected: compilation succeeds; all existing and new tests pass with zero errors and failures.
@@ -380,7 +380,7 @@ git commit -m "fix: rank closed-goal bypass paths by actual progress"
 ```bash
 catkin_make --pkg bspline_race
 catkin_make --pkg bspline_race --make-args run_tests_bspline_race
-catkin_test_results build/bspline_race
+catkin_test_results build/test_results/bspline_race
 ```
 
 Expected: build succeeds and test results report zero errors and zero failures.
