@@ -207,6 +207,10 @@ class gvf_manager
         double ref_project_boundary_eps_ = 0.03;
         double closed_goal_full_success_tol_ = 0.3;
         double closed_goal_prefer_lookahead_w_ = 2.0;
+        double closed_goal_progressive_lookahead_extra_w_ = 0.75;
+        double closed_goal_progressive_min_progress_w_ = 0.6;
+        double closed_goal_progressive_max_progress_w_ = 0.8;
+        double closed_goal_progressive_progress_time_ = 1.0;
         double closed_goal_lookahead_weight_ = 5.0;
         double closed_goal_end_dist_weight_ = 20.0;
         bool closed_goal_push_past_obstacle_ = false;
