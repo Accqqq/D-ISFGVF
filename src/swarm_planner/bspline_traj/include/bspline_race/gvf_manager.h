@@ -648,7 +648,27 @@ class gvf_manager
         double closedRefSigma(double e_parallel) const;
         double updateClosedRefPhaseByDynamics(const Eigen::Vector3d& curr_pos, double dt);
         std::vector<double> buildClosedLookaheadCandidates() const;
-        int selectDefaultClosedLookaheadIndex(const std::vector<double>& candidates) const;
+        static int selectDefaultClosedLookaheadIndex(
+            const std::vector<double>& candidates,
+            double desired_lookahead)
+        {
+            if (candidates.empty()) {
+                return -1;
+            }
+
+            const double default_lookahead = std::min(
+                std::max(desired_lookahead, candidates.front()), candidates.back());
+            int best_idx = 0;
+            double best_diff = std::abs(candidates[0] - default_lookahead);
+            for (int i = 1; i < static_cast<int>(candidates.size()); ++i) {
+                const double diff = std::abs(candidates[i] - default_lookahead);
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    best_idx = i;
+                }
+            }
+            return best_idx;
+        }
         void resetClosedGoalCandidateState();
         void ensureProgressInCurrentPathRange(double start_w, double end_w);
         void logReplanReason(const std::string& reason);

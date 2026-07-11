@@ -60,6 +60,24 @@ TEST(GvfClosedGoalPolicy, BypassAcceptedLookaheadRestoresConfiguredPreference)
       2.0, true, 3.0, true));
 }
 
+TEST(GvfClosedGoalPolicy, SelectsConfiguredDefaultLookaheadIndex)
+{
+  const std::vector<double> candidates{0.5, 1.0, 1.5};
+
+  EXPECT_EQ(1, FLAG_Race::gvf_manager::selectDefaultClosedLookaheadIndex(
+      candidates, 1.0));
+}
+
+TEST(GvfClosedGoalPolicy, ClampsDefaultLookaheadOutsideCandidateRange)
+{
+  const std::vector<double> candidates{0.5, 1.0, 1.5};
+
+  EXPECT_EQ(0, FLAG_Race::gvf_manager::selectDefaultClosedLookaheadIndex(
+      candidates, -1.0));
+  EXPECT_EQ(2, FLAG_Race::gvf_manager::selectDefaultClosedLookaheadIndex(
+      candidates, 3.0));
+}
+
 TEST(GvfClosedGoalBypassPolicy, PassedCandidateBeatsUnpassedCandidate)
 {
   const auto passed = candidate(true, 1.2, 0.4, 1.5);
@@ -137,6 +155,16 @@ TEST(GvfClosedGoalBypassPolicy, OutsideMapDoesNotProveObstacleExit)
       occupancy, 0.1, 3);
   EXPECT_TRUE(interval.found_start);
   EXPECT_FALSE(interval.found_end);
+}
+
+TEST(GvfClosedGoalBypassPolicy, OutsideMapPreservesAccumulatedFreeSamples)
+{
+  const std::vector<int> occupancy{1, 0, -1, 0, -1, 0};
+  const auto interval = FLAG_Race::gvf_manager::detectClosedGoalObstacleInterval(
+      occupancy, 0.1, 3);
+  ASSERT_TRUE(interval.found_start);
+  ASSERT_TRUE(interval.found_end);
+  EXPECT_NEAR(0.2, interval.end_delta_w, 1e-6);
 }
 
 TEST(GvfPointGoalPolicy, ContinuesReplanningInsideLegacyReachRadius)

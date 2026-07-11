@@ -1475,25 +1475,6 @@ std::vector<double> gvf_manager::buildClosedLookaheadCandidates() const
     return candidates;
 }
 
-int gvf_manager::selectDefaultClosedLookaheadIndex(const std::vector<double>& candidates) const
-{
-    if (candidates.empty()) {
-        return -1;
-    }
-
-    const double default_lookahead = std::min(std::max(2.0, candidates.front()), candidates.back());
-    int best_idx = 0;
-    double best_diff = std::abs(candidates[0] - default_lookahead);
-    for (int i = 1; i < static_cast<int>(candidates.size()); ++i) {
-        const double diff = std::abs(candidates[i] - default_lookahead);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best_idx = i;
-        }
-    }
-    return best_idx;
-}
-
 void gvf_manager::resetClosedGoalCandidateState()
 {
     last_selected_goal_w_ = 0.0;
@@ -1692,7 +1673,8 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(
     }
 
     const std::vector<double> candidates = buildClosedLookaheadCandidates();
-    int selected_idx = selectDefaultClosedLookaheadIndex(candidates);
+    int selected_idx = selectDefaultClosedLookaheadIndex(
+        candidates, closed_goal_prefer_lookahead_w_);
     if (closed_ref_has_accepted_goal_ && !closed_ref_accepted_from_bypass_) {
         double best_diff = std::numeric_limits<double>::infinity();
         for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
@@ -1704,7 +1686,8 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(
         }
     }
     if (selected_idx < 0 || selected_idx >= static_cast<int>(candidates.size())) {
-        selected_idx = selectDefaultClosedLookaheadIndex(candidates);
+        selected_idx = selectDefaultClosedLookaheadIndex(
+            candidates, closed_goal_prefer_lookahead_w_);
     }
     const double selected_lookahead = candidates.empty() ? 0.0 : candidates[selected_idx];
     const double goal_w = closed_ref_w_ + selected_lookahead;
@@ -3698,7 +3681,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
         if (bypass_mode) {
             selected_reason = selected.progress.passed_obstacle
                 ? "bypass_passed_actual_end"
-                : "bypass_farthest_partial_progress";
+                : "bypass_farthest_actual_progress";
         } else {
             selected_reason = selected.full_success
                 ? "score_full_success"
