@@ -239,9 +239,11 @@ class gvf_manager
         double closed_ref_pending_goal_w_ = 0.0;
         double closed_ref_pending_lookahead_w_ = 0.0;
         bool closed_ref_has_pending_goal_ = false;
+        bool closed_ref_pending_from_bypass_ = false;
         double closed_ref_accepted_goal_w_ = 0.0;
         double closed_ref_accepted_lookahead_w_ = 0.0;
         bool closed_ref_has_accepted_goal_ = false;
+        bool closed_ref_accepted_from_bypass_ = false;
         Eigen::Vector3d closed_ref_last_goal_pos_ = Eigen::Vector3d::Zero();
         double closed_ref_last_goal_dist_xy_ = 0.0;
         int closed_ref_last_candidate_idx_ = -1;
@@ -578,6 +580,25 @@ class gvf_manager
                 return lhs.end_to_goal_dist < rhs.end_to_goal_dist;
             }
             return lhs.lookahead < rhs.lookahead - eps;
+        }
+        static double closedGoalDesiredLookahead(double configured_lookahead,
+                                                 bool has_accepted_goal,
+                                                 double accepted_lookahead,
+                                                 bool accepted_from_bypass)
+        {
+            return has_accepted_goal && !accepted_from_bypass
+                ? accepted_lookahead
+                : configured_lookahead;
+        }
+        static bool isFiniteClosedGoalCandidate(double end_x,
+                                                double end_y,
+                                                double end_z,
+                                                double end_to_goal_dist,
+                                                double end_delta_w)
+        {
+            return std::isfinite(end_x) && std::isfinite(end_y) &&
+                   std::isfinite(end_z) && std::isfinite(end_to_goal_dist) &&
+                   std::isfinite(end_delta_w);
         }
         static double closedGoalCandidateScore(double lookahead,
                                                double desired_lookahead,

@@ -1508,9 +1508,11 @@ void gvf_manager::resetClosedGoalCandidateState()
     closed_ref_pending_goal_w_ = 0.0;
     closed_ref_pending_lookahead_w_ = 0.0;
     closed_ref_has_pending_goal_ = false;
+    closed_ref_pending_from_bypass_ = false;
     closed_ref_accepted_goal_w_ = 0.0;
     closed_ref_accepted_lookahead_w_ = 0.0;
     closed_ref_has_accepted_goal_ = false;
+    closed_ref_accepted_from_bypass_ = false;
     closed_ref_last_goal_pos_.setZero();
     closed_ref_last_goal_dist_xy_ = 0.0;
     closed_ref_last_candidate_idx_ = -1;
@@ -1691,7 +1693,7 @@ std::pair<Eigen::Vector3d, Eigen::Vector3d> gvf_manager::getCircleReferenceGoal(
 
     const std::vector<double> candidates = buildClosedLookaheadCandidates();
     int selected_idx = selectDefaultClosedLookaheadIndex(candidates);
-    if (closed_ref_has_accepted_goal_) {
+    if (closed_ref_has_accepted_goal_ && !closed_ref_accepted_from_bypass_) {
         double best_diff = std::numeric_limits<double>::infinity();
         for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
             const double diff = std::abs(candidates[i] - closed_ref_accepted_lookahead_w_);
@@ -3437,10 +3439,9 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 
     const bool goal_recover_mode = closed_ref_enable_recover_ && closed_ref_recover_;
     const std::string mode_for_goal = goal_recover_mode ? "RECOVER" : "TRACK";
-    double desired_lookahead = closed_goal_prefer_lookahead_w_;
-    if (closed_ref_has_accepted_goal_) {
-        desired_lookahead = closed_ref_accepted_lookahead_w_;
-    }
+    double desired_lookahead = closedGoalDesiredLookahead(
+        closed_goal_prefer_lookahead_w_, closed_ref_has_accepted_goal_,
+        closed_ref_accepted_lookahead_w_, closed_ref_accepted_from_bypass_);
     if (!candidates.empty()) {
         desired_lookahead = std::max(candidates.front(), std::min(desired_lookahead, candidates.back()));
     }
@@ -3587,22 +3588,35 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 
         const bool sample_valid = !candidate_samples.point_set.empty() &&
                                   candidate_samples.start_end_derivatives.size() >= 3;
+        const Eigen::Vector3d actual_end = sample_valid ?
+            candidate_samples.point_set.back() :
+            Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
         const double end_to_goal_dist = sample_valid ?
-            (candidate_samples.point_set.back() - candidate_goal).norm() :
+            (actual_end - candidate_goal).norm() :
             std::numeric_limits<double>::infinity();
 
         if (tried_end_dists_ss.tellp() > 0) tried_end_dists_ss << ",";
         tried_end_dists_ss << end_to_goal_dist;
 
-        if (!sample_valid) {
+        if (!sample_valid || !isFiniteClosedGoalCandidate(
+                actual_end.x(), actual_end.y(), actual_end.z(),
+                end_to_goal_dist, 0.0)) {
             if (tried_end_delta_ws_ss.tellp() > 0) tried_end_delta_ws_ss << ",";
             tried_end_delta_ws_ss << "invalid";
             continue;
         }
 
         const double projected_end_w = projectClosedLocal(
-            candidate_samples.point_set.back(), closed_ref_w_, 0.0, candidates.back());
-        const double end_delta_w = std::max(0.0, projected_end_w - closed_ref_w_);
+            actual_end, closed_ref_w_, 0.0, candidates.back());
+        const double raw_end_delta_w = projected_end_w - closed_ref_w_;
+        if (!isFiniteClosedGoalCandidate(
+                actual_end.x(), actual_end.y(), actual_end.z(),
+                end_to_goal_dist, raw_end_delta_w)) {
+            if (tried_end_delta_ws_ss.tellp() > 0) tried_end_delta_ws_ss << ",";
+            tried_end_delta_ws_ss << "invalid";
+            continue;
+        }
+        const double end_delta_w = std::max(0.0, raw_end_delta_w);
         const bool passed_obstacle = bypass_mode &&
             end_delta_w >= bypass_delta_w - std::max(1e-3, closed_goal_obstacle_check_step_w_);
         if (tried_end_delta_ws_ss.tellp() > 0) tried_end_delta_ws_ss << ",";
@@ -3730,6 +3744,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     closed_ref_pending_goal_w_ = selected_goal_w;
     closed_ref_pending_lookahead_w_ = selected_lookahead;
     closed_ref_has_pending_goal_ = true;
+    closed_ref_pending_from_bypass_ = bypass_mode;
     closed_ref_last_goal_pos_ = selected_goal_pos;
     closed_ref_last_goal_dist_xy_ = goal_dist_xy;
     closed_ref_last_candidate_idx_ = selected_idx;
@@ -3912,6 +3927,7 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                     closed_ref_accepted_goal_w_ = closed_ref_pending_goal_w_;
                     closed_ref_accepted_lookahead_w_ = closed_ref_pending_lookahead_w_;
                     closed_ref_has_accepted_goal_ = true;
+                    closed_ref_accepted_from_bypass_ = closed_ref_pending_from_bypass_;
                 }
                 ROS_WARN("[GVF][SWITCH_OBS] accept_reason=gen_new_traj accepted_new=1 pending_goal_w=%.3f accepted_goal_w=%.3f pending_lookahead=%.3f accepted_lookahead=%.3f v_ref_start=(%.3f,%.3f,%.3f) v_odom=(%.3f,%.3f,%.3f) cos_start_odom=%.3f",
                          closed_ref_pending_goal_w_, closed_ref_accepted_goal_w_,
@@ -4069,6 +4085,7 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                     closed_ref_accepted_goal_w_ = closed_ref_pending_goal_w_;
                     closed_ref_accepted_lookahead_w_ = closed_ref_pending_lookahead_w_;
                     closed_ref_has_accepted_goal_ = true;
+                    closed_ref_accepted_from_bypass_ = closed_ref_pending_from_bypass_;
                 }
                 ROS_WARN("[GVF][SWITCH_OBS] accept_reason=%s accepted_new=%d pending_goal_w=%.3f accepted_goal_w=%.3f pending_lookahead=%.3f accepted_lookahead=%.3f v_ref_start=(%.3f,%.3f,%.3f) v_odom=(%.3f,%.3f,%.3f) cos_start_odom=%.3f",
                          reason.c_str(), accept_new ? 1 : 0,

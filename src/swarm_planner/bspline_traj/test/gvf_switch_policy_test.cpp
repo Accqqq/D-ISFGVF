@@ -48,6 +48,18 @@ TEST(GvfClosedGoalPolicy, PushesDesiredLookaheadPastDetectedObstacle)
   EXPECT_NEAR(2.2, desired, 1e-6);
 }
 
+TEST(GvfClosedGoalPolicy, NormalAcceptedLookaheadRemainsPreferred)
+{
+  EXPECT_DOUBLE_EQ(3.0, FLAG_Race::gvf_manager::closedGoalDesiredLookahead(
+      2.0, true, 3.0, false));
+}
+
+TEST(GvfClosedGoalPolicy, BypassAcceptedLookaheadRestoresConfiguredPreference)
+{
+  EXPECT_DOUBLE_EQ(2.0, FLAG_Race::gvf_manager::closedGoalDesiredLookahead(
+      2.0, true, 3.0, true));
+}
+
 TEST(GvfClosedGoalBypassPolicy, PassedCandidateBeatsUnpassedCandidate)
 {
   const auto passed = candidate(true, 1.2, 0.4, 1.5);
@@ -90,6 +102,21 @@ TEST(GvfClosedGoalBypassPolicy, DisabledModeDoesNotOverrideNormalSelection)
   const auto rhs = candidate(false, 0.4, 0.1, 0.5);
   EXPECT_FALSE(FLAG_Race::gvf_manager::preferClosedGoalBypassCandidate(
       lhs, rhs, false));
+}
+
+TEST(GvfClosedGoalBypassPolicy, RejectsNonFiniteActualCandidateMetrics)
+{
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double infinity_value = std::numeric_limits<double>::infinity();
+
+  EXPECT_TRUE(FLAG_Race::gvf_manager::isFiniteClosedGoalCandidate(
+      1.0, 2.0, 3.0, 0.2, 1.1));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::isFiniteClosedGoalCandidate(
+      infinity_value, 2.0, 3.0, 0.2, 1.1));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::isFiniteClosedGoalCandidate(
+      1.0, 2.0, 3.0, nan, 1.1));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::isFiniteClosedGoalCandidate(
+      1.0, 2.0, 3.0, 0.2, nan));
 }
 
 TEST(GvfClosedGoalBypassPolicy, FindsObstacleEndAfterThreeFreeSamples)
