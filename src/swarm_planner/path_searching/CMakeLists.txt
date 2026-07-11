@@ -47,3 +47,13 @@ add_library( path_searching
 target_link_libraries( path_searching
     ${catkin_LIBRARIES} 
     )  
+
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(kinodynamic_samples_test test/kinodynamic_samples_test.cpp)
+  if(TARGET kinodynamic_samples_test)
+    target_link_libraries(kinodynamic_samples_test
+      path_searching
+      ${catkin_LIBRARIES}
+    )
+  endif()
+endif()

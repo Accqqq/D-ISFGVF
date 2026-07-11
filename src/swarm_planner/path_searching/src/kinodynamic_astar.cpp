@@ -726,7 +726,7 @@ void KinodynamicAstar::getSamples(double& ts, vector<Eigen::Vector3d>& point_set
   else
   {
     t = path_nodes_.back()->duration;
-    end_vel = node->state.tail(3);
+    end_vel = path_nodes_.back()->state.tail(3);
     end_acc = path_nodes_.back()->input;
   }
 
