@@ -1,6 +1,7 @@
 # Iteration Memory
 
 日期：`2026-06-02`
+最后更新：`2026-07-11`
 
 ## Iteration Goal
 - 稳定当前闭合曲线跟踪实验版。
@@ -29,6 +30,51 @@
   - `selectClosedGoalCandidate()` 从候选目标里试 kino 规划并选择可达目标
 - 当前 `figure8_join_*` 成员已删除，`gvf_manager.cpp` 中对应 reset 引用也已删除。
 - 当前 `generateFigureEightReference()` 中旧的未使用 `cx/c2` 也已删除。
+
+## Fast-Planner-Style B-Spline Parameterization Update (`2026-07-11`)
+- 已完成并提交当前仿真 workspace 的 Fast-Planner 风格 B 样条参数化改造，代码提交范围为：
+  - `5308b7d feat: add Fast-Planner spline parameterization`
+  - `85f0895 feat: initialize optimizer from parameterized spline`
+  - `5629ab0 fix: use terminal velocity for partial Kino samples`
+  - `0c887ac refactor: use Fast-Planner parameterization in astaropt`
+- 旧 active `astaropt()` 链路的问题是：
+  - `K` 个 Kino 样本直接生成 `K+4` 个控制点。
+  - 中间 Kino 位置样本被直接当作 B 样条控制点，但 cubic B-spline 不会经过所有控制点。
+  - B 样条 interval 独立使用 `planning/dist_p / planning/max_vel`，没有使用 Kino `getSamples()` 返回的实际 `ts`。
+  - 位置样本曾按 `num_points_to_take_` 截断，但终端导数仍来自未截断路径，可能造成终端状态不一致。
+- 当前 active `astaropt()` 数据链路为：
+  1. 点到点或闭合候选规划得到同一个 `KinoPlanSamples`。
+  2. 使用完整 `point_set`、四个边界导数 `[v0, vT, a0, aT]` 和 `getSamples()` 返回的实际 `ts`。
+  3. `UniformBspline::parameterizeToBspline()` 解 `K+4` 个方程、`K+2` 个未知控制点的 Fast-Planner 最小二乘系统。
+  4. `bspline_optimizer::setInitialControlPoints()` 用参数化控制点和同一个实际 `ts` 初始化现有 optimizer。
+  5. 现有 optimizer 继续只优化内部控制点，首尾各三个 cubic 控制点保持固定。
+  6. 优化后用 `getFeasibilityRatio()` 检查速度/加速度；若比例大于 1，只通过 `scaleTime()` 统一增大 interval，不改变空间控制点。
+  7. 下游位置/速度采样、`new_i0_out`、FSM、GVF 和 command topic 保持原有接口。
+- 新参数语义：
+  - `gvf/kino_sample_ts`：Kino `getSamples()` 的初始采样时间，当前 `test_gvf.launch` 设为 `0.15 s`。
+  - `gvf/kino_sample_ts_min`：初始采样时间下限，当前为 `0.05 s`。
+  - `getSamples()` 会把输入 `ts` 调整成 `T_sum / seg_num`；返回值才是参数化、optimizer 和 spline 使用的权威 interval。
+  - `planning/dist_p` 不再决定 active `astaropt()` 的 B 样条 interval，只保留给旧接口/其他链路。
+- no-shot / partial 末端速度 bug 已修复：
+  - 旧 `getSamples()` 在累计路径时把局部 `node` 回溯到 root，随后错误使用 `node->state.tail(3)` 作为 `end_vel`，实际得到起点速度。
+  - 当前使用 `path_nodes_.back()->state.tail(3)`，即 partial 搜索路径真实末端速度。
+  - 该修复不改变 `NEAR_END / REACH_HORIZON` 接受策略，只修正传给 B 样条的边界状态。
+- 明确保留的行为：
+  - `planKinoToGoal()` 仍只拒绝 `NO_PATH`，不新增 `NEAR_END / REACH_HORIZON / partial` 拒绝。
+  - 闭合目标候选、`partial_best_end_dist`、碰撞检测、轨迹切换、FSM、GVF、ROS topic 和 command 生成策略未随 B 样条改造改变。
+  - 未加入外部 Fast-Planner catkin 依赖，也未替换现有 optimizer。
+- 新增测试：
+  - `fastplanner_parameterization_test`：覆盖 `K -> K+2`、直线重构、边界速度/加速度、duration、时间缩放保持几何、optimizer 初始化。
+  - `kinodynamic_samples_test`：覆盖 no-shot 时 `vT` 来自真实末端节点。
+  - 最终验证：`path_searching + bspline_race` 构建成功，`38 tests, 0 errors, 0 failures`。
+- B 样条改造后的日志判断：
+  - `[GVF][BSPLINE_PARAM] kino_points / control_points / kino_ts / final_interval / ratio` 用于确认 `K+2` 与时间语义。
+  - 已观察到的两次失稳日志中，该日志数值有限且关系正常，没有 B 样条参数化 NaN/Inf 或控制点数量异常证据。
+  - 已定位的失稳主因在 command governor 和重规划切换：位置指令估算加速度远超 `cmd/acc_max`，碰撞反复触发造成高频强制切轨，fallback 不是固定安全悬停点。这些不属于本轮 B 样条数学改造。
+- 当前 B 样条剩余低优先级事项：
+  - `UniformBspline::getT()` 对非整采样周期 duration 会遗漏不足一个周期的精确尾点。
+  - active pipeline 明确按 cubic 参数化，但 `setControlPointsAndInterval(..., 3, ts)` 与可配置 `planning/traj_order` 之间尚未显式约束。
+  - `setInitialControlPoints()` 的非法输入分支缺少逐项回归测试。
 
 ## Closed Curve Reparam / Goal Selection
 - 当前闭合曲线重参数化链路：
@@ -127,8 +173,6 @@
   - `gvf/cmd/vel_max`
   - `gvf/cmd/pos_gain_equiv`
   - `gvf/cmd/tangent_vel_max`
-  - `gvf/cmd/acc_max`
-  - `gvf/cmd/switch_motion_limit_time`
   - `gvf/cmd/governor_l_min`
   - `gvf/cmd/governor_l_max`
   - `gvf/cmd/governor_l_step`
@@ -147,6 +191,9 @@
   - `gvf/cmd/governor_normal_vel_weight`
   - `gvf/cmd/governor_normal_vel_error_cap`
   - `gvf/switch/governor_path_margin_w`
+- 当前仅用于诊断、没有真正执行限幅：
+  - `gvf/cmd/acc_max`：只与 `estimated_acc` 一起打印，未限制发布位置指令的加速度。
+  - `gvf/cmd/switch_motion_limit_time`：只形成 `switch_active` 日志窗口，未在窗口内限制位置命令跳变。
 - 当前增益测试模式：
   - `gvf/cmd/gain_test_enable`
   - `gvf/cmd/gain_test_lead`
@@ -210,6 +257,10 @@
 - 当前还有两个编译 warning：
   - `KinoPathCallback()` 中 signed/unsigned compare
   - `FSMCallback()` 中 `INIT` 未处理
+- command governor 当前没有真正的发布指令速度/加速度限幅；轨迹切换时日志已出现 `estimated_acc` 数十到数百 `m/s^2`。
+- `GOVERNOR_INVALID_HOLD` 当前每周期使用最新 `odom` 作为命令点，不是锁存进入 fallback 时的安全位置；飞机已有速度时不能主动制动。
+- 碰撞检测可能造成连续 `collision -> accept_collision&timout -> switch -> collision` 抖动，但用户当前确认下一项只修“短轨迹耗尽”，不改碰撞检测与切换策略。
+- 点到点模式当前在 `0.2 m <= dist_xy < goal_reach_radius_(2.0 m)` 时直接从 `EXEC_TRAJ` 返回，停止 collision/planInterval 重规划；旧轨迹耗尽后会出现 `all_candidates_path_end_clamped`。
 
 ## Current File Focus
 - `src/swarm_planner/bspline_traj/src/gvf_manager.cpp`
@@ -227,8 +278,6 @@
   - `gvf/circle_test/lookahead_pts`
   - `gvf/circle_test/realign_min_progress`
   - `gvf/circle_test/join_*`
-  - `gvf/kino_sample_ts`
-  - `gvf/kino_sample_ts_min`
   - `gvf/kino_max_guide_pts`
   - `gvf/path_pub_from_current`
   - `gvf/path_pub_future_pts`
@@ -237,10 +286,10 @@
   - `gvf/debug_gate`
 
 ## Immediate Next Tasks
-1. 将 Realflight 代码同步为 governor-only 控制层，并保留实机 topic / yaw 约束。
-2. Realflight 首飞使用 `K_eq=1.10` 下的 2m/s 保守参数：`l_max/lead_max=1.7~1.9`，法向 deadband `0.06~0.08`。
-3. 清理 `test_gvf.launch / gvf.launch` 中旧控制参数，保持 launch 与当前代码事实一致。
-4. 清理完成后跑 `catkin_make --pkg bspline_race`。
+1. 按已确认范围只修点到点“短轨迹耗尽”：只有 `dist_xy < 0.2 m` 才结束任务；`0.2 m ~ goal_reach_radius_` 内继续允许正常 `planInterval` 重规划。
+2. 保持现有碰撞检测、`accept_collision&timout` 和其他切换策略不变。
+3. 验证进入目标 `2.0 m` 范围后仍会补充轨迹，且在 `stop_radius=0.3 m` 内由现有 goal-position override 收敛到目标，不再出现 `all_candidates_path_end_clamped`。
+4. 当前仿真验证稳定后，再决定是否单独设计 command governor 的真实 motion limit 和锁存 fallback。
 
 ## Short Validation Checklist
 - `catkin_make --pkg bspline_race`
