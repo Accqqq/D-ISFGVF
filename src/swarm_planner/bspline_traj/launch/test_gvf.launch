@@ -63,6 +63,10 @@
         <param name="gvf/circle_test/goal_push_past_obstacle" value="true" />
         <param name="gvf/circle_test/goal_obstacle_check_step_w" value="0.1" />
         <param name="gvf/circle_test/goal_obstacle_pass_margin_w" value="0.8" />
+        <param name="gvf/circle_test/progressive_lookahead_extra_w" value="0.75" />
+        <param name="gvf/circle_test/progressive_min_progress_w" value="0.6" />
+        <param name="gvf/circle_test/progressive_max_progress_w" value="0.8" />
+        <param name="gvf/circle_test/progressive_progress_time" value="1.0" />
         <param name="gvf/circle_test/center_x" value="0.0" />
         <param name="gvf/circle_test/center_y" value="0.0" />
         <param name="gvf/circle_test/center_z" value="0.0" />
