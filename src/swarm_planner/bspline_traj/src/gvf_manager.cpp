@@ -14,6 +14,10 @@ namespace FLAG_Race
         nh.param("gvf/num_points_to_take", num_points_to_take_, 10);  // 默认值为10
         nh.param("gvf/exec_timer_interval", exec_timer_interval, 0.2);  // 默认值为0.2秒
         nh.param("gvf/kino_timer_interval", kino_timer_interval, 0.2);  // 默认值为0.2秒
+        nh.param("gvf/kino_sample_ts", kino_sample_ts_, 0.2);
+        nh.param("gvf/kino_sample_ts_min", kino_sample_ts_min_, 0.05);
+        kino_sample_ts_min_ = std::max(1e-3, kino_sample_ts_min_);
+        kino_sample_ts_ = std::max(kino_sample_ts_min_, kino_sample_ts_);
         nh.param("planning/safe_distance", safe_distance_, 0.5);  // 添加安全距离参数读取
         nh.param("gvf/collision_threshold", collision_threshold_, 0.05);  // 添加碰撞检测阈值参数读取
         nh.param("gvf/use_test_cmd", use_test_cmd_, false);  // 是否使用测试命令模式
@@ -3383,7 +3387,7 @@ bool gvf_manager::planKinoToGoal(gvfManager& pm,
                                               /*init=*/false, /*dynamic=*/false);
     if (status != KinodynamicAstar::NO_PATH) {
         cout << "[kino replan]: kinodynamic search success." << endl;
-        samples.ts = 0.2;
+        samples.ts = std::max(kino_sample_ts_min_, kino_sample_ts_);
         pm.kino_path_finder_->getSamples(samples.ts, samples.point_set, samples.start_end_derivatives);
         return true;
     }
@@ -3399,7 +3403,7 @@ bool gvf_manager::planKinoToGoal(gvfManager& pm,
     }
 
     cout << "[kino replan]: retry search success." << endl;
-    samples.ts = 0.2;
+    samples.ts = std::max(kino_sample_ts_min_, kino_sample_ts_);
     pm.kino_path_finder_->getSamples(samples.ts, samples.point_set, samples.start_end_derivatives);
     return true;
 }
@@ -3710,48 +3714,52 @@ bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos
                  closed_ref_last_candidate_idx_);
     }
 
-    // 只用前 N 个点做 B 样条（像 topo A* 那版一样）
-    int N = std::min((int)point_set.size(), num_points_to_take_);
-    if (N >= 3 && N < (int)point_set.size()) {
-        point_set.resize(N);    
-    }
-
-
-    Eigen::MatrixXd initial_state(3, 3), terminal_state(3, 3);
-
-    Eigen::Vector3d end_pt_kino = point_set.back();
-    initial_state.row(0) = start_pt.transpose();
-    initial_state.row(1) = start_end_derivatives[0].transpose();  // v0
-    initial_state.row(2) = start_end_derivatives[2].transpose();  // a0
-
-    terminal_state.row(0) = end_pt_kino.transpose();
-    if (start_end_derivatives.size() >= 4) {
-        terminal_state.row(1) = start_end_derivatives[1].transpose();  // vT
-        terminal_state.row(2) = start_end_derivatives[3].transpose();  // aT
-    } else {
-        terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT fallback
-        terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT fallback
-    }
-    // terminal_state.row(0) = end_pt_kino.transpose();
-    // terminal_state.row(1) = Eigen::Vector3d::Zero().transpose();  // vT
-    // terminal_state.row(2) = Eigen::Vector3d::Zero().transpose();  // aT
-
-
-    // B样条优化
-    pm.bspline_opt_->set3DPath2(point_set);
-    pm.spline_->setIniandTerandCpsnum(initial_state, terminal_state, pm.bspline_opt_->cps_num_);
-
-    if (pm.bspline_opt_->cps_num_ <= 2 * pm.spline_->p_) {
-        ROS_WARN("[gvf kino replan] cps_num too small: %d", pm.bspline_opt_->cps_num_);
+    if (point_set.size() < 2 || start_end_derivatives.size() != 4 ||
+        !std::isfinite(ts) || ts <= 0.0) {
+        ROS_WARN("[gvf kino replan] invalid Kino samples: points=%zu derivatives=%zu ts=%.6f",
+                 point_set.size(), start_end_derivatives.size(), ts);
         return false;
     }
 
-    UniformBspline spline = *pm.spline_;
-    pm.bspline_opt_->setSplineParam(spline);
+    Eigen::MatrixXd initial_control_points;
+    if (!UniformBspline::parameterizeToBspline(
+            ts, point_set, start_end_derivatives, initial_control_points)) {
+        ROS_WARN("[gvf kino replan] Fast-Planner parameterization failed");
+        return false;
+    }
+
+    if (!pm.bspline_opt_->setInitialControlPoints(initial_control_points, ts)) {
+        ROS_WARN("[gvf kino replan] optimizer rejected parameterized control points");
+        return false;
+    }
+
     pm.bspline_opt_->optimize();
 
-    pm.spline_->setControlPoints(pm.bspline_opt_->control_points_);
+    if (!pm.spline_->setControlPointsAndInterval(
+            pm.bspline_opt_->control_points_, 3, ts)) {
+        ROS_WARN("[gvf kino replan] spline initialization failed");
+        return false;
+    }
+
+    const double feasibility_ratio = pm.spline_->getFeasibilityRatio(
+        pm.bspline_opt_->max_vel_, pm.bspline_opt_->max_acc_);
+    if (!std::isfinite(feasibility_ratio)) {
+        ROS_WARN("[gvf kino replan] invalid feasibility ratio");
+        return false;
+    }
+    if (feasibility_ratio > 1.0 &&
+        !pm.spline_->scaleTime(feasibility_ratio * 1.01)) {
+        ROS_WARN("[gvf kino replan] time scaling failed");
+        return false;
+    }
+
     pm.spline_->getT();
+
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[GVF][BSPLINE_PARAM] kino_points=%zu control_points=%d kino_ts=%.4f final_interval=%.4f ratio=%.3f",
+        point_set.size(), static_cast<int>(pm.bspline_opt_->control_points_.rows()),
+        ts, pm.spline_->interval_, feasibility_ratio);
 
     UniformBspline p = *pm.spline_;
     UniformBspline v = p.getDerivative();

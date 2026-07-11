@@ -82,6 +82,8 @@ class gvf_manager
         int num_points_to_take_;  // 获取的路径点数量
         double exec_timer_interval;  // exec_timer的重规划时间间隔
         double kino_timer_interval;  // kino_timer的重规划时间间隔
+        double kino_sample_ts_ = 0.2;
+        double kino_sample_ts_min_ = 0.05;
 
         double slow_radius = 1.0;//开始减速半径
         double stop_radius = 0.3;//判定到达目标点半径  
