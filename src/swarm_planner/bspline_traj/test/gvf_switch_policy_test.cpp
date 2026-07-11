@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <initializer_list>
 #include <limits>
+#include <vector>
 
 #include <bspline_race/gvf_manager.h>
 
@@ -45,6 +47,19 @@ int selectProgressiveCandidateIndex(
   }
   return best.idx;
 }
+
+std::vector<int> sortClosedGoalAttemptIndices(
+    std::initializer_list<int> indices,
+    const std::vector<double>& lookaheads,
+    double desired_lookahead)
+{
+  std::vector<int> result(indices);
+  std::sort(result.begin(), result.end(), [&](int lhs, int rhs) {
+    return FLAG_Race::gvf_manager::closedGoalAttemptComesBefore(
+        lookaheads[lhs], lhs, lookaheads[rhs], rhs, desired_lookahead);
+  });
+  return result;
+}
 }
 
 TEST(GvfSwitchPolicy, ForcesAcceptWhenAcceptedPathCannotSupportGovernorLookahead)
@@ -87,12 +102,55 @@ TEST(GvfClosedGoalProgressivePolicy, ComputesBoundedRequiredProgress)
       1.2, 1.0, 0.6, 0.8), 1e-6);
 }
 
+TEST(GvfClosedGoalProgressivePolicy, UsesExactRequiredProgressBoundary)
+{
+  EXPECT_TRUE(FLAG_Race::gvf_manager::closedGoalProgressSufficient(0.8, 0.8));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::closedGoalProgressSufficient(
+      0.8 - 5e-7, 0.8));
+}
+
 TEST(GvfClosedGoalProgressivePolicy, BoundsTrackButNotRecoverLookahead)
 {
   EXPECT_NEAR(1.75, FLAG_Race::gvf_manager::closedGoalProgressiveMaxLookahead(
       1.0, 3.0, 0.75, false), 1e-6);
   EXPECT_NEAR(3.0, FLAG_Race::gvf_manager::closedGoalProgressiveMaxLookahead(
       1.0, 3.0, 0.75, true), 1e-6);
+}
+
+TEST(GvfClosedGoalAttemptPolicy, MaintainsStrictOrderAcrossCloseDesiredErrors)
+{
+  const double desired = 1.0;
+  const double exact = 1.0;
+  const double near = 0.99999925;
+  const double farther = 0.9999985;
+
+  EXPECT_TRUE(FLAG_Race::gvf_manager::closedGoalAttemptComesBefore(
+      exact, 0, near, 1, desired));
+  EXPECT_TRUE(FLAG_Race::gvf_manager::closedGoalAttemptComesBefore(
+      near, 1, farther, 2, desired));
+  EXPECT_TRUE(FLAG_Race::gvf_manager::closedGoalAttemptComesBefore(
+      exact, 0, farther, 2, desired));
+}
+
+TEST(GvfClosedGoalAttemptPolicy, ProducesSameOrderAcrossInputPermutations)
+{
+  const std::vector<double> lookaheads{1.0, 0.99999925, 0.9999985};
+  const std::vector<int> expected{0, 1, 2};
+
+  EXPECT_EQ(expected, sortClosedGoalAttemptIndices({0, 1, 2}, lookaheads, 1.0));
+  EXPECT_EQ(expected, sortClosedGoalAttemptIndices({0, 2, 1}, lookaheads, 1.0));
+  EXPECT_EQ(expected, sortClosedGoalAttemptIndices({1, 0, 2}, lookaheads, 1.0));
+  EXPECT_EQ(expected, sortClosedGoalAttemptIndices({1, 2, 0}, lookaheads, 1.0));
+  EXPECT_EQ(expected, sortClosedGoalAttemptIndices({2, 0, 1}, lookaheads, 1.0));
+  EXPECT_EQ(expected, sortClosedGoalAttemptIndices({2, 1, 0}, lookaheads, 1.0));
+}
+
+TEST(GvfClosedGoalAttemptPolicy, DescribesTrackAndRecoverCandidateWindows)
+{
+  EXPECT_STREQ("track_progressive_window",
+               FLAG_Race::gvf_manager::closedGoalCandidateOrderReason(false));
+  EXPECT_STREQ("recover_full_window",
+               FLAG_Race::gvf_manager::closedGoalCandidateOrderReason(true));
 }
 
 TEST(GvfClosedGoalProgressivePolicy, KeepsDesiredLookaheadWhenProgressIsSufficient)

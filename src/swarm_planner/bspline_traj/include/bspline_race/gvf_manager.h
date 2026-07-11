@@ -528,6 +528,13 @@ class gvf_manager
             return std::max(lo, std::min(raw, hi));
         }
 
+        static bool closedGoalProgressSufficient(double end_delta_w,
+                                                 double required_progress)
+        {
+            return std::isfinite(end_delta_w) && std::isfinite(required_progress) &&
+                   end_delta_w >= required_progress;
+        }
+
         static double closedGoalProgressiveMaxLookahead(double preferred,
                                                         double configured_max,
                                                         double extra,
@@ -536,6 +543,33 @@ class gvf_manager
             const double hi = std::max(0.0, configured_max);
             if (recover_mode) return hi;
             return std::min(hi, std::max(0.0, preferred) + std::max(0.0, extra));
+        }
+
+        static bool closedGoalAttemptComesBefore(double lhs_lookahead,
+                                                 int lhs_idx,
+                                                 double rhs_lookahead,
+                                                 int rhs_idx,
+                                                 double desired_lookahead)
+        {
+            const double safe_desired = std::isfinite(desired_lookahead)
+                ? desired_lookahead
+                : 0.0;
+            const double safe_lhs = std::isfinite(lhs_lookahead)
+                ? lhs_lookahead
+                : std::numeric_limits<double>::infinity();
+            const double safe_rhs = std::isfinite(rhs_lookahead)
+                ? rhs_lookahead
+                : std::numeric_limits<double>::infinity();
+            const double lhs_error = std::abs(safe_lhs - safe_desired);
+            const double rhs_error = std::abs(safe_rhs - safe_desired);
+            if (lhs_error != rhs_error) return lhs_error < rhs_error;
+            if (safe_lhs != safe_rhs) return safe_lhs < safe_rhs;
+            return lhs_idx < rhs_idx;
+        }
+
+        static const char* closedGoalCandidateOrderReason(bool recover_mode)
+        {
+            return recover_mode ? "recover_full_window" : "track_progressive_window";
         }
 
         static bool preferClosedGoalProgressiveCandidate(
@@ -555,14 +589,13 @@ class gvf_manager
             if (lhs_valid != rhs_valid) return lhs_valid;
             if (!lhs_valid) return false;
 
-            const double safe_required_progress = std::isfinite(required_progress)
-                ? required_progress
-                : std::numeric_limits<double>::infinity();
             const double safe_desired_lookahead = std::isfinite(desired_lookahead)
                 ? desired_lookahead
                 : 0.0;
-            const bool lhs_sufficient = lhs.end_delta_w >= safe_required_progress;
-            const bool rhs_sufficient = rhs.end_delta_w >= safe_required_progress;
+            const bool lhs_sufficient = closedGoalProgressSufficient(
+                lhs.end_delta_w, required_progress);
+            const bool rhs_sufficient = closedGoalProgressSufficient(
+                rhs.end_delta_w, required_progress);
             if (lhs_sufficient != rhs_sufficient) return lhs_sufficient;
 
             if (lhs_sufficient) {
