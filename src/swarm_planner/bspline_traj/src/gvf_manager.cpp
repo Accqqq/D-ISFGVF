@@ -26,6 +26,24 @@ namespace FLAG_Race
         nh.param("gvf/enable_trajectory_concatenation", enable_trajectory_concatenation_, false);
         nh.param("gvf/max_trajectory_concatenation_points", max_trajectory_concatenation_points_, 50);
 
+        nh.param<std::string>("gvf/closed_tracking_mode", closed_tracking_mode_, std::string("legacy"));
+        nh.param("gvf/point_phase_v2/enable", point_phase_v2_enabled_, false);
+        nh.param("gvf/point_phase_v2/enable_c2_connector", point_phase_c2_enabled_, false);
+        nh.param("gvf/point_phase_v2/endpoint_margin_w", point_phase_endpoint_margin_w_, 0.05);
+        point_phase_endpoint_margin_w_ = std::max(1e-3, point_phase_endpoint_margin_w_);
+        nh.param("gvf/circle_test/acquire_distance", closed_phase_acquire_distance_, 0.5);
+        closed_phase_acquire_distance_ = std::max(0.0, closed_phase_acquire_distance_);
+        nh.param("gvf/closed_phase_v2/enable_c2_connector", closed_phase_c2_enabled_, false);
+        nh.param("gvf/closed_phase_v2/c2_join_min_w", closed_phase_c2_join_min_w_, 0.5);
+        nh.param("gvf/closed_phase_v2/c2_join_max_w", closed_phase_c2_join_max_w_, 1.0);
+        nh.param("gvf/closed_phase_v2/c2_join_step_w", closed_phase_c2_join_step_w_, 0.25);
+        nh.param("gvf/closed_phase_v2/c2_sample_step_w", closed_phase_c2_sample_step_w_, 0.05);
+        nh.param("gvf/closed_phase_v2/back_margin_w", closed_phase_back_margin_w_, 1.0);
+        closed_phase_c2_join_min_w_ = std::max(0.05, closed_phase_c2_join_min_w_);
+        closed_phase_c2_join_max_w_ = std::max(closed_phase_c2_join_min_w_, closed_phase_c2_join_max_w_);
+        closed_phase_c2_join_step_w_ = std::max(0.05, closed_phase_c2_join_step_w_);
+        closed_phase_c2_sample_step_w_ = std::max(0.01, closed_phase_c2_sample_step_w_);
+        closed_phase_back_margin_w_ = std::max(0.0, closed_phase_back_margin_w_);
         nh.param("gvf/circle_test/enable", enable_circle_reference_test_, false);
         nh.param("gvf/circle_test/auto_start", circle_reference_auto_start_, false);
         nh.param<std::string>("gvf/circle_test/shape", reference_shape_, std::string("circle"));
@@ -202,6 +220,8 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
 
     progress_w_ = 0.0;
     progress_initialized_ = false;
+    resetUnifiedPhaseV2();
+    clearActiveTrajectory(true);
     closed_ref_w_ = 0.0;
     closed_ref_initialized_ = false;
     closed_ref_recover_ = false;
@@ -225,7 +245,7 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
         } else {
             generateCircleReference(goal_pt);
         }
-        if (circle_reference_ready_) {
+        if (circle_reference_ready_ && !closedPhaseV2Enabled()) {
             auto circle_goal = getCircleReferenceGoal(start_pt);
             goal_pt = circle_goal.first;
         }
@@ -244,9 +264,6 @@ void gvf_manager::goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
     }
 
     for (auto& manager : swarmParticlesManager) {
-        if (manager.gvf_) {
-            manager.gvf_->clearPathReparamState();
-        }
         manager.receive_startpt = true;
         manager.start_pt = start_pt;
         manager.goal_pt = goal_pt;
@@ -303,6 +320,31 @@ void gvf_manager::resetGovernorState()
     cmd_governor_normal_state_.setZero();
     cmd_governor_initialized_ = false;
     cmd_governor_last_l_ = 0.0;
+}
+
+void gvf_manager::clearActiveTrajectory(bool publish_empty_path,
+                                        bool clear_gvf_path)
+{
+    for (auto& manager : swarmParticlesManager) {
+        manager.last_traj.resize(0, 3);
+        manager.last_vel.resize(0, 3);
+        manager.last_traj_time_.resize(0);
+        if (clear_gvf_path && manager.gvf_) {
+            manager.gvf_->clearPathReparamState();
+        }
+    }
+
+    current_traj_index_ = 0;
+    test_traj_index_ = 0;
+    resetGovernorState();
+
+    if (publish_empty_path) {
+        nav_msgs::Path empty_path;
+        empty_path.header.frame_id = "world";
+        empty_path.header.stamp = ros::Time::now();
+        path_pub.publish(empty_path);
+        kino_path_pub.publish(empty_path);
+    }
 }
 
 gvf_manager::GovernorCommandResult
@@ -477,6 +519,13 @@ gvf_manager::runVelocityMatchingGovernor(gvfManager& pm,
     const double lead_max = std::max(0.0, cmd_governor_lead_max_);
     const double normal_rate_max = std::max(0.0, cmd_governor_normal_rate_max_);
     const double path_end_eps = 1e-6;
+    double phase_per_meter = 1.0;
+    if (closedPhaseV2Active()) {
+        const double dpdw_norm = pm.gvf_->evalDpDwByW(progress_w_after).norm();
+        if (dpdw_norm > 1e-6) {
+            phase_per_meter = 1.0 / dpdw_norm;
+        }
+    }
 
     for (double l : l_candidates)
     {
@@ -491,7 +540,7 @@ gvf_manager::runVelocityMatchingGovernor(gvfManager& pm,
         bool clamped_to_end = false;
         double candidate_path_w_start = 0.0;
         double candidate_path_w_end = 0.0;
-        const double query_w = progress_w_after + l;
+        const double query_w = progress_w_after + l * phase_per_meter;
         if (!pathPointAtW(pm.gvf_, query_w, p_l, clamped_to_end,
                           candidate_path_w_start, candidate_path_w_end))
         {
@@ -807,7 +856,7 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
 
     GovernorCommandDebug dbg;
     dbg.normal_state_norm = cmd_governor_normal_state_.norm();
-    dbg.best_query_w = progress_w_;
+    dbg.best_query_w = activeTrackingPhase();
 
     GovernorCommandResult result;
     result.cmd_pos = pos;
@@ -820,17 +869,102 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     }
     else
     {
-        out = pm.gvf_->calcLiftedGuidance3D(pos, progress_w_);
+        if (unifiedPhaseV2Active() && phase_initialized_)
+        {
+            out = pm.gvf_->calcLiftedGuidanceAtPhase(pos, phase_w_);
+        }
+        else
+        {
+            out = pm.gvf_->calcLiftedGuidance3D(pos, progress_w_);
+        }
         if (!out.valid)
         {
             result = makeGovernorInvalidHold(pos, "guidance_invalid", dbg);
         }
         else
         {
-            progress_w_ = out.w_proj + out.w_dot * dt;
+            if (unifiedPhaseV2Active() && phase_initialized_)
+            {
+                double next_phase = phase_w_ + out.w_dot * dt;
+                if (pointPhaseV2Active()) {
+                    double path_start_w = 0.0;
+                    double path_end_w = 0.0;
+                    const auto path = pm.gvf_->getContinuousPhasePath();
+                    if (path && !path->empty()) {
+                        path_start_w = path->startW();
+                        path_end_w = path->endW();
+                    } else if (!pm.gvf_->sample_w_.empty()) {
+                        path_start_w = pm.gvf_->sample_w_.front();
+                        path_end_w = pm.gvf_->sample_w_.back();
+                    }
+                    if (path_end_w > path_start_w + 1e-6) {
+                        const double margin = std::min(
+                            point_phase_endpoint_margin_w_,
+                            0.25 * (path_end_w - path_start_w));
+                        const double phase_min = path_start_w + margin;
+                        const double phase_max = path_end_w - margin;
+                        next_phase = std::max(
+                            phase_min, std::min(next_phase, phase_max));
+                    }
+                }
+                phase_w_ = next_phase;
+                progress_w_ = phase_w_;  // legacy 诊断镜像；v2 不从这里读回相位。
+                if (!closed_phase_acquired_ &&
+                    out.e_perp.norm() <= closed_phase_acquire_distance_)
+                {
+                    closed_phase_acquired_ = true;
+                    last_replan_time_ = now;
+                    ROS_WARN("[GVF][CLOSED_PHASE_V2][ACQUIRED] phase_w=%.3f error=%.3f",
+                             phase_w_, out.e_perp.norm());
+                }
+            }
+            else
+            {
+                progress_w_ = out.w_proj + out.w_dot * dt;
+            }
             progress_initialized_ = true;
-            pm.gvf_->setVisualizationProgressW(progress_w_);
-            result = runVelocityMatchingGovernor(pm, out, pos, progress_w_, dt, kp_equiv, dbg);
+            pm.gvf_->setVisualizationProgressW(activeTrackingPhase());
+            if (closedPhaseV2Active() && !closed_phase_acquired_)
+            {
+                const Eigen::Vector3d delta = boundedInitialAcquisitionDelta(
+                    out.v_cmd, cmd_vel_max_, kp_equiv, cmd_governor_lead_max_);
+                if (delta.norm() <= 1e-9)
+                {
+                    result = makeGovernorInvalidHold(
+                        pos, "initial_acquisition_zero_command", dbg);
+                }
+                else
+                {
+                    resetGovernorState();
+                    result.cmd_pos = pos + delta;
+                    result.yaw_cmd_vec = delta;
+                    result.final_cmd_source = "GVF_INITIAL_ACQUISITION";
+                    result.fallback_reason = "none";
+                    result.command_valid = true;
+                    result.selected_valid_for_state = false;
+
+                    dbg.guidance_valid = true;
+                    dbg.fallback_hold_pos = false;
+                    dbg.raw_v_norm = out.v_cmd.norm();
+                    dbg.e_perp_norm = out.e_perp.norm();
+                    if (out.tangent.norm() > 1e-6)
+                    {
+                        const Eigen::Vector3d tangent = out.tangent.normalized();
+                        dbg.raw_v_tau = out.v_cmd.dot(tangent);
+                        dbg.raw_v_normal_norm =
+                            (out.v_cmd - dbg.raw_v_tau * tangent).norm();
+                    }
+                    dbg.v_tau_intent = std::max(0.0, dbg.raw_v_tau);
+                    dbg.v_n_intent_norm = dbg.raw_v_normal_norm;
+                    dbg.selected_v_model_norm = (kp_equiv * delta).norm();
+                    dbg.cmd_dist = delta.norm();
+                }
+            }
+            else
+            {
+                result = runVelocityMatchingGovernor(
+                    pm, out, pos, activeTrackingPhase(), dt, kp_equiv, dbg);
+            }
         }
     }
 
@@ -1068,6 +1202,7 @@ void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
 
     progress_w_ = 0.0;
     progress_initialized_ = false;
+    resetUnifiedPhaseV2();
     closed_ref_w_ = 0.0;
     closed_ref_initialized_ = false;
     closed_ref_recover_ = false;
@@ -1092,7 +1227,7 @@ void gvf_manager::odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
     }
 
     Eigen::Vector3d goal_pt = start_pt;
-    if (circle_reference_ready_) {
+    if (circle_reference_ready_ && !closedPhaseV2Enabled()) {
         goal_pt = getCircleReferenceGoal(start_pt).first;
     }
 
@@ -1134,6 +1269,789 @@ void gvf_manager::publishReferencePathMsg(const Eigen::MatrixXd& traj, const Eig
     }
 
     pub.publish(path_msg);
+}
+
+bool gvf_manager::closedPhaseV2Enabled() const
+{
+    return closed_tracking_mode_ == "closed_phase_v2";
+}
+
+bool gvf_manager::closedPhaseV2Active() const
+{
+    return closedPhaseV2Enabled() && enable_circle_reference_test_ && circle_reference_ready_;
+}
+
+bool gvf_manager::pointPhaseV2Active() const
+{
+    return point_phase_v2_enabled_ &&
+           !(enable_circle_reference_test_ && circle_reference_ready_);
+}
+
+bool gvf_manager::unifiedPhaseV2Active() const
+{
+    return closedPhaseV2Active() || pointPhaseV2Active();
+}
+
+double gvf_manager::activeTrackingPhase() const
+{
+    return unifiedPhaseV2Active() && phase_initialized_ ? phase_w_ : progress_w_;
+}
+
+void gvf_manager::resetUnifiedPhaseV2()
+{
+    phase_w_ = 0.0;
+    phase_initialized_ = false;
+    closed_phase_acquired_ = false;
+    closed_phase_pending_path_end_w_ = 0.0;
+    closed_phase_has_pending_path_end_w_ = false;
+    for (auto& manager : swarmParticlesManager) {
+        if (manager.gvf_) {
+            manager.gvf_->setAuthoritativePhaseMode(false);
+            manager.gvf_->clearContinuousPhasePath();
+        }
+    }
+}
+
+double gvf_manager::findInitialClosedPhaseV2(const Eigen::Vector3d& curr_pos) const
+{
+    const int N = static_cast<int>(circle_reference_traj_.rows());
+    if (N <= 1 || circle_reference_w_.size() != static_cast<size_t>(N) ||
+        circle_reference_total_w_ <= 1e-9) {
+        return 0.0;
+    }
+
+    const bool circle_shape =
+        reference_shape_ != "figure8" && reference_shape_ != "8" &&
+        reference_shape_ != "lemniscate";
+    const double center_distance =
+        (curr_pos - circle_reference_center_).head<2>().norm();
+    if (circle_shape && center_distance <= 1e-3) {
+        return closed_ref_initial_phase_w_ >= 0.0
+            ? wrapClosedW(closed_ref_initial_phase_w_)
+            : 0.0;
+    }
+
+    struct PhaseCandidate {
+        double w = 0.0;
+        double dist_sq = std::numeric_limits<double>::infinity();
+        double tangent_dot_odom = -1.0;
+    };
+
+    const Eigen::Vector2d odom_v_xy = odom_vel_lpf_.head<2>();
+    const double odom_v_norm = odom_v_xy.norm();
+    const bool use_direction = odom_v_norm > 0.2;
+    Eigen::Vector2d odom_dir = Eigen::Vector2d::Zero();
+    if (use_direction) {
+        odom_dir = odom_v_xy / odom_v_norm;
+    }
+
+    std::vector<PhaseCandidate> candidates;
+    candidates.reserve(N);
+    double min_dist_sq = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < N; ++i) {
+        const int j = (i + 1) % N;
+        const Eigen::Vector3d p0 = circle_reference_traj_.row(i).transpose();
+        const Eigen::Vector3d p1 = circle_reference_traj_.row(j).transpose();
+        const Eigen::Vector3d seg = p1 - p0;
+        const double seg_len_sq = seg.squaredNorm();
+        if (seg_len_sq <= 1e-12) continue;
+
+        const double u = std::max(0.0, std::min(1.0,
+            (curr_pos - p0).dot(seg) / seg_len_sq));
+        const Eigen::Vector3d projection = p0 + u * seg;
+        PhaseCandidate candidate;
+        candidate.dist_sq = (curr_pos - projection).squaredNorm();
+        const double w0 = circle_reference_w_[i];
+        const double w1 = i == N - 1
+            ? circle_reference_total_w_
+            : circle_reference_w_[j];
+        candidate.w = w0 + u * (w1 - w0);
+
+        const Eigen::Vector2d tangent_xy = seg.head<2>();
+        if (use_direction && tangent_xy.norm() > 1e-9) {
+            candidate.tangent_dot_odom = tangent_xy.normalized().dot(odom_dir);
+        }
+        candidates.push_back(candidate);
+        min_dist_sq = std::min(min_dist_sq, candidate.dist_sq);
+    }
+
+    if (candidates.empty()) return 0.0;
+
+    const double sample_step = circle_reference_total_w_ / static_cast<double>(N);
+    const double tie_distance = std::max(1e-4, 0.05 * sample_step);
+    const double tie_dist_sq = tie_distance * tie_distance;
+    PhaseCandidate best;
+    bool have_best = false;
+    for (const auto& candidate : candidates) {
+        if (candidate.dist_sq > min_dist_sq + tie_dist_sq) continue;
+        if (!have_best ||
+            (use_direction && candidate.tangent_dot_odom > best.tangent_dot_odom + 1e-6) ||
+            ((!use_direction || std::abs(candidate.tangent_dot_odom - best.tangent_dot_odom) <= 1e-6) &&
+             candidate.dist_sq < best.dist_sq - 1e-12) ||
+            (std::abs(candidate.dist_sq - best.dist_sq) <= 1e-12 && candidate.w < best.w)) {
+            best = candidate;
+            have_best = true;
+        }
+    }
+    return have_best ? best.w : 0.0;
+}
+
+bool gvf_manager::buildNominalClosedFrontend(
+    double start_w,
+    Eigen::MatrixXd& traj,
+    Eigen::MatrixXd& vel,
+    Eigen::VectorXd& time,
+    std::vector<double>& global_w) const
+{
+    const int reference_points = static_cast<int>(circle_reference_traj_.rows());
+    if (!circle_reference_ready_ || reference_points < 2 ||
+        circle_reference_total_w_ <= 1e-9) {
+        return false;
+    }
+
+    const double frontend_length = std::max(
+        1.0,
+        std::max(closed_goal_prefer_lookahead_w_,
+                 cmd_governor_l_max_ + std::max(0.0, switch_governor_path_margin_w_)));
+    const double nominal_step = std::max(
+        1e-3, circle_reference_total_w_ / static_cast<double>(reference_points));
+    const int count = std::max(2, static_cast<int>(std::ceil(frontend_length / nominal_step)) + 1);
+
+    traj.resize(count, 3);
+    vel.resize(count, 3);
+    time.resize(count);
+    global_w.resize(count);
+    time(0) = 0.0;
+    const double nominal_speed = std::max(0.1, cmd_tangent_vel_max_);
+
+    for (int i = 0; i < count; ++i) {
+        const double ratio = static_cast<double>(i) / static_cast<double>(count - 1);
+        const double w = start_w + ratio * frontend_length;
+        global_w[i] = w;
+        traj.row(i) = pointFromClosedW(w).transpose();
+        vel.row(i) = (nominal_speed * tangentFromClosedW(w)).transpose();
+        if (i > 0) {
+            const double ds = (traj.row(i) - traj.row(i - 1)).norm();
+            time(i) = time(i - 1) + ds / nominal_speed;
+        }
+    }
+    return true;
+}
+
+bool gvf_manager::buildMappedPhaseFrontend(
+    double phase_anchor,
+    double path_end_w,
+    int candidate_anchor_idx,
+    const UniformBspline& candidate_spline,
+    const Eigen::MatrixXd& candidate_traj,
+    const Eigen::VectorXd& candidate_time,
+    Eigen::MatrixXd& mapped_traj,
+    Eigen::MatrixXd& mapped_vel,
+    Eigen::VectorXd& mapped_time,
+    std::vector<double>& mapped_w,
+    std::shared_ptr<const ContinuousPhasePath>& continuous_path) const
+{
+    continuous_path.reset();
+    const int rows = static_cast<int>(candidate_traj.rows());
+    if (rows < 2 || candidate_time.size() != rows ||
+        !std::isfinite(phase_anchor) || !std::isfinite(path_end_w) ||
+        path_end_w <= phase_anchor + 1e-6) {
+        return false;
+    }
+
+    candidate_anchor_idx = std::max(0, std::min(candidate_anchor_idx, rows - 2));
+    const double spline_t_anchor = candidate_time(candidate_anchor_idx);
+    const double spline_t_end = candidate_time(rows - 1);
+    const auto evaluator = ContinuousPhasePath::makeMappedBspline(
+        candidate_spline, spline_t_anchor, spline_t_end,
+        phase_anchor, path_end_w);
+    if (!evaluator) return false;
+
+    auto path = std::make_shared<ContinuousPhasePath>();
+    if (!path->appendSegment(
+            phase_anchor, path_end_w, "mapped_bspline", evaluator)) {
+        return false;
+    }
+
+    const std::shared_ptr<const ContinuousPhasePath> immutable_path = path;
+    if (!sampleContinuousPhasePath(
+            immutable_path, mapped_traj, mapped_vel, mapped_time, mapped_w)) {
+        return false;
+    }
+    continuous_path = immutable_path;
+    return true;
+}
+
+bool gvf_manager::buildNominalContinuousPhasePath(
+    double start_w,
+    double end_w,
+    std::shared_ptr<const ContinuousPhasePath>& path) const
+{
+    path.reset();
+    if (!circle_reference_ready_ || circle_reference_total_w_ <= 1e-9 ||
+        !std::isfinite(start_w) || !std::isfinite(end_w) ||
+        end_w <= start_w + 1e-6) {
+        return false;
+    }
+
+    const bool figure8 = reference_shape_ == "figure8" ||
+                         reference_shape_ == "8" ||
+                         reference_shape_ == "lemniscate";
+    const double radius = figure8
+        ? std::max(0.3, figure8_reference_radius_)
+        : std::max(0.3, circle_reference_radius_);
+    const double nominal_speed = std::max(0.1, cmd_tangent_vel_max_);
+    const auto evaluator = figure8
+        ? ContinuousPhasePath::makePeriodicFigureEight(
+              circle_reference_center_, radius, circle_reference_total_w_, nominal_speed)
+        : ContinuousPhasePath::makePeriodicCircle(
+              circle_reference_center_, radius, circle_reference_total_w_, nominal_speed);
+    if (!evaluator) return false;
+
+    auto result = std::make_shared<ContinuousPhasePath>();
+    if (!result->appendSegment(start_w, end_w,
+                               figure8 ? "nominal_figure8" : "nominal_circle",
+                               evaluator)) {
+        return false;
+    }
+    path = result;
+    return true;
+}
+
+bool gvf_manager::sampleContinuousPhasePath(
+    const std::shared_ptr<const ContinuousPhasePath>& path,
+    Eigen::MatrixXd& traj,
+    Eigen::MatrixXd& vel,
+    Eigen::VectorXd& time,
+    std::vector<double>& global_w) const
+{
+    traj.resize(0, 0);
+    vel.resize(0, 0);
+    time.resize(0);
+    global_w.clear();
+    if (!path || path->empty()) return false;
+
+    std::vector<ContinuousPhasePathState> states;
+    if (!path->sample(std::max(0.01, closed_phase_c2_sample_step_w_),
+                      global_w, states) || states.size() < 2) {
+        return false;
+    }
+
+    const int rows = static_cast<int>(states.size());
+    traj.resize(rows, 3);
+    vel.resize(rows, 3);
+    time.resize(rows);
+    time(0) = 0.0;
+    for (int i = 0; i < rows; ++i) {
+        traj.row(i) = states[i].p.transpose();
+        Eigen::Vector3d sample_vel = states[i].vel;
+        if (!sample_vel.allFinite() || sample_vel.norm() <= 0.1) {
+            if (states[i].dp_dw.norm() > 1e-9) {
+                sample_vel = states[i].dp_dw.normalized() *
+                             std::max(0.1, cmd_tangent_vel_max_);
+            } else {
+                sample_vel.setZero();
+            }
+        }
+        vel.row(i) = sample_vel.transpose();
+        if (i > 0) {
+            const double ds = (states[i].p - states[i - 1].p).norm();
+            const double speed = std::max(
+                0.1, 0.5 * (sample_vel.norm() + vel.row(i - 1).norm()));
+            time(i) = time(i - 1) + ds / speed;
+        }
+    }
+    return true;
+}
+
+bool gvf_manager::buildGlobalPhaseSamples(
+    const Eigen::MatrixXd& traj,
+    int anchor_idx,
+    double anchor_w,
+    double end_w,
+    std::vector<double>& global_w) const
+{
+    const int rows = static_cast<int>(traj.rows());
+    if (rows < 2 || !std::isfinite(anchor_w) || !std::isfinite(end_w)) return false;
+
+    anchor_idx = std::max(0, std::min(anchor_idx, rows - 2));
+    if (end_w <= anchor_w + 1e-6) return false;
+
+    std::vector<double> cumulative(rows, 0.0);
+    for (int i = 1; i < rows; ++i) {
+        const double ds = (traj.row(i) - traj.row(i - 1)).norm();
+        cumulative[i] = cumulative[i - 1] + std::max(1e-6, ds);
+    }
+
+    const double future_length = cumulative.back() - cumulative[anchor_idx];
+    if (future_length <= 1e-9) return false;
+    const double scale = (end_w - anchor_w) / future_length;
+
+    global_w.resize(rows);
+    for (int i = 0; i < rows; ++i) {
+        global_w[i] = anchor_w + (cumulative[i] - cumulative[anchor_idx]) * scale;
+    }
+    return true;
+}
+
+bool gvf_manager::evaluateC2QuinticHermite(
+    const Eigen::Vector3d& p0,
+    const Eigen::Vector3d& dp0,
+    const Eigen::Vector3d& d2p0,
+    const Eigen::Vector3d& p1,
+    const Eigen::Vector3d& dp1,
+    const Eigen::Vector3d& d2p1,
+    double interval_w,
+    double u,
+    Eigen::Vector3d& p,
+    Eigen::Vector3d& dp_dw,
+    Eigen::Vector3d& d2p_dw2)
+{
+    if (!std::isfinite(interval_w) || interval_w <= 1e-6 ||
+        !std::isfinite(u)) {
+        return false;
+    }
+
+    const double s = std::max(0.0, std::min(1.0, u));
+    const double h = interval_w;
+    const Eigen::Vector3d a0 = p0;
+    const Eigen::Vector3d a1 = h * dp0;
+    const Eigen::Vector3d a2 = 0.5 * h * h * d2p0;
+    const Eigen::Vector3d r0 = p1 - a0 - a1 - a2;
+    const Eigen::Vector3d r1 = h * dp1 - a1 - 2.0 * a2;
+    const Eigen::Vector3d r2 = h * h * d2p1 - 2.0 * a2;
+    const Eigen::Vector3d a3 = 10.0 * r0 - 4.0 * r1 + 0.5 * r2;
+    const Eigen::Vector3d a4 = -15.0 * r0 + 7.0 * r1 - r2;
+    const Eigen::Vector3d a5 = 6.0 * r0 - 3.0 * r1 + 0.5 * r2;
+
+    const double s2 = s * s;
+    const double s3 = s2 * s;
+    const double s4 = s3 * s;
+    const double s5 = s4 * s;
+    p = a0 + a1 * s + a2 * s2 + a3 * s3 + a4 * s4 + a5 * s5;
+    dp_dw = (a1 + 2.0 * a2 * s + 3.0 * a3 * s2 +
+             4.0 * a4 * s3 + 5.0 * a5 * s4) / h;
+    d2p_dw2 = (2.0 * a2 + 6.0 * a3 * s + 12.0 * a4 * s2 +
+                20.0 * a5 * s3) / (h * h);
+    return p.allFinite() && dp_dw.allFinite() && d2p_dw2.allFinite();
+}
+
+bool gvf_manager::evaluateSampledPhasePathState(
+    const Eigen::MatrixXd& traj,
+    const Eigen::MatrixXd& vel,
+    const std::vector<double>& global_w,
+    double query_w,
+    PhasePathState& state) const
+{
+    state = PhasePathState();
+    const int rows = static_cast<int>(traj.rows());
+    if (rows < 3 || traj.cols() < 3 ||
+        global_w.size() != static_cast<size_t>(rows) ||
+        !std::isfinite(query_w)) {
+        return false;
+    }
+    for (int i = 0; i < rows; ++i) {
+        if (!std::isfinite(global_w[i]) ||
+            (i > 0 && global_w[i] <= global_w[i - 1])) {
+            return false;
+        }
+    }
+
+    auto pointAt = [&](int i) {
+        return Eigen::Vector3d(traj(i, 0), traj(i, 1), traj(i, 2));
+    };
+    auto firstDerivativeAt = [&](int i) {
+        Eigen::Vector3d derivative = Eigen::Vector3d::Zero();
+        if (i <= 0) {
+            const double dw = std::max(1e-9, global_w[1] - global_w[0]);
+            derivative = (pointAt(1) - pointAt(0)) / dw;
+        } else if (i >= rows - 1) {
+            const double dw = std::max(1e-9, global_w[rows - 1] - global_w[rows - 2]);
+            derivative = (pointAt(rows - 1) - pointAt(rows - 2)) / dw;
+        } else {
+            const double dw = std::max(1e-9, global_w[i + 1] - global_w[i - 1]);
+            derivative = (pointAt(i + 1) - pointAt(i - 1)) / dw;
+        }
+        return derivative;
+    };
+    auto secondDerivativeAt = [&](int i) {
+        Eigen::Vector3d derivative = Eigen::Vector3d::Zero();
+        if (i <= 0) {
+            const double dw = std::max(1e-9, global_w[1] - global_w[0]);
+            derivative = (firstDerivativeAt(1) - firstDerivativeAt(0)) / dw;
+        } else if (i >= rows - 1) {
+            const double dw = std::max(1e-9, global_w[rows - 1] - global_w[rows - 2]);
+            derivative = (firstDerivativeAt(rows - 1) - firstDerivativeAt(rows - 2)) / dw;
+        } else {
+            const double dw = std::max(1e-9, global_w[i + 1] - global_w[i - 1]);
+            derivative = (firstDerivativeAt(i + 1) - firstDerivativeAt(i - 1)) / dw;
+        }
+        return derivative;
+    };
+
+    int i0 = 0;
+    int i1 = 0;
+    double ratio = 0.0;
+    if (query_w <= global_w.front()) {
+        i0 = i1 = 0;
+    } else if (query_w >= global_w.back()) {
+        i0 = i1 = rows - 1;
+    } else {
+        auto it = std::lower_bound(global_w.begin(), global_w.end(), query_w);
+        i1 = static_cast<int>(std::distance(global_w.begin(), it));
+        i0 = i1 - 1;
+        ratio = (query_w - global_w[i0]) /
+            std::max(1e-9, global_w[i1] - global_w[i0]);
+    }
+
+    state.p = (1.0 - ratio) * pointAt(i0) + ratio * pointAt(i1);
+    state.dp_dw = (1.0 - ratio) * firstDerivativeAt(i0) +
+                  ratio * firstDerivativeAt(i1);
+    state.d2p_dw2 = (1.0 - ratio) * secondDerivativeAt(i0) +
+                    ratio * secondDerivativeAt(i1);
+    if (vel.rows() == rows && vel.cols() >= 3) {
+        const Eigen::Vector3d v0(vel(i0, 0), vel(i0, 1), vel(i0, 2));
+        const Eigen::Vector3d v1(vel(i1, 0), vel(i1, 1), vel(i1, 2));
+        state.vel = (1.0 - ratio) * v0 + ratio * v1;
+    }
+    state.valid = state.p.allFinite() && state.dp_dw.allFinite() &&
+                  state.d2p_dw2.allFinite() && state.dp_dw.norm() > 1e-6;
+    return state.valid;
+}
+
+bool gvf_manager::buildPhaseV2C2Frontend(
+    gvfManager& pm,
+    double phase_at_switch,
+    double path_end_w,
+    int candidate_anchor_idx,
+    const UniformBspline& candidate_spline,
+    const Eigen::MatrixXd& candidate_traj,
+    const Eigen::MatrixXd& candidate_vel,
+    const Eigen::VectorXd& candidate_time,
+    const std::vector<double>& candidate_w,
+    Eigen::MatrixXd& stitched_traj,
+    Eigen::MatrixXd& stitched_vel,
+    Eigen::VectorXd& stitched_time,
+    std::vector<double>& stitched_w,
+    std::shared_ptr<const ContinuousPhasePath>& continuous_path) const
+{
+    continuous_path.reset();
+    const bool c2_enabled = closedPhaseV2Active()
+        ? closed_phase_c2_enabled_
+        : (pointPhaseV2Active() ? point_phase_c2_enabled_ : false);
+    const char* mode_name = closedPhaseV2Active() ? "closed" : "point";
+    if (!c2_enabled || !pm.gvf_ ||
+        candidate_traj.rows() < 3 ||
+        candidate_vel.rows() != candidate_traj.rows() ||
+        candidate_time.size() != candidate_traj.rows() ||
+        candidate_w.size() != static_cast<size_t>(candidate_traj.rows()) ||
+        !std::isfinite(phase_at_switch) || !std::isfinite(path_end_w) ||
+        path_end_w <= phase_at_switch + 1e-3) {
+        return false;
+    }
+
+    const auto old_path = pm.gvf_->getContinuousPhasePath();
+    ContinuousPhasePathState old_state;
+    if (!old_path || !old_path->evaluate(phase_at_switch, old_state, false)) {
+        return false;
+    }
+
+    candidate_anchor_idx = std::max(
+        0, std::min(candidate_anchor_idx, static_cast<int>(candidate_time.size()) - 2));
+    const double spline_t_anchor = candidate_time(candidate_anchor_idx);
+    const double spline_t_end = candidate_time(candidate_time.size() - 1);
+    const auto mapped_bspline = ContinuousPhasePath::makeMappedBspline(
+        candidate_spline, spline_t_anchor, spline_t_end,
+        phase_at_switch, path_end_w);
+    if (!mapped_bspline) return false;
+
+    bool have_best = false;
+    double best_cost = std::numeric_limits<double>::infinity();
+    double best_join_delta_w = 0.0;
+    Eigen::MatrixXd best_traj;
+    Eigen::MatrixXd best_vel;
+    Eigen::VectorXd best_time;
+    std::vector<double> best_w;
+    std::shared_ptr<const ContinuousPhasePath> best_path;
+
+    const double join_min = std::max(0.05, closed_phase_c2_join_min_w_);
+    const double join_max = std::max(join_min, closed_phase_c2_join_max_w_);
+    const double join_step = std::max(0.05, closed_phase_c2_join_step_w_);
+    const double sample_step = std::max(0.01, closed_phase_c2_sample_step_w_);
+
+    for (double join_delta_w = join_min;
+         join_delta_w <= join_max + 1e-9;
+         join_delta_w += join_step) {
+        const double join_w = phase_at_switch + join_delta_w;
+        if (join_w >= path_end_w - 1e-4) continue;
+
+        ContinuousPhasePathState new_state;
+        if (!mapped_bspline(join_w, new_state)) {
+            continue;
+        }
+
+        const auto connector = ContinuousPhasePath::makeQuinticHermite(
+            phase_at_switch, join_w, old_state, new_state);
+        if (!connector) continue;
+
+        ContinuousPhasePathState connector_start;
+        ContinuousPhasePathState connector_end;
+        if (!connector(phase_at_switch, connector_start) ||
+            !connector(join_w, connector_end)) {
+            continue;
+        }
+        const double boundary_error =
+            (connector_start.p - old_state.p).norm() +
+            (connector_start.dp_dw - old_state.dp_dw).norm() +
+            (connector_start.d2p_dw2 - old_state.d2p_dw2).norm() +
+            (connector_end.p - new_state.p).norm() +
+            (connector_end.dp_dw - new_state.dp_dw).norm() +
+            (connector_end.d2p_dw2 - new_state.d2p_dw2).norm();
+        if (!std::isfinite(boundary_error) || boundary_error > 1e-6) continue;
+
+        auto trial_path = std::make_shared<ContinuousPhasePath>();
+        const double prefix_start = std::max(
+            old_path->startW(), phase_at_switch - closed_phase_back_margin_w_);
+        if (phase_at_switch > prefix_start + 1e-6 &&
+            !trial_path->appendSlice(*old_path, prefix_start, phase_at_switch)) {
+            continue;
+        }
+        if (!trial_path->appendSegment(
+                phase_at_switch, join_w, "c2_quintic", connector) ||
+            !trial_path->appendSegment(
+                join_w, path_end_w, "mapped_bspline", mapped_bspline)) {
+            continue;
+        }
+
+        std::vector<double> trial_sample_w;
+        std::vector<ContinuousPhasePathState> trial_states;
+        if (!trial_path->sample(sample_step, trial_sample_w, trial_states) ||
+            trial_states.size() < 3) {
+            continue;
+        }
+
+        bool connector_valid = true;
+        double smoothness_cost = 0.0;
+        double connector_length = 0.0;
+        Eigen::Vector3d previous_connector_p = old_state.p;
+
+        for (size_t i = 0; i < trial_states.size(); ++i) {
+            const auto& state = trial_states[i];
+            const bool terminal_sample = i + 1 == trial_states.size();
+            if (!state.valid || (!terminal_sample && state.dp_dw.norm() <= 1e-6)) {
+                connector_valid = false;
+                break;
+            }
+            if (i > 0 && trial_states[i - 1].dp_dw.norm() > 1e-6 &&
+                state.dp_dw.norm() > 1e-6) {
+                const double tangent_dot = trial_states[i - 1].dp_dw.normalized().dot(
+                    state.dp_dw.normalized());
+                if (tangent_dot < -0.2) {
+                    connector_valid = false;
+                    break;
+                }
+            }
+            if (trial_sample_w[i] > phase_at_switch + 1e-6 &&
+                pm.sdf_map_ && pm.sdf_map_->isInMap(state.p) &&
+                pm.sdf_map_->getInflateOccupancy(state.p) != 0) {
+                connector_valid = false;
+                break;
+            }
+            if (trial_sample_w[i] >= phase_at_switch - 1e-9 &&
+                trial_sample_w[i] <= join_w + 1e-9) {
+                if (trial_sample_w[i] > phase_at_switch + 1e-9) {
+                    connector_length += (state.p - previous_connector_p).norm();
+                }
+                previous_connector_p = state.p;
+                smoothness_cost += state.d2p_dw2.squaredNorm() * sample_step;
+            }
+        }
+        if (!connector_valid) continue;
+
+        Eigen::MatrixXd trial_traj;
+        Eigen::MatrixXd trial_vel;
+        Eigen::VectorXd trial_time;
+        std::vector<double> trial_w;
+        const std::shared_ptr<const ContinuousPhasePath> immutable_trial = trial_path;
+        if (!sampleContinuousPhasePath(
+                immutable_trial, trial_traj, trial_vel, trial_time, trial_w)) {
+            continue;
+        }
+
+        const double chord_length = (new_state.p - old_state.p).norm();
+        const double excess_length = std::max(0.0, connector_length - chord_length);
+        const double cost = smoothness_cost + 0.2 * excess_length * excess_length;
+        if (!have_best || cost < best_cost) {
+            have_best = true;
+            best_cost = cost;
+            best_join_delta_w = join_delta_w;
+            best_traj = trial_traj;
+            best_vel = trial_vel;
+            best_time = trial_time;
+            best_w = trial_w;
+            best_path = immutable_trial;
+        }
+    }
+
+    if (!have_best) {
+        ROS_WARN("[GVF][PHASE_V2][C2] mode=%s connector_failed phase_w=%.3f join_range=[%.3f,%.3f]",
+                 mode_name, phase_at_switch, join_min, join_max);
+        return false;
+    }
+
+    stitched_traj = best_traj;
+    stitched_vel = best_vel;
+    stitched_time = best_time;
+    stitched_w = best_w;
+    continuous_path = best_path;
+    ROS_WARN("[GVF][PHASE_V2][C2] mode=%s connector_success phase_w=%.3f join_delta_w=%.3f cost=%.6f points=%d exact_path=1",
+             mode_name, phase_at_switch, best_join_delta_w, best_cost,
+             static_cast<int>(stitched_traj.rows()));
+    return true;
+}
+
+bool gvf_manager::installInitialClosedPhaseFrontend(
+    gvfManager& pm,
+    const Eigen::Vector3d& current_pos,
+    const ros::Time& current_time)
+{
+    if (!closedPhaseV2Active() || !pm.gvf_) return false;
+
+    phase_w_ = findInitialClosedPhaseV2(current_pos);
+    phase_initialized_ = true;
+    progress_w_ = phase_w_;  // 仅保留为 legacy 诊断镜像，不作为 v2 相位来源。
+    progress_initialized_ = true;
+
+    Eigen::MatrixXd traj;
+    Eigen::MatrixXd vel;
+    Eigen::VectorXd time;
+    std::vector<double> global_w;
+    const double frontend_length = std::max(
+        1.0,
+        std::max(closed_goal_prefer_lookahead_w_,
+                 cmd_governor_l_max_ + std::max(0.0, switch_governor_path_margin_w_)));
+    std::shared_ptr<const ContinuousPhasePath> continuous_path;
+    if (!buildNominalContinuousPhasePath(
+            phase_w_ - closed_phase_back_margin_w_,
+            phase_w_ + frontend_length,
+            continuous_path) ||
+        !sampleContinuousPhasePath(
+            continuous_path, traj, vel, time, global_w)) {
+        resetUnifiedPhaseV2();
+        return false;
+    }
+
+    ContinuousPhasePathState phase_state;
+    ContinuousPhasePathState end_state;
+    if (!continuous_path->evaluate(phase_w_, phase_state, false) ||
+        !continuous_path->evaluate(continuous_path->endW(), end_state, false)) {
+        resetUnifiedPhaseV2();
+        return false;
+    }
+
+    pm.last_traj = traj;
+    pm.last_vel = vel;
+    pm.last_traj_time_ = time;
+    pm.goal_pt = end_state.p;
+    pm.is_first_goal = true;
+    current_traj_index_ = static_cast<int>(std::distance(
+        global_w.begin(), std::lower_bound(global_w.begin(), global_w.end(), phase_w_)));
+    current_traj_index_ = std::max(
+        0, std::min(current_traj_index_, static_cast<int>(global_w.size()) - 1));
+    closed_phase_acquired_ =
+        (current_pos - phase_state.p).norm() <= closed_phase_acquire_distance_;
+    closed_phase_pending_path_end_w_ = global_w.back();
+    closed_phase_has_pending_path_end_w_ = true;
+
+    pm.gvf_->setAuthoritativePhaseMode(true);
+    pm.gvf_->setContinuousPhasePath(continuous_path);
+    pm.gvf_->setNextPathWSamples(global_w);
+    pm.gvf_->setVisualizationProgressW(phase_w_);
+    publishPathMsg(pm.last_traj, pm.last_vel);
+
+    last_replan_time_ = current_time;
+    last_switch_time_ = current_time;
+    resetGovernorState();
+    ROS_WARN("[GVF][CLOSED_PHASE_V2][INIT] phase_w=%.3f phase_mod=%.3f frontend_start_w=%.3f frontend_end_w=%.3f points=%d acquired=%d distance=%.3f exact_path=1",
+             phase_w_, wrapClosedW(phase_w_), global_w.front(), global_w.back(),
+             static_cast<int>(traj.rows()), closed_phase_acquired_ ? 1 : 0,
+             (current_pos - phase_state.p).norm());
+    return true;
+}
+
+bool gvf_manager::installInitialPointPhaseFrontend(
+    gvfManager& pm,
+    const Eigen::Vector3d& current_pos,
+    const ros::Time& current_time,
+    const Eigen::MatrixXd& candidate_traj,
+    const Eigen::MatrixXd& candidate_vel,
+    const Eigen::VectorXd& candidate_time,
+    int candidate_anchor_idx,
+    const UniformBspline& candidate_spline)
+{
+    if (!pointPhaseV2Active() || !pm.gvf_ || candidate_traj.rows() < 2 ||
+        candidate_vel.rows() != candidate_traj.rows()) {
+        return false;
+    }
+
+    candidate_anchor_idx = std::max(
+        0, std::min(candidate_anchor_idx, static_cast<int>(candidate_traj.rows()) - 2));
+    double remaining_length = 0.0;
+    for (int i = candidate_anchor_idx + 1; i < candidate_traj.rows(); ++i) {
+        remaining_length +=
+            (candidate_traj.row(i) - candidate_traj.row(i - 1)).norm();
+    }
+    if (!std::isfinite(remaining_length) || remaining_length <= 1e-3) {
+        return false;
+    }
+
+    const double path_start_w = 0.0;
+    const double path_end_w = path_start_w + remaining_length;
+    Eigen::MatrixXd install_traj;
+    Eigen::MatrixXd install_vel;
+    Eigen::VectorXd install_time;
+    std::vector<double> install_w;
+    std::shared_ptr<const ContinuousPhasePath> continuous_path;
+    if (!buildMappedPhaseFrontend(
+            path_start_w, path_end_w, candidate_anchor_idx, candidate_spline,
+            candidate_traj, candidate_time, install_traj, install_vel,
+            install_time, install_w, continuous_path)) {
+        return false;
+    }
+
+    const double endpoint_margin = std::min(
+        point_phase_endpoint_margin_w_, 0.25 * (path_end_w - path_start_w));
+    phase_w_ = std::min(
+        path_end_w - endpoint_margin, path_start_w + endpoint_margin);
+    phase_initialized_ = true;
+    progress_w_ = phase_w_;
+    progress_initialized_ = true;
+    closed_phase_acquired_ = true;
+
+    pm.last_traj = install_traj;
+    pm.last_vel = install_vel;
+    pm.last_traj_time_ = install_time;
+    pm.is_first_goal = false;
+    current_traj_index_ = static_cast<int>(std::distance(
+        install_w.begin(),
+        std::lower_bound(install_w.begin(), install_w.end(), phase_w_)));
+    current_traj_index_ = std::max(
+        0, std::min(current_traj_index_, static_cast<int>(install_w.size()) - 1));
+
+    pm.gvf_->setAuthoritativePhaseMode(true);
+    pm.gvf_->setContinuousPhasePath(continuous_path);
+    pm.gvf_->setNextPathWSamples(install_w);
+    pm.gvf_->setVisualizationProgressW(phase_w_);
+    publishPathMsg(pm.last_traj, pm.last_vel);
+
+    last_replan_time_ = current_time;
+    last_switch_time_ = current_time;
+    resetGovernorState();
+    ROS_WARN("[GVF][POINT_PHASE_V2][INIT] phase_w=%.3f path_start_w=%.3f path_end_w=%.3f points=%d start_error=%.3f exact_path=1",
+             phase_w_, install_w.front(), install_w.back(),
+             static_cast<int>(install_traj.rows()),
+             (current_pos - install_traj.row(0).transpose()).norm());
+    return true;
 }
 
 void gvf_manager::generateCircleReference(const Eigen::Vector3d& center)
@@ -3246,7 +4164,15 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
                          closed_ref_has_accepted_goal_ ? 1 : 0,
                          pending_end_to_goal_dist,
                          accepted_end_to_goal_dist);
-                ensureProgressInCurrentPathRange(start_w, end_w);
+                if (unifiedPhaseV2Active() && phase_initialized_) {
+                    swarmParticlesManager[0].gvf_->setVisualizationProgressW(phase_w_);
+                    ROS_WARN("[GVF][PHASE_V2][PATH] mode=%s phase_w=%.3f start_w=%.3f end_w=%.3f points=%zu",
+                             closedPhaseV2Active() ? "closed" : "point",
+                             phase_w_, start_w, end_w,
+                             swarmParticlesManager[0].gvf_->sample_w_.size());
+                } else {
+                    ensureProgressInCurrentPathRange(start_w, end_w);
+                }
             }
         }
 
@@ -3401,6 +4327,114 @@ bool gvf_manager::planKinoToGoal(gvfManager& pm,
     return true;
 }
 
+bool gvf_manager::selectClosedPhaseV2Goal(
+    gvfManager& pm,
+    const Eigen::Vector3d& curr_pos,
+    const Eigen::Vector3d& start_pt,
+    const Eigen::Vector3d& start_vel,
+    const Eigen::Vector3d& start_acc,
+    Eigen::Vector3d& goal_pt,
+    Eigen::Vector3d& end_vel,
+    KinoPlanSamples& samples)
+{
+    if (!closedPhaseV2Active() || !phase_initialized_ ||
+        !circle_reference_ready_ || circle_reference_total_w_ <= 1e-9) {
+        return false;
+    }
+
+    const double planning_phase_w = phase_w_;
+    const double min_delta_w = std::max(
+        0.0, std::min(closed_ref_lookahead_min_w_, closed_ref_lookahead_max_w_));
+    const double max_delta_w = std::max(
+        min_delta_w, std::max(closed_ref_lookahead_min_w_, closed_ref_lookahead_max_w_));
+    const double base_delta_w = std::max(
+        min_delta_w, std::min(closed_goal_prefer_lookahead_w_, max_delta_w));
+
+    const double check_step_w = std::max(1e-3, closed_goal_obstacle_check_step_w_);
+    ClosedGoalObstacleInterval obstacle_interval;
+    if (closed_goal_push_past_obstacle_ && pm.sdf_map_ && max_delta_w > 1e-6) {
+        std::vector<int> occupancy;
+        occupancy.reserve(static_cast<size_t>(std::ceil(max_delta_w / check_step_w)));
+        for (double delta_w = check_step_w;
+             delta_w <= max_delta_w + 1e-9;
+             delta_w += check_step_w) {
+            const Eigen::Vector3d ref_pt = pointFromClosedW(planning_phase_w + delta_w);
+            if (!pm.sdf_map_->isInMap(ref_pt)) {
+                occupancy.push_back(-1);
+            } else {
+                occupancy.push_back(pm.sdf_map_->getInflateOccupancy(ref_pt));
+            }
+        }
+        obstacle_interval = detectClosedGoalObstacleInterval(occupancy, check_step_w, 3);
+    }
+
+    const double selected_delta_w = closedPhaseV2SelectedDeltaW(
+        base_delta_w, max_delta_w, obstacle_interval.found_end,
+        obstacle_interval.end_delta_w, closed_goal_obstacle_pass_margin_w_);
+    const bool pushed_past_obstacle = selected_delta_w > base_delta_w + 1e-6;
+
+    const double selected_goal_w = planning_phase_w + selected_delta_w;
+    goal_pt = pointFromClosedW(selected_goal_w);
+    end_vel = Eigen::Vector3d::Zero();
+
+    if (!planKinoToGoal(pm, start_pt, start_vel, start_acc,
+                        goal_pt, end_vel, samples)) {
+        last_closed_goal_plan_success_ = false;
+        closed_ref_has_pending_goal_ = false;
+        closed_phase_has_pending_path_end_w_ = false;
+        ROS_WARN("[GVF][CLOSED_PHASE_V2][GOAL] planner_success=0 phase_w=%.3f selected_delta_w=%.3f goal_w=%.3f base_delta_w=%.3f max_delta_w=%.3f obstacle_start_w=%.3f obstacle_end_w=%.3f pushed=%d reason=kino_failed",
+                 planning_phase_w, selected_delta_w, selected_goal_w,
+                 base_delta_w, max_delta_w,
+                 obstacle_interval.found_start ? obstacle_interval.start_delta_w : -1.0,
+                 obstacle_interval.found_end ? obstacle_interval.end_delta_w : -1.0,
+                 pushed_past_obstacle ? 1 : 0);
+        return false;
+    }
+
+    if (samples.point_set.empty()) {
+        last_closed_goal_plan_success_ = false;
+        closed_ref_has_pending_goal_ = false;
+        closed_phase_has_pending_path_end_w_ = false;
+        return false;
+    }
+
+    const Eigen::Vector3d actual_end = samples.point_set.back();
+    const double projected_end_w = projectClosedLocal(
+        actual_end, planning_phase_w, 0.0, max_delta_w);
+    const double actual_end_delta_w = std::max(0.0, projected_end_w - planning_phase_w);
+    const double end_to_goal_dist = (actual_end - goal_pt).norm();
+
+    pm.goal_pt = goal_pt;
+    closed_ref_pending_goal_w_ = selected_goal_w;
+    closed_ref_pending_lookahead_w_ = selected_delta_w;
+    closed_ref_has_pending_goal_ = true;
+    closed_ref_pending_from_bypass_ = pushed_past_obstacle;
+    closed_ref_last_goal_pos_ = goal_pt;
+    closed_ref_last_goal_dist_xy_ = (goal_pt.head<2>() - curr_pos.head<2>()).norm();
+    closed_ref_last_candidate_idx_ = -1;
+    closed_ref_last_selected_goal_w_ = selected_goal_w;
+    closed_ref_last_selected_lookahead_w_ = selected_delta_w;
+    closed_ref_has_selected_goal_ = true;
+    last_selected_goal_w_ = selected_goal_w;
+    last_selected_lookahead_w_ = selected_delta_w;
+    last_selected_goal_idx_ = -1;
+    last_failed_goal_idx_ = -1;
+    last_closed_goal_plan_success_ = true;
+
+    closed_phase_pending_path_end_w_ =
+        actual_end_delta_w > 1e-3 ? projected_end_w : selected_goal_w;
+    closed_phase_has_pending_path_end_w_ = true;
+
+    ROS_WARN("[GVF][CLOSED_PHASE_V2][GOAL] planner_success=1 phase_w=%.3f selected_delta_w=%.3f goal_w=%.3f base_delta_w=%.3f max_delta_w=%.3f obstacle_start_w=%.3f obstacle_end_w=%.3f pushed=%d actual_end_delta_w=%.3f end_to_goal_dist=%.3f kino_points=%zu",
+             planning_phase_w, selected_delta_w, selected_goal_w,
+             base_delta_w, max_delta_w,
+             obstacle_interval.found_start ? obstacle_interval.start_delta_w : -1.0,
+             obstacle_interval.found_end ? obstacle_interval.end_delta_w : -1.0,
+             pushed_past_obstacle ? 1 : 0,
+             actual_end_delta_w, end_to_goal_dist, samples.point_set.size());
+    return true;
+}
+
 bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
                                             const Eigen::Vector3d& curr_pos,
                                             const Eigen::Vector3d& start_pt,
@@ -3410,18 +4444,25 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
                                             Eigen::Vector3d& end_vel,
                                             KinoPlanSamples& samples)
 {
+    if (closedPhaseV2Active()) {
+        return selectClosedPhaseV2Goal(pm, curr_pos, start_pt, start_vel,
+                                       start_acc, goal_pt, end_vel, samples);
+    }
+
+    double planning_phase_w = closed_ref_w_;
     getCircleReferenceGoal(curr_pos);
+    planning_phase_w = closed_ref_w_;
     end_vel = Eigen::Vector3d::Zero();
 
     const std::vector<double> candidates = buildClosedLookaheadCandidates();
     const int candidate_count = static_cast<int>(candidates.size());
 
-    const double local_d_for_goal = (curr_pos - pointFromClosedW(closed_ref_w_)).head<2>().norm();
+    const double local_d_for_goal = (curr_pos - pointFromClosedW(planning_phase_w)).head<2>().norm();
     double tangent_dot_odom_for_goal = 0.0;
     const Eigen::Vector2d odom_v_xy = odom_vel_lpf_.head<2>();
     const double odom_v_norm = odom_v_xy.norm();
     if (odom_v_norm > 1e-6) {
-        const Eigen::Vector2d tangent_xy = tangentFromClosedW(closed_ref_w_).head<2>();
+        const Eigen::Vector2d tangent_xy = tangentFromClosedW(planning_phase_w).head<2>();
         const double tangent_norm = tangent_xy.norm();
         if (tangent_norm > 1e-6) {
             tangent_dot_odom_for_goal = (tangent_xy / tangent_norm).dot(odom_v_xy / odom_v_norm);
@@ -3445,7 +4486,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
         std::vector<int> occupancy;
         occupancy.reserve(static_cast<size_t>(std::ceil(max_check_w / check_step)));
         for (double delta_w = check_step; delta_w <= max_check_w + 1e-9; delta_w += check_step) {
-            const Eigen::Vector3d ref_pt = pointFromClosedW(closed_ref_w_ + delta_w);
+            const Eigen::Vector3d ref_pt = pointFromClosedW(planning_phase_w + delta_w);
             if (!pm.sdf_map_->isInMap(ref_pt)) {
                 occupancy.push_back(-1);
                 continue;
@@ -3498,7 +4539,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     }
 
     if (order.empty()) {
-        const Eigen::Vector3d failed_goal_pos = pointFromClosedW(closed_ref_w_);
+        const Eigen::Vector3d failed_goal_pos = pointFromClosedW(planning_phase_w);
         const double failed_goal_dist_xy = (failed_goal_pos.head<2>() - curr_pos.head<2>()).norm();
         ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f desired_lookahead=%.3f obstacle_delta_w=%.3f desired_pushed=%d selected_score=-1.000 closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=%d considered_candidate_count=%d selected_idx=-1 planner_success=0 reason=no_candidates mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"\" full_success_tol=%.3f accepted_full_goal=0 accepted_partial_goal=0 selected_end_to_goal_dist=-1.000 tried_lookaheads=\"\" tried_end_to_goal_dists=\"\" obstacle_end_delta_w=%.3f bypass_delta_w=%.3f bypass_mode=%d selected_end_delta_w=-1.000 selected_passed_obstacle=0 tried_end_delta_ws=\"\" selection_mode=progressive progressive_max_lookahead_w=%.3f required_progress_w=%.3f selected_kino_path_length=-1.000 selected_progress_sufficient=0 tried_kino_path_lengths=\"\"",
                  curr_pos.x(), curr_pos.y(), curr_pos.z(),
@@ -3506,7 +4547,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
                  failed_goal_dist_xy, 0.0, 0.0, desired_lookahead,
                  std::isfinite(first_obstacle_delta_w) ? first_obstacle_delta_w : -1.0,
                  desired_pushed_by_obstacle ? 1 : 0,
-                 closed_ref_w_, closed_ref_w_,
+                 planning_phase_w, planning_phase_w,
                  candidate_count, considered_candidate_count,
                  mode_for_goal.c_str(), candidate_order_reason.c_str(),
                  local_d_for_goal, tangent_dot_odom_for_goal,
@@ -3522,7 +4563,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     bool planner_success = false;
     int selected_idx = order.front();
     double selected_lookahead = candidates[selected_idx];
-    double selected_goal_w = closed_ref_w_ + selected_lookahead;
+    double selected_goal_w = planning_phase_w + selected_lookahead;
     double selected_end_to_goal_dist = std::numeric_limits<double>::infinity();
     bool accepted_full_goal = false;
     bool accepted_partial_goal = false;
@@ -3560,7 +4601,7 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 
     for (int idx : order) {
         const double lookahead = candidates[idx];
-        const double goal_w = closed_ref_w_ + lookahead;
+        const double goal_w = planning_phase_w + lookahead;
         const Eigen::Vector3d candidate_goal = pointFromClosedW(goal_w);
         if (tried_lookaheads_ss.tellp() > 0) tried_lookaheads_ss << ",";
         tried_lookaheads_ss << lookahead;
@@ -3612,8 +4653,8 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
         }
 
         const double projected_end_w = projectClosedLocal(
-            actual_end, closed_ref_w_, 0.0, candidates.back());
-        const double raw_end_delta_w = projected_end_w - closed_ref_w_;
+            actual_end, planning_phase_w, 0.0, candidates.back());
+        const double raw_end_delta_w = projected_end_w - planning_phase_w;
         if (!isFiniteClosedGoalCandidate(
                 actual_end.x(), actual_end.y(), actual_end.z(),
                 end_to_goal_dist, raw_end_delta_w)) {
@@ -3692,12 +4733,12 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
     ROS_WARN("[GVF][CLOSED_GOAL] curr_pos=(%.3f,%.3f,%.3f) goal_pos=(%.3f,%.3f,%.3f) goal_dist_xy=%.3f selected_lookahead=%.3f selected_delta_w=%.3f desired_lookahead=%.3f obstacle_delta_w=%.3f desired_pushed=%d selected_score=%.3f closed_ref_w=%.3f selected_goal_w=%.3f candidate_count=%d considered_candidate_count=%d selected_idx=%d planner_success=%d reason=%s mode_for_goal=%s candidate_order_reason=%s local_d=%.3f tangent_dot_odom=%.3f candidate_order=\"%s\" full_success_tol=%.3f accepted_full_goal=%d accepted_partial_goal=%d selected_end_to_goal_dist=%.3f tried_lookaheads=\"%s\" tried_end_to_goal_dists=\"%s\" obstacle_end_delta_w=%.3f bypass_delta_w=%.3f bypass_mode=%d selected_end_delta_w=%.3f selected_passed_obstacle=%d tried_end_delta_ws=\"%s\" selection_mode=progressive progressive_max_lookahead_w=%.3f required_progress_w=%.3f selected_kino_path_length=%.3f selected_progress_sufficient=%d tried_kino_path_lengths=\"%s\"",
              curr_pos.x(), curr_pos.y(), curr_pos.z(),
              selected_goal_pos.x(), selected_goal_pos.y(), selected_goal_pos.z(),
-             goal_dist_xy, selected_lookahead, selected_goal_w - closed_ref_w_,
+             goal_dist_xy, selected_lookahead, selected_goal_w - planning_phase_w,
              desired_lookahead,
              std::isfinite(first_obstacle_delta_w) ? first_obstacle_delta_w : -1.0,
              desired_pushed_by_obstacle ? 1 : 0,
              selected_score,
-             closed_ref_w_, selected_goal_w, candidate_count, considered_candidate_count,
+             planning_phase_w, selected_goal_w, candidate_count, considered_candidate_count,
              selected_idx, planner_success ? 1 : 0, selected_reason.c_str(),
              mode_for_goal.c_str(), candidate_order_reason.c_str(),
              local_d_for_goal, tangent_dot_odom_for_goal,
@@ -3737,7 +4778,8 @@ bool gvf_manager::selectClosedGoalCandidate(gvfManager& pm,
 }
 
 bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
-                           int& new_i0_out , Eigen::VectorXd& time)
+                           int& new_i0_out, Eigen::VectorXd& time,
+                           UniformBspline* continuous_spline_out)
 {
     auto& pm = swarmParticlesManager[0];
     /*----------- ① Kino A* 搜索路径 + B 样条 -----------*/
@@ -3746,7 +4788,6 @@ bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos
 
     if (pm.is_first_goal || pm.last_traj.rows() == 0) {
         start_pt = Eigen::Vector3d(odom_.x() + 1e-6, odom_.y() + 1e-6, 1.0);
-        pm.is_first_goal = false;
     } else {
 
         int i0 = std::max(0, std::min(current_traj_index_, (int)pm.last_traj.rows() - 1));
@@ -3862,6 +4903,9 @@ bool gvf_manager::astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos
     vel_out = v_;
     time = p.time_;
     new_i0_out = std::max(0, std::min(best, (int)p_.rows() - 1));
+    if (continuous_spline_out) {
+        *continuous_spline_out = p;
+    }
     return true;
 }
 
@@ -3890,6 +4934,34 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
         break;
 
         case GEN_NEW_TRAJ:{
+            if (closedPhaseV2Active()) {
+                if (installInitialClosedPhaseFrontend(pm, current_pos, current_time)) {
+                    changeFSMExecState(EXEC_TRAJ, "closed_phase_v2 init");
+                } else {
+                    ROS_WARN_THROTTLE(1.0,
+                        "[GVF][CLOSED_PHASE_V2] nominal frontend initialization failed; retry in GEN_NEW_TRAJ");
+                }
+                break;
+            }
+
+            if (pointPhaseV2Active()) {
+                Eigen::MatrixXd cand_traj, cand_vel;
+                Eigen::VectorXd cand_time;
+                UniformBspline cand_spline;
+                int new_i0 = 0;
+                if (astaropt(current_pos, cand_traj, cand_vel, new_i0,
+                             cand_time, &cand_spline) &&
+                    installInitialPointPhaseFrontend(
+                        pm, current_pos, current_time, cand_traj, cand_vel,
+                        cand_time, new_i0, cand_spline)) {
+                    changeFSMExecState(EXEC_TRAJ, "point_phase_v2 init");
+                } else {
+                    ROS_WARN_THROTTLE(1.0,
+                        "[GVF][POINT_PHASE_V2] initial finite frontend failed; retry in GEN_NEW_TRAJ");
+                }
+                break;
+            }
+
             Eigen::MatrixXd cand_traj, cand_vel;
             Eigen::VectorXd cand_time;
             int new_i0 = 0;
@@ -3918,6 +4990,7 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 pm.last_traj = cand_traj;
                 pm.last_vel = cand_vel;
                 pm.last_traj_time_ = cand_time;
+                pm.is_first_goal = false;
                 current_traj_index_ = new_i0;
                 last_switch_time_ = current_time;
                 cmd_switch_motion_limit_until_ = ros::Time::now() + ros::Duration(std::max(0.0, cmd_switch_motion_limit_time_));
@@ -3936,13 +5009,23 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
 
         case EXEC_TRAJ:{
             if (pm.last_traj.rows() > 0) {
-                double min_dist = std::numeric_limits<double>::max();
-                for (int i = current_traj_index_; i < pm.last_traj.rows(); ++i) {
-                    Eigen::Vector3d traj_point(pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
-                    double dist = (traj_point - current_pos).norm();
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        current_traj_index_ = i;
+                if (unifiedPhaseV2Active() && phase_initialized_ && pm.gvf_ &&
+                    pm.gvf_->sample_w_.size() == static_cast<size_t>(pm.last_traj.rows())) {
+                    auto it = std::lower_bound(
+                        pm.gvf_->sample_w_.begin(), pm.gvf_->sample_w_.end(), phase_w_);
+                    current_traj_index_ = it == pm.gvf_->sample_w_.end()
+                        ? pm.last_traj.rows() - 1
+                        : static_cast<int>(std::distance(pm.gvf_->sample_w_.begin(), it));
+                } else {
+                    double min_dist = std::numeric_limits<double>::max();
+                    for (int i = current_traj_index_; i < pm.last_traj.rows(); ++i) {
+                        Eigen::Vector3d traj_point(
+                            pm.last_traj(i,0), pm.last_traj(i,1), pm.last_traj(i,2));
+                        const double dist = (traj_point - current_pos).norm();
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            current_traj_index_ = i;
+                        }
                     }
                 }
             }
@@ -3950,6 +5033,14 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
             const bool circle_mode_active = enable_circle_reference_test_ && circle_reference_ready_;
             const double dist_xy = (pm.goal_pt.head<2>() - current_pos.head<2>()).norm();
             if (shouldDeclarePointGoalReached(circle_mode_active, dist_xy, 0.2)) {
+                // 到达后停止控制，但完整保留最终轨迹、相位路径和向量场。
+                // 下一个目标进入 goalCallback 时再统一清空，避免跨任务 C2 拼接。
+                resetGovernorState();
+                if (pm.gvf_) {
+                    pm.gvf_->setTerminalGoalVisualization(pm.goal_pt);
+                }
+                ROS_WARN("[GVF][POINT_GOAL][REACHED] distance=%.3f retained_final_traj=1 terminal_attractor_field=1 clear_on_next_goal=1",
+                         dist_xy);
                 changeFSMExecState(WAIT_TARGET, "reach_goal");
                 pm.receive_goal = false;
                 pm.is_first_goal = false;
@@ -3960,15 +5051,247 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                 logReplanReason("collision");
                 changeFSMExecState(REPLAN_TRAJ, "collision detection");
             }
-            else if((current_time - last_replan_time_).toSec() >= planInterval){
+            else if((current_time - last_replan_time_).toSec() >= planInterval &&
+                    (!closedPhaseV2Active() || closed_phase_acquired_)){
                 logReplanReason("plan_interval");
                 changeFSMExecState(REPLAN_TRAJ, "planInterval reached");
+            }
+            else if (closedPhaseV2Active() && !closed_phase_acquired_) {
+                const Eigen::Vector3d phase_point = pm.gvf_
+                    ? pm.gvf_->evalPathByW(phase_w_)
+                    : pointFromClosedW(phase_w_);
+                ROS_INFO_THROTTLE(1.0,
+                    "[GVF][CLOSED_PHASE_V2] initial GVF acquisition: phase_w=%.3f distance=%.3f threshold=%.3f",
+                    phase_w_, (current_pos - phase_point).norm(),
+                    closed_phase_acquire_distance_);
             }
 
             break;
         }
 
         case REPLAN_TRAJ:{
+            if (closedPhaseV2Active()) {
+                Eigen::MatrixXd cand_traj, cand_vel;
+                Eigen::VectorXd cand_time;
+                UniformBspline cand_spline;
+                int new_i0 = 0;
+                bool installed = false;
+
+                if (astaropt(current_pos, cand_traj, cand_vel, new_i0, cand_time,
+                             &cand_spline)) {
+                    const double phase_at_switch = phase_w_;
+                    double path_end_w = closed_phase_has_pending_path_end_w_
+                        ? closed_phase_pending_path_end_w_
+                        : closed_ref_pending_goal_w_;
+                    if (path_end_w <= phase_at_switch + 1e-3) {
+                        path_end_w = std::max(closed_ref_pending_goal_w_,
+                            phase_at_switch + std::max(0.1, closed_ref_lookahead_min_w_));
+                    }
+
+                    std::vector<double> global_w;
+                    if (pm.gvf_ && buildGlobalPhaseSamples(
+                            cand_traj, new_i0, phase_at_switch, path_end_w, global_w)) {
+                        Eigen::MatrixXd install_traj = cand_traj;
+                        Eigen::MatrixXd install_vel = cand_vel;
+                        Eigen::VectorXd install_time = cand_time;
+                        std::vector<double> install_w = global_w;
+                        std::shared_ptr<const ContinuousPhasePath> install_continuous_path;
+                        int install_i0 = std::max(
+                            0, std::min(new_i0, static_cast<int>(cand_traj.rows()) - 1));
+                        bool connector_ready = true;
+
+                        if (closed_phase_c2_enabled_) {
+                            connector_ready = buildPhaseV2C2Frontend(
+                                pm, phase_at_switch,
+                                path_end_w, new_i0, cand_spline,
+                                cand_traj, cand_vel, cand_time, global_w,
+                                install_traj, install_vel, install_time, install_w,
+                                install_continuous_path);
+                            if (connector_ready) {
+                                install_i0 = static_cast<int>(std::distance(
+                                    install_w.begin(),
+                                    std::lower_bound(
+                                        install_w.begin(), install_w.end(), phase_at_switch)));
+                                install_i0 = std::max(
+                                    0, std::min(install_i0,
+                                        static_cast<int>(install_w.size()) - 1));
+                            }
+                        }
+
+                        if (!connector_ready) {
+                            ROS_WARN("[GVF][CLOSED_PHASE_V2] C2 connector unavailable; keep old frontend");
+                        } else {
+                            // 规划成功后只替换当前有限前端，phase_w_ 本身不赋新值。
+                            pm.last_traj = install_traj;
+                            pm.last_vel = install_vel;
+                            pm.last_traj_time_ = install_time;
+                            pm.is_first_goal = false;
+                            current_traj_index_ = install_i0;
+                            last_switch_time_ = current_time;
+                            cmd_switch_motion_limit_until_ = ros::Time::now() +
+                                ros::Duration(std::max(0.0, cmd_switch_motion_limit_time_));
+                            resetGovernorState();
+
+                            pm.gvf_->setAuthoritativePhaseMode(true);
+                            if (install_continuous_path) {
+                                pm.gvf_->setContinuousPhasePath(install_continuous_path);
+                            } else {
+                                pm.gvf_->clearContinuousPhasePath();
+                            }
+                            pm.gvf_->setNextPathWSamples(install_w);
+                            publishPathMsg(pm.last_traj, pm.last_vel);
+                            installed = true;
+
+                            if (closed_ref_has_pending_goal_) {
+                                closed_ref_accepted_goal_w_ = closed_ref_pending_goal_w_;
+                                closed_ref_accepted_lookahead_w_ = closed_ref_pending_lookahead_w_;
+                                closed_ref_has_accepted_goal_ = true;
+                                closed_ref_accepted_from_bypass_ = closed_ref_pending_from_bypass_;
+                            }
+
+                            ROS_WARN("[GVF][CLOSED_PHASE_V2][SWITCH] accepted_new=1 phase_before=%.6f phase_after=%.6f path_start_w=%.3f path_end_w=%.3f anchor_idx=%d points=%d c2=%d exact_path=%d segments=%zu",
+                                     phase_at_switch, phase_w_, install_w.front(), install_w.back(),
+                                     install_i0, static_cast<int>(install_traj.rows()),
+                                     closed_phase_c2_enabled_ ? 1 : 0,
+                                     install_continuous_path ? 1 : 0,
+                                     install_continuous_path
+                                         ? install_continuous_path->segments().size()
+                                         : 0u);
+                        }
+                    } else {
+                        ROS_WARN("[GVF][CLOSED_PHASE_V2] planned path could not be mapped into global phase; keep old frontend");
+                    }
+                }
+
+                if (!installed) {
+                    // 不重发旧路径：保留当前 gvf::last_path_、显式 w_i 和已经构建的场。
+                    ROS_WARN_THROTTLE(1.0,
+                        "[GVF][CLOSED_PHASE_V2] replan failed; keep current frontend and phase_w=%.3f",
+                        phase_w_);
+                }
+                closed_phase_has_pending_path_end_w_ = false;
+                last_replan_time_ = current_time;
+                changeFSMExecState(EXEC_TRAJ, "closed_phase_v2 replan");
+                break;
+            }
+
+            if (pointPhaseV2Active()) {
+                const Eigen::MatrixXd old_traj = pm.last_traj;
+                const Eigen::MatrixXd old_vel = pm.last_vel;
+                Eigen::MatrixXd cand_traj, cand_vel;
+                Eigen::VectorXd cand_time;
+                UniformBspline cand_spline;
+                int new_i0 = 0;
+                bool installed = false;
+
+                if (astaropt(current_pos, cand_traj, cand_vel, new_i0,
+                             cand_time, &cand_spline)) {
+                    bool accept_new = true;
+                    std::string reason = "accept_default";
+                    if (old_traj.rows() > 0 && old_vel.rows() == old_traj.rows()) {
+                        double accepted_path_w_end =
+                            std::numeric_limits<double>::quiet_NaN();
+                        const auto old_path = pm.gvf_
+                            ? pm.gvf_->getContinuousPhasePath()
+                            : std::shared_ptr<const ContinuousPhasePath>();
+                        if (old_path && !old_path->empty()) {
+                            accepted_path_w_end = old_path->endW();
+                        }
+                        accept_new = shouldAcceptCandidate(
+                            old_traj, old_vel, pm.last_traj_time_,
+                            current_traj_index_, cand_traj, cand_vel,
+                            cand_time, new_i0, pm.goal_pt, reason,
+                            phase_w_, accepted_path_w_end);
+                    }
+
+                    if (accept_new) {
+                        new_i0 = std::max(
+                            0, std::min(new_i0, static_cast<int>(cand_traj.rows()) - 2));
+                        double remaining_length = 0.0;
+                        for (int i = new_i0 + 1; i < cand_traj.rows(); ++i) {
+                            remaining_length +=
+                                (cand_traj.row(i) - cand_traj.row(i - 1)).norm();
+                        }
+                        const double phase_at_switch = phase_w_;
+                        const double path_end_w = phase_at_switch + remaining_length;
+                        std::vector<double> candidate_w;
+                        if (remaining_length > 1e-3 && pm.gvf_ &&
+                            buildGlobalPhaseSamples(
+                                cand_traj, new_i0, phase_at_switch,
+                                path_end_w, candidate_w)) {
+                            Eigen::MatrixXd install_traj;
+                            Eigen::MatrixXd install_vel;
+                            Eigen::VectorXd install_time;
+                            std::vector<double> install_w;
+                            std::shared_ptr<const ContinuousPhasePath>
+                                install_continuous_path;
+                            bool frontend_ready = false;
+
+                            if (point_phase_c2_enabled_) {
+                                frontend_ready = buildPhaseV2C2Frontend(
+                                    pm, phase_at_switch, path_end_w, new_i0,
+                                    cand_spline, cand_traj, cand_vel, cand_time,
+                                    candidate_w, install_traj, install_vel,
+                                    install_time, install_w,
+                                    install_continuous_path);
+                            } else {
+                                frontend_ready = buildMappedPhaseFrontend(
+                                    phase_at_switch, path_end_w, new_i0,
+                                    cand_spline, cand_traj, cand_time,
+                                    install_traj, install_vel, install_time,
+                                    install_w, install_continuous_path);
+                            }
+
+                            if (frontend_ready && !install_w.empty()) {
+                                pm.last_traj = install_traj;
+                                pm.last_vel = install_vel;
+                                pm.last_traj_time_ = install_time;
+                                pm.is_first_goal = false;
+                                current_traj_index_ = static_cast<int>(
+                                    std::distance(
+                                        install_w.begin(),
+                                        std::lower_bound(
+                                            install_w.begin(), install_w.end(),
+                                            phase_at_switch)));
+                                current_traj_index_ = std::max(
+                                    0, std::min(current_traj_index_,
+                                        static_cast<int>(install_w.size()) - 1));
+                                last_switch_time_ = current_time;
+                                cmd_switch_motion_limit_until_ = ros::Time::now() +
+                                    ros::Duration(std::max(
+                                        0.0, cmd_switch_motion_limit_time_));
+                                resetGovernorState();
+
+                                pm.gvf_->setAuthoritativePhaseMode(true);
+                                pm.gvf_->setContinuousPhasePath(
+                                    install_continuous_path);
+                                pm.gvf_->setNextPathWSamples(install_w);
+                                publishPathMsg(pm.last_traj, pm.last_vel);
+                                installed = true;
+                                ROS_WARN("[GVF][POINT_PHASE_V2][SWITCH] accepted_new=1 reason=%s phase_before=%.6f phase_after=%.6f path_start_w=%.3f path_end_w=%.3f points=%d c2=%d exact_path=1",
+                                         reason.c_str(), phase_at_switch,
+                                         phase_w_, install_w.front(),
+                                         install_w.back(),
+                                         static_cast<int>(install_traj.rows()),
+                                         point_phase_c2_enabled_ ? 1 : 0);
+                            }
+                        }
+                    } else {
+                        ROS_WARN("[GVF][POINT_PHASE_V2][SWITCH] accepted_new=0 reason=%s phase_w=%.3f; keep current frontend",
+                                 reason.c_str(), phase_w_);
+                    }
+                }
+
+                if (!installed) {
+                    ROS_WARN_THROTTLE(1.0,
+                        "[GVF][POINT_PHASE_V2] replan not installed; keep current frontend and phase_w=%.3f",
+                        phase_w_);
+                }
+                last_replan_time_ = current_time;
+                changeFSMExecState(EXEC_TRAJ, "point_phase_v2 replan");
+                break;
+            }
+
             const Eigen::MatrixXd old_traj = pm.last_traj;
             const Eigen::MatrixXd old_vel  = pm.last_vel;
             Eigen::MatrixXd cand_traj, cand_vel;

@@ -74,6 +74,33 @@ TEST(GvfSwitchPolicy, KeepsScoreBasedSwitchWhenAcceptedPathHasEnoughGovernorLook
       27.40, 29.40, 1.6, 0.2));
 }
 
+TEST(GvfInitialAcquisition, ConvertsGuidanceVelocityToNearbyPositionCommand)
+{
+  const Eigen::Vector3d delta =
+      FLAG_Race::gvf_manager::boundedInitialAcquisitionDelta(
+          Eigen::Vector3d(3.0, 4.0, 0.0), 2.0, 2.0, 1.6);
+  EXPECT_NEAR(1.0, delta.norm(), 1e-9);
+  EXPECT_NEAR(0.6, delta.x(), 1e-9);
+  EXPECT_NEAR(0.8, delta.y(), 1e-9);
+}
+
+TEST(GvfInitialAcquisition, ScalesCommandInsteadOfRejectingLeadLimitViolation)
+{
+  const Eigen::Vector3d delta =
+      FLAG_Race::gvf_manager::boundedInitialAcquisitionDelta(
+          Eigen::Vector3d(4.0, 0.0, 0.0), 4.0, 1.0, 1.6);
+  EXPECT_NEAR(1.6, delta.norm(), 1e-9);
+  EXPECT_GT(delta.x(), 0.0);
+}
+
+TEST(GvfInitialAcquisition, RejectsInvalidCommandInputs)
+{
+  const Eigen::Vector3d delta =
+      FLAG_Race::gvf_manager::boundedInitialAcquisitionDelta(
+          Eigen::Vector3d::Ones(), 2.0, 0.0, 1.6);
+  EXPECT_NEAR(0.0, delta.norm(), 1e-12);
+}
+
 TEST(GvfClosedGoalPolicy, PrefersDesiredLookaheadOverFarthestFullSuccess)
 {
   const double near_desired_score =
@@ -438,6 +465,63 @@ TEST(GvfPointGoalPolicy, RejectsInvalidDistancesAndTolerance)
       false, std::numeric_limits<double>::infinity(), 0.2));
   EXPECT_FALSE(FLAG_Race::gvf_manager::shouldDeclarePointGoalReached(
       false, 0.1, 0.0));
+}
+
+TEST(ClosedPhaseV2, MapsCandidateAroundUnchangedAnchorPhase)
+{
+  FLAG_Race::gvf_manager manager;
+  Eigen::MatrixXd traj(4, 3);
+  traj << 0.0, 0.0, 1.0,
+          1.0, 0.0, 1.0,
+          2.0, 1.0, 1.0,
+          3.0, 1.0, 1.0;
+
+  std::vector<double> global_w;
+  ASSERT_TRUE(manager.buildGlobalPhaseSamples(traj, 1, 25.0, 28.0, global_w));
+  ASSERT_EQ(4u, global_w.size());
+  EXPECT_NEAR(25.0, global_w[1], 1e-12);
+  EXPECT_NEAR(28.0, global_w.back(), 1e-12);
+  for (size_t i = 1; i < global_w.size(); ++i) {
+    EXPECT_LT(global_w[i - 1], global_w[i]);
+  }
+}
+
+TEST(ClosedPhaseV2, SelectsRollingGoalDirectlyInGlobalPhase)
+{
+  EXPECT_DOUBLE_EQ(3.0,
+      FLAG_Race::gvf_manager::closedPhaseV2SelectedDeltaW(
+          3.0, 6.0, false, std::numeric_limits<double>::infinity(), 0.8));
+  EXPECT_DOUBLE_EQ(5.3,
+      FLAG_Race::gvf_manager::closedPhaseV2SelectedDeltaW(
+          3.0, 6.0, true, 4.5, 0.8));
+  EXPECT_DOUBLE_EQ(6.0,
+      FLAG_Race::gvf_manager::closedPhaseV2SelectedDeltaW(
+          3.0, 6.0, true, 5.8, 0.8));
+}
+
+TEST(ClosedPhaseV2, QuinticConnectorMatchesC2BoundaryStates)
+{
+  const Eigen::Vector3d p0(0.0, 0.0, 1.0);
+  const Eigen::Vector3d dp0(1.0, 0.2, 0.0);
+  const Eigen::Vector3d d2p0(0.1, -0.2, 0.0);
+  const Eigen::Vector3d p1(1.2, 0.8, 1.0);
+  const Eigen::Vector3d dp1(0.3, 1.1, 0.0);
+  const Eigen::Vector3d d2p1(-0.2, 0.4, 0.0);
+
+  Eigen::Vector3d p;
+  Eigen::Vector3d dp;
+  Eigen::Vector3d d2p;
+  ASSERT_TRUE(FLAG_Race::gvf_manager::evaluateC2QuinticHermite(
+      p0, dp0, d2p0, p1, dp1, d2p1, 0.8, 0.0, p, dp, d2p));
+  EXPECT_NEAR(0.0, (p - p0).norm(), 1e-10);
+  EXPECT_NEAR(0.0, (dp - dp0).norm(), 1e-10);
+  EXPECT_NEAR(0.0, (d2p - d2p0).norm(), 1e-9);
+
+  ASSERT_TRUE(FLAG_Race::gvf_manager::evaluateC2QuinticHermite(
+      p0, dp0, d2p0, p1, dp1, d2p1, 0.8, 1.0, p, dp, d2p));
+  EXPECT_NEAR(0.0, (p - p1).norm(), 1e-9);
+  EXPECT_NEAR(0.0, (dp - dp1).norm(), 1e-9);
+  EXPECT_NEAR(0.0, (d2p - d2p1).norm(), 1e-8);
 }
 
 int main(int argc, char** argv)

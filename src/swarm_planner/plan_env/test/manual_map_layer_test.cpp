@@ -25,8 +25,9 @@ void initManualTestMap(SDFMap& map) {
   map.mp_.min_occupancy_log_ = logit(map.mp_.p_occ_);
   map.mp_.unknown_flag_ = 0.01;
   map.mp_.ground_height_ = 0.0;
-  map.mp_.virtual_ceil_height_ = 2.5;
+  map.mp_.virtual_ceil_height_ = -1.0;
   map.mp_.visualization_truncate_height_ = 2.49;
+  map.mp_.obstacles_inflation_ = 0.15;
   map.mp_.frame_id_ = "world";
   map.mp_.enable_manual_map_ = true;
   map.mp_.manual_click_direct_ = false;
@@ -39,17 +40,30 @@ void initManualTestMap(SDFMap& map) {
   map.mp_.manual_map_auto_load_ = false;
   map.mp_.manual_map_auto_save_ = false;
   map.mp_.manual_map_file_.clear();
+  map.mp_.static_preinflated_map_enable_ = false;
+  map.mp_.static_preinflated_map_file_.clear();
 
   const int buffer_size = map.mp_.map_voxel_num_(0) * map.mp_.map_voxel_num_(1) *
                           map.mp_.map_voxel_num_(2);
   map.md_.occupancy_buffer_ =
       std::vector<double>(buffer_size, map.mp_.clamp_min_log_ - map.mp_.unknown_flag_);
+  map.md_.occupancy_buffer_neg = std::vector<char>(buffer_size, 0);
   map.md_.occupancy_buffer_inflate_ = std::vector<char>(buffer_size, 0);
   map.md_.manual_occupancy_buffer_ = std::vector<char>(buffer_size, 0);
+  map.md_.static_preinflated_buffer_ = std::vector<char>(buffer_size, 0);
+  map.md_.distance_buffer_ = std::vector<double>(buffer_size, 10000);
+  map.md_.distance_buffer_neg_ = std::vector<double>(buffer_size, 10000);
   map.md_.distance_buffer_all_ = std::vector<double>(buffer_size, 10000);
+  map.md_.tmp_buffer1_ = std::vector<double>(buffer_size, 0);
+  map.md_.tmp_buffer2_ = std::vector<double>(buffer_size, 0);
   map.md_.manual_boundary_enabled_ = false;
   map.md_.manual_obstacle_centers_.clear();
   map.md_.manual_boundary_points_.clear();
+  map.md_.static_preinflated_map_loaded_ = false;
+  map.md_.static_preinflated_map_ready_ = false;
+  map.md_.static_preinflated_voxel_count_ = 0;
+  map.md_.local_bound_min_ = Eigen::Vector3i::Zero();
+  map.md_.local_bound_max_ = map.mp_.map_max_idx_;
 }
 
 geometry_msgs::PointStamped::ConstPtr pointMsg(double x, double y, double z) {
@@ -128,6 +142,60 @@ TEST(SDFMapManualLayer, SavesAndLoadsManualObstacleCenters) {
   EXPECT_NEAR(1.0, loaded_map.md_.manual_obstacle_centers_.front().x(), 1e-6);
   EXPECT_NEAR(0.0, loaded_map.md_.manual_obstacle_centers_.front().y(), 1e-6);
   EXPECT_NEAR(1.0, loaded_map.md_.manual_obstacle_centers_.front().z(), 1e-6);
+
+  std::remove(file_path.c_str());
+}
+
+TEST(SDFMapManualLayer, StaticPreinflatedFileMarksOnlyInflatedOccupancy) {
+  const std::string file_path = "/tmp/static_preinflated_map_test.xyz";
+  {
+    std::ofstream output(file_path);
+    output << "# x y z\n";
+    output << "0.05 0.05 1.05\n";
+  }
+
+  SDFMap map;
+  initManualTestMap(map);
+  map.mp_.static_preinflated_map_enable_ = true;
+  map.mp_.static_preinflated_map_file_ = file_path;
+
+  map.loadStaticPreinflatedMapFile();
+
+  const Eigen::Vector3d occupied(0.05, 0.05, 1.05);
+  Eigen::Vector3i id;
+  map.posToIndex(occupied, id);
+  const int addr = map.toAddress(id);
+
+  EXPECT_EQ(1, map.md_.static_preinflated_buffer_[addr]);
+  EXPECT_EQ(1, map.getInflateOccupancy(occupied));
+  EXPECT_LT(map.md_.occupancy_buffer_[addr], map.mp_.min_occupancy_log_);
+  EXPECT_TRUE(map.md_.static_preinflated_map_loaded_);
+  EXPECT_TRUE(map.md_.static_preinflated_map_ready_);
+  EXPECT_EQ(1u, map.md_.static_preinflated_voxel_count_);
+  EXPECT_NEAR(0.0, map.getDistance(occupied), 1e-6);
+
+  std::remove(file_path.c_str());
+}
+
+TEST(SDFMapManualLayer, StaticPreinflatedLayerDoesNotGrowDuringNormalInflation) {
+  const std::string file_path = "/tmp/static_preinflated_map_no_growth_test.xyz";
+  {
+    std::ofstream output(file_path);
+    output << "0.05 0.05 1.05\n";
+  }
+
+  SDFMap map;
+  initManualTestMap(map);
+  map.mp_.static_preinflated_map_enable_ = true;
+  map.mp_.static_preinflated_map_file_ = file_path;
+  map.loadStaticPreinflatedMapFile();
+
+  map.clearAndInflateLocalMap();
+  map.applyStaticPreinflatedLayer();
+
+  EXPECT_EQ(1, map.getInflateOccupancy(Eigen::Vector3d(0.05, 0.05, 1.05)));
+  EXPECT_EQ(0, map.getInflateOccupancy(Eigen::Vector3d(0.15, 0.05, 1.05)));
+  EXPECT_EQ(0, map.getInflateOccupancy(Eigen::Vector3d(-0.05, 0.05, 1.05)));
 
   std::remove(file_path.c_str());
 }

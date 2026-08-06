@@ -6,6 +6,10 @@
 #include <pcl/point_types.h>
 #include <pcl/kdtree/kdtree_flann.h>
 
+#include <algorithm>
+#include <cmath>
+#include <string>
+
 pcl::PointCloud<pcl::PointXYZ>::Ptr full_cloud(new pcl::PointCloud<pcl::PointXYZ>);
 pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
 bool has_map = false;
@@ -17,6 +21,13 @@ Eigen::Vector3d local_range;
 
 // 当前UAV位置
 Eigen::Vector3d current_position;
+
+// 话题和发布参数。默认值保持原仿真接口不变，同时允许 launch 显式接线。
+std::string odom_topic = "/sim/odom";
+std::string global_map_topic = "/mock_map";
+std::string local_map_topic = "/sim/local_map";
+std::string output_frame = "world";
+double sensing_rate = 10.0;
 
 // 发布器
 ros::Publisher local_map_pub;
@@ -48,24 +59,33 @@ void pubLocalMap() {
     std::vector<int> pointIdxRadiusSearch;
     std::vector<float> pointRadiusSquaredDistance;
 
-    double sensing_radius = local_range.norm() / 2.0; // 简单近似
+    // local_update_range_* 在 SDFMap 中表示各轴的半范围。先用包围球做
+    // KD-tree 粗筛，再做轴对齐范围过滤，保证两端对参数的解释一致。
+    const double sensing_radius = local_range.norm();
 
     if (kdtree.radiusSearch(center, sensing_radius, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0) {
         for (size_t i = 0; i < pointIdxRadiusSearch.size(); ++i) {
-            localMap.points.push_back(full_cloud->points[pointIdxRadiusSearch[i]]);
+            const pcl::PointXYZ& point = full_cloud->points[pointIdxRadiusSearch[i]];
+            if (std::abs(point.x - current_position.x()) <= local_range.x() &&
+                std::abs(point.y - current_position.y()) <= local_range.y() &&
+                std::abs(point.z - current_position.z()) <= local_range.z()) {
+                localMap.points.push_back(point);
+            }
         }
-
-        localMap.width = localMap.points.size();
-        localMap.height = 1;
-        localMap.is_dense = true;
-
-        sensor_msgs::PointCloud2 localMapMsg;
-        pcl::toROSMsg(localMap, localMapMsg);
-        localMapMsg.header.frame_id = "world";
-        localMapMsg.header.stamp = ros::Time::now();
-
-        local_map_pub.publish(localMapMsg);
     }
+
+    // 空视野也发布空点云，便于 rosbag/话题检查明确区分“传感器正常但
+    // 当前无点”和“感知节点没有启动”。
+    localMap.width = localMap.points.size();
+    localMap.height = 1;
+    localMap.is_dense = true;
+
+    sensor_msgs::PointCloud2 localMapMsg;
+    pcl::toROSMsg(localMap, localMapMsg);
+    localMapMsg.header.frame_id = output_frame;
+    localMapMsg.header.stamp = ros::Time::now();
+
+    local_map_pub.publish(localMapMsg);
 }
 
 int main(int argc, char** argv) {
@@ -81,16 +101,30 @@ int main(int argc, char** argv) {
     nh.param("sdf_map/local_update_range_y", local_range(1), -1.0);
     nh.param("sdf_map/local_update_range_z", local_range(2), -1.0);
 
-    // 订阅 /sim/odom 和 /mock_map
-    ros::Subscriber odom_sub = nh.subscribe("/sim/odom", 1, odomCallback);
-    ros::Subscriber map_sub = nh.subscribe("/mock_map", 1, mockMapCallback);
+    nh.param<std::string>("odom_topic", odom_topic, odom_topic);
+    nh.param<std::string>("global_map_topic", global_map_topic, global_map_topic);
+    nh.param<std::string>("local_map_topic", local_map_topic, local_map_topic);
+    nh.param<std::string>("output_frame", output_frame, output_frame);
+    nh.param("sensing_rate", sensing_rate, sensing_rate);
 
-    // 发布 /sim/local_map
-    local_map_pub = nh.advertise<sensor_msgs::PointCloud2>("/sim/local_map", 1);
+    if (!local_range.allFinite() || (local_range.array() <= 0.0).any()) {
+        ROS_FATAL_STREAM("[local_sensing] invalid local update range: "
+                         << local_range.transpose());
+        return 1;
+    }
+    sensing_rate = std::max(1.0, sensing_rate);
 
-    ROS_INFO("[local_sensing] Node initialized. Subscribing to /sim/odom and /mock_map, publishing to /sim/local_map");
+    ros::Subscriber odom_sub = nh.subscribe(odom_topic, 1, odomCallback);
+    ros::Subscriber map_sub = nh.subscribe(global_map_topic, 1, mockMapCallback);
 
-    ros::Rate rate(10.0);
+    local_map_pub = nh.advertise<sensor_msgs::PointCloud2>(local_map_topic, 1);
+
+    ROS_INFO("[local_sensing] odom=%s global_map=%s local_map=%s frame=%s range=(%.2f, %.2f, %.2f) rate=%.1fHz",
+             odom_topic.c_str(), global_map_topic.c_str(), local_map_topic.c_str(),
+             output_frame.c_str(), local_range.x(), local_range.y(), local_range.z(),
+             sensing_rate);
+
+    ros::Rate rate(sensing_rate);
 
     while (ros::ok()) {
         ros::spinOnce();

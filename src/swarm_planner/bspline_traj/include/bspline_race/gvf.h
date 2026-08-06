@@ -39,6 +39,7 @@
 #include <ros/topic_manager.h>
 #include <std_msgs/String.h>
 #include <quadrotor_msgs/PositionCommand.h>
+#include <bspline_race/continuous_phase_path.h>
 
 using namespace std;
 
@@ -102,7 +103,7 @@ class gvf
         VectorFieldData gvf_;
         ros::Subscriber indep_odom_sub_, indep_cloud_sub_, path_sub_, goal_sub_, kino_path_sub_;
         ros::Publisher map_pub_, esdf_pub_, map_inf_pub_, update_range_pub_,gvf_vis_pub_, vector_field_pub_;
-        ros::Timer esdf_timer_, vis_timer_;
+        ros::Timer esdf_timer_, vis_timer_, gvf_vis_timer_;
         nav_msgs::Path last_path_;
         bool use_kinopath_;
         bool use_quad_fit_;  // 添加新参数
@@ -120,6 +121,10 @@ class gvf
         bool reparam_ready_ = false;
         double next_path_w_anchor_ = 0.0;
         bool has_next_path_w_anchor_ = false;
+        std::vector<double> next_path_w_samples_;
+        bool has_next_path_w_samples_ = false;
+        bool authoritative_phase_mode_ = false;
+        std::shared_ptr<const ContinuousPhasePath> continuous_phase_path_;
 
         // ===== Lifted GVF parameters =====
         double progress_window_ = 1.0;   // 局部投影搜索窗口
@@ -128,6 +133,8 @@ class gvf
         double alpha_min_ = 0.05;        // 保证alpha始终>0，避免切向项退化
         double visualization_progress_w_ = 0.0;
         bool visualization_progress_initialized_ = false;
+        bool terminal_goal_visualization_active_ = false;
+        Eigen::Vector3d terminal_goal_visualization_pos_ = Eigen::Vector3d::Zero();
 
         struct LiftedGuidanceResult {
           Eigen::Vector3d v_cmd = Eigen::Vector3d::Zero();   // 前3维物理速度
@@ -152,6 +159,7 @@ class gvf
         void resetBuffer(Eigen::Vector3d min, Eigen::Vector3d max);
         void updateESDFCallback(const ros::TimerEvent& /*event*/);
         void visCallback(const ros::TimerEvent& /*event*/);
+        void gvfVisCallback(const ros::TimerEvent& /*event*/);
         void pathCallback(const nav_msgs::Path::ConstPtr& msg);
         void goalCallback(const geometry_msgs::PoseStamped::ConstPtr& msg);
         void kinoPathCallback(const nav_msgs::Path::ConstPtr& msg);
@@ -169,17 +177,30 @@ class gvf
         void clearPathReparamState();
         void buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg);
         void setNextPathWAnchor(double w_anchor);
+        void setNextPathWSamples(const std::vector<double>& w_samples);
+        void setAuthoritativePhaseMode(bool enabled);
+        void setContinuousPhasePath(const std::shared_ptr<const ContinuousPhasePath>& path);
+        void clearContinuousPhasePath();
+        std::shared_ptr<const ContinuousPhasePath> getContinuousPhasePath() const;
         Eigen::Vector3d evalPathByW(double w) const;
         Eigen::Vector3d evalTangentByW(double w) const;
         Eigen::Vector3d evalDpDwByW(double w) const;
+        Eigen::Vector3d evalD2pDw2ByW(double w) const;
 
         double projectToPathLocal(const Eigen::Vector3d& x,
                                   double w_prev,
                                   double window) const;
+        double projectToPathLocalForVisualization(const Eigen::Vector3d& x,
+                                                  double w_prev,
+                                                  double window) const;
 
         LiftedGuidanceResult calcLiftedGuidance3D(const Eigen::Vector3d& pos,
                                                   double w_prev) const;
+        LiftedGuidanceResult calcLiftedGuidanceAtPhase(const Eigen::Vector3d& pos,
+                                                       double w) const;
         void setVisualizationProgressW(double w);
+        void setTerminalGoalVisualization(const Eigen::Vector3d& goal);
+        void clearTerminalGoalVisualization();
         bool calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
                                            Eigen::Vector3d& vec) const;
         

@@ -161,6 +161,22 @@ class gvf_manager
 
         double progress_w_ = 0.0;
         bool progress_initialized_ = false;
+        std::string closed_tracking_mode_ = "legacy";
+        bool point_phase_v2_enabled_ = false;
+        bool point_phase_c2_enabled_ = false;
+        double point_phase_endpoint_margin_w_ = 0.05;
+        double phase_w_ = 0.0;
+        bool phase_initialized_ = false;
+        bool closed_phase_acquired_ = false;
+        double closed_phase_acquire_distance_ = 0.5;
+        double closed_phase_pending_path_end_w_ = 0.0;
+        bool closed_phase_has_pending_path_end_w_ = false;
+        bool closed_phase_c2_enabled_ = false;
+        double closed_phase_c2_join_min_w_ = 0.5;
+        double closed_phase_c2_join_max_w_ = 1.0;
+        double closed_phase_c2_join_step_w_ = 0.25;
+        double closed_phase_c2_sample_step_w_ = 0.05;
+        double closed_phase_back_margin_w_ = 1.0;
         bool enable_circle_reference_test_ = false;
         bool circle_reference_auto_start_ = false;
         bool circle_reference_auto_started_ = false;
@@ -314,6 +330,14 @@ class gvf_manager
             std::vector<Eigen::Vector3d> start_end_derivatives;
         };
 
+        struct PhasePathState {
+            Eigen::Vector3d p = Eigen::Vector3d::Zero();
+            Eigen::Vector3d dp_dw = Eigen::Vector3d::Zero();
+            Eigen::Vector3d d2p_dw2 = Eigen::Vector3d::Zero();
+            Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+            bool valid = false;
+        };
+
         struct GovernorCandidate {
             bool have = false;
             double cost = 0.0;
@@ -407,6 +431,55 @@ class gvf_manager
                                        Eigen::Vector3d& goal_pt,
                                        Eigen::Vector3d& end_vel,
                                        KinoPlanSamples& samples);
+        bool selectClosedPhaseV2Goal(gvfManager& pm,
+                                     const Eigen::Vector3d& curr_pos,
+                                     const Eigen::Vector3d& start_pt,
+                                     const Eigen::Vector3d& start_vel,
+                                     const Eigen::Vector3d& start_acc,
+                                     Eigen::Vector3d& goal_pt,
+                                     Eigen::Vector3d& end_vel,
+                                     KinoPlanSamples& samples);
+        bool evaluateSampledPhasePathState(const Eigen::MatrixXd& traj,
+                                           const Eigen::MatrixXd& vel,
+                                           const std::vector<double>& global_w,
+                                           double query_w,
+                                           PhasePathState& state) const;
+        bool buildPhaseV2C2Frontend(gvfManager& pm,
+                                    double phase_at_switch,
+                                    double path_end_w,
+                                    int candidate_anchor_idx,
+                                    const UniformBspline& candidate_spline,
+                                    const Eigen::MatrixXd& candidate_traj,
+                                    const Eigen::MatrixXd& candidate_vel,
+                                    const Eigen::VectorXd& candidate_time,
+                                    const std::vector<double>& candidate_w,
+                                    Eigen::MatrixXd& stitched_traj,
+                                    Eigen::MatrixXd& stitched_vel,
+                                    Eigen::VectorXd& stitched_time,
+                                    std::vector<double>& stitched_w,
+                                    std::shared_ptr<const ContinuousPhasePath>& continuous_path) const;
+        bool buildMappedPhaseFrontend(
+            double phase_anchor,
+            double path_end_w,
+            int candidate_anchor_idx,
+            const UniformBspline& candidate_spline,
+            const Eigen::MatrixXd& candidate_traj,
+            const Eigen::VectorXd& candidate_time,
+            Eigen::MatrixXd& mapped_traj,
+            Eigen::MatrixXd& mapped_vel,
+            Eigen::VectorXd& mapped_time,
+            std::vector<double>& mapped_w,
+            std::shared_ptr<const ContinuousPhasePath>& continuous_path) const;
+        bool buildNominalContinuousPhasePath(
+            double start_w,
+            double end_w,
+            std::shared_ptr<const ContinuousPhasePath>& path) const;
+        bool sampleContinuousPhasePath(
+            const std::shared_ptr<const ContinuousPhasePath>& path,
+            Eigen::MatrixXd& traj,
+            Eigen::MatrixXd& vel,
+            Eigen::VectorXd& time,
+            std::vector<double>& global_w) const;
         bool pathPointAtW(const std::shared_ptr<gvf>& g,
                           double query_w,
                           Eigen::Vector3d& point,
@@ -417,6 +490,8 @@ class gvf_manager
                             double query_w,
                             Eigen::Vector3d& tangent) const;
         void resetGovernorState();
+        void clearActiveTrajectory(bool publish_empty_path,
+                                   bool clear_gvf_path = true);
         GovernorCommandResult makeGovernorInvalidHold(const Eigen::Vector3d& pos,
                                                       const std::string& reason,
                                                       GovernorCommandDebug& dbg);
@@ -451,7 +526,8 @@ class gvf_manager
         void execTimerCallback(const ros::TimerEvent& event);
 
         bool astaropt(const Eigen::Vector3d& curr_pos, Eigen::MatrixXd& pos_out, Eigen::MatrixXd& vel_out,
-                      int& new_i0_out, Eigen::VectorXd& time);
+                      int& new_i0_out, Eigen::VectorXd& time,
+                      UniformBspline* continuous_spline_out = nullptr);
                       
         bool checkCollision();
         void cmdCallback(const ros::TimerEvent& event);
@@ -486,6 +562,33 @@ class gvf_manager
             const double remaining_w = path_w_end - progress_w;
             const double required_w = std::max(0.0, governor_l_max) + std::max(0.0, margin_w);
             return remaining_w <= required_w;
+        }
+        static Eigen::Vector3d boundedInitialAcquisitionDelta(
+            const Eigen::Vector3d& guidance_velocity,
+            double velocity_limit,
+            double position_gain,
+            double lead_limit)
+        {
+            if (!guidance_velocity.allFinite() ||
+                !std::isfinite(velocity_limit) ||
+                !std::isfinite(position_gain) ||
+                !std::isfinite(lead_limit) || position_gain <= 0.0) {
+                return Eigen::Vector3d::Zero();
+            }
+
+            Eigen::Vector3d velocity = guidance_velocity;
+            const double safe_velocity_limit = std::max(0.0, velocity_limit);
+            if (safe_velocity_limit > 1e-9 &&
+                velocity.norm() > safe_velocity_limit) {
+                velocity *= safe_velocity_limit / velocity.norm();
+            }
+
+            Eigen::Vector3d delta = velocity / position_gain;
+            const double safe_lead_limit = std::max(0.0, lead_limit);
+            if (safe_lead_limit > 1e-9 && delta.norm() > safe_lead_limit) {
+                delta *= safe_lead_limit / delta.norm();
+            }
+            return delta;
         }
         static bool shouldDeclarePointGoalReached(bool circle_mode_active,
                                                   double dist_xy,
@@ -534,6 +637,35 @@ class gvf_manager
             return std::isfinite(end_delta_w) && std::isfinite(required_progress) &&
                    end_delta_w >= required_progress;
         }
+
+        static double closedPhaseV2SelectedDeltaW(double base_delta_w,
+                                                  double max_delta_w,
+                                                  bool obstacle_end_found,
+                                                  double obstacle_end_delta_w,
+                                                  double pass_margin_w)
+        {
+            const double hi = std::max(0.0, max_delta_w);
+            double selected = std::max(0.0, std::min(base_delta_w, hi));
+            if (obstacle_end_found && std::isfinite(obstacle_end_delta_w)) {
+                selected = std::max(
+                    selected,
+                    obstacle_end_delta_w + std::max(0.0, pass_margin_w));
+            }
+            return std::min(selected, hi);
+        }
+
+        static bool evaluateC2QuinticHermite(
+            const Eigen::Vector3d& p0,
+            const Eigen::Vector3d& dp0,
+            const Eigen::Vector3d& d2p0,
+            const Eigen::Vector3d& p1,
+            const Eigen::Vector3d& dp1,
+            const Eigen::Vector3d& d2p1,
+            double interval_w,
+            double u,
+            Eigen::Vector3d& p,
+            Eigen::Vector3d& dp_dw,
+            Eigen::Vector3d& d2p_dw2);
 
         static double closedGoalProgressiveMaxLookahead(double preferred,
                                                         double configured_max,
@@ -751,6 +883,38 @@ class gvf_manager
         }
         void publishPathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel);
         void publishReferencePathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, ros::Publisher& pub);
+        bool closedPhaseV2Enabled() const;
+        bool closedPhaseV2Active() const;
+        bool pointPhaseV2Active() const;
+        bool unifiedPhaseV2Active() const;
+        double activeTrackingPhase() const;
+        void resetUnifiedPhaseV2();
+        double findInitialClosedPhaseV2(const Eigen::Vector3d& curr_pos) const;
+        bool buildNominalClosedFrontend(double start_w,
+                                        Eigen::MatrixXd& traj,
+                                        Eigen::MatrixXd& vel,
+                                        Eigen::VectorXd& time,
+                                        std::vector<double>& global_w) const;
+        bool buildGlobalPhaseSamples(const Eigen::MatrixXd& traj,
+                                     int anchor_idx,
+                                     double anchor_w,
+                                     double end_w,
+                                     std::vector<double>& global_w) const;
+        static bool buildArcLengthPhaseSamples(const Eigen::MatrixXd& traj,
+                                               int anchor_idx,
+                                               double anchor_w,
+                                               std::vector<double>& global_w);
+        bool installInitialClosedPhaseFrontend(gvfManager& pm,
+                                               const Eigen::Vector3d& current_pos,
+                                               const ros::Time& current_time);
+        bool installInitialPointPhaseFrontend(gvfManager& pm,
+                                              const Eigen::Vector3d& current_pos,
+                                              const ros::Time& current_time,
+                                              const Eigen::MatrixXd& candidate_traj,
+                                              const Eigen::MatrixXd& candidate_vel,
+                                              const Eigen::VectorXd& candidate_time,
+                                              int candidate_anchor_idx,
+                                              const UniformBspline& candidate_spline);
         void generateCircleReference(const Eigen::Vector3d& center);
         void generateFigureEightReference(const Eigen::Vector3d& center);
         std::pair<Eigen::Vector3d, Eigen::Vector3d> getCircleReferenceGoal(const Eigen::Vector3d& curr_pos);

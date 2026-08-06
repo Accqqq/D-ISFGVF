@@ -85,12 +85,12 @@ namespace FLAG_Race
                 getInterval();
             }
             Eigen::MatrixXd getTrajectory(const Eigen::VectorXd &t);
-            Eigen::Vector3d singleDeboor(const double &u_probe);
+            Eigen::Vector3d singleDeboor(const double &u_probe) const;
             void getAvailableSrange();
             void getAvailableTrange();
             void getInterval();
             void getT();//轨迹采样点的时间序列
-            UniformBspline getDerivative();//返回b样条的导数类
+            UniformBspline getDerivative() const;//返回b样条的导数类
             Eigen::VectorXd getBoundConstraintb();//得到边界
     };
 }

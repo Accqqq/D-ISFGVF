@@ -40,6 +40,7 @@ include_directories(
 
 add_library(bspline_gvf
    src/UniformBspline_3d.cpp
+   src/continuous_phase_path.cpp
    src/bspline_opt_3d.cpp 
    src/gvf_manager.cpp
    src/gvf.cpp
@@ -60,6 +61,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(reference_join_test test/reference_join_test.cpp)
   catkin_add_gtest(gvf_switch_policy_test test/gvf_switch_policy_test.cpp)
   catkin_add_gtest(gvf_lifted_visualization_test test/gvf_lifted_visualization_test.cpp)
+  catkin_add_gtest(continuous_phase_path_test test/continuous_phase_path_test.cpp)
   catkin_add_gtest(fastplanner_parameterization_test
     test/fastplanner_parameterization_test.cpp)
   if(TARGET fastplanner_parameterization_test)
@@ -71,6 +73,20 @@ if(CATKIN_ENABLE_TESTING)
   endif()
   if(TARGET gvf_lifted_visualization_test)
     target_link_libraries(gvf_lifted_visualization_test
+      bspline_gvf
+      ${catkin_LIBRARIES}
+      ${NLOPT_LIBRARIES}
+    )
+  endif()
+  if(TARGET continuous_phase_path_test)
+    target_link_libraries(continuous_phase_path_test
+      bspline_gvf
+      ${catkin_LIBRARIES}
+      ${NLOPT_LIBRARIES}
+    )
+  endif()
+  if(TARGET gvf_switch_policy_test)
+    target_link_libraries(gvf_switch_policy_test
       bspline_gvf
       ${catkin_LIBRARIES}
       ${NLOPT_LIBRARIES}

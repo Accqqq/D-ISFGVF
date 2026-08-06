@@ -179,7 +179,7 @@ namespace FLAG_Race
         return trajectory;
     }
 
-     Eigen::Vector3d UniformBspline::singleDeboor(const double &u_probe)//the deboor's algorithm
+     Eigen::Vector3d UniformBspline::singleDeboor(const double &u_probe) const//the deboor's algorithm
      {  
         //bound the u_probe
         double u_probe_;
@@ -240,7 +240,7 @@ namespace FLAG_Race
         }
     }
 
-    UniformBspline UniformBspline::getDerivative()
+    UniformBspline UniformBspline::getDerivative() const
     {     
             UniformBspline spline(p_,n_,beta_,D_,s_ini_,s_ter_);
             spline.p_ = spline.p_ -1;

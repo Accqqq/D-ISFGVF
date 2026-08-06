@@ -249,6 +249,108 @@
   - `manual_click_direct=false`，由 `uav_server` 在 `MANUAL_MAP` 状态下转发 `/clicked_point` 到 `/manual_map/add_obstacle_center`。
   - 实机保存文件建议放在实机 workspace 的 `bspline_traj/config/manual_maps/realflight_obstacles.txt`，并在 launch 中使用绝对路径。
 
+## Closed Kino Forward-Consistency Fix (2026-07-13)
+- 本轮修复的现象不是 B 样条重新出现“又字形自交”，而是闭合模式选中了空间上先前进、后绕回的 Kino 完整路径。
+- 本机 ROS 日志中的关键反例：
+  - `closed_ref_w=71.674`
+  - `accepted_goal_w=71.884`
+  - 新 `goal_w=72.674`，绝对参考相位仍向前 `0.790 m`
+  - 但 `lookahead=1.0 m` 得到 `kino_path_length=5.186 m`
+  - 该路径被 `accept_collision&timout` 接受；下一轮 `1.0 m` 候选又得到 `5.139 m` 路径并被接受
+  - 随后 `tangent_dot_odom` 从正值翻到 `-0.912`，说明实际执行路径已经转为参考反方向
+- 根因：`closed_ref_w_ + lookahead` 只保证目标点在全局参考相位上位于前方；点到点 KinoA* 不知道闭合参考的正向拓扑。旧选择器只检查终点状态/终点进度和最小长度，第一个 `REACH_END` 只要足够长就 early-break，反而会把超长绕回路径当作高质量完整路径。
+- 已实施的范围：
+  - 保留动态、连续未取模的全局 `closed_ref_w_`
+  - 保留 `goal_w = closed_ref_w_ + lookahead`
+  - 不增加第二套规划相位，不冻结 `closed_ref_w_`
+  - 不保存固定左右绕障决策
+  - 不修改 B 样条、governor、碰撞检测、换轨策略或点到点目标选择
+- `selectClosedGoalCandidate()` 现在会对每条 Kino `point_set` 做整路径正向性检查：
+  1. 从当前连续 `closed_ref_w_` 开始，对 Kino 样本逐点投影到连续未取模参考 `w`
+  2. 投影使用专用的局部连续区间，不复用旧固定 `0.3 m` 的 `projectClosedLocal()` 窗口
+  3. 投影记录 `trusted / on_boundary / ambiguous / projection_error`
+  4. 只有相邻投影都可信时，才累计沿参考切向的连续反向段
+  5. `max_backward_w` 与 `reverse_length` 都绑定同一段达到 `min_reverse_run` 的连续可信反向 run，不把孤立噪声和后续小反向段拼接
+- 当前方向分类：
+  - `FORWARD`：投影可信比例足够，且没有持续明显反向段
+  - `TURNBACK`：同一连续可信反向段超过允许尺度
+  - `UNKNOWN`：投影可信比例不足、撞局部窗口边界或出现非局部分支歧义
+- 当前候选行为：
+  - 只有可信且 `FORWARD` 的 usable `REACH_END` 才能以 `first_usable_forward_reach_end` early-break
+  - `TURNBACK / UNKNOWN` full 不进入 early-break，也不进入最终 fallback，会继续尝试后面的 `1.25 ... 3.0 m` 候选
+  - 可信正向的原生 `REACH_HORIZON / NEAR_END` partial 继续保留
+  - 当前优先级为 `forward_full > usable forward_partial`；`usable=false` 的短路径不再有执行 fallback
+  - 若所有候选都回绕或投影不可信，规划返回失败；首版不会把完整调头路径伪装成正常 full
+- 首版明确没有人工截断 full 的“正向前缀”：
+  - 当前 Kino 样本只提供整条路径首末导数，没有截断时刻的真实速度/加速度
+  - 直接有限差分重算可能造成末端动力学跳变、B 样条超调或再次短轨迹耗尽
+  - 后续若要实现 prefix，必须先由 Kino 输出截断时刻真实状态并重新验证动力学、碰撞和 B 样条正向性
+- 投影歧义修正：
+  - 960 点密集参考线上的相邻线段属于同一局部分支，不能作为第二投影解
+  - ambiguity 只比较与最佳投影相位分离至少 `max(0.5 m, step_window_w)` 的非局部候选
+  - 保存 `second_w`，最佳投影变化后重新验证旧 best/second 是否仍满足非局部分离
+- 当前首版内部尺度（尚未新增 launch 参数）：
+  - `allowed_backward_w = max(0.1, closed_ref_search_back_w_)`，当前约 `0.3 m`
+  - `allowed_reverse_length = allowed_backward_w`
+  - `min_reverse_run = 3`
+  - `min_direction_trusted_ratio = 0.8`
+  - `direction_max_projection_error = max(1.5 m, current_local_d + 0.5 m)`
+- 新增 `[GVF][CLOSED_GOAL]` 诊断字段：
+  - `selected_direction_trusted`
+  - `selected_forward_consistent`
+  - `selected_max_backward_w`
+  - `selected_reverse_length`
+  - `selected_direction_trusted_ratio`
+  - `selected_turnback_start_idx`
+  - `tried_direction`
+  - `tried_direction_trust`
+  - `tried_max_backward_ws`
+  - `tried_reverse_lengths`
+  - `tried_direction_trusted_ratios`
+  - `tried_direction_boundary_hits`
+  - `tried_direction_ambiguous`
+- 测试与构建：
+  - `gvf_switch_policy_test`：`70/70` 通过
+  - `kinodynamic_samples_test`：`3/3` 通过
+  - 新测试覆盖单调前进、纯横向、持续回绕、孤立反向噪声、低可信比例、非有限输入、跨圈未取模、终点仍前进但中途回绕、960 点密集参考邻段、方形闭合跨圈与运行时边界投影
+  - `path_searching`、`bspline_race` 完整编译通过
+  - 独立代码审查确认 success 日志 `72/72`、all-failed 日志 `13/13`，所有 `tried_*` 数组按候选对齐
+- 测试目标现在链接 `bspline_gvf`，用于运行时连续投影测试；该 CMake 修改只影响测试构建。
+- 点到点导航不进入 `selectClosedGoalCandidate()` 的方向检查，仍走公共 `planKinoToGoal(..., retry_once=true)`，原二次搜索行为保持。
+- 尚未完成的唯一关键验证：重新运行原障碍仿真并确认历史 `1.0 m / 5.186 m` 候选显示为 `TURNBACK` 或 `UNKNOWN`，不能成为 `first_usable_forward_reach_end`；同时观察 `planning_duration_ms` 是否持续低于 `0.5 s` 重规划周期。
+
+## Closed Short-Trajectory Exhaustion Root Fix (2026-07-14)
+- rosbag `4239` 已确认的停顿链路：`all_candidates_short_fallback -> 几厘米新轨迹被视为成功 -> old_collision/near_end/governor_path_short 强制换轨 -> governor 领先量耗尽 -> 障碍物前明显停顿`。
+- `selectClosedGoalCandidate()` 当前只允许 `valid && usable` 的 Kino 候选进入最终执行池：
+  - `usable` 同时要求可信正向、真实相位进度达到 `required_progress_w`、实际路径长度达到 `required_execution_length`
+  - `REACH_HORIZON / NEAR_END` 的 usable partial 仍可增量执行
+  - 所有候选都太短时直接规划失败，生产代码已无 `all_candidates_short_fallback`
+- 每次重规划都从配置的 `goal_prefer_lookahead_w` 重新开始，不沿用上一次候选前视，避免前视粘滞，也不保存绕障决策。
+- 当前地图的障碍物三状态选点：
+  1. 未发现障碍物起点：使用普通配置前视
+  2. 已发现起点、尚未确认末端：`desired_lookahead=lookahead_max_w`，遍历全部候选并选实际 `end_delta_w` 最大的 usable 路径
+  3. 已确认末端：目标为 `obstacle_end_delta_w + goal_obstacle_pass_margin_w`；优先实际越障且超越量最小的 usable 路径，否则选实际进度最大的 usable partial
+- 障碍物模式不会因一个较近的 full 路径提前结束搜索；只有无障碍 full，或已真正越过已确认障碍物末端的 full，才允许 early-break。
+- Kino 合格后，`astaropt()` 会从最终 B 样条的实际执行索引重新检查：
+  - 剩余实际路径长度
+  - 连续未取模闭合参考投影
+  - 终点真实相位进度
+  - 投影可信度与持续正向性
+  - 若选中的 Kino 已越障，则最终 B 样条也必须保持越障
+- 若只有未越障但 usable 的 partial，允许先推进并继续增量重规划，不会被 B 样条越障后验误拒。
+- 若闭合模式无 usable 新轨迹：
+  - 旧轨迹安全：继续旧轨迹
+  - 旧轨迹碰撞：锁存当前位置进入 `[GVF][CLOSED_HOLD]`
+  - 接受安全新轨迹、旧轨迹恢复安全或退出闭合模式时解除 hold
+  - hold 激活和 B 样条后验都只作用于闭合模式；点到点规划路径与换轨策略保持原样
+- 新增关键日志：`[GVF][BSPLINE_VALIDATE]`、`[GVF][CLOSED_HOLD]`。
+- 本轮未新增 launch 参数，也未修改碰撞检测算法或 `shouldAcceptCandidate()` 的原换轨判据。
+- 验证结果：
+  - `bspline_race` 全部测试通过，其中 `gvf_switch_policy_test 74/74`
+  - `kinodynamic_samples_test 3/3`
+  - `catkin_test_results build/test_results`：`182 tests, 0 errors, 0 failures`
+  - 独立只读代码审查确认短轨迹执行入口已阻断、点到点模式无 hold 泄漏
+
 ## Active Concerns
 - `cmdCallback()` 里还有一些旧控制状态/未调用函数可继续清理：
   - `computePositionCmdOffset()`
@@ -258,9 +360,10 @@
   - `KinoPathCallback()` 中 signed/unsigned compare
   - `FSMCallback()` 中 `INIT` 未处理
 - command governor 当前没有真正的发布指令速度/加速度限幅；轨迹切换时日志已出现 `estimated_acc` 数十到数百 `m/s^2`。
-- `GOVERNOR_INVALID_HOLD` 当前每周期使用最新 `odom` 作为命令点，不是锁存进入 fallback 时的安全位置；飞机已有速度时不能主动制动。
+- 通用 `GOVERNOR_INVALID_HOLD` 当前每周期使用最新 `odom` 作为命令点；闭合规划失败且旧轨迹碰撞的专用 `[GVF][CLOSED_HOLD]` 已改为锁存进入时的位置。两者语义不同。
 - 碰撞检测可能造成连续 `collision -> accept_collision&timout -> switch -> collision` 抖动，但用户当前确认下一项只修“短轨迹耗尽”，不改碰撞检测与切换策略。
-- 点到点模式当前在 `0.2 m <= dist_xy < goal_reach_radius_(2.0 m)` 时直接从 `EXEC_TRAJ` 返回，停止 collision/planInterval 重规划；旧轨迹耗尽后会出现 `all_candidates_path_end_clamped`。
+- 闭合整路径正向性投影当前复杂度约为 `候选数 × Kino样本数 × 参考线段数`；参考点 `960` 时需要用新仿真日志确认 `planning_duration_ms`，若接近 `0.5 s` 再优化为局部参考索引扫描。
+- 所有闭合候选均为 `TURNBACK/UNKNOWN` 时首版会规划失败并保留现有安全行为，不会人工截断 full；后续是否增加带真实 Kino 末端状态的正向 prefix 需要单独设计。
 
 ## Current File Focus
 - `src/swarm_planner/bspline_traj/src/gvf_manager.cpp`
@@ -286,10 +389,11 @@
   - `gvf/debug_gate`
 
 ## Immediate Next Tasks
-1. 按已确认范围只修点到点“短轨迹耗尽”：只有 `dist_xy < 0.2 m` 才结束任务；`0.2 m ~ goal_reach_radius_` 内继续允许正常 `planInterval` 重规划。
-2. 保持现有碰撞检测、`accept_collision&timout` 和其他切换策略不变。
-3. 验证进入目标 `2.0 m` 范围后仍会补充轨迹，且在 `stop_radius=0.3 m` 内由现有 goal-position override 收敛到目标，不再出现 `all_candidates_path_end_clamped`。
-4. 当前仿真验证稳定后，再决定是否单独设计 command governor 的真实 motion limit 和锁存 fallback。
+1. 重新运行产生过 `1.0 m lookahead / 5.186 m Kino path` 的闭合障碍仿真。
+2. 确认坏候选在 `[GVF][CLOSED_GOAL]` 中标记为 `TURNBACK` 或 `UNKNOWN`，并且 `early_break=0`，随后继续尝试更远候选。
+3. 确认正常无遮挡 `1.0 m` 候选仍为 `FORWARD` 并优先选择；正向原生 partial 仍能 fallback。
+4. 检查 `planning_duration_ms` 的 P95 是否低于 `0.5 s`；若投影耗时过高，再把逐样本全参考段扫描优化成连续局部索引扫描。
+5. 仿真稳定后再同步到无人机 `catkin_ws_gvf`，当前本机修改尚未同步无人机。
 
 ## Short Validation Checklist
 - `catkin_make --pkg bspline_race`

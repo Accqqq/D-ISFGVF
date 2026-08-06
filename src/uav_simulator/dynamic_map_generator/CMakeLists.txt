@@ -10,6 +10,8 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   geometry_msgs
+  nav_msgs
+  sensor_msgs
   pcl_conversions
   message_generation
   message_runtime
@@ -35,7 +37,8 @@ generate_messages(
 
 catkin_package(
   INCLUDE_DIRS include
-  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs common_msgs visualization_msgs
+  CATKIN_DEPENDS roscpp rospy std_msgs geometry_msgs nav_msgs sensor_msgs
+                 pcl_conversions common_msgs visualization_msgs
 )
 
 include_directories(

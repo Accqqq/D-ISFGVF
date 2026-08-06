@@ -223,6 +223,31 @@ main(int argc, char** argv)
   Eigen::Vector3d position = Eigen::Vector3d(_init_x, _init_y, _init_z);
   quad.setStatePos(position);
 
+  bool start_at_hover;
+  n.param("simulator/start_at_hover", start_at_hover, false);
+  if (start_at_hover)
+  {
+    const double hover_force = quad.getMass() * quad.getGravity();
+    const double hover_rpm =
+      std::sqrt(hover_force /
+                (4.0 * quad.getPropellerThrustCoefficient()));
+
+    QuadrotorSimulator::Quadrotor::State hover_state = quad.getState();
+    hover_state.motor_rpm = Eigen::Array4d::Constant(hover_rpm);
+    quad.setState(hover_state);
+
+    command.force[0] = 0.0;
+    command.force[1] = 0.0;
+    command.force[2] = hover_force;
+    command.qx = 0.0;
+    command.qy = 0.0;
+    command.qz = 0.0;
+    command.qw = 1.0;
+
+    ROS_INFO("[SO3_SIM] initialized at hover rpm=%.1f force=%.3f",
+             hover_rpm, hover_force);
+  }
+
   double simulation_rate;
   n.param("rate/simulation", simulation_rate, 1000.0);
   ROS_ASSERT(simulation_rate > 0);
@@ -233,6 +258,8 @@ main(int argc, char** argv)
 
   std::string quad_name;
   n.param("quadrotor_name", quad_name, std::string("quadrotor"));
+  std::string frame_id;
+  n.param("simulator/frame_id", frame_id, std::string("/simulator"));
 
   QuadrotorSimulator::Quadrotor::State state = quad.getState();
 
@@ -242,11 +269,11 @@ main(int argc, char** argv)
   Control control;
 
   nav_msgs::Odometry odom_msg;
-  odom_msg.header.frame_id = "/simulator";
+  odom_msg.header.frame_id = frame_id;
   odom_msg.child_frame_id  = "/" + quad_name;
 
   sensor_msgs::Imu imu;
-  imu.header.frame_id = "/simulator";
+  imu.header.frame_id = frame_id;
 
   /*
   command.force[0] = 0;

@@ -130,6 +130,10 @@ struct MappingParameters {
   string manual_map_file_;
   bool manual_map_auto_load_;
   bool manual_map_auto_save_;
+
+  /* static pre-inflated map reconstructed from rosbag */
+  bool static_preinflated_map_enable_;
+  string static_preinflated_map_file_;
 };
 
 // intermediate mapping data for fusion, esdf
@@ -152,6 +156,11 @@ struct MappingData {
   Eigen::Vector3d manual_boundary_max_;
   std::vector<Eigen::Vector3d> manual_obstacle_centers_;
   std::vector<Eigen::Vector3d> manual_boundary_points_;
+
+  std::vector<char> static_preinflated_buffer_;
+  bool static_preinflated_map_loaded_ = false;
+  bool static_preinflated_map_ready_ = false;
+  size_t static_preinflated_voxel_count_ = 0;
 
   // camera position and pose data
 
@@ -255,6 +264,7 @@ public:
   double getResolution();
   Eigen::Vector3d getOrigin();
   int getVoxelNum();
+  bool staticPreinflatedMapReady() const;
 
   typedef std::shared_ptr<SDFMap> Ptr;
 
@@ -290,6 +300,8 @@ private:
   void publishManualMap();
   void loadManualMapFile();
   void saveManualMapFile();
+  void loadStaticPreinflatedMapFile();
+  void applyStaticPreinflatedLayer();
 
   // main update process
   void projectDepthImage();

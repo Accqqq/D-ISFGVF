@@ -100,6 +100,11 @@ void gvf::init(ros::NodeHandle& nh, const std::string& particle, const std::stri
 
     esdf_timer_ = nh.createTimer(ros::Duration(0.10), &gvf::updateESDFCallback, this);
     vis_timer_ = nh.createTimer(ros::Duration(0.10), &gvf::visCallback, this);
+    double vector_field_vis_interval = 0.05;
+    nh.param("gvf/vector_field_vis_interval", vector_field_vis_interval, 0.05);
+    vector_field_vis_interval = std::max(0.02, vector_field_vis_interval);
+    gvf_vis_timer_ = nh.createTimer(
+        ros::Duration(vector_field_vis_interval), &gvf::gvfVisCallback, this);
 
     indep_odom_sub_ = nh.subscribe<nav_msgs::Odometry>(odom, 10, &gvf::odomCallback, this);
     path_sub_ = nh.subscribe<nav_msgs::Path>(particle + "/path", 10, &gvf::pathCallback, this);
@@ -737,8 +742,11 @@ void gvf::visCallback(const ros::TimerEvent& /*event*/) {
     publishMapInflate(false);
     publishUpdateRange();
     publishESDF();
-    publishGVF();  // 添加GVF可视化
     publishPathCylinderVisualization();  // 添加路径圆柱体可视化
+}
+
+void gvf::gvfVisCallback(const ros::TimerEvent& /*event*/) {
+    publishGVF();
 }
 
 void gvf::publishPathCylinderVisualization() {
@@ -1030,6 +1038,38 @@ void gvf::setNextPathWAnchor(double w_anchor)
 {
     next_path_w_anchor_ = w_anchor;
     has_next_path_w_anchor_ = true;
+    next_path_w_samples_.clear();
+    has_next_path_w_samples_ = false;
+}
+
+void gvf::setNextPathWSamples(const std::vector<double>& w_samples)
+{
+    next_path_w_samples_ = w_samples;
+    has_next_path_w_samples_ = true;
+    next_path_w_anchor_ = 0.0;
+    has_next_path_w_anchor_ = false;
+}
+
+void gvf::setAuthoritativePhaseMode(bool enabled)
+{
+    authoritative_phase_mode_ = enabled;
+}
+
+void gvf::setContinuousPhasePath(
+    const std::shared_ptr<const ContinuousPhasePath>& path)
+{
+    std::atomic_store(&continuous_phase_path_, path);
+}
+
+void gvf::clearContinuousPhasePath()
+{
+    std::atomic_store(
+        &continuous_phase_path_, std::shared_ptr<const ContinuousPhasePath>());
+}
+
+std::shared_ptr<const ContinuousPhasePath> gvf::getContinuousPhasePath() const
+{
+    return std::atomic_load(&continuous_phase_path_);
 }
 
 void gvf::clearPathReparamState()
@@ -1043,8 +1083,12 @@ void gvf::clearPathReparamState()
     reparam_ready_ = false;
     next_path_w_anchor_ = 0.0;
     has_next_path_w_anchor_ = false;
+    next_path_w_samples_.clear();
+    has_next_path_w_samples_ = false;
     visualization_progress_w_ = 0.0;
     visualization_progress_initialized_ = false;
+    clearTerminalGoalVisualization();
+    clearContinuousPhasePath();
 }
 
 void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
@@ -1073,13 +1117,32 @@ void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
         );
     }
 
-    // 2) 近似弧长参数化：新轨迹起点先继承旧轨迹当前progress锚点，再按新轨迹自身弧长继续累加
-    sample_w_[0] = has_next_path_w_anchor_ ? next_path_w_anchor_ : 0.0;
-    has_next_path_w_anchor_ = false;
-    for (size_t i = 1; i < N; ++i) {
-        double ds = (sample_p_[i] - sample_p_[i - 1]).norm();
-        sample_w_[i] = sample_w_[i - 1] + ds;
+    // 2) phase_v2 可显式提供同一全局相位域中的 w_i；
+    //    legacy 模式继续使用原来的弧长参数化和起点锚定逻辑。
+    bool use_explicit_w = has_next_path_w_samples_ && next_path_w_samples_.size() == N;
+    if (use_explicit_w) {
+        for (size_t i = 0; i < N; ++i) {
+            if (!std::isfinite(next_path_w_samples_[i]) ||
+                (i > 0 && next_path_w_samples_[i] <= next_path_w_samples_[i - 1])) {
+                use_explicit_w = false;
+                break;
+            }
+        }
     }
+
+    if (use_explicit_w) {
+        sample_w_ = next_path_w_samples_;
+    } else {
+        sample_w_[0] = has_next_path_w_anchor_ ? next_path_w_anchor_ : 0.0;
+        for (size_t i = 1; i < N; ++i) {
+            double ds = (sample_p_[i] - sample_p_[i - 1]).norm();
+            sample_w_[i] = sample_w_[i - 1] + ds;
+        }
+    }
+
+    next_path_w_samples_.clear();
+    has_next_path_w_samples_ = false;
+    has_next_path_w_anchor_ = false;
     total_w_ = sample_w_.back();
     if (!visualization_progress_initialized_ ||
         visualization_progress_w_ < sample_w_.front() - progress_window_ ||
@@ -1119,6 +1182,11 @@ void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
 
 Eigen::Vector3d gvf::evalPathByW(double w) const
 {
+    if (authoritative_phase_mode_) {
+        const auto path = getContinuousPhasePath();
+        ContinuousPhasePathState state;
+        if (path && path->evaluate(w, state)) return state.p;
+    }
     if (!reparam_ready_ || sample_w_.empty()) return Eigen::Vector3d::Zero();
 
     if (w <= sample_w_.front()) return sample_p_.front();
@@ -1138,6 +1206,11 @@ Eigen::Vector3d gvf::evalPathByW(double w) const
 
 Eigen::Vector3d gvf::evalDpDwByW(double w) const
 {
+    if (authoritative_phase_mode_) {
+        const auto path = getContinuousPhasePath();
+        ContinuousPhasePathState state;
+        if (path && path->evaluate(w, state)) return state.dp_dw;
+    }
     if (!reparam_ready_ || sample_w_.empty()) return Eigen::Vector3d::Zero();
 
     if (w <= sample_w_.front()) return sample_dp_.front();
@@ -1152,6 +1225,31 @@ Eigen::Vector3d gvf::evalDpDwByW(double w) const
     double s = (w - w0) / std::max(1e-9, w1 - w0);
 
     return (1.0 - s) * sample_dp_[i0] + s * sample_dp_[i1];
+}
+
+Eigen::Vector3d gvf::evalD2pDw2ByW(double w) const
+{
+    if (authoritative_phase_mode_) {
+        const auto path = getContinuousPhasePath();
+        ContinuousPhasePathState state;
+        if (path && path->evaluate(w, state)) return state.d2p_dw2;
+    }
+
+    if (!reparam_ready_ || sample_w_.size() < 3) {
+        return Eigen::Vector3d::Zero();
+    }
+    if (w <= sample_w_.front()) w = sample_w_.front();
+    if (w >= sample_w_.back()) w = sample_w_.back();
+
+    auto it = std::lower_bound(sample_w_.begin(), sample_w_.end(), w);
+    size_t i = static_cast<size_t>(std::distance(sample_w_.begin(), it));
+    if (i == 0) i = 1;
+    if (i >= sample_w_.size() - 1) i = sample_w_.size() - 2;
+    const double dw0 = std::max(1e-9, sample_w_[i] - sample_w_[i - 1]);
+    const double dw1 = std::max(1e-9, sample_w_[i + 1] - sample_w_[i]);
+    const Eigen::Vector3d left = (sample_p_[i] - sample_p_[i - 1]) / dw0;
+    const Eigen::Vector3d right = (sample_p_[i + 1] - sample_p_[i]) / dw1;
+    return 2.0 * (right - left) / (dw0 + dw1);
 }
 
 Eigen::Vector3d gvf::evalTangentByW(double w) const
@@ -1187,6 +1285,56 @@ double gvf::projectToPathLocal(const Eigen::Vector3d& x,
         if (cost < best_cost) {
             best_cost = cost;
             best_w = wi;
+        }
+    }
+    return best_w;
+}
+
+double gvf::projectToPathLocalForVisualization(
+    const Eigen::Vector3d& x,
+    double w_prev,
+    double window) const
+{
+    if (!reparam_ready_ || sample_w_.size() < 2 ||
+        sample_p_.size() != sample_w_.size() || !x.allFinite()) {
+        return 0.0;
+    }
+
+    const double safe_window = std::max(0.0, window);
+    const double w_min = std::max(sample_w_.front(), w_prev - safe_window);
+    const double w_max = std::min(sample_w_.back(), w_prev + safe_window);
+    double best_w = std::max(sample_w_.front(), std::min(w_prev, sample_w_.back()));
+    double best_distance_sq = std::numeric_limits<double>::infinity();
+
+    for (size_t i = 0; i + 1 < sample_w_.size(); ++i) {
+        const double segment_w0 = sample_w_[i];
+        const double segment_w1 = sample_w_[i + 1];
+        if (segment_w1 < w_min || segment_w0 > w_max ||
+            segment_w1 <= segment_w0 + 1e-12) {
+            continue;
+        }
+
+        const Eigen::Vector3d segment = sample_p_[i + 1] - sample_p_[i];
+        const double segment_length_sq = segment.squaredNorm();
+        if (segment_length_sq <= 1e-12) continue;
+
+        const double u_min = std::max(
+            0.0, (w_min - segment_w0) / (segment_w1 - segment_w0));
+        const double u_max = std::min(
+            1.0, (w_max - segment_w0) / (segment_w1 - segment_w0));
+        if (u_min > u_max) continue;
+
+        double u = (x - sample_p_[i]).dot(segment) / segment_length_sq;
+        u = std::max(u_min, std::min(u, u_max));
+        const Eigen::Vector3d projection = sample_p_[i] + u * segment;
+        const double candidate_w =
+            segment_w0 + u * (segment_w1 - segment_w0);
+        const double distance_sq = (x - projection).squaredNorm();
+        if (distance_sq < best_distance_sq - 1e-12 ||
+            (std::abs(distance_sq - best_distance_sq) <= 1e-12 &&
+             std::abs(candidate_w - w_prev) < std::abs(best_w - w_prev))) {
+            best_distance_sq = distance_sq;
+            best_w = candidate_w;
         }
     }
     return best_w;
@@ -1247,26 +1395,98 @@ gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
     return out;
 }
 
+gvf::LiftedGuidanceResult gvf::calcLiftedGuidanceAtPhase(
+    const Eigen::Vector3d& pos, double w) const
+{
+    LiftedGuidanceResult out;
+    if (!reparam_ready_ || sample_w_.size() < 2 || !std::isfinite(w)) return out;
+
+    // phase_v2 的 w 是唯一权威状态。这里不做最近点投影，
+    // 只在当前有限前端上直接查询 p(w) 和 p'(w)。
+    const Eigen::Vector3d p = evalPathByW(w);
+    const Eigen::Vector3d dpdw = evalDpDwByW(w);
+    const double dpdw_norm = dpdw.norm();
+    if (dpdw_norm < 1e-6) return out;
+
+    const Eigen::Vector3d t = dpdw / dpdw_norm;
+    const Eigen::Vector3d e = pos - p;
+    const double e_parallel = t.dot(e);
+    const Eigen::Vector3d e_perp = e - e_parallel * t;
+    const double rho = e_perp.norm();
+
+    const double r = std::max(1e-6, gvf_.convergence_bandwidth_);
+    const double q = (rho > 1e-6) ? std::tanh(rho / r) / rho : 1.0 / r;
+    const double rho0 = std::max(1e-6, progress_rho0_);
+    const double alpha = alpha_min_ + (1.0 - alpha_min_) /
+        (1.0 + (rho / rho0) * (rho / rho0));
+    const double delta = std::max(1e-6, progress_delta_);
+    const double sigma = std::tanh(e_parallel / delta);
+
+    out.v_cmd = gvf_.K1_ * alpha * t + gvf_.K2_ * q * e_perp;
+    out.w_proj = w;
+    out.w_dot = gvf_.K1_ * (alpha + sigma) / dpdw_norm;
+    out.e_parallel = e_parallel;
+    out.e_perp = e_perp;
+    out.ref_pt = p;
+    out.tangent = t;
+    out.valid = true;
+    return out;
+}
+
 void gvf::setVisualizationProgressW(double w)
 {
     visualization_progress_w_ = w;
     visualization_progress_initialized_ = true;
 }
 
+void gvf::setTerminalGoalVisualization(const Eigen::Vector3d& goal)
+{
+    if (!goal.allFinite()) return;
+    terminal_goal_visualization_pos_ = goal;
+    terminal_goal_visualization_active_ = true;
+}
+
+void gvf::clearTerminalGoalVisualization()
+{
+    terminal_goal_visualization_active_ = false;
+    terminal_goal_visualization_pos_.setZero();
+}
+
 bool gvf::calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
                                         Eigen::Vector3d& vec) const
 {
     vec.setZero();
+    if (terminal_goal_visualization_active_) {
+        const Eigen::Vector3d to_goal = terminal_goal_visualization_pos_ - pos;
+        const double distance = to_goal.norm();
+        if (!std::isfinite(distance)) return false;
+        if (distance <= 1e-9) return true;
+
+        const double bandwidth = std::max(0.1, gvf_.convergence_bandwidth_);
+        const double attraction_gain = std::max(0.1, std::abs(gvf_.K1_));
+        vec = attraction_gain * std::tanh(distance / bandwidth) *
+              to_goal / distance;
+        return vec.allFinite();
+    }
     if (!reparam_ready_ || sample_w_.size() < 2) return false;
 
     double w_prev = visualization_progress_initialized_ ?
         visualization_progress_w_ : sample_w_.front();
-    if (w_prev < sample_w_.front() - progress_window_ ||
-        w_prev > sample_w_.back() + progress_window_) {
+    if (!authoritative_phase_mode_ &&
+        (w_prev < sample_w_.front() - progress_window_ ||
+         w_prev > sample_w_.back() + progress_window_)) {
         w_prev = sample_w_.front();
     }
 
-    const auto out = calcLiftedGuidance3D(pos, w_prev);
+    // 显示形式始终是无人机周围的局部正方形网格。统一相位模式下，
+    // 每个网格点独立投影到当前相位邻域内的最近轨迹位置 w_vis；这个
+    // 投影只用于 RViz，不会回写或改变控制器的权威 phase_w。
+    const double w_vis = authoritative_phase_mode_
+        ? projectToPathLocalForVisualization(pos, w_prev, progress_window_)
+        : w_prev;
+    const auto out = authoritative_phase_mode_
+        ? calcLiftedGuidanceAtPhase(pos, w_vis)
+        : calcLiftedGuidance3D(pos, w_prev);
     if (!out.valid) return false;
 
     vec = out.v_cmd;

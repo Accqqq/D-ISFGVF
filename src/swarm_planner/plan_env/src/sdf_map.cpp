@@ -42,6 +42,10 @@ void loadManualMapParams(ros::NodeHandle& nh, MappingParameters& mp) {
   nh.param("sdf_map/manual_map_file", mp.manual_map_file_, std::string(""));
   nh.param("sdf_map/manual_map_auto_load", mp.manual_map_auto_load_, false);
   nh.param("sdf_map/manual_map_auto_save", mp.manual_map_auto_save_, false);
+  nh.param("sdf_map/static_preinflated_map_enable",
+           mp.static_preinflated_map_enable_, false);
+  nh.param("sdf_map/static_preinflated_map_file",
+           mp.static_preinflated_map_file_, std::string(""));
 }
 
 bool isInBaseMapBounds(const MappingParameters& mp, const Eigen::Vector3d& pos) {
@@ -140,6 +144,10 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   md_.occupancy_buffer_neg = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
   md_.manual_occupancy_buffer_ = vector<char>(buffer_size, 0);
+  md_.static_preinflated_buffer_ = vector<char>(buffer_size, 0);
+  md_.static_preinflated_map_loaded_ = false;
+  md_.static_preinflated_map_ready_ = false;
+  md_.static_preinflated_voxel_count_ = 0;
   md_.manual_boundary_enabled_ = false;
   md_.manual_obstacle_centers_.clear();
   md_.manual_boundary_points_.clear();
@@ -209,6 +217,7 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   md_.max_fuse_time_ = 0.0;
 
   loadManualMapFile();
+  loadStaticPreinflatedMapFile();
 
   rand_noise_ = uniform_real_distribution<double>(-0.2, 0.2);
   rand_noise2_ = normal_distribution<double>(0, 0.2);
@@ -302,6 +311,10 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   md_.occupancy_buffer_neg = vector<char>(buffer_size, 0);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
   md_.manual_occupancy_buffer_ = vector<char>(buffer_size, 0);
+  md_.static_preinflated_buffer_ = vector<char>(buffer_size, 0);
+  md_.static_preinflated_map_loaded_ = false;
+  md_.static_preinflated_map_ready_ = false;
+  md_.static_preinflated_voxel_count_ = 0;
   md_.manual_boundary_enabled_ = false;
   md_.manual_obstacle_centers_.clear();
   md_.manual_boundary_points_.clear();
@@ -372,6 +385,7 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   md_.max_fuse_time_ = 0.0;
 
   loadManualMapFile();
+  loadStaticPreinflatedMapFile();
 
   rand_noise_ = uniform_real_distribution<double>(-0.2, 0.2);
   rand_noise2_ = normal_distribution<double>(0, 0.2);
@@ -407,6 +421,8 @@ void SDFMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
         md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 0;
         md_.distance_buffer_[toAddress(x, y, z)] = 10000;
       }
+
+  applyStaticPreinflatedLayer();
 }
 
 void SDFMap::gradualResetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
@@ -503,6 +519,7 @@ void SDFMap::manualObstacleCallback(const geometry_msgs::PointStamped::ConstPtr&
   md_.local_bound_min_ = Eigen::Vector3i::Zero();
   md_.local_bound_max_ = mp_.map_max_idx_;
   applyManualLayer();
+  applyStaticPreinflatedLayer();
   md_.esdf_need_update_ = true;
   publishManualMap();
   saveManualMapFile();
@@ -559,6 +576,7 @@ void SDFMap::manualBoundaryCallback(const geometry_msgs::PointStamped::ConstPtr&
   md_.local_bound_min_ = Eigen::Vector3i::Zero();
   md_.local_bound_max_ = mp_.map_max_idx_;
   applyManualLayer();
+  applyStaticPreinflatedLayer();
   md_.esdf_need_update_ = true;
   publishManualMap();
 
@@ -633,6 +651,22 @@ void SDFMap::applyManualLayer() {
   }
 
   if (has_manual_voxel) md_.esdf_need_update_ = true;
+}
+
+void SDFMap::applyStaticPreinflatedLayer() {
+  if (!mp_.static_preinflated_map_enable_ ||
+      md_.static_preinflated_buffer_.empty()) {
+    return;
+  }
+
+  const size_t buffer_size = std::min(
+      md_.static_preinflated_buffer_.size(),
+      md_.occupancy_buffer_inflate_.size());
+  for (size_t addr = 0; addr < buffer_size; ++addr) {
+    if (md_.static_preinflated_buffer_[addr] != 0) {
+      md_.occupancy_buffer_inflate_[addr] = 1;
+    }
+  }
 }
 
 void SDFMap::publishManualMap() {
@@ -713,6 +747,7 @@ void SDFMap::loadManualMapFile() {
     md_.local_bound_min_ = Eigen::Vector3i::Zero();
     md_.local_bound_max_ = mp_.map_max_idx_;
     applyManualLayer();
+    applyStaticPreinflatedLayer();
     md_.esdf_need_update_ = true;
     publishManualMap();
   }
@@ -740,6 +775,104 @@ void SDFMap::saveManualMapFile() {
 
   ROS_WARN("[MANUAL_MAP] saved %zu obstacle centers to %s",
            md_.manual_obstacle_centers_.size(), mp_.manual_map_file_.c_str());
+}
+
+void SDFMap::loadStaticPreinflatedMapFile() {
+  md_.static_preinflated_map_loaded_ = false;
+  md_.static_preinflated_map_ready_ = false;
+  md_.static_preinflated_voxel_count_ = 0;
+
+  if (!mp_.static_preinflated_map_enable_) return;
+  if (mp_.static_preinflated_map_file_.empty()) {
+    ROS_ERROR("[STATIC_MAP] enabled but file path is empty");
+    return;
+  }
+  if (md_.static_preinflated_buffer_.empty()) {
+    ROS_ERROR("[STATIC_MAP] map buffer is not initialized");
+    return;
+  }
+
+  std::ifstream file(mp_.static_preinflated_map_file_);
+  if (!file.good()) {
+    ROS_ERROR("[STATIC_MAP] file not found: %s",
+              mp_.static_preinflated_map_file_.c_str());
+    return;
+  }
+
+  std::fill(md_.static_preinflated_buffer_.begin(),
+            md_.static_preinflated_buffer_.end(), 0);
+  Eigen::Vector3i min_id = mp_.map_max_idx_;
+  Eigen::Vector3i max_id = Eigen::Vector3i::Zero();
+  size_t skipped_count = 0;
+  size_t duplicate_count = 0;
+  std::string line;
+  while (std::getline(file, line)) {
+    const size_t first = line.find_first_not_of(" \t\r");
+    if (first == std::string::npos || line[first] == '#') continue;
+
+    std::istringstream input(line);
+    double x, y, z;
+    if (!(input >> x >> y >> z) || !std::isfinite(x) ||
+        !std::isfinite(y) || !std::isfinite(z)) {
+      ++skipped_count;
+      continue;
+    }
+
+    const Eigen::Vector3d position(x, y, z);
+    if (!isInBaseMapBounds(mp_, position)) {
+      ++skipped_count;
+      continue;
+    }
+
+    Eigen::Vector3i id;
+    posToIndex(position, id);
+    boundIndex(id);
+    const int address = toAddress(id);
+    if (md_.static_preinflated_buffer_[address] != 0) {
+      ++duplicate_count;
+      continue;
+    }
+
+    md_.static_preinflated_buffer_[address] = 1;
+    ++md_.static_preinflated_voxel_count_;
+    min_id = min_id.cwiseMin(id);
+    max_id = max_id.cwiseMax(id);
+  }
+
+  if (md_.static_preinflated_voxel_count_ == 0) {
+    ROS_ERROR("[STATIC_MAP] no usable voxels loaded from %s, skipped=%zu",
+              mp_.static_preinflated_map_file_.c_str(), skipped_count);
+    return;
+  }
+
+  const Eigen::Vector3i esdf_padding = Eigen::Vector3i::Ones();
+  md_.local_bound_min_ = min_id - esdf_padding;
+  md_.local_bound_max_ = max_id + esdf_padding;
+  boundIndex(md_.local_bound_min_);
+  boundIndex(md_.local_bound_max_);
+  applyManualLayer();
+  applyStaticPreinflatedLayer();
+  updateESDF3d();
+  md_.esdf_need_update_ = false;
+  md_.static_preinflated_map_loaded_ = true;
+  md_.static_preinflated_map_ready_ = true;
+
+  Eigen::Vector3d min_position;
+  Eigen::Vector3d max_position;
+  indexToPos(min_id, min_position);
+  indexToPos(max_id, max_position);
+  ROS_WARN(
+      "[STATIC_MAP] ready=1 voxels=%zu skipped=%zu duplicates=%zu "
+      "bounds_min=(%.3f,%.3f,%.3f) bounds_max=(%.3f,%.3f,%.3f) file=%s",
+      md_.static_preinflated_voxel_count_, skipped_count, duplicate_count,
+      min_position.x(), min_position.y(), min_position.z(),
+      max_position.x(), max_position.y(), max_position.z(),
+      mp_.static_preinflated_map_file_.c_str());
+}
+
+bool SDFMap::staticPreinflatedMapReady() const {
+  return !mp_.static_preinflated_map_enable_ ||
+         md_.static_preinflated_map_ready_;
 }
 
 template <typename F_get_val, typename F_set_val>
@@ -1403,11 +1536,22 @@ void SDFMap::clearAndInflateLocalMap() {
 
   // add virtual ceiling to limit flight height
   if (mp_.virtual_ceil_height_ > -0.5) {
-    int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_);
-    for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
+    int ceil_id = floor(
+        (mp_.virtual_ceil_height_ - mp_.map_origin_(2)) *
+        mp_.resolution_inv_);
+    if (ceil_id < 0 || ceil_id >= mp_.map_voxel_num_(2)) {
+      ROS_WARN_THROTTLE(
+          5.0,
+          "virtual ceiling %.3f is outside map z voxels [0,%d); skip ceiling layer",
+          mp_.virtual_ceil_height_, mp_.map_voxel_num_(2));
+    } else {
+      for (int x = md_.local_bound_min_(0);
+           x <= md_.local_bound_max_(0); ++x)
+        for (int y = md_.local_bound_min_(1);
+             y <= md_.local_bound_max_(1); ++y) {
+          md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
+        }
+    }
   }
 }
 
@@ -1452,6 +1596,7 @@ void SDFMap::bufferRefreshCallback(const ros::TimerEvent& /*event*/){
   this->gradualResetBuffer(md_.camera_pos_ - mp_.local_update_range_,
                           md_.camera_pos_ + mp_.local_update_range_);
   applyManualLayer();
+  applyStaticPreinflatedLayer();
 }
 
 void SDFMap::updateOccupancyCallback(const ros::TimerEvent& /*event*/) {
@@ -1467,6 +1612,7 @@ void SDFMap::updateOccupancyCallback(const ros::TimerEvent& /*event*/) {
   if (md_.local_updated_) {
     clearAndInflateLocalMap();
     applyManualLayer();
+    applyStaticPreinflatedLayer();
   }
 
   t2 = ros::Time::now();
@@ -1632,6 +1778,7 @@ void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
   boundIndex(md_.local_bound_max_);
 
   applyManualLayer();
+  applyStaticPreinflatedLayer();
   md_.esdf_need_update_ = true;
 }
 
