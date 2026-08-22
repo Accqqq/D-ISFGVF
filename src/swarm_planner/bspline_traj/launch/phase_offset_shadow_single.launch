@@ -1,0 +1,8 @@
+<launch>
+  <arg name="shadow_delta" default="0.40" />
+
+  <include file="$(find bspline_race)/launch/test_gvf.launch">
+    <arg name="phase_offset_mode" value="shadow" />
+    <arg name="phase_offset_shadow_delta" value="$(arg shadow_delta)" />
+  </include>
+</launch>

@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
+
 #include <bspline_race/gvf.h>
 
 namespace {
@@ -155,6 +157,31 @@ TEST(GvfLiftedPhase, DirectEvaluationDoesNotProjectAwayFromAuthoritativePhase)
   EXPECT_NEAR(1.0, on_path.w_dot, 1e-6);
 }
 
+TEST(GvfLiftedPhase, AuthoritativeGuidanceKeepsHardCodedRepresentativeOutput)
+{
+  FLAG_Race::gvf field;
+  field.gvf_.K1_ = 2.0;
+  field.gvf_.K2_ = -2.2;
+  field.gvf_.convergence_bandwidth_ = 0.1;
+  field.progress_rho0_ = 0.5;
+  field.progress_delta_ = 0.3;
+  field.alpha_min_ = 0.05;
+  field.setNextPathWSamples({10.0, 11.0, 12.0});
+  field.buildReparamTableFromPathMsg(makeScaledPhasePath());
+
+  const auto guidance = field.calcLiftedGuidanceAtPhase(
+      Eigen::Vector3d(1.0, 0.2, 1.0), 10.5);
+  ASSERT_TRUE(guidance.valid);
+  EXPECT_NEAR(1.7379310344827585, guidance.v_cmd.x(), 1e-12);
+  EXPECT_NEAR(-2.1208606761667970, guidance.v_cmd.y(), 1e-12);
+  EXPECT_NEAR(0.0, guidance.v_cmd.z(), 1e-12);
+  EXPECT_NEAR(0.8689655172413793, guidance.w_dot, 1e-12);
+  EXPECT_NEAR(0.0, guidance.e_parallel, 1e-12);
+  EXPECT_NEAR(0.2, guidance.e_perp.y(), 1e-12);
+  EXPECT_NEAR(1.0, guidance.ref_pt.x(), 1e-12);
+  EXPECT_NEAR(1.0, guidance.tangent.x(), 1e-12);
+}
+
 TEST(GvfLiftedVisualization, AuthoritativeSquareUsesExactDisplayedPhase)
 {
   FLAG_Race::gvf field;
@@ -209,6 +236,45 @@ TEST(GvfLiftedPhase, AuthoritativeModeEvaluatesContinuousPathNotDisplaySamples)
   const auto guidance = field.calcLiftedGuidanceAtPhase(expected.p, w);
   ASSERT_TRUE(guidance.valid);
   EXPECT_NEAR(0.0, (guidance.ref_pt - expected.p).norm(), 1e-12);
+  EXPECT_NEAR(0.0, guidance.e_perp.norm(), 1e-12);
+}
+
+TEST(GvfLiftedPhase, AuthoritativeModeUsesFullThreeDimensionalContinuousTangent)
+{
+  FLAG_Race::gvf field;
+  field.gvf_.K1_ = 2.0;
+  field.gvf_.K2_ = -2.2;
+  field.gvf_.convergence_bandwidth_ = 0.1;
+  field.progress_rho0_ = 0.5;
+  field.progress_delta_ = 0.3;
+  field.alpha_min_ = 0.05;
+  field.setNextPathWSamples({10.0, 11.0, 12.0});
+  field.buildReparamTableFromPathMsg(makeScaledPhasePath());
+
+  auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  const auto height_varying = [](double w,
+                                 FLAG_Race::ContinuousPhasePathState& state) {
+    const double s = w - 10.0;
+    state.p = Eigen::Vector3d(s, 0.5 * std::sin(s), 1.0 + 0.2 * s);
+    state.dp_dw = Eigen::Vector3d(1.0, 0.5 * std::cos(s), 0.2);
+    state.d2p_dw2 = Eigen::Vector3d(0.0, -0.5 * std::sin(s), 0.0);
+    state.vel = state.dp_dw;
+    state.valid = true;
+    return true;
+  };
+  ASSERT_TRUE(path->appendSegment(10.0, 12.0, "height_varying", height_varying));
+  field.setContinuousPhasePath(path);
+  field.setAuthoritativePhaseMode(true);
+
+  const double w = 10.7;
+  FLAG_Race::ContinuousPhasePathState expected;
+  ASSERT_TRUE(path->evaluate(w, expected, false));
+  const auto guidance = field.calcLiftedGuidanceAtPhase(expected.p, w);
+  ASSERT_TRUE(guidance.valid);
+  EXPECT_NEAR(0.0, (guidance.ref_pt - expected.p).norm(), 1e-12);
+  EXPECT_NEAR(0.0, (guidance.tangent -
+                     expected.dp_dw / expected.dp_dw.norm()).norm(), 1e-12);
+  EXPECT_GT(std::abs(guidance.tangent.z()), 1e-3);
   EXPECT_NEAR(0.0, guidance.e_perp.norm(), 1e-12);
 }
 

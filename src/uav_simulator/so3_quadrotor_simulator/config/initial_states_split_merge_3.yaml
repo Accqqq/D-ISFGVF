@@ -1,0 +1,21 @@
+# Three UAVs approaching the central box from the left, all OUTSIDE the
+# obstacle (box x in [-1.5,1.5], y in [-1,1]).  Batch 10 split/merge scenario.
+initial_states:
+  - robot_id: 0
+    name: uav_0
+    x: -4.0
+    y: 2.5
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 1
+    name: uav_1
+    x: -4.0
+    y: -2.5
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 2
+    name: uav_2
+    x: -4.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0

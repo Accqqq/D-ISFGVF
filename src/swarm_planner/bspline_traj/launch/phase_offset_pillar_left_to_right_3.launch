@@ -1,0 +1,34 @@
+<launch>
+  <!--
+    P2P stabilization: 3 UAVs, original pillar.pcd, left-to-right
+    (-5, y) -> (5, y).  Speed is adjusted ONLY via gvf_gain1/gvf_gain2
+    (same ratio as the original K1=2.0 / K2=-2.2); no max-velocity override.
+  -->
+  <arg name="enable_phase_offset" default="true"/>
+  <arg name="enable_swarm" default="true"/>
+  <arg name="enable_tube" default="true"/>
+  <arg name="enable_cbf_safety" default="true"/>
+  <arg name="gvf_gain1" default="0.8"/>
+  <arg name="gvf_gain2" default="-0.88"/>
+
+  <include file="$(find bspline_race)/launch/phase_offset_swarm_sim.launch">
+    <arg name="num_agents" value="3"/>
+    <arg name="scenario" value="none"/>
+    <arg name="map_file" value="$(find map_generator)/resource/pillar.pcd"/>
+    <arg name="initial_state_file"
+         value="$(find so3_quadrotor_simulator)/config/initial_states_pillar_left_to_right_3.yaml"/>
+    <arg name="init0_x" value="-5.0"/><arg name="init0_y" value="-4.75"/>
+    <arg name="init1_x" value="-5.0"/><arg name="init1_y" value="-3.50"/>
+    <arg name="init2_x" value="-5.0"/><arg name="init2_y" value="-2.25"/>
+    <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+    <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+    <arg name="enable_tube" value="$(arg enable_tube)"/>
+    <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+    <arg name="closed_shape" value="none"/>
+    <!-- 点到点依赖原工程周期重规划延伸 5 m 前端（非 C2 增量换路，不冻结） -->
+    <arg name="plan_interval" value="0.5"/>
+    <arg name="use_velocity_feedforward" value="true"/>
+    <arg name="gvf_gain1" value="$(arg gvf_gain1)"/>
+    <arg name="gvf_gain2" value="$(arg gvf_gain2)"/>
+  </include>
+</launch>

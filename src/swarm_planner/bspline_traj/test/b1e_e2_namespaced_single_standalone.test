@@ -1,0 +1,21 @@
+<launch>
+  <include file="$(find bspline_race)/launch/b1e_namespaced_single_standalone_original_gains.launch"/>
+  <test test-name="b1e_e2_namespaced_single_standalone"
+        pkg="bspline_race" type="b1e_single_equivalence_diagnostic_test.py"
+        time-limit="125.0">
+    <param name="variant_id" value="E2"/>
+    <param name="layout" value="namespaced"/>
+    <param name="expected_plant" value="original"/>
+    <param name="expected_so3_topology" value="standalone"/>
+    <param name="expected_plant_frame" value="/simulator"/>
+    <param name="expected_start_at_hover" value="false"/>
+    <param name="expected_use_external_yaw" value="true"/>
+    <param name="expected_gain1" value="2.0"/>
+    <param name="expected_gain2" value="-2.2"/>
+    <param name="expected_manual_enable" value="false"/>
+    <param name="expected_manual_auto_load" value="false"/>
+    <param name="expected_manual_auto_save" value="false"/>
+    <param name="expected_nodes" value="/map_pub|/quadrotor_simulator_so3|/so3_control|/uav_0/formation_planning|/uav_0/map_generator"/>
+    <param name="expected_nodelets" value=""/>
+  </test>
+</launch>

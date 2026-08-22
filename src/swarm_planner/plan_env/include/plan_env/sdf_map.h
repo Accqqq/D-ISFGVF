@@ -35,6 +35,8 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <nav_msgs/Odometry.h>
 #include <queue>
@@ -54,10 +56,25 @@
 #include <message_filters/time_synchronizer.h>
 
 #include <plan_env/raycast.h>
+#include <plan_env/cloud_occupancy_snapshot.h>
+#include <plan_env/sdf_map_environment_evidence.h>
 
 #define logit(x) (log((x) / (1 - (x))))
 
 using namespace std;
+
+namespace plan_env {
+
+// Keep snapshot publication independent from the copyable legacy SDFMap
+// object.  A shared store lets cloud callbacks replace one immutable snapshot
+// under a small lock without making SDFMap itself non-copyable in old tests.
+struct CloudOccupancySnapshotStore {
+  std::mutex mutex;
+  std::uint64_t observation_sequence = 0U;
+  std::shared_ptr<const CloudOccupancySnapshot> latest;
+};
+
+}  // namespace plan_env
 
 // voxel hashing
 // template <typename T>
@@ -204,7 +221,9 @@ struct MappingData {
 
 class SDFMap {
 public:
-  SDFMap() {}
+  SDFMap()
+      : cloud_occupancy_snapshot_store_(
+            std::make_shared<plan_env::CloudOccupancySnapshotStore>()) {}
   ~SDFMap() {}
 
   enum { POSE_STAMPED = 1, ODOMETRY = 2, INVALID_IDX = -10000 };
@@ -237,6 +256,14 @@ public:
   // distance field management
   inline double getDistance(const Eigen::Vector3d& pos);
   inline double getDistance(const Eigen::Vector3i& id);
+  // Returns the latest immutable cloud observation backing.  It is absent
+  // before one cloud message has been processed with a valid odom.
+  std::shared_ptr<const plan_env::CloudOccupancySnapshot>
+  cloudOccupancySnapshot() const;
+  plan_env::SDFMapEnvironmentEvidenceCapabilities
+  observedUninflatedEnvironmentCapabilities() const;
+  plan_env::SDFMapEnvironmentEvidenceResult
+  queryObservedUninflatedEnvironment(const Eigen::Vector3d& point);
   inline double getDistWithGradTrilinear(Eigen::Vector3d pos, Eigen::Vector3d& grad);
   void getSurroundPts(const Eigen::Vector3d& pos, Eigen::Vector3d pts[2][2][2], Eigen::Vector3d& diff);
   // /inline void setLocalRange(Eigen::Vector3d min_pos, Eigen::Vector3d
@@ -342,6 +369,8 @@ private:
   uniform_real_distribution<double> rand_noise_;
   normal_distribution<double> rand_noise2_;
   default_random_engine eng_;
+  std::shared_ptr<plan_env::CloudOccupancySnapshotStore>
+      cloud_occupancy_snapshot_store_;
 };
 
 /* ============================== definition of inline function

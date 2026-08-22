@@ -1,0 +1,14 @@
+<launch>
+  <arg name="robot_id" default="1"/>
+  <arg name="local_odom_topic" default="odom"/>
+  <arg name="state_topic" default="agent_states"/>
+
+  <node pkg="phase_offset_swarm" type="swarm_intent_shadow_node"
+        name="swarm_intent_shadow" output="screen">
+    <rosparam command="load"
+              file="$(find phase_offset_swarm)/config/swarm_intent_v1.yaml"/>
+    <param name="robot_id" value="$(arg robot_id)"/>
+    <param name="local_odom_topic" value="$(arg local_odom_topic)"/>
+    <param name="state_topic" value="$(arg state_topic)"/>
+  </node>
+</launch>

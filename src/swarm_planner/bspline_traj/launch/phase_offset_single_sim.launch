@@ -1,0 +1,95 @@
+<launch>
+  <!--
+    Single-UAV phase-offset simulation entry (batch 2).
+
+    Ownership:
+      plant-only simulator.launch (no controller/map/rviz/odom_vis)
+      + one nodelet manager
+      + one phase_offset_agent (controller + local_sensing + planner)
+      + one map_pub + one read-only visualizer + one RViz
+  -->
+  <arg name="enable_phase_offset" default="false"/>
+  <arg name="enable_swarm" default="false"/>
+  <arg name="enable_tube" default="false"/>
+  <arg name="enable_cbf_safety" default="false"/>
+  <arg name="test_delta" default="-1000.0"/>
+  <arg name="test_port_enable" default="false"/>
+  <arg name="test_u_w" default="0.0"/>
+  <arg name="test_u_delta" default="0.0"/>
+  <arg name="test_u_w_amp" default="0.0"/>
+  <arg name="test_u_delta_amp" default="0.0"/>
+  <arg name="test_port_freq" default="0.0"/>
+  <arg name="test_port_phase" default="0.0"/>
+  <arg name="map_size_x" default="20.0"/>
+  <arg name="map_size_y" default="30.0"/>
+  <arg name="map_size_z" default="2.5"/>
+  <arg name="map_file" default="$(find map_generator)/resource/pillar.pcd"/>
+  <!-- 批次 10：闭合圆/8 字场景（不改动 test_gvf.launch 的默认行） -->
+  <arg name="closed_shape" default="none"/>
+  <arg name="closed_radius" default="4.0"/>
+  <arg name="closed_center_x" default="0.0"/>
+  <arg name="closed_center_y" default="0.0"/>
+
+  <include file="$(find so3_quadrotor_simulator)/launch/simulator.launch">
+    <arg name="start_controller" value="false"/>
+    <arg name="start_map" value="false"/>
+    <arg name="start_rviz" value="false"/>
+    <arg name="start_odom_visualization" value="false"/>
+  </include>
+
+  <node pkg="nodelet" type="nodelet" name="so3_nodelet_manager"
+        args="manager" output="screen"/>
+
+  <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+    <arg name="robot_id" value="0"/>
+    <arg name="uav_ns" value="uav_0"/>
+    <arg name="init_x" value="0.0"/>
+    <arg name="init_y" value="0.0"/>
+    <arg name="init_z" value="1.0"/>
+    <arg name="odom_topic" value="/sim/odom"/>
+    <arg name="cmd_topic" value="/position_cmd"/>
+    <arg name="so3_cmd_topic" value="/so3_cmd"/>
+    <arg name="imu_topic" value="/sim/imu"/>
+    <arg name="local_map_topic" value="/sim/local_map"/>
+    <arg name="global_map_topic" value="/mock_map"/>
+    <arg name="goal_topic" value="/uav_0/goal"/>
+    <arg name="particle_base" value="/particle0"/>
+    <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+    <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+    <arg name="enable_tube" value="$(arg enable_tube)"/>
+    <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+    <arg name="test_delta" value="$(arg test_delta)"/>
+    <arg name="test_port_enable" value="$(arg test_port_enable)"/>
+    <arg name="test_u_w" value="$(arg test_u_w)"/>
+    <arg name="test_u_delta" value="$(arg test_u_delta)"/>
+    <arg name="test_u_w_amp" value="$(arg test_u_w_amp)"/>
+    <arg name="test_u_delta_amp" value="$(arg test_u_delta_amp)"/>
+    <arg name="test_port_freq" value="$(arg test_port_freq)"/>
+    <arg name="test_port_phase" value="$(arg test_port_phase)"/>
+    <arg name="map_size_x" value="$(arg map_size_x)"/>
+    <arg name="map_size_y" value="$(arg map_size_y)"/>
+    <arg name="map_size_z" value="$(arg map_size_z)"/>
+  </include>
+
+  <node pkg="map_generator" name="map_pub" type="map_pub" output="screen"
+        args="$(arg map_file)"/>
+
+  <node pkg="bspline_race" type="phase_offset_swarm_visualizer"
+        name="phase_offset_swarm_visualizer" output="screen">
+    <param name="num_agents" value="1"/>
+  </node>
+
+  <!-- 闭合轨迹参数在 include 之后覆盖（节点在 launch 解析完成后才启动） -->
+  <group ns="uav_0/formation_planning" if="$(eval arg('closed_shape') != 'none')">
+    <param name="gvf/circle_test/enable" value="true"/>
+    <param name="gvf/circle_test/auto_start" value="true"/>
+    <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+    <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+    <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+    <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+    <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+  </group>
+
+  <node name="rviz" pkg="rviz" type="rviz" required="true"
+        args="-d $(find bspline_race)/config/phase_offset_swarm/rviz/phase_offset_swarm.rviz"/>
+</launch>

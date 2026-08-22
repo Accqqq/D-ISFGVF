@@ -10,6 +10,9 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall -g")
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   quadrotor_msgs
+  geometry_msgs
+  nav_msgs
+  sensor_msgs
   uav_utils
   cmake_utils
 )
@@ -29,7 +32,7 @@ include_directories(${ARMADILLO_INCLUDE_DIRS})
 catkin_package(
   INCLUDE_DIRS include
 #  LIBRARIES irobot_msgs
-  CATKIN_DEPENDS roscpp quadrotor_msgs uav_utils
+  CATKIN_DEPENDS roscpp quadrotor_msgs geometry_msgs nav_msgs sensor_msgs uav_utils
   DEPENDS Eigen3 system_lib
 )
 
@@ -45,7 +48,21 @@ add_library(quadrotor_dynamics src/dynamics/Quadrotor.cpp)
 add_executable(quadrotor_simulator_so3
   src/quadrotor_simulator_so3.cpp)
 
-target_link_libraries(quadrotor_simulator_so3 
+target_link_libraries(quadrotor_simulator_so3
    ${catkin_LIBRARIES}
    quadrotor_dynamics
 )
+
+add_executable(multi_quadrotor_simulator_so3
+  src/multi_quadrotor_simulator_so3.cpp)
+
+target_link_libraries(multi_quadrotor_simulator_so3
+  ${catkin_LIBRARIES}
+  quadrotor_dynamics
+)
+
+if(CATKIN_ENABLE_TESTING)
+  find_package(rostest REQUIRED)
+  add_rostest(test/b0_multi_simulator_equivalence.test)
+  add_rostest(test/b0_multi_simulator_three_agent.test)
+endif()

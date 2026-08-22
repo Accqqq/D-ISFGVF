@@ -1,0 +1,18 @@
+<launch>
+  <include file="$(find so3_quadrotor_simulator)/launch/multi_simulator.launch">
+    <arg name="num_agents" value="3"/>
+    <arg name="frame_id" value="world"/>
+    <arg name="simulation_rate" value="1000.0"/>
+    <arg name="odom_rate" value="100.0"/>
+    <arg name="start_at_hover" value="true"/>
+    <arg name="initial_state_file"
+         value="$(find so3_quadrotor_simulator)/config/initial_states_3.yaml"/>
+  </include>
+
+  <test test-name="b0_multi_simulator_three_agent"
+        pkg="so3_quadrotor_simulator"
+        type="b0_multi_simulator_test.py"
+        time-limit="40.0">
+    <param name="scenario" value="three_agent"/>
+  </test>
+</launch>

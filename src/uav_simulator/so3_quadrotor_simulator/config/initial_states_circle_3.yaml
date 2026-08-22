@@ -1,0 +1,21 @@
+# Three UAVs starting ON the radius-4 circle, 120 deg apart (no unsafe
+# acquisition transient).  Batch 10 closed-circle scenario.
+initial_states:
+  - robot_id: 0
+    name: uav_0
+    x: 4.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 1
+    name: uav_1
+    x: -2.0
+    y: 3.464
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 2
+    name: uav_2
+    x: -2.0
+    y: -3.464
+    z: 1.0
+    yaw: 0.0

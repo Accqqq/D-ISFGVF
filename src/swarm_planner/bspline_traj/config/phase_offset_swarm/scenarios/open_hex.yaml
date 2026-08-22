@@ -1,0 +1,32 @@
+# Open-field hex scenario: each UAV gets a distinct goal (absolute z = 1.0).
+scenario:
+  name: open_hex
+  goals:
+    - robot_id: 0
+      x: 6.0
+      y: 6.0
+      z: 1.0
+    - robot_id: 1
+      x: 7.0
+      y: 5.0
+      z: 1.0
+    - robot_id: 2
+      x: 5.0
+      y: 4.0
+      z: 1.0
+    - robot_id: 3
+      x: 6.0
+      y: 3.0
+      z: 1.0
+    - robot_id: 4
+      x: 7.0
+      y: 2.0
+      z: 1.0
+    - robot_id: 5
+      x: 5.0
+      y: 1.0
+      z: 1.0
+    - robot_id: 6
+      x: 6.0
+      y: 0.0
+      z: 1.0

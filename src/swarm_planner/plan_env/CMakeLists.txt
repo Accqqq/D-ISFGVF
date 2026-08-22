@@ -40,7 +40,9 @@ include_directories(
 link_directories(${PCL_LIBRARY_DIRS})
 
 add_library(plan_env 
+    src/cloud_occupancy_snapshot.cpp
     src/sdf_map.cpp 
+    src/sdf_map_environment_evidence.cpp
     src/obj_predictor.cpp 
     src/edt_environment.cpp 
     src/raycast.cpp
@@ -59,8 +61,28 @@ target_link_libraries(obj_generator
 
 if(CATKIN_ENABLE_TESTING)
     catkin_add_gtest(manual_map_layer_test test/manual_map_layer_test.cpp)
+    catkin_add_gtest(sdf_map_environment_evidence_test
+        test/sdf_map_environment_evidence_test.cpp)
+    catkin_add_gtest(cloud_occupancy_snapshot_test
+        test/cloud_occupancy_snapshot_test.cpp)
     if(TARGET manual_map_layer_test)
         target_link_libraries(manual_map_layer_test
+            plan_env
+            ${catkin_LIBRARIES}
+            ${PCL_LIBRARIES}
+            ${OpenCV_LIBS}
+        )
+    endif()
+    if(TARGET sdf_map_environment_evidence_test)
+        target_link_libraries(sdf_map_environment_evidence_test
+            plan_env
+            ${catkin_LIBRARIES}
+            ${PCL_LIBRARIES}
+            ${OpenCV_LIBS}
+        )
+    endif()
+    if(TARGET cloud_occupancy_snapshot_test)
+        target_link_libraries(cloud_occupancy_snapshot_test
             plan_env
             ${catkin_LIBRARIES}
             ${PCL_LIBRARIES}

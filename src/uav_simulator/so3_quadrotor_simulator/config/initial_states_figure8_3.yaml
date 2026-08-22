@@ -1,0 +1,21 @@
+# Three UAVs starting ON the radius-4 figure-8, 120 deg apart in theta.
+# Batch 10 figure-8 scenario.
+initial_states:
+  - robot_id: 0
+    name: uav_0
+    x: 1.732
+    y: 2.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 1
+    name: uav_1
+    x: -1.732
+    y: 2.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 2
+    name: uav_2
+    x: 0.0
+    y: -4.0
+    z: 1.0
+    yaw: 0.0

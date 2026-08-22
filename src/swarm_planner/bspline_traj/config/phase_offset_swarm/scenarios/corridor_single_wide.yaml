@@ -1,0 +1,15 @@
+scenario:
+  name: corridor_single_wide
+  goals:
+    - robot_id: 0
+      x: 14.0
+      y: 0.0
+      z: 1.0
+    - robot_id: 1
+      x: 14.0
+      y: 0.5
+      z: 1.0
+    - robot_id: 2
+      x: 14.0
+      y: -0.5
+      z: 1.0

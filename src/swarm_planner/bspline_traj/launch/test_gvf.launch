@@ -4,6 +4,69 @@
     <arg name="init_x" default="0.0" />
     <arg name="init_y" default="0.0" />
     <arg name="init_z" default="1.0" />
+    <!--  disabled/manual -->
+    <arg name="phase_offset_mode" default="disabled" />
+    <arg name="phase_offset_shadow_delta" default="0.0" />
+    <arg name="phase_offset_shadow_sample_step_w" default="0.10" />
+    <arg name="phase_offset_shadow_publish_rate" default="5.0" />
+    <arg name="phase_offset_frame_id" default="world" />
+    <arg name="phase_offset_active_equivalence_tolerance" default="1e-10" />
+    <arg name="phase_offset_active_required_consecutive_cycles" default="100" />
+    <arg name="phase_offset_manual_amplitude" default="0.10" />
+    <arg name="phase_offset_manual_observe_only" default="true" />
+    <!-- 10.0/2.0 -->
+    <arg name="phase_offset_manual_profile_period" default="10.0" />
+    <arg name="phase_offset_manual_warmup_cycles" default="100" />
+    <arg name="phase_offset_manual_delta_tracking_gain" default="3.0" />
+    <arg name="phase_offset_manual_u_w_amplitude" default="0.05" />
+    <arg name="phase_offset_manual_u_w_abs_max" default="0.12" />
+    <arg name="phase_offset_manual_u_delta_abs_max" default="0.25" />
+    <arg name="phase_offset_manual_u_w_rate_max" default="0.60" />
+    <arg name="phase_offset_manual_u_delta_rate_max" default="1.20" />
+    <arg name="phase_offset_manual_phase_dot_min" default="0.02" />
+    <arg name="phase_offset_manual_tangent_speed_min" default="0.02" />
+    <arg name="phase_offset_manual_preflight_sample_step_w" default="0.10" />
+    <!--  none/esdf/fixed -->
+    <arg name="phase_offset_manual_tube_source" default="none" />
+    <arg name="phase_offset_tube_fixed_delta_max" default="0.06" />
+    <arg name="phase_offset_tube_sample_step_w" default="0.10" />
+    <arg name="phase_offset_tube_lookahead_w" default="2.0" />
+    <arg name="phase_offset_tube_back_w" default="0.20" />
+    <arg name="phase_offset_tube_min_certified_forward_w" default="0.40" />
+    <arg name="phase_offset_tube_ray_step" default="0.05" />
+    <arg name="phase_offset_tube_max_offset" default="0.20" />
+    <arg name="phase_offset_tube_boundary_slope_max" default="0.80" />
+    <arg name="phase_offset_tube_invariant_gain" default="1.0" />
+    <arg name="phase_offset_tube_interior_margin" default="0.0" />
+    <arg name="phase_offset_tube_update_period" default="0.10" />
+    <!-- Compatibility-only: older fixed regression launch files still pass
+         this argument.  It is intentionally not forwarded as a parameter and
+         cannot reinstate the retired rebuild/stability gate. -->
+    <arg name="phase_offset_tube_stable_rebuild_cycles" default="1" />
+    <arg name="phase_offset_tube_esdf_unobserved_threshold" default="1000.0" />
+    <arg name="phase_offset_tube_uav_radius" default="0.25" />
+    <arg name="phase_offset_tube_localization_margin" default="0.05" />
+    <arg name="phase_offset_tube_tracking_error_bound" default="0.15" />
+    <arg name="phase_offset_tube_map_margin" default="0.10" />
+    <arg name="phase_offset_tube_extra_margin" default="0.05" />
+    <arg name="phase_offset_tube_discretization_margin" default="0.10" />
+    <!-- Raw occupancy tube contract: these are independent of the legacy
+         inflated-ESDF max_offset and six-field erosion settings above. -->
+    <arg name="phase_offset_tube_environment_search_extent" default="3.0" />
+    <arg name="phase_offset_tube_raw_ray_step" default="0.05" />
+    <arg name="phase_offset_tube_boundary_tolerance" default="0.01" />
+    <arg name="phase_offset_tube_raw_regularity_margin" default="0.10" />
+    <arg name="phase_offset_tube_curvature_epsilon" default="1e-9" />
+    <arg name="phase_offset_tube_raw_uav_radius" default="0.25" />
+    <arg name="phase_offset_tube_raw_map_uncertainty" default="0.10" />
+    <arg name="phase_offset_tube_raw_localization_uncertainty" default="0.05" />
+    <arg name="phase_offset_tube_raw_tracking_error_bound" default="0.15" />
+    <!-- Explicit opt-in: local_sensing publishes the complete local obstacle
+         set in its update AABB.  Real sparse hit clouds must leave this false
+         until an observed-domain producer is supplied. -->
+    <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false" />
+    <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0" />
+    <arg name="sdf_map_buffer_refresh_period" default="3.0" />
     <!-- Planning  parameters-->
     <arg name="map_size_x_" value="20.0"/>
     <arg name="map_size_y_" value="30.0"/>
@@ -23,6 +86,56 @@
         <param name="gvf/cloud_topic"      type="string" value="/sim/local_map" />
         <param name="gvf/odom_topic"       type="string" value="/sim/odom" />
         <param name="gvf/cmd_topic"        type="string" value="/position_cmd" />
+        <param name="phase_offset/mode" value="$(arg phase_offset_mode)" />
+        <param name="phase_offset/shadow_delta" value="$(arg phase_offset_shadow_delta)" />
+        <param name="phase_offset/shadow_sample_step_w" value="$(arg phase_offset_shadow_sample_step_w)" />
+        <param name="phase_offset/shadow_publish_rate" value="$(arg phase_offset_shadow_publish_rate)" />
+        <param name="phase_offset/frame_id" value="$(arg phase_offset_frame_id)" />
+        <param name="phase_offset/active_equivalence_tolerance" value="$(arg phase_offset_active_equivalence_tolerance)" />
+        <param name="phase_offset/active_required_consecutive_cycles" value="$(arg phase_offset_active_required_consecutive_cycles)" />
+        <param name="phase_offset/manual/amplitude" value="$(arg phase_offset_manual_amplitude)" />
+        <param name="phase_offset/manual/observe_only" value="$(arg phase_offset_manual_observe_only)" />
+        <param name="phase_offset/manual/profile_period" value="$(arg phase_offset_manual_profile_period)" />
+        <param name="phase_offset/manual/warmup_cycles" value="$(arg phase_offset_manual_warmup_cycles)" />
+        <param name="phase_offset/manual/delta_tracking_gain" value="$(arg phase_offset_manual_delta_tracking_gain)" />
+        <param name="phase_offset/manual/u_w_amplitude" value="$(arg phase_offset_manual_u_w_amplitude)" />
+        <param name="phase_offset/manual/u_w_abs_max" value="$(arg phase_offset_manual_u_w_abs_max)" />
+        <param name="phase_offset/manual/u_delta_abs_max" value="$(arg phase_offset_manual_u_delta_abs_max)" />
+        <param name="phase_offset/manual/u_w_rate_max" value="$(arg phase_offset_manual_u_w_rate_max)" />
+        <param name="phase_offset/manual/u_delta_rate_max" value="$(arg phase_offset_manual_u_delta_rate_max)" />
+        <param name="phase_offset/manual/phase_dot_min" value="$(arg phase_offset_manual_phase_dot_min)" />
+        <param name="phase_offset/manual/tangent_speed_min" value="$(arg phase_offset_manual_tangent_speed_min)" />
+        <param name="phase_offset/manual/preflight_sample_step_w" value="$(arg phase_offset_manual_preflight_sample_step_w)" />
+        <param name="phase_offset/manual/tube_source" value="$(arg phase_offset_manual_tube_source)" />
+        <param name="phase_offset/tube/fixed_delta_max" value="$(arg phase_offset_tube_fixed_delta_max)" />
+        <param name="phase_offset/tube/sample_step_w" value="$(arg phase_offset_tube_sample_step_w)" />
+        <param name="phase_offset/tube/lookahead_w" value="$(arg phase_offset_tube_lookahead_w)" />
+        <param name="phase_offset/tube/back_w" value="$(arg phase_offset_tube_back_w)" />
+        <param name="phase_offset/tube/min_certified_forward_w" value="$(arg phase_offset_tube_min_certified_forward_w)" />
+        <param name="phase_offset/tube/ray_step" value="$(arg phase_offset_tube_ray_step)" />
+        <param name="phase_offset/tube/max_offset" value="$(arg phase_offset_tube_max_offset)" />
+        <param name="phase_offset/tube/boundary_slope_max" value="$(arg phase_offset_tube_boundary_slope_max)" />
+        <param name="phase_offset/tube/invariant_gain" value="$(arg phase_offset_tube_invariant_gain)" />
+        <param name="phase_offset/tube/interior_margin" value="$(arg phase_offset_tube_interior_margin)" />
+        <param name="phase_offset/tube/update_period" value="$(arg phase_offset_tube_update_period)" />
+        <param name="phase_offset/tube/esdf_unobserved_threshold" value="$(arg phase_offset_tube_esdf_unobserved_threshold)" />
+        <param name="phase_offset/tube/uav_radius" value="$(arg phase_offset_tube_uav_radius)" />
+        <param name="phase_offset/tube/localization_margin" value="$(arg phase_offset_tube_localization_margin)" />
+        <param name="phase_offset/tube/tracking_error_bound" value="$(arg phase_offset_tube_tracking_error_bound)" />
+        <param name="phase_offset/tube/map_margin" value="$(arg phase_offset_tube_map_margin)" />
+        <param name="phase_offset/tube/extra_margin" value="$(arg phase_offset_tube_extra_margin)" />
+        <param name="phase_offset/tube/discretization_margin" value="$(arg phase_offset_tube_discretization_margin)" />
+        <param name="phase_offset/tube/environment_search_extent" value="$(arg phase_offset_tube_environment_search_extent)" />
+        <param name="phase_offset/tube/raw_ray_step" value="$(arg phase_offset_tube_raw_ray_step)" />
+        <param name="phase_offset/tube/boundary_tolerance" value="$(arg phase_offset_tube_boundary_tolerance)" />
+        <param name="phase_offset/tube/raw_regularity_margin" value="$(arg phase_offset_tube_raw_regularity_margin)" />
+        <param name="phase_offset/tube/curvature_epsilon" value="$(arg phase_offset_tube_curvature_epsilon)" />
+        <param name="phase_offset/tube/raw_uav_radius" value="$(arg phase_offset_tube_raw_uav_radius)" />
+        <param name="phase_offset/tube/raw_map_uncertainty" value="$(arg phase_offset_tube_raw_map_uncertainty)" />
+        <param name="phase_offset/tube/raw_localization_uncertainty" value="$(arg phase_offset_tube_raw_localization_uncertainty)" />
+        <param name="phase_offset/tube/raw_tracking_error_bound" value="$(arg phase_offset_tube_raw_tracking_error_bound)" />
+        <param name="phase_offset/tube/cloud_obstacle_set_complete" value="$(arg phase_offset_tube_cloud_obstacle_set_complete)" />
+        <param name="phase_offset/tube/preincluded_map_uncertainty" value="$(arg phase_offset_tube_preincluded_map_uncertainty)" />
         <param name="gvf/planInterval"     value="0.5" /> 
         <param name="gvf/num_points_to_take" value="30" />
         <param name="gvf/use_test_cmd" value="false" />
@@ -60,8 +173,8 @@
         <param name="gvf/circle_test/center_y" value="0.0" />
         <param name="gvf/circle_test/center_z" value="0.0" /> -->
 
-        <param name="gvf/circle_test/enable" value="true" />
-        <param name="gvf/circle_test/auto_start" value="true" />
+        <param name="gvf/circle_test/enable" value="false" />
+        <param name="gvf/circle_test/auto_start" value="false" />
         <!-- circle/figure8 -->
         <param name="gvf/circle_test/shape" value="circle" />
         <param name="gvf/circle_test/radius" value="8.0" />
@@ -198,7 +311,8 @@
         <param name="sdf_map/show_esdf_time" value="false"/>
         <param name="sdf_map/pose_type"     value="2"/>  
         <param name="sdf_map/frame_id"      value="world"/>
-        <param name="sdf_map/buffer_refresh_period" value="3.0" />
+        <param name="sdf_map/buffer_refresh_period"
+               value="$(arg sdf_map_buffer_refresh_period)" />
         <!-- geometric path searching -->
         <param name="astar/lambda_heu" value="10.0" type="double"/>
         <param name="astar/resolution_astar" value="0.1" type="double"/>

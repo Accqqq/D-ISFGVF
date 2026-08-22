@@ -3,6 +3,9 @@
 
 //standard
 #include <fstream>
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <regex>
 #include <algorithm>
@@ -48,6 +51,8 @@
 #include <path_searching/astar_topo.h>
 #include <path_searching/kinodynamic_astar.h>
 #include "bspline_race/gvf.h"
+#include "bspline_race/integration/phase_offset_matched_adapter.h"
+#include "bspline_race/integration/phase_offset_shadow_adapter.h"
 
 using namespace std;
 
@@ -165,6 +170,11 @@ class gvf_manager
         bool point_phase_v2_enabled_ = false;
         bool point_phase_c2_enabled_ = false;
         double point_phase_endpoint_margin_w_ = 0.05;
+        // The H2 phase tuple is shared by the 50 Hz command callback and the
+        // asynchronous FSM/replan callback.  Direct access is prohibited:
+        // capture/publish it only through the short private helpers below so
+        // a future-seam transaction receives one coherent w/init/acquired
+        // snapshot without holding a lock during planning or tube work.
         double phase_w_ = 0.0;
         bool phase_initialized_ = false;
         bool closed_phase_acquired_ = false;
@@ -317,6 +327,182 @@ class gvf_manager
         ros::Publisher  circle_ref_pub_;
 
     private:
+        struct AuthoritativePhaseSnapshot {
+            double w = 0.0;
+            bool initialized = false;
+            bool closed_acquired = false;
+            // Synchronization-only sequence: it is neither a control state
+            // nor a published diagnostic.  It prevents a stale command
+            // completion from overwriting an FSM reset/initialization.
+            std::uint64_t generation = 0U;
+        };
+        // Per-call bootstrap attribution only.  This is deliberately not an
+        // authority, gate, latch, mailbox, or Runtime value: it records the
+        // one first-false outcome of a single timer activation attempt.
+        enum class OffsetBootstrapAttemptOutcome {
+            NOT_REQUIRED,
+            ENTRY_OR_SLOT_PRECONDITION,
+            OWNER_OR_SAMPLE,
+            STRUCTURAL_SEAM,
+            STAGE_PATH_TUBE_PAIR,
+            LIVE_PHASE_STATE,
+            LIVE_PHASE_WINDOW,
+            POST_STAGE_OWNER_OR_SESSION,
+            LIVE_PREPARE_OR_LATEST_MAP,
+            FINAL_CAS,
+            COMMITTED,
+        };
+        struct OffsetBootstrapAttemptResult {
+            OffsetBootstrapAttemptOutcome outcome =
+                OffsetBootstrapAttemptOutcome::NOT_REQUIRED;
+            PathTubePairStageFailure stage_failure =
+                PathTubePairStageFailure::NONE;
+            double captured_w0 = 0.0;
+            double live_wc = 0.0;
+            double future_seam_w = 0.0;
+            std::uint64_t authority_session = 0U;
+            std::uint64_t map_observation_sequence = 0U;
+            std::uint64_t pair_generation = 0U;
+        };
+        // Test-only synchronization seams for the otherwise unobservable
+        // post-stage/live-prepare and post-prepare/final-CAS gaps.  They are
+        // default-empty and are never authority or runtime predicates;
+        // production execution therefore takes exactly the same path when no
+        // unit test installs either callback.
+        std::function<void()> bootstrap_after_stage_test_hook_;
+        std::function<void()> bootstrap_before_final_cas_test_hook_;
+        static const char* offsetBootstrapAttemptOutcomeName(
+            OffsetBootstrapAttemptOutcome outcome);
+        static const char* pathTubePairStageFailureName(
+            PathTubePairStageFailure failure);
+        AuthoritativePhaseSnapshot captureAuthoritativePhase() const;
+        void publishAuthoritativePhaseLocked(
+            double w, bool initialized, bool closed_acquired);
+        void publishAuthoritativePhase(
+            double w, bool initialized, bool closed_acquired);
+        bool commitAuthoritativePhase(
+            const AuthoritativePhaseSnapshot& captured,
+            double w, bool acquire_closed_phase,
+            AuthoritativePhaseSnapshot& committed);
+        struct CallbackTimingSample {
+            std::uint64_t sequence = 0U;
+            std::uint64_t steady_duration_ns = 0U;
+            std::uint64_t ros_stamp_ns = 0U;
+        };
+        std::unique_ptr<PhaseOffsetMatchedAdapter> phase_offset_matched_adapter_;
+        std::unique_ptr<PhaseOffsetShadowAdapter> phase_offset_shadow_adapter_;
+        struct PendingPathTubeFrontend {
+            PathTubePairTransaction transaction;
+            std::shared_ptr<const PathTubePair> candidate_pair;
+            // PlannerAuthority exists independently of OffsetAuthority.  H2
+            // frontends normally obtain this owner from candidate_pair;
+            // observe-only/neutral bootstrap frontends carry it directly
+            // because manufacturing a dummy PathTubePair is forbidden.
+            std::shared_ptr<const ContinuousPhasePath> planner_path_owner;
+            // Sole manager-side owner of the exact old-pair transaction pin.
+            // It is present only while the handoff is pending and is released
+            // before the pin-free completed mailbox is published.
+            std::unique_ptr<PathTubePairPin> transaction_pin;
+            Eigen::MatrixXd traj;
+            Eigen::MatrixXd vel;
+            Eigen::VectorXd time;
+            std::vector<double> w;
+            int anchor_idx = 0;
+            bool closed_phase = false;
+            bool is_first_goal = false;
+            bool replace_goal = false;
+            Eigen::Vector3d goal = Eigen::Vector3d::Zero();
+            // The only phase/session facts allowed to carry a staged H2
+            // handoff across callbacks.  They are synchronization evidence,
+            // never published control state.
+            std::uint64_t authority_session = 0U;
+        };
+        // Manager-local outcome of a pending/completed mailbox attempt.  This
+        // is deliberately neither Runtime state nor a ROS-facing mode: it
+        // makes the small H2 lifecycle explicit without turning a retryable
+        // dry-run failure into a navigation gate.
+        enum class PathTubeHandoffLifecycleResult {
+            NONE,
+            RETRY_PENDING,
+            COMMITTED,
+            DROPPED_EXPIRED,
+            DROPPED_STALE,
+            CONSUMED
+        };
+        // One manager-owned transaction slot and one completed mailbox.  A
+        // command can only consume the former into the latter; it never
+        // writes pm.last_* or the GVF display mirror.  FSM is the sole writer
+        // of those frontend mirrors.
+        std::mutex frontend_apply_mutex_;
+        std::mutex path_tube_handoff_mutex_;
+        std::shared_ptr<PendingPathTubeFrontend> pending_path_tube_handoff_;
+        std::shared_ptr<PendingPathTubeFrontend> completed_path_tube_handoff_;
+        // Protected by path_tube_handoff_mutex_.  Diagnostics/tests may read
+        // it only under that same lock.
+        PathTubeHandoffLifecycleResult
+            last_path_tube_handoff_lifecycle_result_ =
+                PathTubeHandoffLifecycleResult::NONE;
+        std::uint64_t path_tube_authority_session_ = 0U;
+        // Pair-generation keyed evidence for the one transition that begins
+        // after a bootstrap CAS and ends at Runtime's first selected command.
+        // These are logs only: they neither gate nor mutate authority.
+        std::atomic<std::uint64_t>
+            pending_activation_command_logged_generation_ {0U};
+        std::atomic<std::uint64_t>
+            pending_activation_executed_logged_generation_ {0U};
+        std::atomic<std::uint64_t>
+            pending_activation_nonzero_logged_generation_ {0U};
+        std::atomic<std::uint64_t>
+            pending_activation_not_selected_logged_generation_ {0U};
+        std::atomic<std::uint64_t>
+            path_tube_replan_logged_generation_ {0U};
+        // Internal one-shot classification for a nonzero-offset terminal
+        // handoff with no existing recovery owner.  It is diagnostic only;
+        // no emergency command or weakened seam threshold is synthesized.
+        bool nonzero_handoff_recovery_required_reported_ = false;
+        // A terminal nonzero-offset handoff denial is a one-shot diagnostic
+        // for the current authority session.  It is not consulted by the
+        // frontend replan trigger: periodic retries remain available for a
+        // later valid Path+Tube transaction, while collision/reset semantics
+        // stay unchanged.
+        // A reset-only mailbox sequence.  It is not a gate/latch or exposed
+        // state: it lets FSM, the sole frontend writer, clear an old mirror
+        // after a goal/reset retired control authority.
+        std::uint64_t pending_frontend_clear_session_ = 0U;
+        std::uint64_t consumed_frontend_clear_session_ = 0U;
+        // P2a only: an internal, single-entry handoff from command-side
+        // current-state denial to a future route-specific recovery owner.
+        // This is deliberately separate from the H2 mailbox: it carries no
+        // path/tube transaction, does not touch H2 authority, and has no
+        // ROS-facing state.  P2b is the only stage allowed to attach a
+        // physical recovery command owner to the FSM-side consume seam.
+        struct PendingCurrentStateRecoveryRequest {
+            std::shared_ptr<const PathTubePair> owner_pair;
+            std::uint64_t source_revision = 0U;
+            std::uint64_t generation = 0U;
+            std::uint64_t authority_session = 0U;
+            std::uint64_t ticket = 0U;
+        };
+        std::mutex current_state_recovery_mutex_;
+        std::shared_ptr<PendingCurrentStateRecoveryRequest>
+            pending_current_state_recovery_request_;
+        std::uint64_t next_current_state_recovery_ticket_ = 0U;
+        std::uint64_t consumed_current_state_recovery_ticket_ = 0U;
+        bool current_state_recovery_shutdown_ = false;
+        // This mutex protects exactly {phase_w_, phase_initialized_,
+        // closed_phase_acquired_, generation}.  Never hold it across path
+        // construction, A*, tube construction, publication, or Runtime work.
+        mutable std::mutex authoritative_phase_mutex_;
+        std::uint64_t authoritative_phase_generation_ = 0U;
+        // S3: MANUAL tube construction/visualization only.  The 50 Hz command
+        // callback never calls TubeEpochManager.
+        ros::Timer phase_offset_tube_timer_;
+        PhaseOffsetMatchedAdapterConfig matched_config_;
+        bool phase_offset_measurement_callback_enabled_ = false;
+        std::string phase_offset_measurement_callback_csv_path_;
+        std::mutex phase_offset_measurement_callback_mutex_;
+        std::vector<CallbackTimingSample> phase_offset_measurement_callback_samples_;
+        std::uint64_t phase_offset_measurement_callback_sequence_ = 0U;
         int test_traj_index_;  // 测试轨迹执行索引
         bool use_test_cmd_;    // 是否使用测试命令模式
         bool enable_gvfcmd_control; //标记是否收到 gvf 控制指令
@@ -446,6 +632,9 @@ class gvf_manager
                                            PhasePathState& state) const;
         bool buildPhaseV2C2Frontend(gvfManager& pm,
                                     double phase_at_switch,
+                                    double future_switch_w,
+                                    const std::shared_ptr<const ContinuousPhasePath>&
+                                        old_path_owner,
                                     double path_end_w,
                                     int candidate_anchor_idx,
                                     const UniformBspline& candidate_spline,
@@ -458,9 +647,126 @@ class gvf_manager
                                     Eigen::VectorXd& stitched_time,
                                     std::vector<double>& stitched_w,
                                     std::shared_ptr<const ContinuousPhasePath>& continuous_path) const;
+        bool stageFutureSeamPathTubeTransaction(
+            double captured_w0,
+            const Eigen::Vector3d& position,
+            const guidance::IsfGains& gains,
+            double dt,
+            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
+                frozen_cloud_occupancy_snapshot,
+            gvfManager& pm,
+            double path_end_w,
+            int candidate_anchor_idx,
+            const UniformBspline& candidate_spline,
+            const Eigen::MatrixXd& candidate_traj,
+            const Eigen::MatrixXd& candidate_vel,
+            const Eigen::VectorXd& candidate_time,
+            const std::vector<double>& candidate_w,
+            Eigen::MatrixXd& staged_traj,
+            Eigen::MatrixXd& staged_vel,
+            Eigen::VectorXd& staged_time,
+            std::vector<double>& staged_w,
+            std::shared_ptr<const ContinuousPhasePath>& staged_path,
+            PathTubePairStageFailure* stage_failure = nullptr);
+        bool consumeCompletedPathTubeHandoff(gvfManager& pm,
+                                             const ros::Time& now);
+        static bool samePathTubeAuthority(
+            const std::shared_ptr<const PathTubePair>& lhs,
+            const std::shared_ptr<const PathTubePair>& rhs);
+        static std::shared_ptr<const ContinuousPhasePath>
+            plannerPathOwnerForFrontend(
+                const PendingPathTubeFrontend& frontend);
+        static bool validatePathTubeFrontendForMirror(
+            const gvfManager& pm, const PendingPathTubeFrontend& frontend);
+        bool consumeFrontendClearMailbox(gvfManager& pm);
+        static bool requiresCurrentStateRecovery(
+            const MatchedAdapterOutput& output);
+        bool stageCurrentStateRecoveryRequest(
+            const MatchedAdapterOutput& output,
+            const std::shared_ptr<const PathTubePair>& owner_pair);
+        // P2a deliberately leaves this seam unwired in production: there is
+        // no authorised physical recovery owner yet.  P2b may call it only
+        // from FSM after it has supplied a route-specific recovery contract.
+        bool consumeCurrentStateRecoveryRequestForFsm(
+            const std::shared_ptr<const PathTubePair>& active_pair,
+            PendingCurrentStateRecoveryRequest& request);
+        void shutdownCurrentStateRecoveryMailbox();
+        void applyPathTubeFrontendMirrorLocked(
+            gvfManager& pm, const PendingPathTubeFrontend& frontend,
+            const ros::Time& now);
+        bool installAuthoritativePathMirrorLocked(
+            const Eigen::MatrixXd& traj,
+            const Eigen::MatrixXd& vel,
+            const std::vector<double>& w,
+            nav_msgs::Path& path_msg);
+        bool prepareAndCommitPendingPathTubeHandoff(
+            const AuthoritativePhaseSnapshot& captured_phase,
+            const Eigen::Vector3d& position,
+            const guidance::IsfGains& gains,
+            double dt,
+            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
+                latest_cloud_occupancy_snapshot);
+        // A neutral planner owner supersedes any stale offset pair before
+        // its frontend is published.  This is an ownership invalidation only;
+        // it never fabricates a zero Tube or changes Runtime delta state.
+        bool retireOffsetAuthorityForPlannerOwnerLocked();
+        struct PathTubeReplanHandoffRequirement {
+            std::shared_ptr<const PathTubePair> captured_pair;
+            bool executed_authority = false;
+            bool pending_activation = false;
+
+            bool required() const {
+                return executed_authority || pending_activation;
+            }
+        };
+        // Capture one exact Pair for a replan decision.  Pending activation is
+        // an authority-preservation state even before Runtime has executed
+        // its first nonzero command.
+        PathTubeReplanHandoffRequirement
+        capturePathTubeReplanHandoffRequirement() const;
+        bool commitNeutralPlannerFrontend(
+            gvfManager& pm,
+            const Eigen::MatrixXd& traj,
+            const Eigen::MatrixXd& vel,
+            const Eigen::VectorXd& time,
+            const std::vector<double>& w,
+            const std::shared_ptr<const ContinuousPhasePath>& path_owner,
+            int anchor_idx,
+            const ros::Time& now,
+            nav_msgs::Path& path_msg);
+        bool pendingOffsetBootstrapMatchesCurrentPlannerLocked(
+            const gvfManager& pm,
+            const std::shared_ptr<const ContinuousPhasePath>& planner_owner,
+            std::uint64_t authority_session) const;
+        // The neutral-to-offset activation bridge proves a fresh Tube for the
+        // current immutable planner owner and publishes the pair atomically.
+        // It never changes the planner frontend or constructs a C2 path.
+        bool activatePendingOffsetAuthority(
+            gvfManager& pm,
+            const AuthoritativePhaseSnapshot& captured_phase,
+            const Eigen::Vector3d& position,
+            const guidance::IsfGains& gains,
+            double dt,
+            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
+                frozen_cloud_occupancy_snapshot,
+            OffsetBootstrapAttemptResult* attempt_result = nullptr);
+        bool prepareBootstrapPathTubeTransaction(
+            const std::shared_ptr<const ContinuousPhasePath>& path_owner,
+            const std::vector<double>& sample_w,
+            double current_w,
+            const Eigen::Vector3d& position,
+            const guidance::IsfGains& gains,
+            double dt,
+            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
+                frozen_cloud_occupancy_snapshot,
+            std::uint64_t authority_session,
+            PathTubePairTransaction& transaction,
+            std::shared_ptr<const PathTubePair>& candidate_pair,
+            OffsetBootstrapAttemptResult* attempt_result = nullptr);
         bool buildMappedPhaseFrontend(
             double phase_anchor,
             double path_end_w,
+            bool trim_start_endpoint,
             int candidate_anchor_idx,
             const UniformBspline& candidate_spline,
             const Eigen::MatrixXd& candidate_traj,
@@ -480,14 +786,17 @@ class gvf_manager
             Eigen::MatrixXd& vel,
             Eigen::VectorXd& time,
             std::vector<double>& global_w) const;
-        bool pathPointAtW(const std::shared_ptr<gvf>& g,
+        friend class GvfManagerS4AnchorTestAccess;
+        bool pathPointAtW(const std::shared_ptr<const ContinuousPhasePath>& path,
                           double query_w,
+                          double reference_delta,
                           Eigen::Vector3d& point,
                           bool& clamped_to_end,
                           double& path_w_start,
                           double& path_w_end) const;
-        bool pathTangentAtW(const std::shared_ptr<gvf>& g,
+        bool pathTangentAtW(const std::shared_ptr<const ContinuousPhasePath>& path,
                             double query_w,
+                            double reference_delta,
                             Eigen::Vector3d& tangent) const;
         void resetGovernorState();
         void clearActiveTrajectory(bool publish_empty_path,
@@ -495,10 +804,12 @@ class gvf_manager
         GovernorCommandResult makeGovernorInvalidHold(const Eigen::Vector3d& pos,
                                                       const std::string& reason,
                                                       GovernorCommandDebug& dbg);
-        GovernorCommandResult runVelocityMatchingGovernor(gvfManager& pm,
+        GovernorCommandResult runVelocityMatchingGovernor(
+                                                          const std::shared_ptr<const ContinuousPhasePath>& path,
                                                           const gvf::LiftedGuidanceResult& out,
                                                           const Eigen::Vector3d& pos,
                                                           double progress_w_after,
+                                                          double reference_delta,
                                                           double dt,
                                                           double kp_equiv,
                                                           GovernorCommandDebug& dbg);
@@ -514,6 +825,9 @@ class gvf_manager
                                 bool switch_active) const;
         void publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
                                             const Eigen::Vector3d& yaw_cmd_vec);
+        void recordCallbackTiming(std::uint64_t steady_duration_ns,
+                                  std::uint64_t ros_stamp_ns);
+        void flushCallbackTiming();
 
     public:
         gvf_manager(){};  
@@ -531,6 +845,7 @@ class gvf_manager
                       
         bool checkCollision();
         void cmdCallback(const ros::TimerEvent& event);
+        void phaseOffsetTubeTimerCallback(const ros::TimerEvent& event);
         void test_cmdCallback(const ros::TimerEvent& event);  // 新增测试命令回调函数
         void KinoPathCallback(const ros::TimerEvent& event);  // 新增回调函数
         void publishCorridorMarker(double C_thresh = -1.0);
@@ -590,6 +905,69 @@ class gvf_manager
             }
             return delta;
         }
+        // The authoritative v2 phase is a transaction: form a candidate before
+        // command selection, then publish it only after a final governor command
+        // has survived validation and the goal-position override.  Initial
+        // closed-phase acquisition moves the vehicle, but is not that port.
+        struct AuthoritativePhaseCommitDecision
+        {
+            bool commit = false;
+            bool acquire_closed_phase = false;
+            double phase_after = 0.0;
+            double applied_delta_w = 0.0;
+        };
+        static double clampPointPhaseCandidate(double requested_phase,
+                                               double path_start_w,
+                                               double path_end_w)
+        {
+            if (path_end_w <= path_start_w + 1e-6) {
+                return requested_phase;
+            }
+            return std::max(path_start_w,
+                            std::min(requested_phase, path_end_w));
+        }
+        static AuthoritativePhaseCommitDecision decideAuthoritativePhaseCommit(
+            bool have_phase_candidate,
+            bool command_valid,
+            bool force_goal_position,
+            bool initial_closed_phase_acquisition_used,
+            double phase_before,
+            double phase_candidate,
+            bool closed_phase_acquired_before,
+            bool will_acquire_closed_phase)
+        {
+            AuthoritativePhaseCommitDecision decision;
+            decision.phase_after = phase_before;
+            decision.commit = have_phase_candidate && command_valid &&
+                              !force_goal_position &&
+                              !initial_closed_phase_acquisition_used;
+            if (decision.commit) {
+                decision.phase_after = phase_candidate;
+                decision.applied_delta_w = phase_candidate - phase_before;
+                decision.acquire_closed_phase =
+                    !closed_phase_acquired_before && will_acquire_closed_phase;
+            }
+            return decision;
+        }
+        static bool shouldRunInitialClosedPhaseAcquisition(
+            bool closed_phase_active,
+            bool closed_phase_acquired_before,
+            bool will_acquire_closed_phase)
+        {
+            return closed_phase_active && !closed_phase_acquired_before &&
+                   !will_acquire_closed_phase;
+        }
+        // H2 geometric seams are ordered phases from the captured old
+        // owner's immutable structural samples.  The existing deterministic
+        // Construction lead bounds only the structural seam: it never asks
+        // the old Tube/profile to cover that seam.  A replan callback selects
+        // exactly one earliest owner-aligned immutable sample; retrying a
+        // failed build occurs in a later callback with a fresh live phase.
+        static bool selectStructuralFutureSeam(
+            const std::shared_ptr<const PathTubePair>& old_pair,
+            double captured_w0,
+            double min_construction_lead_w,
+            double& seam_w);
         static bool shouldDeclarePointGoalReached(bool circle_mode_active,
                                                   double dist_xy,
                                                   double final_tolerance = 0.2)
@@ -600,6 +978,40 @@ class gvf_manager
                 return false;
             }
             return dist_xy < final_tolerance;
+        }
+        static bool canInstallBootstrapPlannerOwner(
+            bool requires_authoritative_offset_handoff,
+            bool requires_path_tube_pair_bootstrap,
+            bool bootstrap_pair_ready)
+        {
+            // An already-executed offset may not be rebound to a new planner
+            // owner by the no-old-pair bootstrap path.  Pending neutral intent
+            // is different: it may install only after its same-owner Pair is
+            // fully prepared and committed.
+            if (requires_authoritative_offset_handoff) return false;
+            return !requires_path_tube_pair_bootstrap || bootstrap_pair_ready;
+        }
+        enum class ReplanTriggerDecision
+        {
+            NONE = 0,
+            COLLISION,
+            PERIODIC
+        };
+        static ReplanTriggerDecision selectReplanTrigger(
+            bool collision_detected,
+            bool periodic_due,
+            bool periodic_phase_ready,
+            bool terminal_nonzero_retry_suppressed)
+        {
+            // The H2 terminal latch suppresses duplicate periodic attempts
+            // only.  A newly observed collision is a higher-priority safety
+            // event and must always remain able to request replanning.
+            if (collision_detected) return ReplanTriggerDecision::COLLISION;
+            if (periodic_due && periodic_phase_ready &&
+                !terminal_nonzero_retry_suppressed) {
+                return ReplanTriggerDecision::PERIODIC;
+            }
+            return ReplanTriggerDecision::NONE;
         }
         struct ClosedGoalCandidateProgress
         {
@@ -881,13 +1293,19 @@ class gvf_manager
             const double pushed = std::max(desired, obstacle_delta_w + std::max(0.0, pass_margin_w));
             return std::max(lo, std::min(pushed, hi));
         }
-        void publishPathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel);
+        void publishPathMsg(
+            const Eigen::MatrixXd& traj,
+            const Eigen::MatrixXd& vel,
+            const std::vector<double>* authoritative_w_samples = nullptr);
         void publishReferencePathMsg(const Eigen::MatrixXd& traj, const Eigen::MatrixXd& vel, ros::Publisher& pub);
         bool closedPhaseV2Enabled() const;
         bool closedPhaseV2Active() const;
         bool pointPhaseV2Active() const;
         bool unifiedPhaseV2Active() const;
         double activeTrackingPhase() const;
+        // User-goal boundary: unlike same-goal H2 retirement it also asks
+        // the adapter to neutralize path-coordinate Runtime history.
+        bool resetForNewNavigationTask();
         void resetUnifiedPhaseV2();
         double findInitialClosedPhaseV2(const Eigen::Vector3d& curr_pos) const;
         bool buildNominalClosedFrontend(double start_w,

@@ -15,14 +15,21 @@
 
   <build_depend>roscpp</build_depend>
   <build_depend>quadrotor_msgs</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>sensor_msgs</build_depend>
   <build_depend>uav_utils</build_depend>
   <build_depend>cmake_utils</build_depend>
 
   <run_depend>roscpp</run_depend>
   <run_depend>quadrotor_msgs</run_depend>
+  <run_depend>geometry_msgs</run_depend>
+  <run_depend>nav_msgs</run_depend>
+  <run_depend>sensor_msgs</run_depend>
   <run_depend>uav_utils</run_depend>
   <run_depend>cmake_utils</run_depend>
 
-</package>
+  <test_depend>rostest</test_depend>
 
+</package>
 

@@ -1,0 +1,121 @@
+<launch>
+  <!--
+    Single UAV instance wrapper (batch 2).
+
+    - loads exactly one SO3ControlNodelet into the shared nodelet manager;
+    - includes test_gvf.launch exactly once (formation_planning + local_sensing);
+    - does NOT start any dynamics simulator, map, RViz or TF.
+
+    All topics are absolute; the caller is responsible for providing the
+    per-UAV topic names.
+  -->
+  <arg name="robot_id" default="0"/>
+  <arg name="uav_ns" default="uav_$(arg robot_id)"/>
+  <arg name="nodelet_manager" default="/so3_nodelet_manager"/>
+
+  <arg name="init_x" default="0.0"/>
+  <arg name="init_y" default="0.0"/>
+  <arg name="init_z" default="1.0"/>
+
+  <arg name="odom_topic" default="/uav_$(arg robot_id)/sim/odom"/>
+  <arg name="cmd_topic" default="/uav_$(arg robot_id)/position_cmd"/>
+  <arg name="so3_cmd_topic" default="/uav_$(arg robot_id)/so3_cmd"/>
+  <arg name="imu_topic" default="/uav_$(arg robot_id)/sim/imu"/>
+  <arg name="local_map_topic" default="/uav_$(arg robot_id)/sim/local_map"/>
+  <arg name="global_map_topic" default="/mock_map"/>
+  <arg name="goal_topic" default="/uav_$(arg robot_id)/goal"/>
+  <arg name="particle_base" default="/uav_$(arg robot_id)/particle0"/>
+  <arg name="state_topic" default="/phase_offset_swarm/state"/>
+  <arg name="path_event_topic" default="/phase_offset_swarm/path_event"/>
+  <arg name="conflict_state_topic" default="/phase_offset_swarm/conflict_state"/>
+  <arg name="debug_topic" default="/phase_offset_swarm/debug"/>
+
+  <arg name="enable_phase_offset" default="false"/>
+  <arg name="enable_swarm" default="false"/>
+  <arg name="enable_tube" default="false"/>
+  <arg name="enable_cbf_safety" default="false"/>
+  <arg name="goal_z_mode" default="absolute_world"/>
+  <arg name="test_delta" default="-1000.0"/>
+  <arg name="test_port_enable" default="false"/>
+  <arg name="test_u_w" default="0.0"/>
+  <arg name="test_u_delta" default="0.0"/>
+  <arg name="test_u_w_amp" default="0.0"/>
+  <arg name="test_u_delta_amp" default="0.0"/>
+  <arg name="test_port_freq" default="0.0"/>
+  <arg name="test_port_phase" default="0.0"/>
+  <arg name="spinner_threads" default="2"/>
+  <arg name="use_velocity_feedforward" default="false"/>
+  <arg name="gvf_gain1" default="2.0"/>
+  <arg name="gvf_gain2" default="-2.2"/>
+  <arg name="map_size_x" default="20.0"/>
+  <arg name="map_size_y" default="30.0"/>
+  <arg name="map_size_z" default="2.5"/>
+
+  <!-- SO3 controller: one logical instance per UAV, loaded into the shared
+       nodelet manager. -->
+  <node pkg="nodelet" type="nodelet"
+        name="so3_control_nodelet_$(arg robot_id)"
+        args="load so3_control/SO3ControlNodelet $(arg nodelet_manager)"
+        output="screen">
+    <param name="so3_control/init_state_x" value="$(arg init_x)"/>
+    <param name="so3_control/init_state_y" value="$(arg init_y)"/>
+    <param name="so3_control/init_state_z" value="$(arg init_z)"/>
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <remap from="~position_cmd" to="$(arg cmd_topic)"/>
+    <remap from="~motors" to="$(arg uav_ns)/motors"/>
+    <remap from="~corrections" to="$(arg uav_ns)/corrections"/>
+    <remap from="~so3_cmd" to="$(arg so3_cmd_topic)"/>
+    <remap from="~imu" to="$(arg imu_topic)"/>
+    <rosparam file="$(find so3_control)/config/gains_hummingbird.yaml"/>
+    <rosparam file="$(find so3_control)/config/corrections_hummingbird.yaml"/>
+    <param name="mass" value="0.98"/>
+    <param name="use_angle_corrections" value="false"/>
+    <param name="use_external_yaw" value="false"/>
+    <param name="gains/rot/z" value="1.0"/>
+    <param name="gains/ang/z" value="0.1"/>
+  </node>
+
+  <!-- Exactly one local_sensing + formation_planning per UAV. -->
+  <group ns="$(arg uav_ns)">
+    <include file="$(find bspline_race)/launch/test_gvf.launch">
+      <arg name="uav_ns" value="$(arg uav_ns)"/>
+      <arg name="robot_id" value="$(arg robot_id)"/>
+      <arg name="init_x" value="$(arg init_x)"/>
+      <arg name="init_y" value="$(arg init_y)"/>
+      <arg name="init_z" value="$(arg init_z)"/>
+      <arg name="odom_topic" value="$(arg odom_topic)"/>
+      <arg name="local_map_topic" value="$(arg local_map_topic)"/>
+      <arg name="global_map_topic" value="$(arg global_map_topic)"/>
+      <arg name="cmd_topic" value="$(arg cmd_topic)"/>
+      <arg name="goal_topic" value="$(arg goal_topic)"/>
+      <arg name="particle_base" value="$(arg particle_base)"/>
+      <arg name="state_topic" value="$(arg state_topic)"/>
+      <arg name="path_event_topic" value="$(arg path_event_topic)"/>
+      <arg name="conflict_state_topic" value="$(arg conflict_state_topic)"/>
+      <arg name="debug_topic" value="$(arg debug_topic)"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="goal_z_mode" value="$(arg goal_z_mode)"/>
+      <arg name="test_delta" value="$(arg test_delta)"/>
+      <arg name="test_port_enable" value="$(arg test_port_enable)"/>
+      <arg name="test_u_w" value="$(arg test_u_w)"/>
+      <arg name="test_u_delta" value="$(arg test_u_delta)"/>
+      <arg name="test_u_w_amp" value="$(arg test_u_w_amp)"/>
+      <arg name="test_u_delta_amp" value="$(arg test_u_delta_amp)"/>
+      <arg name="test_port_freq" value="$(arg test_port_freq)"/>
+      <arg name="test_port_phase" value="$(arg test_port_phase)"/>
+      <arg name="manual_map_auto_save" value="false"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+      <arg name="gvf_gain1" value="$(arg gvf_gain1)"/>
+      <arg name="gvf_gain2" value="$(arg gvf_gain2)"/>
+      <arg name="map_size_x_" value="$(arg map_size_x)"/>
+      <arg name="map_size_y_" value="$(arg map_size_y)"/>
+      <arg name="map_size_z_" value="$(arg map_size_z)"/>
+      <arg name="start_formation_planning" value="true"/>
+      <arg name="start_local_sensing" value="true"/>
+    </include>
+  </group>
+</launch>

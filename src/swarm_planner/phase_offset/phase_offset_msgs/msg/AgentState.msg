@@ -1,0 +1,4 @@
+std_msgs/Header header
+uint16 robot_id
+geometry_msgs/Point position_world
+geometry_msgs/Vector3 velocity_world

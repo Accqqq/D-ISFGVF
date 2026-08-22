@@ -1,0 +1,21 @@
+# Three UAVs in a line INSIDE the 1.0 m single-wide corridor (wall inner
+# edges at y = +-0.5).  Batch 10 narrow-channel scenario.
+initial_states:
+  - robot_id: 0
+    name: uav_0
+    x: 0.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 1
+    name: uav_1
+    x: 1.2
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 2
+    name: uav_2
+    x: 2.4
+    y: 0.0
+    z: 1.0
+    yaw: 0.0

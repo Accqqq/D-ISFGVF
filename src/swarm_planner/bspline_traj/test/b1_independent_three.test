@@ -1,0 +1,12 @@
+<launch>
+  <include file="$(find bspline_race)/launch/b1_pillar_independent_3.launch"/>
+  <!-- 150 s = 25 s readiness + 15 s concurrent goal connection + 25 s path
+       readiness + 45 s arrival + 3 s stable + 5 s post-stable drift,
+       with the remaining startup/graph/reporting scheduling margin. -->
+  <test test-name="b1_independent_three_navigation"
+        pkg="bspline_race"
+        type="b1_independent_navigation_test.py"
+        time-limit="150.0">
+    <param name="scenario" value="three"/>
+  </test>
+</launch>

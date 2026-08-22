@@ -1,0 +1,91 @@
+# Phase-offset swarm parameters (loaded into each formation_planning node).
+gvf:
+  goal_z_mode: absolute_world
+  cmd:
+    use_velocity_feedforward: false
+
+phase_offset_swarm:
+  enabled: true
+  robot_id: 0
+  state_topic: /phase_offset_swarm/state
+  path_event_topic: /phase_offset_swarm/path_event
+  conflict_state_topic: /phase_offset_swarm/conflict_state
+  state_publish_rate: 25.0
+  path_event_heartbeat_rate: 5.0
+  conflict_heartbeat_rate: 10.0
+  neighbor_timeout: 0.30
+  neighbor_retention_timeout: 1.00
+
+phase_offset:
+  enabled: true
+  delta_init: 0.0
+  delta_fixed_limit: 0.80
+  delta_rate_max: 0.60
+  delta_rate_accel_max: 1.50
+  mu_regular: 0.20
+  k_recenter: 0.40
+
+tube:
+  enabled: false
+  rebuild_rate: 10.0
+  sample_step_w: 0.10
+  lookahead_w: 2.00
+  ray_step: 0.05
+  max_offset: 1.20
+  reference_clearance: 0.30
+  boundary_slope_max: 0.80
+  open_width: 1.60
+
+swarm:
+  enabled: true
+  organization_enter_radius: 1.55
+  organization_exit_radius: 1.65
+  safety_radius: 1.40
+  d_minus: 0.80
+  d_plus: 1.20
+  ttc_safe: 2.00
+  k_repulsion: 1.20
+  k_cohesion: 0.25
+  k_damping: 0.80
+  soft_safety_gain: 0.50
+  soft_safety_max: 0.80
+  use_los: true
+  use_semantic_filter: false
+
+allocator:
+  enabled: true
+  phase_speed_min: 0.10
+  phase_speed_max: 3.00
+  tangent_speed_min: 0.10
+  tangent_speed_max: 2.00
+  u_w_slew_rate: 1.50
+  u_delta_slew_rate: 2.50
+  cbf_gamma_pair: 4.00
+  cbf_gamma_tube: 3.00
+  qp_dt_max: 0.03
+  weight_world_error: 1.00
+  weight_u_w: 0.10
+  weight_u_delta: 0.10
+  weight_delta_u_w: 0.05
+  weight_delta_u_delta: 0.05
+
+safety:
+  max_message_age: 0.30
+  physical_safe_distance: 0.60
+  self_position_error_bound: 0.08
+  neighbor_position_error_bound: 0.08
+  communication_position_margin: 0.05
+  self_velocity_error_bound: 0.10
+  neighbor_velocity_error_bound: 0.10
+  execution_velocity_error_bound: 0.10
+  self_acceleration_bound: 2.50
+  neighbor_acceleration_bound: 2.50
+  tube_uav_radius: 0.25
+  tube_tracking_error_bound: 0.15
+  tube_localization_margin: 0.05
+  tube_map_margin: 0.05
+
+debug:
+  publish_markers: true
+  publish_debug_msg: true
+  log_rate: 2.0

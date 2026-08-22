@@ -1,0 +1,34 @@
+<launch>
+  <node pkg="so3_quadrotor_simulator"
+        type="quadrotor_simulator_so3"
+        name="quadrotor_simulator_so3"
+        output="screen">
+    <param name="rate/simulation" value="1000.0"/>
+    <param name="rate/odom" value="100.0"/>
+    <param name="simulator/init_state_x" value="0.0"/>
+    <param name="simulator/init_state_y" value="0.0"/>
+    <param name="simulator/init_state_z" value="1.0"/>
+    <param name="simulator/start_at_hover" value="true"/>
+    <param name="simulator/frame_id" value="world"/>
+    <remap from="~odom" to="/single/sim/odom"/>
+    <remap from="~imu" to="/single/sim/imu"/>
+    <remap from="~cmd" to="/single/so3_cmd"/>
+  </node>
+
+  <include file="$(find so3_quadrotor_simulator)/launch/multi_simulator.launch">
+    <arg name="num_agents" value="1"/>
+    <arg name="frame_id" value="world"/>
+    <arg name="simulation_rate" value="1000.0"/>
+    <arg name="odom_rate" value="100.0"/>
+    <arg name="start_at_hover" value="true"/>
+    <arg name="initial_state_file"
+         value="$(find so3_quadrotor_simulator)/config/initial_states_1.yaml"/>
+  </include>
+
+  <test test-name="b0_multi_simulator_equivalence"
+        pkg="so3_quadrotor_simulator"
+        type="b0_multi_simulator_test.py"
+        time-limit="40.0">
+    <param name="scenario" value="equivalence"/>
+  </test>
+</launch>

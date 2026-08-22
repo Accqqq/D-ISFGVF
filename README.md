@@ -82,6 +82,12 @@ source ~/GVF_close_loop_planning/devel/setup.bash
 
 以下内容对应 `formation_planning` 节点当前实现（见 `src/swarm_planner/bspline_traj/src/gvf_manager.cpp` 和 `src/swarm_planner/bspline_traj/src/gvf.cpp`）。
 
+### Phase-offset 云障碍物完备性约定
+
+当 phase-offset ESDF tube 使用 `obstacle_set_complete=true` 时，这不是“点云质量较好”的提示，而是 producer 对其声明 observed domain 的证明：该 domain 内的全部障碍物必须已被表示，且未占据体素必须可证明为已知自由空间。只有满足这项证明的 producer（例如能对自身观测域给出完整障碍集合的 local-sensing producer）才能置为 true；domain 外始终是 unknown。
+
+稀疏真实深度 hit、传感器 FOV 外空间，以及被遮挡形成的阴影体积都不能证明该完备性，必须置为 `obstacle_set_complete=false`。没有完备 cloud-clearance query 时，ESDF tube 会 fail-closed，不会回退到 legacy SDF distance/ray 路径。
+
 ### 规划频率（重规划）
 
 - `gvf/planInterval`：重规划周期（秒）。当前 `execTimerCallback()` 会在以下条件触发 `astaropt()`：

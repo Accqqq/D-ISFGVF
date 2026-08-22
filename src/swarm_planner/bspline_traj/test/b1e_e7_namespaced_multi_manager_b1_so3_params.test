@@ -1,0 +1,21 @@
+<launch>
+  <include file="$(find bspline_race)/launch/b1e_namespaced_multi_manager_original_gains_b1_so3_params.launch"/>
+  <test test-name="b1e_e7_namespaced_multi_manager_b1_so3_params"
+        pkg="bspline_race" type="b1e_single_equivalence_diagnostic_test.py"
+        time-limit="125.0">
+    <param name="variant_id" value="E7"/>
+    <param name="layout" value="namespaced"/>
+    <param name="expected_plant" value="multi"/>
+    <param name="expected_so3_topology" value="manager"/>
+    <param name="expected_plant_frame" value="world"/>
+    <param name="expected_start_at_hover" value="true"/>
+    <param name="expected_use_external_yaw" value="false"/>
+    <param name="expected_gain1" value="2.0"/>
+    <param name="expected_gain2" value="-2.2"/>
+    <param name="expected_manual_enable" value="false"/>
+    <param name="expected_manual_auto_load" value="false"/>
+    <param name="expected_manual_auto_save" value="false"/>
+    <param name="expected_nodes" value="/map_pub|/multi_quadrotor_simulator_so3|/so3_nodelet_manager|/uav_0/formation_planning|/uav_0/map_generator"/>
+    <param name="expected_nodelets" value="/so3_control_nodelet_0"/>
+  </test>
+</launch>

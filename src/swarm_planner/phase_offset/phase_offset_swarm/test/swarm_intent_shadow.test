@@ -1,0 +1,20 @@
+<launch>
+  <node pkg="phase_offset_swarm" type="swarm_intent_shadow_node"
+        name="swarm_intent_shadow_test_node" ns="shadow" output="screen">
+    <param name="robot_id" value="1"/>
+    <param name="expected_world_frame" value="world"/>
+    <param name="local_odom_topic" value="/shadow/odom"/>
+    <param name="state_topic" value="/shadow/agent_states"/>
+    <param name="g_coord_topic" value="/shadow/g_coord"/>
+    <param name="g_sep_topic" value="/shadow/g_sep"/>
+    <param name="g_coh_topic" value="/shadow/g_coh"/>
+    <param name="g_conf_topic" value="/shadow/g_conf"/>
+    <param name="update_rate_hz" value="30.0"/>
+    <param name="beta_preview" value="1.0"/>
+  </node>
+
+  <test test-name="swarm_intent_shadow_acceptance"
+        pkg="phase_offset_swarm"
+        type="swarm_intent_shadow_test.py"
+        time-limit="30.0"/>
+</launch>

@@ -1,0 +1,12 @@
+<launch>
+  <arg name="active_equivalence_tolerance" default="1e-10" />
+  <arg name="active_required_consecutive_cycles" default="100" />
+
+  <include file="$(find bspline_race)/launch/test_gvf.launch">
+    <arg name="phase_offset_mode" value="active" />
+    <arg name="phase_offset_active_equivalence_tolerance"
+         value="$(arg active_equivalence_tolerance)" />
+    <arg name="phase_offset_active_required_consecutive_cycles"
+         value="$(arg active_required_consecutive_cycles)" />
+  </include>
+</launch>

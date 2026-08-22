@@ -1,0 +1,5 @@
+<launch>
+  <include file="$(find bspline_race)/launch/phase_offset_swarm_sim.launch">
+    <arg name="num_agents" value="3"/>
+  </include>
+</launch>

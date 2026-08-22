@@ -1,0 +1,43 @@
+initial_states:
+  - robot_id: 0
+    name: uav_0
+    x: 4.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 1
+    name: uav_1
+    x: 2.494
+    y: 3.127
+    z: 1.0
+    yaw: 0.898
+  - robot_id: 2
+    name: uav_2
+    x: -0.894
+    y: 3.899
+    z: 1.0
+    yaw: 1.795
+  - robot_id: 3
+    name: uav_3
+    x: -3.603
+    y: 1.736
+    z: 1.0
+    yaw: 2.693
+  - robot_id: 4
+    name: uav_4
+    x: -3.603
+    y: -1.736
+    z: 1.0
+    yaw: -2.693
+  - robot_id: 5
+    name: uav_5
+    x: -0.894
+    y: -3.899
+    z: 1.0
+    yaw: -1.795
+  - robot_id: 6
+    name: uav_6
+    x: 2.494
+    y: -3.127
+    z: 1.0
+    yaw: -0.898

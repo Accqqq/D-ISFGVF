@@ -1,0 +1,4 @@
+# No goals: used by tests that publish their own goals.
+scenario:
+  name: none
+  goals: []

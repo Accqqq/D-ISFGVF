@@ -1700,6 +1700,51 @@ void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
     return;
   }
 
+  // The cloud path intentionally does not write raw log odds.  Build a
+  // separate immutable categorical snapshot from exactly this observation so
+  // phase-offset tube construction never reads a mutable, unobserved raw
+  // buffer while the planner keeps using its original inflated map / ESDF.
+  plan_env::CloudOccupancySnapshotBuildInput snapshot_input;
+  snapshot_input.odom_valid = true;
+  snapshot_input.observation_stamp = img->header.stamp;
+  snapshot_input.camera_position = md_.camera_pos_;
+  snapshot_input.map_min = mp_.map_min_boundary_;
+  snapshot_input.map_max = mp_.map_max_boundary_;
+  snapshot_input.grid_origin = mp_.map_origin_;
+  snapshot_input.voxel_count = mp_.map_voxel_num_;
+  snapshot_input.local_update_range = mp_.local_update_range_;
+  snapshot_input.resolution = mp_.resolution_;
+  snapshot_input.obstacles_inflation = mp_.obstacles_inflation_;
+  snapshot_input.cloud_points.reserve(latest_cloud.points.size());
+  for (const pcl::PointXYZ& point : latest_cloud.points) {
+    snapshot_input.cloud_points.emplace_back(point.x, point.y, point.z);
+  }
+  const std::shared_ptr<plan_env::CloudOccupancySnapshotStore> snapshot_store =
+      cloud_occupancy_snapshot_store_;
+  if (snapshot_store) {
+    {
+      std::lock_guard<std::mutex> lock(snapshot_store->mutex);
+      snapshot_input.observation_sequence =
+          ++snapshot_store->observation_sequence;
+    }
+    const plan_env::CloudOccupancySnapshot snapshot =
+        plan_env::buildCloudOccupancySnapshot(snapshot_input);
+    {
+      std::lock_guard<std::mutex> lock(snapshot_store->mutex);
+      // cloudCallback may run on the AsyncSpinner.  A slower older callback
+      // must never overwrite a snapshot already published by a newer cloud
+      // observation.  The immutable pointer is therefore monotonic in the
+      // real observation sequence, while any build which captured the old
+      // pointer remains internally consistent.
+      if (!snapshot_store->latest ||
+          snapshot.observation_sequence >=
+              snapshot_store->latest->observation_sequence) {
+        snapshot_store->latest =
+            std::make_shared<const plan_env::CloudOccupancySnapshot>(snapshot);
+      }
+    }
+  }
+
   if (latest_cloud.points.size() == 0) return;
 
   if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2))) return;
@@ -2150,6 +2195,15 @@ void SDFMap::checkDist() {
 bool SDFMap::odomValid() { return md_.has_odom_; }
 
 bool SDFMap::hasDepthObservation() { return md_.has_first_depth_; }
+
+std::shared_ptr<const plan_env::CloudOccupancySnapshot>
+SDFMap::cloudOccupancySnapshot() const {
+  const std::shared_ptr<plan_env::CloudOccupancySnapshotStore> snapshot_store =
+      cloud_occupancy_snapshot_store_;
+  if (!snapshot_store) return std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
+  std::lock_guard<std::mutex> lock(snapshot_store->mutex);
+  return snapshot_store->latest;
+}
 
 double SDFMap::getResolution() { return mp_.resolution_; }
 

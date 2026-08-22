@@ -9,6 +9,7 @@
 #include <iostream>
 #include <math.h>
 #include <numeric>
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -123,8 +124,12 @@ class gvf
         bool has_next_path_w_anchor_ = false;
         std::vector<double> next_path_w_samples_;
         bool has_next_path_w_samples_ = false;
-        bool authoritative_phase_mode_ = false;
+        std::atomic<bool> authoritative_phase_mode_{false};
         std::shared_ptr<const ContinuousPhasePath> continuous_phase_path_;
+
+        // The legacy ROS path callbacks and the H2 frontend mirror can run on
+        // different spinner threads.  They share this cache as one unit.
+        mutable std::recursive_mutex path_cache_mutex_;
 
         // ===== Lifted GVF parameters =====
         double progress_window_ = 1.0;   // 局部投影搜索窗口
@@ -145,6 +150,14 @@ class gvf
           Eigen::Vector3d ref_pt = Eigen::Vector3d::Zero();  // p(w)
           Eigen::Vector3d tangent = Eigen::Vector3d::Zero(); // t(w)
           bool valid = false;
+        };
+
+        // A read-only copy of the reparameterized cache.  It carries no
+        // control authority and exists solely to keep async manager readers
+        // from touching mutable cache storage directly.
+        struct ReparamCacheSnapshot {
+          bool ready = false;
+          std::vector<double> w;
         };
 
     public:
@@ -175,10 +188,16 @@ class gvf
         Eigen::Vector3d getTangentVector(const Eigen::Vector3d& pos);
 
         void clearPathReparamState();
+        ReparamCacheSnapshot captureReparamCacheSnapshot() const;
         void buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg);
         void setNextPathWAnchor(double w_anchor);
         void setNextPathWSamples(const std::vector<double>& w_samples);
         void setAuthoritativePhaseMode(bool enabled);
+        bool authoritativePhaseMode() const;
+        // Bypasses the topic callback authority guard and installs the exact
+        // frontend selected by the H2 manager before its ROS publication.
+        void installAuthoritativePathMirror(const nav_msgs::Path& path,
+                                            const std::vector<double>& w_samples);
         void setContinuousPhasePath(const std::shared_ptr<const ContinuousPhasePath>& path);
         void clearContinuousPhasePath();
         std::shared_ptr<const ContinuousPhasePath> getContinuousPhasePath() const;
@@ -198,6 +217,13 @@ class gvf
                                                   double w_prev) const;
         LiftedGuidanceResult calcLiftedGuidanceAtPhase(const Eigen::Vector3d& pos,
                                                        double w) const;
+        // The command path owner is captured once at the command boundary.
+        // This overload evaluates that immutable owner directly, so a later
+        // publication cannot mix a new path into the current guidance step.
+        LiftedGuidanceResult calcLiftedGuidanceAtPhase(
+            const Eigen::Vector3d& pos,
+            double w,
+            const std::shared_ptr<const ContinuousPhasePath>& path_owner) const;
         void setVisualizationProgressW(double w);
         void setTerminalGoalVisualization(const Eigen::Vector3d& goal);
         void clearTerminalGoalVisualization();

@@ -1,0 +1,14 @@
+corridor_single_wide:
+  wall_thickness: 0.5
+  width_m: 1.0
+  x_range: '[-10,28]'
+corridor_two_wide:
+  wall_thickness: 0.5
+  width_m: 2.0
+  x_range: '[-10,28]'
+open:
+  corridor_free: y=0, x in [0,16]
+  range: x[-9.8,9.8] y[-14.8,14.8] z[0.5,2.0]
+split_merge:
+  obstacle: box [-1.5,1.5]x[-1.0,1.0] z 0..2.5
+  range: x[-9.8,9.8] y[-14.8,14.8]

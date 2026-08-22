@@ -1,0 +1,312 @@
+<launch>
+  <!--
+    Unified multi-UAV phase-offset simulation entry (batch 2).
+
+    Exactly once: map_pub, multi_quadrotor_simulator_so3, nodelet manager,
+    read-only visualizer, RViz, scenario publisher.
+    Per UAV: phase_offset_agent (controller nodelet + local_sensing +
+    formation_planning) in its /uav_i namespace.
+  -->
+  <arg name="num_agents" default="7"/>
+  <arg name="scenario" default="open_hex"/>
+  <arg name="map_file" default="$(find map_generator)/resource/pillar.pcd"/>
+  <arg name="initial_state_file"
+       default="$(find so3_quadrotor_simulator)/config/initial_states_hex_$(arg num_agents).yaml"/>
+
+  <arg name="enable_phase_offset" default="false"/>
+  <arg name="enable_swarm" default="false"/>
+  <arg name="enable_tube" default="false"/>
+  <arg name="enable_cbf_safety" default="false"/>
+  <arg name="simulation_rate" default="500.0"/>
+  <arg name="odom_rate" default="100.0"/>
+  <arg name="command_timeout" default="0.5"/>
+  <arg name="spinner_threads" default="2"/>
+  <arg name="use_velocity_feedforward" default="true"/>
+  <!-- 批次 10：闭合圆/8 字（不改动 test_gvf.launch 默认行） -->
+  <arg name="closed_shape" default="none"/>
+  <arg name="closed_radius" default="4.0"/>
+  <arg name="closed_center_x" default="0.0"/>
+  <arg name="closed_center_y" default="0.0"/>
+  <arg name="ablation_mode" default="0"/>
+  <arg name="plan_interval" default="0.5"/>
+  <arg name="alloc_u_w_slew_rate" default="1.5"/>
+  <arg name="alloc_u_delta_slew_rate" default="2.5"/>
+  <arg name="cmd_tangent_vel_max" default="2.0"/>
+  <arg name="gvf_gain1" default="2.0"/>
+  <arg name="gvf_gain2" default="-2.2"/>
+  <!-- per-agent controller init must match the simulator initial states -->
+  <arg name="init0_x" default="-0.5"/><arg name="init0_y" default="0.866"/>
+  <arg name="init1_x" default="0.5"/><arg name="init1_y" default="0.866"/>
+  <arg name="init2_x" default="-1.0"/><arg name="init2_y" default="0.0"/>
+  <arg name="init3_x" default="0.0"/><arg name="init3_y" default="0.0"/>
+  <arg name="init4_x" default="1.0"/><arg name="init4_y" default="0.0"/>
+  <arg name="init5_x" default="-0.5"/><arg name="init5_y" default="-0.866"/>
+  <arg name="init6_x" default="0.5"/><arg name="init6_y" default="-0.866"/>
+
+  <!-- 1. map (exactly once) -->
+  <node pkg="map_generator" name="map_pub" type="map_pub" output="screen"
+        args="$(arg map_file)"/>
+
+  <!-- 2. single-process multi-plant simulator (exactly once) -->
+  <include file="$(find so3_quadrotor_simulator)/launch/multi_simulator.launch">
+    <arg name="num_agents" value="$(arg num_agents)"/>
+    <arg name="initial_state_file" value="$(arg initial_state_file)"/>
+    <arg name="start_at_hover" value="true"/>
+    <arg name="simulation_rate" value="$(arg simulation_rate)"/>
+    <arg name="odom_rate" value="$(arg odom_rate)"/>
+    <arg name="command_timeout" value="$(arg command_timeout)"/>
+  </include>
+
+  <!-- 3. shared nodelet manager (exactly once) -->
+  <node pkg="nodelet" type="nodelet" name="so3_nodelet_manager"
+        args="manager" output="screen"/>
+
+  <!-- 4. one agent per UAV -->
+  <group if="$(eval int(arg('num_agents')) > 0)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="0"/>
+      <arg name="init_x" value="$(arg init0_x)"/>
+      <arg name="init_y" value="$(arg init0_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+  <group if="$(eval int(arg('num_agents')) > 1)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="1"/>
+      <arg name="init_x" value="$(arg init1_x)"/>
+      <arg name="init_y" value="$(arg init1_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+  <group if="$(eval int(arg('num_agents')) > 2)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="2"/>
+      <arg name="init_x" value="$(arg init2_x)"/>
+      <arg name="init_y" value="$(arg init2_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+  <group if="$(eval int(arg('num_agents')) > 3)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="3"/>
+      <arg name="init_x" value="$(arg init3_x)"/>
+      <arg name="init_y" value="$(arg init3_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+  <group if="$(eval int(arg('num_agents')) > 4)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="4"/>
+      <arg name="init_x" value="$(arg init4_x)"/>
+      <arg name="init_y" value="$(arg init4_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+  <group if="$(eval int(arg('num_agents')) > 5)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="5"/>
+      <arg name="init_x" value="$(arg init5_x)"/>
+      <arg name="init_y" value="$(arg init5_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+  <group if="$(eval int(arg('num_agents')) > 6)">
+    <include file="$(find bspline_race)/launch/phase_offset_agent.launch">
+      <arg name="robot_id" value="6"/>
+      <arg name="init_x" value="$(arg init6_x)"/>
+      <arg name="init_y" value="$(arg init6_y)"/>
+      <arg name="init_z" value="1.0"/>
+      <arg name="enable_phase_offset" value="$(arg enable_phase_offset)"/>
+      <arg name="enable_swarm" value="$(arg enable_swarm)"/>
+      <arg name="enable_tube" value="$(arg enable_tube)"/>
+      <arg name="enable_cbf_safety" value="$(arg enable_cbf_safety)"/>
+      <arg name="spinner_threads" value="$(arg spinner_threads)"/>
+      <arg name="use_velocity_feedforward" value="$(arg use_velocity_feedforward)"/>
+    </include>
+  </group>
+
+  <!-- 5. read-only visualizer (observer only) -->
+  <node pkg="bspline_race" type="phase_offset_swarm_visualizer"
+        name="phase_offset_swarm_visualizer" output="screen">
+    <param name="num_agents" value="$(arg num_agents)"/>
+  </node>
+
+  <!-- 6. scenario goal publisher -->
+  <node pkg="bspline_race" type="swarm_scenario_publisher.py"
+        name="swarm_scenario_publisher" output="screen">
+    <param name="scenario_file"
+           value="$(find bspline_race)/config/phase_offset_swarm/scenarios/$(arg scenario).yaml"/>
+  </node>
+
+  <!-- 6b. closed trajectory overrides (after includes, before nodes start) -->
+  <group if="$(eval arg('closed_shape') != 'none')">
+    <group ns="uav_0/formation_planning" if="$(eval int(arg('num_agents')) > 0)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+    <group ns="uav_1/formation_planning" if="$(eval int(arg('num_agents')) > 1)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+    <group ns="uav_2/formation_planning" if="$(eval int(arg('num_agents')) > 2)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+    <group ns="uav_3/formation_planning" if="$(eval int(arg('num_agents')) > 3)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+    <group ns="uav_4/formation_planning" if="$(eval int(arg('num_agents')) > 4)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+    <group ns="uav_5/formation_planning" if="$(eval int(arg('num_agents')) > 5)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+    <group ns="uav_6/formation_planning" if="$(eval int(arg('num_agents')) > 6)">
+      <param name="gvf/circle_test/enable" value="true"/>
+      <param name="gvf/circle_test/auto_start" value="true"/>
+      <param name="gvf/circle_test/shape" value="$(arg closed_shape)"/>
+      <param name="gvf/circle_test/radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/figure8_radius" value="$(arg closed_radius)"/>
+      <param name="gvf/circle_test/center_x" value="$(arg closed_center_x)"/>
+      <param name="gvf/circle_test/center_y" value="$(arg closed_center_y)"/>
+    </group>
+  </group>
+
+  <!-- 6c. ablation mode override (batch 10) -->
+  <group ns="uav_0/formation_planning" if="$(eval int(arg('num_agents')) > 0)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+  <group ns="uav_1/formation_planning" if="$(eval int(arg('num_agents')) > 1)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+  <group ns="uav_2/formation_planning" if="$(eval int(arg('num_agents')) > 2)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+  <group ns="uav_3/formation_planning" if="$(eval int(arg('num_agents')) > 3)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+  <group ns="uav_4/formation_planning" if="$(eval int(arg('num_agents')) > 4)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+  <group ns="uav_5/formation_planning" if="$(eval int(arg('num_agents')) > 5)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+  <group ns="uav_6/formation_planning" if="$(eval int(arg('num_agents')) > 6)">
+    <param name="phase_offset_swarm/ablation_mode" value="$(arg ablation_mode)"/>
+    <param name="gvf/planInterval" value="$(arg plan_interval)"/>
+    <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+    <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+    <param name="allocator/u_w_slew_rate" value="$(arg alloc_u_w_slew_rate)"/>
+    <param name="allocator/u_delta_slew_rate" value="$(arg alloc_u_delta_slew_rate)"/>
+    <param name="gvf/cmd/tangent_vel_max" value="$(arg cmd_tangent_vel_max)"/>
+  </group>
+
+  <!-- 7. RViz (exactly once) -->
+  <node name="rviz" pkg="rviz" type="rviz" required="true"
+        args="-d $(find bspline_race)/config/phase_offset_swarm/rviz/phase_offset_swarm.rviz"/>
+</launch>

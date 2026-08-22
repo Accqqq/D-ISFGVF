@@ -1,0 +1,21 @@
+<launch>
+  <arg name="num_agents" default="3"/>
+  <arg name="frame_id" default="world"/>
+  <arg name="simulation_rate" default="1000.0"/>
+  <arg name="odom_rate" default="100.0"/>
+  <arg name="start_at_hover" default="true"/>
+  <arg name="initial_state_file"
+       default="$(find so3_quadrotor_simulator)/config/initial_states_3.yaml"/>
+
+  <node pkg="so3_quadrotor_simulator"
+        type="multi_quadrotor_simulator_so3"
+        name="multi_quadrotor_simulator_so3"
+        output="screen">
+    <param name="num_agents" value="$(arg num_agents)"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+    <param name="rate/simulation" value="$(arg simulation_rate)"/>
+    <param name="rate/odom" value="$(arg odom_rate)"/>
+    <param name="start_at_hover" value="$(arg start_at_hover)"/>
+    <rosparam command="load" file="$(arg initial_state_file)"/>
+  </node>
+</launch>

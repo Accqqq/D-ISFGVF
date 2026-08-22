@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint16 robot_id
+int32 conflict_region_id
+geometry_msgs/Point region_center
+geometry_msgs/Vector3 region_axis
+geometry_msgs/Vector3 region_extent
+float64 channel_beta
+float64 eta_to_region
+uint8 conflict_state
+uint32 event_sequence
+time valid_until
+bool active

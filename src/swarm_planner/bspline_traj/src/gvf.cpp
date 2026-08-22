@@ -1,4 +1,5 @@
 #include "bspline_race/gvf.h"
+#include "bspline_race/guidance/isf_reference_kernel.h"
 
 namespace FLAG_Race
 {
@@ -278,7 +279,14 @@ void gvf::odomCallback(const nav_msgs::OdometryConstPtr& odom)
 
 void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
 {
+    // The H2 manager owns this frontend mirror.  A queued legacy topic
+    // callback must never restore an older path after a reset/clear.
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) return;
     if (use_kinopath_) return;  // 如果使用动力学路径，则不处理A*路径
+    std::lock_guard<std::recursive_mutex> cache_lock(path_cache_mutex_);
+    // Recheck after acquiring the cache lock: a manager authoritative install
+    // may have completed between the first load and this callback's write.
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) return;
     last_path_recv_time_ = ros::Time::now();
     if (msg->poses.empty()) {
         last_path_.poses.clear();
@@ -350,7 +358,12 @@ void gvf::pathCallback(const nav_msgs::Path::ConstPtr& msg)
 
 void gvf::kinoPathCallback(const nav_msgs::Path::ConstPtr& msg)
 {
+    // See pathCallback(): only the manager-authorized mirror may update this
+    // cache while H2 owns it.
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) return;
     if (!use_kinopath_) return;  // 如果不使用动力学路径，则不处理
+    std::lock_guard<std::recursive_mutex> cache_lock(path_cache_mutex_);
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) return;
     last_path_recv_time_ = ros::Time::now();
     if (msg->poses.empty()) {
         last_path_.poses.clear();
@@ -416,6 +429,7 @@ void gvf::kinoPathCallback(const nav_msgs::Path::ConstPtr& msg)
 
 
 Eigen::Vector3d gvf::estimateTangentViaQuadraticFit(const Eigen::Vector3d& pos) {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     Eigen::Vector3d tau = Eigen::Vector3d::Zero();
 
     if (last_path_.poses.size() < 3)  // 至少要有3个点
@@ -660,7 +674,12 @@ void gvf::publishGVF()
     delete_marker.action = visualization_msgs::Marker::DELETEALL;
     marker_array.markers.push_back(delete_marker);
 
-    if (!reparam_ready_ || sample_w_.size() < 2) {
+    bool cache_ready = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
+        cache_ready = reparam_ready_ && sample_w_.size() >= 2;
+    }
+    if (!cache_ready) {
         vector_field_pub_.publish(marker_array);
         return;
     }
@@ -750,7 +769,12 @@ void gvf::gvfVisCallback(const ros::TimerEvent& /*event*/) {
 }
 
 void gvf::publishPathCylinderVisualization() {
-    if (last_path_.poses.empty()) return;
+    nav_msgs::Path path;
+    {
+        std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
+        path = last_path_;
+    }
+    if (path.poses.empty()) return;
     
     // 创建MarkerArray来存储多个圆柱体
     visualization_msgs::MarkerArray cylinder_array;
@@ -774,9 +798,9 @@ void gvf::publishPathCylinderVisualization() {
     double color_b = 0.0;  // 蓝色分量
     
     // 遍历路径点，为每两个相邻点创建一个圆柱体
-    for (size_t i = 0; i < last_path_.poses.size() - 1; ++i) {
-        const auto& pose1 = last_path_.poses[i];
-        const auto& pose2 = last_path_.poses[i + 1];
+    for (size_t i = 0; i < path.poses.size() - 1; ++i) {
+        const auto& pose1 = path.poses[i];
+        const auto& pose2 = path.poses[i + 1];
         
         // 计算两个点之间的中点
         Eigen::Vector3d pos1(pose1.pose.position.x, pose1.pose.position.y, pose1.pose.position.z);
@@ -836,7 +860,7 @@ void gvf::publishPathCylinderVisualization() {
         cylinder.scale.z = segment_length;          // 高度为两点间距离
         
         // 设置圆柱体的颜色（渐变色效果）
-        double progress = static_cast<double>(i) / static_cast<double>(last_path_.poses.size() - 2);
+        double progress = static_cast<double>(i) / static_cast<double>(path.poses.size() - 2);
 
         if (progress < 0.25) {
             // 0.0-0.25: 蓝色到青色
@@ -1036,6 +1060,7 @@ void gvf::publishESDF() {
 
 void gvf::setNextPathWAnchor(double w_anchor)
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     next_path_w_anchor_ = w_anchor;
     has_next_path_w_anchor_ = true;
     next_path_w_samples_.clear();
@@ -1044,6 +1069,7 @@ void gvf::setNextPathWAnchor(double w_anchor)
 
 void gvf::setNextPathWSamples(const std::vector<double>& w_samples)
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     next_path_w_samples_ = w_samples;
     has_next_path_w_samples_ = true;
     next_path_w_anchor_ = 0.0;
@@ -1052,7 +1078,25 @@ void gvf::setNextPathWSamples(const std::vector<double>& w_samples)
 
 void gvf::setAuthoritativePhaseMode(bool enabled)
 {
-    authoritative_phase_mode_ = enabled;
+    authoritative_phase_mode_.store(enabled, std::memory_order_release);
+}
+
+bool gvf::authoritativePhaseMode() const
+{
+    return authoritative_phase_mode_.load(std::memory_order_acquire);
+}
+
+void gvf::installAuthoritativePathMirror(
+    const nav_msgs::Path& path, const std::vector<double>& w_samples)
+{
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
+    last_path_ = path;
+    next_path_w_samples_ = w_samples;
+    has_next_path_w_samples_ = true;
+    next_path_w_anchor_ = 0.0;
+    has_next_path_w_anchor_ = false;
+    nav_msgs::Path::ConstPtr path_ptr(new nav_msgs::Path(path));
+    buildReparamTableFromPathMsg(path_ptr);
 }
 
 void gvf::setContinuousPhasePath(
@@ -1074,6 +1118,7 @@ std::shared_ptr<const ContinuousPhasePath> gvf::getContinuousPhasePath() const
 
 void gvf::clearPathReparamState()
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     last_path_.poses.clear();
     sample_w_.clear();
     sample_p_.clear();
@@ -1091,8 +1136,18 @@ void gvf::clearPathReparamState()
     clearContinuousPhasePath();
 }
 
+gvf::ReparamCacheSnapshot gvf::captureReparamCacheSnapshot() const
+{
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
+    ReparamCacheSnapshot snapshot;
+    snapshot.ready = reparam_ready_;
+    snapshot.w = sample_w_;
+    return snapshot;
+}
+
 void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     sample_w_.clear();
     sample_p_.clear();
     sample_dp_.clear();
@@ -1182,11 +1237,12 @@ void gvf::buildReparamTableFromPathMsg(const nav_msgs::Path::ConstPtr& msg)
 
 Eigen::Vector3d gvf::evalPathByW(double w) const
 {
-    if (authoritative_phase_mode_) {
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) {
         const auto path = getContinuousPhasePath();
         ContinuousPhasePathState state;
         if (path && path->evaluate(w, state)) return state.p;
     }
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     if (!reparam_ready_ || sample_w_.empty()) return Eigen::Vector3d::Zero();
 
     if (w <= sample_w_.front()) return sample_p_.front();
@@ -1206,11 +1262,12 @@ Eigen::Vector3d gvf::evalPathByW(double w) const
 
 Eigen::Vector3d gvf::evalDpDwByW(double w) const
 {
-    if (authoritative_phase_mode_) {
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) {
         const auto path = getContinuousPhasePath();
         ContinuousPhasePathState state;
         if (path && path->evaluate(w, state)) return state.dp_dw;
     }
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     if (!reparam_ready_ || sample_w_.empty()) return Eigen::Vector3d::Zero();
 
     if (w <= sample_w_.front()) return sample_dp_.front();
@@ -1229,12 +1286,13 @@ Eigen::Vector3d gvf::evalDpDwByW(double w) const
 
 Eigen::Vector3d gvf::evalD2pDw2ByW(double w) const
 {
-    if (authoritative_phase_mode_) {
+    if (authoritative_phase_mode_.load(std::memory_order_acquire)) {
         const auto path = getContinuousPhasePath();
         ContinuousPhasePathState state;
         if (path && path->evaluate(w, state)) return state.d2p_dw2;
     }
 
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     if (!reparam_ready_ || sample_w_.size() < 3) {
         return Eigen::Vector3d::Zero();
     }
@@ -1263,6 +1321,7 @@ double gvf::projectToPathLocal(const Eigen::Vector3d& x,
                                double w_prev,
                                double window) const
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     if (!reparam_ready_ || sample_w_.empty()) return 0.0;
 
     double w_min = std::max(sample_w_.front(), w_prev - window);
@@ -1295,6 +1354,7 @@ double gvf::projectToPathLocalForVisualization(
     double w_prev,
     double window) const
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     if (!reparam_ready_ || sample_w_.size() < 2 ||
         sample_p_.size() != sample_w_.size() || !x.allFinite()) {
         return 0.0;
@@ -1343,6 +1403,7 @@ double gvf::projectToPathLocalForVisualization(
 gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
                                               double w_prev) const
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     LiftedGuidanceResult out;
     if (!reparam_ready_ || sample_w_.size() < 2) return out;
 
@@ -1398,43 +1459,101 @@ gvf::LiftedGuidanceResult gvf::calcLiftedGuidance3D(const Eigen::Vector3d& pos,
 gvf::LiftedGuidanceResult gvf::calcLiftedGuidanceAtPhase(
     const Eigen::Vector3d& pos, double w) const
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     LiftedGuidanceResult out;
     if (!reparam_ready_ || sample_w_.size() < 2 || !std::isfinite(w)) return out;
 
-    // phase_v2 的 w 是唯一权威状态。这里不做最近点投影，
-    // 只在当前有限前端上直接查询 p(w) 和 p'(w)。
+    // Legacy/display callers retain their established slot-backed semantics.
+    // Command control uses the explicit-owner overload below.
     const Eigen::Vector3d p = evalPathByW(w);
     const Eigen::Vector3d dpdw = evalDpDwByW(w);
     const double dpdw_norm = dpdw.norm();
     if (dpdw_norm < 1e-6) return out;
 
-    const Eigen::Vector3d t = dpdw / dpdw_norm;
-    const Eigen::Vector3d e = pos - p;
-    const double e_parallel = t.dot(e);
-    const Eigen::Vector3d e_perp = e - e_parallel * t;
-    const double rho = e_perp.norm();
+    guidance::ReferenceGeometry reference;
+    reference.point = p;
+    reference.tangent = dpdw / dpdw_norm;
+    reference.derivative_norm = dpdw_norm;
+    reference.valid = true;
+    guidance::IsfGains gains;
+    gains.k1 = gvf_.K1_;
+    gains.k2 = gvf_.K2_;
+    gains.convergence_bandwidth = gvf_.convergence_bandwidth_;
+    gains.progress_rho0 = progress_rho0_;
+    gains.progress_delta = progress_delta_;
+    gains.alpha_min = alpha_min_;
+    guidance::IsfGuidance guidance_output;
+    if (!guidance::IsfReferenceKernel::evaluate(
+            pos, reference, gains, guidance_output)) {
+        return out;
+    }
 
-    const double r = std::max(1e-6, gvf_.convergence_bandwidth_);
-    const double q = (rho > 1e-6) ? std::tanh(rho / r) / rho : 1.0 / r;
-    const double rho0 = std::max(1e-6, progress_rho0_);
-    const double alpha = alpha_min_ + (1.0 - alpha_min_) /
-        (1.0 + (rho / rho0) * (rho / rho0));
-    const double delta = std::max(1e-6, progress_delta_);
-    const double sigma = std::tanh(e_parallel / delta);
-
-    out.v_cmd = gvf_.K1_ * alpha * t + gvf_.K2_ * q * e_perp;
+    out.v_cmd = guidance_output.v_cmd;
     out.w_proj = w;
-    out.w_dot = gvf_.K1_ * (alpha + sigma) / dpdw_norm;
-    out.e_parallel = e_parallel;
-    out.e_perp = e_perp;
-    out.ref_pt = p;
-    out.tangent = t;
+    out.w_dot = guidance_output.w_dot;
+    out.e_parallel = guidance_output.e_parallel;
+    out.e_perp = guidance_output.e_perp;
+    out.ref_pt = guidance_output.ref_pt;
+    out.tangent = guidance_output.tangent;
+    out.valid = true;
+    return out;
+}
+
+gvf::LiftedGuidanceResult gvf::calcLiftedGuidanceAtPhase(
+    const Eigen::Vector3d& pos,
+    double w,
+    const std::shared_ptr<const ContinuousPhasePath>& path_owner) const
+{
+    LiftedGuidanceResult out;
+    if (!std::isfinite(w)) return out;
+
+    // phase_v2 的 w 是唯一权威状态。这里不做最近点投影，
+    // 只在当前有限前端上直接查询 p(w) 和 p'(w)。
+    // Do not call evalPathByW/evalDpDwByW here: those legacy helpers load the
+    // mutable publication slot independently.  A command supplies its one
+    // captured immutable owner instead.
+    ContinuousPhasePathState state;
+    if (!path_owner || path_owner->empty() ||
+        !path_owner->evaluate(w, state)) {
+        return out;
+    }
+    const Eigen::Vector3d p = state.p;
+    const Eigen::Vector3d dpdw = state.dp_dw;
+    const double dpdw_norm = dpdw.norm();
+    if (dpdw_norm < 1e-6) return out;
+
+    guidance::ReferenceGeometry reference;
+    reference.point = p;
+    reference.tangent = dpdw / dpdw_norm;
+    reference.derivative_norm = dpdw_norm;
+    reference.valid = true;
+    guidance::IsfGains gains;
+    gains.k1 = gvf_.K1_;
+    gains.k2 = gvf_.K2_;
+    gains.convergence_bandwidth = gvf_.convergence_bandwidth_;
+    gains.progress_rho0 = progress_rho0_;
+    gains.progress_delta = progress_delta_;
+    gains.alpha_min = alpha_min_;
+    guidance::IsfGuidance guidance_output;
+    if (!guidance::IsfReferenceKernel::evaluate(
+            pos, reference, gains, guidance_output)) {
+        return out;
+    }
+
+    out.v_cmd = guidance_output.v_cmd;
+    out.w_proj = w;
+    out.w_dot = guidance_output.w_dot;
+    out.e_parallel = guidance_output.e_parallel;
+    out.e_perp = guidance_output.e_perp;
+    out.ref_pt = guidance_output.ref_pt;
+    out.tangent = guidance_output.tangent;
     out.valid = true;
     return out;
 }
 
 void gvf::setVisualizationProgressW(double w)
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     visualization_progress_w_ = w;
     visualization_progress_initialized_ = true;
 }
@@ -1442,12 +1561,14 @@ void gvf::setVisualizationProgressW(double w)
 void gvf::setTerminalGoalVisualization(const Eigen::Vector3d& goal)
 {
     if (!goal.allFinite()) return;
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     terminal_goal_visualization_pos_ = goal;
     terminal_goal_visualization_active_ = true;
 }
 
 void gvf::clearTerminalGoalVisualization()
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     terminal_goal_visualization_active_ = false;
     terminal_goal_visualization_pos_.setZero();
 }
@@ -1455,6 +1576,7 @@ void gvf::clearTerminalGoalVisualization()
 bool gvf::calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
                                         Eigen::Vector3d& vec) const
 {
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
     vec.setZero();
     if (terminal_goal_visualization_active_) {
         const Eigen::Vector3d to_goal = terminal_goal_visualization_pos_ - pos;
@@ -1472,7 +1594,7 @@ bool gvf::calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
 
     double w_prev = visualization_progress_initialized_ ?
         visualization_progress_w_ : sample_w_.front();
-    if (!authoritative_phase_mode_ &&
+    if (!authoritative_phase_mode_.load(std::memory_order_acquire) &&
         (w_prev < sample_w_.front() - progress_window_ ||
          w_prev > sample_w_.back() + progress_window_)) {
         w_prev = sample_w_.front();
@@ -1481,10 +1603,12 @@ bool gvf::calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
     // 显示形式始终是无人机周围的局部正方形网格。统一相位模式下，
     // 每个网格点独立投影到当前相位邻域内的最近轨迹位置 w_vis；这个
     // 投影只用于 RViz，不会回写或改变控制器的权威 phase_w。
-    const double w_vis = authoritative_phase_mode_
+    const bool authoritative_mode =
+        authoritative_phase_mode_.load(std::memory_order_acquire);
+    const double w_vis = authoritative_mode
         ? projectToPathLocalForVisualization(pos, w_prev, progress_window_)
         : w_prev;
-    const auto out = authoritative_phase_mode_
+    const auto out = authoritative_mode
         ? calcLiftedGuidanceAtPhase(pos, w_vis)
         : calcLiftedGuidance3D(pos, w_prev);
     if (!out.valid) return false;

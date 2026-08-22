@@ -26,6 +26,8 @@
   <build_depend>common_msgs</build_depend>
   <build_depend>plan_env</build_depend>
   <build_depend>path_searching</build_depend>
+  <build_depend>phase_offset_core</build_depend>
+  <build_depend>phase_offset_navigation</build_depend>
   <build_depend>cv_bridge</build_depend>
   <build_depend>message_filters</build_depend>
 
@@ -39,6 +41,8 @@
   <exec_depend>common_msgs</exec_depend>
   <exec_depend>plan_env</exec_depend>
   <exec_depend>path_searching</exec_depend>
+  <exec_depend>phase_offset_core</exec_depend>
+  <exec_depend>phase_offset_navigation</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>message_filters</exec_depend>
 
@@ -52,6 +56,8 @@
   <build_export_depend>common_msgs</build_export_depend>
   <build_export_depend>plan_env</build_export_depend>
   <build_export_depend>path_searching</build_export_depend>
+  <build_export_depend>phase_offset_core</build_export_depend>
+  <build_export_depend>phase_offset_navigation</build_export_depend>
   <build_export_depend>cv_bridge</build_export_depend>
   <build_export_depend>message_filters</build_export_depend>
 
