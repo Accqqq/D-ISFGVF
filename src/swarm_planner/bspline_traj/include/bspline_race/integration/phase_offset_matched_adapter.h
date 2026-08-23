@@ -19,11 +19,14 @@
 #include <visualization_msgs/MarkerArray.h>
 
 #include <bspline_race/continuous_phase_path.h>
+#include <bspline_race/continuous_phase_normal_frame.h>
 #include <bspline_race/integration/phase_offset_active_adapter.h>
 #include <bspline_race/integration/phase_offset_cloud_occupancy_query.h>
 #include <bspline_race/integration/phase_offset_raw_candidate_diagnostics.h>
 #include <plan_env/cloud_occupancy_snapshot.h>
 #include <phase_offset_navigation/phase_offset_runtime.h>
+#include <phase_offset_navigation/immutable_executed_reference_query.h>
+#include <phase_offset_navigation/active_reference_snapshot.h>
 #include <phase_offset_navigation/tube_epoch_manager.h>
 
 namespace FLAG_Race {
@@ -94,6 +97,8 @@ struct PathTubePair {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   std::uint64_t source_revision = 0U;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
   std::uint64_t generation = 0U;
   // Private H2 retirement domain.  It is neither a Runtime state nor a
   // diagnostic: a goal/reset increments it so a command that captured an old
@@ -102,10 +107,15 @@ struct PathTubePair {
   std::uint64_t map_observation_sequence = 0U;
   bool map_observation_is_snapshot = false;
   std::shared_ptr<const ContinuousPhasePath> path_owner;
+  // One immutable Bishop frame is shared by all path-state, cell-proof, and
+  // executed-reference queries for this authority handoff.
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       frozen_cloud_occupancy_snapshot;
   std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
   std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
+      executed_reference_query;
   phase_offset_navigation::TubeEpochStatus epoch_status;
   // The precommit facts are retained verbatim so a later command can reject
   // a stale stage before it exchanges authority.
@@ -128,6 +138,7 @@ struct PathTubePairPinCapture {
   std::uint64_t map_observation_sequence = 0U;
   bool map_observation_is_snapshot = false;
   std::shared_ptr<const ContinuousPhasePath> path_owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       frozen_cloud_occupancy_snapshot;
   std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
@@ -143,6 +154,7 @@ struct PathTubePairPinCapture {
         map_observation_sequence == pair->map_observation_sequence &&
         map_observation_is_snapshot == pair->map_observation_is_snapshot &&
         path_owner == pair->path_owner &&
+        frame_owner == pair->frame_owner &&
         frozen_cloud_occupancy_snapshot ==
             pair->frozen_cloud_occupancy_snapshot &&
         full_path_samples == pair->full_path_samples &&
@@ -269,6 +281,7 @@ struct MatchedAdapterInput {
   // Production ownership handoff.  The manager captures these immutable
   // owners in the command callback before storing a build request.
   std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   // When H2 authority is installed this is the sole path/tube source for the
   // control step.  It is intentionally immutable and never synthesized from
   // independent path/epoch slots inside update().
@@ -438,6 +451,7 @@ struct TubeBuildRequest {
   bool map_observation_is_snapshot = false;
   ros::Time stamp;
   std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   // H2 same-path refresh is anchored to this immutable authority.  The timer
   // may only replace its tube/profile if this exact pair is still live.
   std::shared_ptr<const PathTubePair> base_path_tube_pair;
@@ -498,6 +512,7 @@ struct PreparedTubeBuildResult {
   // this uncommitted build.  A PreparedTubeBuildResult must never rely on a
   // stack-local query closure surviving the staging manager.
   std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       frozen_cloud_occupancy_snapshot;
   // These are facts verified from the actual prepared samples/profile, not

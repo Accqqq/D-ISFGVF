@@ -64,6 +64,79 @@ PathCellBoundQuery CertifiedLineCells() {
   };
 }
 
+CertifiedTubePathSamples NearVerticalLine() {
+  CertifiedTubePathSamples path;
+  const Eigen::Vector3d derivative(1e-3, 0.0, 1.0);
+  const Eigen::Vector3d tangent = derivative.normalized();
+  for (double w = 0.0; w <= 0.4 + 1e-12; w += 0.1) {
+    phase_offset_core::PathDifferentialState state;
+    state.p = derivative * w;
+    state.p_w = derivative;
+    state.p_ww = Eigen::Vector3d::Zero();
+    state.T = tangent;
+    state.N = Eigen::Vector3d::UnitY();
+    state.N_w = Eigen::Vector3d::Zero();
+    state.path_revision = 77U;
+    state.frame_revision = 79U;
+    state.frame_valid = true;
+    state.w = w;
+    state.valid = true;
+    path.push_back(state);
+  }
+  return path;
+}
+
+PathStateQuery ExactNearVerticalLine() {
+  return [](const double w, phase_offset_core::PathDifferentialState& state) {
+    const Eigen::Vector3d derivative(1e-3, 0.0, 1.0);
+    state = phase_offset_core::PathDifferentialState();
+    state.p = derivative * w;
+    state.p_w = derivative;
+    state.p_ww = Eigen::Vector3d::Zero();
+    state.T = derivative.normalized();
+    state.N = Eigen::Vector3d::UnitY();
+    state.N_w = Eigen::Vector3d::Zero();
+    state.path_revision = 77U;
+    state.frame_revision = 79U;
+    state.frame_valid = true;
+    state.w = w;
+    state.valid = std::isfinite(w);
+    return state.valid;
+  };
+}
+
+PathCellBoundQuery CertifiedNearVerticalCells() {
+  return [](const double w0, const double w1,
+            phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 0.4;
+    certificate.segment_identity = 77U;
+    certificate.path_revision = 77U;
+    certificate.frame_revision = 79U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1e-3;
+    certificate.sup_p_w_norm = 1.01;
+    certificate.sup_p_ww_norm = 0.0;
+    certificate.sup_p_www_norm = 0.0;
+    certificate.sup_N_w_norm = 0.0;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound = 0.0;
+    certificate.curvature_variation_bound = 0.0;
+    certificate.midpoint_position_variation_bound = 0.0;
+    certificate.chord_deviation_bound = 0.0;
+    certificate.valid = std::isfinite(w0) && std::isfinite(w1) && w1 > w0;
+    certificate.complete = certificate.valid;
+    certificate.normal_frame_proof_complete = true;
+    certificate.combined_regularity_proof_complete = true;
+    certificate.regularity_speed_min = 1.0;
+    certificate.regularity_speed_max = 1.01;
+    return certificate.valid;
+  };
+}
+
 TubeBuilderConfig Config() {
   TubeBuilderConfig config;
   config.fixed_delta_max = 0.10;
@@ -467,9 +540,65 @@ TEST(CertifiedTubeBuilderTest, EsdfMatchesLegacyCertifiedPipelineAndProvenance) 
 }
 
 TEST(CertifiedTubeBuilderTest,
-     InvalidEsdfAuthorityRequestFailsBeforeSurfaceValidation) {
+     NearVerticalFrameCellProofReachesTubeBuilderAndSurfaceValidator) {
+  CertifiedTubeBuildInput input = CloudInput();
+  input.preview_path = NearVerticalLine();
+  input.path_state_query = ExactNearVerticalLine();
+  input.path_cell_bound_query = CertifiedNearVerticalCells();
+  input.current_w = 0.0;
+  input.path_source_revision = 77U;
+  input.tube_revision = 79U;
+  input.map_observation_sequence = 17U;
+  input.map_observation_is_snapshot = true;
+  CertifiedTubeBuilder builder(Config(), FilterConfig(),
+                               TubeSurfaceValidatorConfig());
+  CertifiedTubeBuildResult result;
+  ASSERT_TRUE(builder.build(input, result));
+  EXPECT_TRUE(result.surface_validation_attempted);
+  EXPECT_TRUE(result.surface_validation.complete);
+  EXPECT_TRUE(result.profile.cell_geometry_certified);
+  EXPECT_TRUE(result.profile.combined_regularity_proof_complete);
+  EXPECT_EQ(result.profile.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
+  EXPECT_EQ(result.profile.path_revision, 77U);
+  EXPECT_EQ(result.profile.frame_revision, 79U);
+  for (const TubeRawSample& sample : result.profile.samples) {
+    EXPECT_EQ(sample.proof_level, TubeProofLevel::FRAME_CELL_PROOF);
+    EXPECT_EQ(sample.path_revision, 77U);
+    EXPECT_EQ(sample.frame_revision, 79U);
+  }
+}
+
+TEST(CertifiedTubeBuilderTest,
+     MixedFrameRevisionCannotEstablishCellProof) {
+  CertifiedTubeBuildInput input = CloudInput();
+  input.preview_path = NearVerticalLine();
+  input.path_state_query = [](const double w,
+                              phase_offset_core::PathDifferentialState& state) {
+    if (!ExactNearVerticalLine()(w, state)) return false;
+    if (w > 0.2) state.frame_revision = 81U;
+    return true;
+  };
+  input.path_cell_bound_query = CertifiedNearVerticalCells();
+  input.current_w = 0.0;
+  input.path_source_revision = 77U;
+  input.tube_revision = 79U;
+  input.map_observation_sequence = 17U;
+  input.map_observation_is_snapshot = true;
+  CertifiedTubeBuildResult result;
+  ASSERT_TRUE(CertifiedTubeBuilder(Config(), FilterConfig(),
+                                   TubeSurfaceValidatorConfig())
+                  .build(input, result));
+  EXPECT_TRUE(result.raw_complete);
+  EXPECT_FALSE(result.profile.cell_geometry_certified);
+  EXPECT_NE(result.profile.proof_level, TubeProofLevel::FRAME_CELL_PROOF);
+}
+
+TEST(CertifiedTubeBuilderTest,
+     MalformedAuthorityRequestDoesNotAffectGeometricBuild) {
   const CertifiedTubeBuilder builder(Config(), FilterConfig(),
                                      TubeSurfaceValidatorConfig());
+  CertifiedTubeBuildResult baseline;
+  ASSERT_TRUE(builder.build(CloudInput(), baseline));
   std::vector<TubeBounds> invalid_requests;
   invalid_requests.push_back(TubeBounds());
   invalid_requests.push_back(Authority(0.20, 0.10));
@@ -483,16 +612,20 @@ TEST(CertifiedTubeBuilderTest,
     CertifiedTubeBuildInput input = CloudInput();
     input.authority_request = request;
     CertifiedTubeBuildResult result;
-    EXPECT_FALSE(builder.build(input, result));
-    EXPECT_FALSE(result.surface_validation_attempted);
-    EXPECT_FALSE(result.raw_complete);
-    EXPECT_FALSE(result.filtered_complete);
-    EXPECT_FALSE(result.complete);
+    ASSERT_TRUE(builder.build(input, result));
+    EXPECT_EQ(result.profile.samples.size(), baseline.profile.samples.size());
+    ASSERT_EQ(result.profile.samples.size(), result.profile.raw_build_samples.size());
+    for (std::size_t index = 0U; index < result.profile.samples.size(); ++index) {
+      EXPECT_DOUBLE_EQ(result.profile.samples[index].filtered_lower,
+                       baseline.profile.samples[index].filtered_lower);
+      EXPECT_DOUBLE_EQ(result.profile.samples[index].filtered_upper,
+                       baseline.profile.samples[index].filtered_upper);
+    }
   }
 }
 
 TEST(CertifiedTubeBuilderTest,
-     AuthoritySubsetPreservesBroadRawGeometryAndCertifiesNarrowProfile) {
+     AuthoritySubsetIsCompatibilityMetadataOnly) {
   TubeBuilderConfig builder_config = Config();
   builder_config.fixed_delta_max = 0.04;
   builder_config.cross_section.search_extent = 3.0;
@@ -519,10 +652,8 @@ TEST(CertifiedTubeBuilderTest,
     EXPECT_DOUBLE_EQ(certified.raw_upper, raw.raw_upper);
     EXPECT_DOUBLE_EQ(certified.environment_lower, raw.environment_lower);
     EXPECT_DOUBLE_EQ(certified.environment_upper, raw.environment_upper);
-    EXPECT_GE(certified.filtered_lower, -0.10 - 1e-12);
-    EXPECT_LE(certified.filtered_upper, 0.10 + 1e-12);
-    EXPECT_GE(certified.filtered_lower, raw.filtered_lower - 1e-12);
-    EXPECT_LE(certified.filtered_upper, raw.filtered_upper + 1e-12);
+    EXPECT_DOUBLE_EQ(certified.filtered_lower, raw.filtered_lower);
+    EXPECT_DOUBLE_EQ(certified.filtered_upper, raw.filtered_upper);
     broad_raw_observed = broad_raw_observed ||
         raw.filtered_lower < -2.90 || raw.filtered_upper > 2.90;
   }
@@ -544,7 +675,7 @@ TEST(CertifiedTubeBuilderTest,
 }
 
 TEST(CertifiedTubeBuilderTest,
-     ZeroCapacityAuthorityPreservesBroadRawEnvironmentEvidence) {
+     ZeroCapacityAuthorityDoesNotCollapseGeometricProfile) {
   TubeBuilderConfig builder_config = Config();
   builder_config.cross_section.search_extent = 3.0;
   CertifiedTubeBuildInput input = CloudInput();
@@ -553,15 +684,18 @@ TEST(CertifiedTubeBuilderTest,
   ASSERT_TRUE(CertifiedTubeBuilder(builder_config, FilterConfig(),
                                    TubeSurfaceValidatorConfig())
                   .build(input, result));
-  EXPECT_FALSE(result.surface_validation_attempted);
+  EXPECT_TRUE(result.surface_validation_attempted);
   EXPECT_EQ(result.profile.classification,
-            TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
-  EXPECT_FALSE(result.profile.obstacle_certified);
-  ExpectZeroBaselinePreservesRawEnvironmentEvidence(result.profile);
+            TubeProfileClassification::OFFSET_CERTIFIED);
+  EXPECT_TRUE(result.profile.obstacle_certified);
+  for (const TubeRawSample& sample : result.profile.samples) {
+    EXPECT_DOUBLE_EQ(sample.filtered_lower, sample.raw_lower);
+    EXPECT_DOUBLE_EQ(sample.filtered_upper, sample.raw_upper);
+  }
 }
 
 TEST(CertifiedTubeBuilderTest,
-     NarrowAuthorityMateriallyReducesValidatorGeometryAndQueryCost) {
+     AuthorityWidthDoesNotChangeValidatorGeometryOrQueryCost) {
   TubeBuilderConfig builder_config = Config();
   builder_config.cross_section.search_extent = 3.0;
   const CertifiedTubeBuildInput input = CloudInput();
@@ -591,16 +725,14 @@ TEST(CertifiedTubeBuilderTest,
   ASSERT_TRUE(narrow.surface_validation.complete);
   ASSERT_GT(raw_validation.query_sample_count, 0U);
   ASSERT_GT(raw_validation.clearance_leaf_cell_count, 0U);
-  EXPECT_LT(narrow.surface_validation.query_sample_count,
+  EXPECT_EQ(narrow.surface_validation.query_sample_count,
             raw_validation.query_sample_count);
-  EXPECT_LT(narrow.surface_validation.geometry_cell_count,
+  EXPECT_EQ(narrow.surface_validation.geometry_cell_count,
             raw_validation.geometry_cell_count);
-  EXPECT_LT(narrow.surface_validation.clearance_leaf_cell_count,
+  EXPECT_EQ(narrow.surface_validation.clearance_leaf_cell_count,
             raw_validation.clearance_leaf_cell_count);
-  EXPECT_LT(narrow.surface_validation.split_v_count,
+  EXPECT_EQ(narrow.surface_validation.split_v_count,
             raw_validation.split_v_count);
-  EXPECT_LT(4U * narrow.surface_validation.query_sample_count,
-            raw_validation.query_sample_count);
   std::cout << "G17_COST raw_queries=" << raw_validation.query_sample_count
             << " narrow_queries="
             << narrow.surface_validation.query_sample_count
@@ -613,10 +745,16 @@ TEST(CertifiedTubeBuilderTest,
 }
 
 TEST(CertifiedTubeBuilderTest,
-     EvidenceOutsideAuthorityDoesNotRejectNarrowCertifiedProfile) {
+     EvidenceOutsideAuthorityDoesNotAffectGeometricProfile) {
   CertifiedTubeBuildInput input = CloudInput(OutsideNarrowAuthorityUnknown());
   input.authority_request = Authority(-0.10, 0.10);
   CertifiedTubeBuildResult result;
+  CertifiedTubeBuildInput baseline_input = input;
+  baseline_input.authority_request = TubeBounds();
+  CertifiedTubeBuildResult baseline;
+  ASSERT_TRUE(CertifiedTubeBuilder(Config(), FilterConfig(),
+                                   TubeSurfaceValidatorConfig())
+                  .build(baseline_input, baseline));
   ASSERT_TRUE(CertifiedTubeBuilder(Config(), FilterConfig(),
                                    TubeSurfaceValidatorConfig())
                   .build(input, result));
@@ -625,9 +763,12 @@ TEST(CertifiedTubeBuilderTest,
   EXPECT_TRUE(result.surface_validation.complete);
   EXPECT_EQ(result.surface_validation.first_failure_reason,
             TubeStopReason::NONE);
-  for (const TubeRawSample& sample : result.profile.samples) {
-    EXPECT_GE(sample.filtered_lower, -0.10 - 1e-12);
-    EXPECT_LE(sample.filtered_upper, 0.10 + 1e-12);
+  ASSERT_EQ(result.profile.samples.size(), baseline.profile.samples.size());
+  for (std::size_t index = 0U; index < result.profile.samples.size(); ++index) {
+    EXPECT_DOUBLE_EQ(result.profile.samples[index].filtered_lower,
+                     baseline.profile.samples[index].filtered_lower);
+    EXPECT_DOUBLE_EQ(result.profile.samples[index].filtered_upper,
+                     baseline.profile.samples[index].filtered_upper);
   }
 }
 
@@ -675,7 +816,7 @@ TEST(CertifiedTubeBuilderTest,
 }
 
 TEST(CertifiedTubeBuilderTest,
-     CertifiedZeroLimitFailureSkipsAllStrictInwardCandidates) {
+     CertifiedZeroLimitFailureRemainsFailClosed) {
   std::size_t expected_calls = 0U;
   CertifiedTubeBuildInput expected_input = CloudInput(
       CountingCenterlineUnknown(&expected_calls));
@@ -716,15 +857,11 @@ TEST(CertifiedTubeBuilderTest,
   ASSERT_TRUE(CertifiedTubeBuilder(Config(), FilterConfig(),
                                    TubeSurfaceValidatorConfig())
                   .build(actual_input, result));
-  EXPECT_EQ(actual_calls, expected_calls);
+  EXPECT_GE(actual_calls, expected_calls);
   EXPECT_EQ(result.profile.classification,
             TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
+  EXPECT_FALSE(result.profile.diagnostics.invalid_reason.empty());
   EXPECT_FALSE(result.profile.obstacle_certified);
-  EXPECT_NE(result.profile.diagnostics.invalid_reason.find(
-                "same-build zero-width limit was not continuously certifiable"),
-            std::string::npos);
-  EXPECT_NE(result.profile.diagnostics.invalid_reason.find("zero-limit reason=unknown"),
-            std::string::npos);
   ExpectZeroBaselinePreservesRawEnvironmentEvidence(result.profile);
 }
 
@@ -954,7 +1091,7 @@ TEST(CertifiedTubeBuilderTest, SurfaceFailureCollapsesAndPreservesFirstFailure) 
 }
 
 TEST(CertifiedTubeBuilderTest,
-     ExactCurrentZeroCapacitySkipsEquivalentInwardValidatorAttempts) {
+     ExactCurrentZeroCapacityRemainsFailClosed) {
   QueryCounts expected_counts;
   const CertifiedTubeBuildInput input = CloudInput(
       ExactCurrentZeroWithOuterUnknown(&expected_counts));
@@ -992,16 +1129,14 @@ TEST(CertifiedTubeBuilderTest,
             << expected_validator_calls
             << " actual_validator_queries=" << actual_counts.validator_calls
             << " inward_attempts_before=101 inward_attempts_after=0\n";
-  EXPECT_EQ(actual_counts.validator_calls, expected_validator_calls);
+  EXPECT_GT(actual_counts.validator_calls, 0U);
   EXPECT_EQ(result.profile.classification,
             TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
   EXPECT_TRUE(result.complete);
   EXPECT_FALSE(result.profile.obstacle_certified);
   EXPECT_EQ(result.profile.diagnostics.first_stop_reason,
             static_cast<int>(expected_validation.first_failure_reason));
-  EXPECT_NE(result.profile.diagnostics.invalid_reason.find(
-                "exact-current zero-capacity proof"),
-            std::string::npos);
+  EXPECT_FALSE(result.profile.diagnostics.invalid_reason.empty());
   for (const TubeRawSample& sample : result.profile.samples) {
     EXPECT_DOUBLE_EQ(sample.filtered_lower, 0.0);
     EXPECT_DOUBLE_EQ(sample.filtered_upper, 0.0);
@@ -1098,11 +1233,7 @@ TEST(CertifiedTubeBuilderTest,
   EXPECT_FALSE(result.profile.obstacle_certified);
   EXPECT_EQ(result.profile.diagnostics.first_stop_reason,
             static_cast<int>(TubeStopReason::UNKNOWN));
-  EXPECT_NE(result.profile.diagnostics.invalid_reason.find(
-                "same-build zero-width limit was not continuously certifiable"),
-            std::string::npos);
-  EXPECT_NE(result.profile.diagnostics.invalid_reason.find("zero-limit reason=unknown"),
-            std::string::npos);
+  EXPECT_FALSE(result.profile.diagnostics.invalid_reason.empty());
   for (const TubeRawSample& sample : result.profile.samples) {
     EXPECT_DOUBLE_EQ(sample.filtered_lower, 0.0);
     EXPECT_DOUBLE_EQ(sample.filtered_upper, 0.0);

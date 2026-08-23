@@ -19,10 +19,22 @@ namespace FLAG_Race
 
 struct ContinuousPhasePathState
 {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
     Eigen::Vector3d p = Eigen::Vector3d::Zero();
     Eigen::Vector3d dp_dw = Eigen::Vector3d::Zero();
     Eigen::Vector3d d2p_dw2 = Eigen::Vector3d::Zero();
     Eigen::Vector3d vel = Eigen::Vector3d::Zero();
+    // Optional frame fields are populated by ContinuousPhaseNormalFrame and
+    // propagated mechanically through adapters. ContinuousPhasePath itself
+    // remains the sole owner of p and its derivatives.
+    Eigen::Vector3d T = Eigen::Vector3d::Zero();
+    Eigen::Vector3d N = Eigen::Vector3d::Zero();
+    Eigen::Vector3d N_w = Eigen::Vector3d::Zero();
+    std::uint64_t path_revision = 0U;
+    std::uint64_t frame_revision = 0U;
+    bool frame_valid = false;
+    std::string frame_provenance;
     bool valid = false;
 };
 
@@ -106,6 +118,8 @@ public:
     bool empty() const { return segments_.empty(); }
     double startW() const;
     double endW() const;
+    void setPathRevision(std::uint64_t revision) { path_revision_ = revision; }
+    std::uint64_t pathRevision() const { return path_revision_; }
     const std::vector<Segment>& segments() const { return segments_; }
 
     static Evaluator makeQuinticHermite(
@@ -155,6 +169,7 @@ public:
 private:
     std::vector<Segment> segments_;
     std::uint64_t next_segment_identity_ = 1U;
+    std::uint64_t path_revision_ = 0U;
 };
 
 }  // namespace FLAG_Race

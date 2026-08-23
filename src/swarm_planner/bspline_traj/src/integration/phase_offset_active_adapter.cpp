@@ -84,6 +84,13 @@ phase_offset_core::PathDifferentialState ConvertContinuousPhasePathStateForActiv
   converted.p_w = source.dp_dw;
   converted.p_ww = source.d2p_dw2;
   converted.w = w;
+  converted.T = source.T;
+  converted.N = source.N;
+  converted.N_w = source.N_w;
+  converted.path_revision = source.path_revision;
+  converted.frame_revision = source.frame_revision;
+  converted.frame_valid = source.frame_valid;
+  converted.frame_provenance = source.frame_provenance;
   converted.valid = source.valid;
   return converted;
 }

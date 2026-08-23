@@ -32,6 +32,7 @@ struct CertifiedTubeBuildInput {
   PathCellBoundQuery path_cell_bound_query;
   double cloud_snapshot_resolution = 0.0;
   double current_w = 0.0;
+  double current_delta = 0.0;
   std::uint64_t path_source_revision = 0U;
   std::uint64_t tube_revision = 0U;
   std::uint64_t map_observation_sequence = 0U;

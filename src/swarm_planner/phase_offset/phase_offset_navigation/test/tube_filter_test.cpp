@@ -230,11 +230,52 @@ TEST(TubeFilterTest, ZeroConnectedAndZeroOnlyIntervalsRemainRawFacts) {
   TubeProfile zero_only = MakeRawProfile({{0.0, 0.0}, {0.0, 0.0},
                                           {0.0, 0.0}});
   ASSERT_TRUE(filter.filter(zero_only, 0.0));
+  EXPECT_TRUE(zero_only.zero_component_contains_zero);
+  EXPECT_TRUE(zero_only.zero_only);
   for (const TubeRawSample& sample : zero_only.samples) {
     EXPECT_TRUE(sample.filtered_contains_zero);
     EXPECT_DOUBLE_EQ(sample.filtered_lower, 0.0);
     EXPECT_DOUBLE_EQ(sample.filtered_upper, 0.0);
   }
+}
+
+TEST(TubeFilterTest, NonzeroSingletonIsNotZeroOnly) {
+  TubeFilter filter;
+  TubeProfile profile = MakeRawProfile({{0.40, 0.40}, {0.40, 0.40}});
+  ASSERT_TRUE(filter.filter(profile, 0.0, 0.40));
+  EXPECT_TRUE(profile.current_component_contains_delta);
+  EXPECT_FALSE(profile.zero_component_contains_zero);
+  EXPECT_FALSE(profile.zero_only);
+  EXPECT_EQ(profile.selected_component,
+            TubeComponentSelection::CURRENT_DELTA_CONNECTED);
+}
+
+TEST(TubeFilterTest, SelectedCurrentComponentExcludingZeroIsNotZeroOnly) {
+  TubeFilter filter;
+  TubeProfile profile = MakeRawProfile({{0.20, 0.60}, {0.20, 0.60}});
+  ASSERT_TRUE(filter.filter(profile, 0.0, 0.40));
+  EXPECT_TRUE(profile.current_component_contains_delta);
+  EXPECT_FALSE(profile.zero_component_contains_zero);
+  EXPECT_FALSE(profile.zero_only);
+}
+
+TEST(TubeFilterTest,
+     CurrentDeltaOutsideLeavesCompleteCandidateForEpochClassification) {
+  TubeFilter filter;
+  TubeProfile profile = MakeRawProfile({{-0.10, 0.10}, {-0.10, 0.10},
+                                        {-0.10, 0.10}});
+  ASSERT_TRUE(filter.filter(profile, 0.0, 0.20));
+  EXPECT_TRUE(profile.complete);
+  EXPECT_TRUE(profile.filtered_complete);
+  EXPECT_EQ(profile.selected_component,
+            TubeComponentSelection::CURRENT_DELTA_CONNECTED);
+  EXPECT_DOUBLE_EQ(profile.current_delta, 0.20);
+  EXPECT_TRUE(profile.current_delta_valid);
+  EXPECT_FALSE(profile.current_component_contains_delta);
+  EXPECT_TRUE(profile.zero_component_contains_zero);
+  EXPECT_FALSE(profile.zero_only);
+  EXPECT_EQ(profile.samples.size(), 3U);
+  ExpectRawSubsetEquality(profile);
 }
 
 TEST(TubeFilterTest, QueryRoundoffIsClampedButOutsideDomainRejected) {

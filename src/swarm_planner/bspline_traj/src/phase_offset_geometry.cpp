@@ -38,12 +38,35 @@ checkC2ConnectorSamples(
       out.reason = "degenerate_tangent";
       return false;
     }
-    const Eigen::Vector3d T = st.dp_dw / v_p;
-    const Eigen::Vector3d N(-T.y(), T.x(), 0.0);
-    const double kappa =
+    const Eigen::Vector3d T = st.frame_valid && st.T.allFinite()
+        ? st.T.normalized() : st.dp_dw / v_p;
+    Eigen::Vector3d N = st.frame_valid && st.N.allFinite()
+        ? st.N.normalized() : Eigen::Vector3d(-T.y(), T.x(), 0.0);
+    if (N.norm() <= 1e-9) {
+      const Eigen::Vector3d axes[] = {Eigen::Vector3d::UnitX(),
+                                      Eigen::Vector3d::UnitY(),
+                                      Eigen::Vector3d::UnitZ()};
+      int best = 0;
+      double alignment = std::abs(T.dot(axes[0]));
+      for (int i = 1; i < 3; ++i) {
+        const double next = std::abs(T.dot(axes[i]));
+        if (next < alignment) { alignment = next; best = i; }
+      }
+      N = (axes[best] - T * T.dot(axes[best])).normalized();
+    }
+    const double legacy_curvature =
       (st.dp_dw.x() * st.d2p_dw2.y() - st.dp_dw.y() * st.d2p_dw2.x()) /
       (v_p * v_p * v_p);
-    const double regularity = 1.0 - kappa * delta;
+    // The immutable frame is authoritative whenever it is available.  This
+    // planar derivative is only the explicitly synthetic/legacy fallback;
+    // N_w = -kappa * p_w makes r_w = (1 - kappa*delta) p_w consistent with
+    // the fallback normal and the legacy curvature contract.
+    const Eigen::Vector3d N_w = st.frame_valid
+        ? (st.N_w.allFinite() ? st.N_w : Eigen::Vector3d::Zero())
+        : -legacy_curvature * st.dp_dw;
+    const double regularity = st.frame_valid
+        ? (st.dp_dw + N_w * delta).norm()
+        : 1.0 - legacy_curvature * delta;
     out.min_regularity = std::min(out.min_regularity, regularity);
     if (regularity < mu_regular)
     {
@@ -97,36 +120,46 @@ PhaseOffsetGeometryEvaluator::evaluate(
     return false;
   }
 
-  // Level-flight guard: only approximately horizontal paths enter the
-  // phase-offset mode.
-  if (p_w.head<2>().norm() < params.v_xy_min)
-  {
-    out.invalid_reason = "v_xy_too_small";
-    return false;
+  const Eigen::Vector3d T = path_state.frame_valid && path_state.T.allFinite()
+      ? path_state.T.normalized() : p_w / v_p;
+  Eigen::Vector3d N = path_state.frame_valid && path_state.N.allFinite()
+      ? path_state.N.normalized()
+      : Eigen::Vector3d(-T.y(), T.x(), 0.0);
+  if (N.norm() <= 1e-9) {
+    const Eigen::Vector3d axes[] = {Eigen::Vector3d::UnitX(),
+                                    Eigen::Vector3d::UnitY(),
+                                    Eigen::Vector3d::UnitZ()};
+    int best = 0;
+    double alignment = std::abs(T.dot(axes[0]));
+    for (int i = 1; i < 3; ++i) {
+      const double next = std::abs(T.dot(axes[i]));
+      if (next < alignment) { alignment = next; best = i; }
+    }
+    N = (axes[best] - T * T.dot(axes[best])).normalized();
   }
-
-  const Eigen::Vector3d T = p_w / v_p;
-  if (std::abs(T.z()) > params.z_tolerance)
+  const double legacy_curvature =
+    (p_w.x() * p_ww.y() - p_w.y() * p_ww.x()) /
+    (v_p * v_p * v_p);
+  // Keep production frame-bound paths on their shared immutable N_w.  Only
+  // synthetic/legacy planar states reconstruct the derivative, so their
+  // active-reference derivative agrees with the fallback normal/curvature.
+  const Eigen::Vector3d N_w = path_state.frame_valid
+      ? (path_state.N_w.allFinite() ? path_state.N_w : Eigen::Vector3d::Zero())
+      : -legacy_curvature * p_w;
+  const double regularity = path_state.frame_valid
+      ? (p_w + N_w * delta).norm()
+      : 1.0 - legacy_curvature * delta;
+  if (regularity < (path_state.frame_valid
+                        ? params.minimum_reference_speed
+                        : params.mu_regular))
   {
-    out.invalid_reason = "T_z_out_of_tolerance";
-    return false;
-  }
-
-  const Eigen::Vector3d N(-T.y(), T.x(), 0.0);
-  const double kappa =
-    (p_w.x() * p_ww.y() - p_w.y() * p_ww.x()) / (v_p * v_p * v_p);
-
-  // Regularity: 1 - kappa*delta >= mu > 0.
-  const double regularity = 1.0 - kappa * delta;
-  if (regularity < params.mu_regular)
-  {
-    out.invalid_reason = "regularity_below_mu";
+    out.invalid_reason = "r_w_degenerate";
     return false;
   }
 
   const Eigen::Vector3d r = p + N * delta;
-  const Eigen::Vector3d r_w = regularity * p_w;
-  if (r_w.norm() < 1e-9)
+  const Eigen::Vector3d r_w = p_w + N_w * delta;
+  if (r_w.norm() < params.minimum_reference_speed)
   {
     out.invalid_reason = "r_w_degenerate";
     return false;
@@ -159,7 +192,7 @@ PhaseOffsetGeometryEvaluator::evaluate(
   out.r_w = r_w;
   out.e_perp = e_perp;
   out.base_v = base_v;
-  out.curvature = kappa;
+  out.curvature = path_state.frame_valid ? 0.0 : legacy_curvature;
   out.e_parallel = e_parallel;
   out.rho = rho;
   out.alpha = alpha;

@@ -73,10 +73,13 @@ struct ValidationContext {
   double current_w = 0.0;
   double required_clearance = 0.0;
   double regularity_margin = 0.0;
+  double minimum_reference_speed = 1e-8;
   double cover_epsilon = 0.0;
   const TubeSurfaceValidatorConfig* config = nullptr;
   phase_offset_core::GeometryEvaluator geometry_evaluator;
   TubeSurfaceValidationResult* result = nullptr;
+  bool all_non_degenerate_cells_have_frame_proof = true;
+  std::size_t frame_proof_cell_count = 0U;
 };
 
 void RecordFailure(ValidationContext& context,
@@ -91,20 +94,40 @@ bool CertifiedCellCoverRadius(ValidationContext& context,
   cover_radius = 0.0;
   certificate_attempted = false;
   breakdown = CellCoverBreakdown();
+  const bool non_degenerate_cell = cell.w1 > cell.w0 + kEpsilon;
+  if (non_degenerate_cell &&
+      (!context.profile->cell_geometry_certified ||
+       context.path_cell_bound_query == nullptr ||
+       !(*context.path_cell_bound_query))) {
+    context.all_non_degenerate_cells_have_frame_proof = false;
+  }
   if (!context.profile->cell_geometry_certified ||
       context.path_cell_bound_query == nullptr ||
       !(*context.path_cell_bound_query) ||
       cell.w1 <= cell.w0 + kEpsilon) {
     return false;
   }
-  certificate_attempted = true;
   phase_offset_core::PathCellGeometryCertificate certificate;
-  if (!(*context.path_cell_bound_query)(cell.w0, cell.w1, certificate) ||
+  const bool callback_complete = (*context.path_cell_bound_query)(
+      cell.w0, cell.w1, certificate);
+  if (!callback_complete ||
       !phase_offset_core::pathCellGeometryCertificateIsComplete(certificate) ||
       std::abs(certificate.w0 - cell.w0) > kAnchorTolerance ||
       std::abs(certificate.w1 - cell.w1) > kAnchorTolerance) {
+    context.all_non_degenerate_cells_have_frame_proof = false;
     return false;
   }
+  if (!phase_offset_core::pathCellGeometryCertificateMatches(
+          certificate, context.profile->path_revision,
+          context.profile->frame_revision)) {
+    context.all_non_degenerate_cells_have_frame_proof = false;
+    return false;
+  }
+  // From this point onward a complete, matching certificate has opted into
+  // the stronger fail-closed regularity/cover contract.  Missing, malformed,
+  // or mismatched callbacks remain ordinary sampled fallback evidence.
+  certificate_attempted = true;
+  ++context.frame_proof_cell_count;
   TubeBounds first;
   TubeBounds second;
   if (!TubeFilter::query(*context.profile, cell.w0, first) ||
@@ -145,11 +168,11 @@ bool CertifiedCellCoverRadius(ValidationContext& context,
   // the two delayed invariants before accepting the smaller cover.
   const double active_speed_lower = certificate.inf_p_w_norm -
       certificate.sup_N_w_norm * maximum_delta;
-  const double regularity_lower = 1.0 -
-      certificate.sup_abs_curvature * maximum_delta;
+  const double regularity_lower = certificate.inf_p_w_norm -
+      certificate.sup_N_w_norm * maximum_delta;
   if (!IsFinite(active_speed_lower) || !IsFinite(regularity_lower) ||
-      active_speed_lower <= 1e-8 ||
-      regularity_lower < context.regularity_margin) {
+      active_speed_lower < context.minimum_reference_speed ||
+      regularity_lower < context.minimum_reference_speed) {
     return false;
   }
   const bool valid = IsFinite(maximum_delta) && IsFinite(delta_slope) &&
@@ -581,7 +604,9 @@ TubeSurfaceValidator::TubeSurfaceValidator(
 bool TubeSurfaceValidator::configurationValid() const {
   return config_.max_subdivision_depth >= 0 &&
       config_.max_subdivision_depth <= 24 &&
-      config_.max_query_samples >= 9U;
+      config_.max_query_samples >= 9U &&
+      IsFinite(config_.minimum_reference_speed) &&
+      config_.minimum_reference_speed > 0.0;
 }
 
 bool TubeSurfaceValidator::validate(
@@ -614,6 +639,11 @@ bool TubeSurfaceValidator::validate(
   profile.validator_knot_evidence.clear();
   profile.zero_centerline_continuously_certified = false;
   profile.obstacle_certified = false;
+  if (profile.proof_level == TubeProofLevel::NONE ||
+      profile.proof_level == TubeProofLevel::CONTINUOUS_COVER_PROOF) {
+    profile.proof_level = profile.cell_geometry_certified
+        ? TubeProofLevel::FRAME_CELL_PROOF : TubeProofLevel::SAMPLED_EVIDENCE;
+  }
   if (!configurationValid() || !profile.complete || profile.samples.size() < 2U ||
       !path_state_query || !clearance_query || !IsFinite(current_w) ||
       !IsFinite(snapshot_resolution) || snapshot_resolution <= 0.0 ||
@@ -627,6 +657,7 @@ bool TubeSurfaceValidator::validate(
 
   phase_offset_core::GeometryParams geometry_params;
   geometry_params.regularity_margin = regularity_margin;
+  geometry_params.minimum_reference_speed = config_.minimum_reference_speed;
   ValidationContext context;
   context.profile = &profile;
   context.path_state_query = &path_state_query;
@@ -636,6 +667,7 @@ bool TubeSurfaceValidator::validate(
   context.current_w = current_w;
   context.required_clearance = required_clearance;
   context.regularity_margin = regularity_margin;
+  context.minimum_reference_speed = config_.minimum_reference_speed;
   context.cover_epsilon = std::min(1e-6, 0.01 * snapshot_resolution);
   context.config = &config_;
   context.geometry_evaluator = phase_offset_core::GeometryEvaluator(geometry_params);
@@ -707,6 +739,15 @@ bool TubeSurfaceValidator::validate(
   if (!IsFinite(result.min_cover_radius)) result.min_cover_radius = 0.0;
   profile.zero_centerline_continuously_certified =
       ZeroCentrelineCoveredAtAllProfileKnots(profile);
+  const bool continuous_cover_proven = profile.cell_geometry_certified &&
+      profile.combined_regularity_proof_complete &&
+      context.all_non_degenerate_cells_have_frame_proof &&
+      context.frame_proof_cell_count > 0U;
+  if (continuous_cover_proven) {
+    profile.proof_level = TubeProofLevel::CONTINUOUS_COVER_PROOF;
+  } else if (profile.proof_level == TubeProofLevel::NONE) {
+    profile.proof_level = TubeProofLevel::SAMPLED_EVIDENCE;
+  }
   result.zero_centerline_continuously_certified =
       profile.zero_centerline_continuously_certified;
   result.knot_evidence = profile.validator_knot_evidence;

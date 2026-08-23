@@ -14,6 +14,7 @@ class TubeFilter {
   // not Candidate geometry completeness.  A remote preview conflict must
   // truncate this local corridor, never invalidate it wholesale.
   bool filter(TubeProfile& profile, double current_w) const;
+  bool filter(TubeProfile& profile, double current_w, double current_delta) const;
   static bool query(const TubeProfile& profile, double w, TubeBounds& bounds);
 
  private:

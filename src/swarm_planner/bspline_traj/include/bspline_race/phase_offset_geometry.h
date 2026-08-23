@@ -25,6 +25,8 @@ struct PhaseOffsetGeometryParams
 
   // Regularity / level-flight guards.
   double mu_regular = 0.20;   // 1 - kappa*delta >= mu
+  // Minimum norm of the active reference derivative for frame-bound paths.
+  double minimum_reference_speed = 1e-8;
   double v_xy_min = 0.05;     // minimum horizontal |p_w|
   double z_tolerance = 0.10;  // maximum |T_z| allowed
   double max_delta = 1.20;    // |delta| clamp for degenerate queries

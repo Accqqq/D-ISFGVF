@@ -29,6 +29,19 @@ enum class TubeProfileClassification {
   OFFSET_CERTIFIED,
 };
 
+enum class TubeProofLevel {
+  NONE,
+  SAMPLED_EVIDENCE,
+  FRAME_CELL_PROOF,
+  CONTINUOUS_COVER_PROOF,
+};
+
+enum class TubeComponentSelection {
+  NONE,
+  ZERO_CONNECTED,
+  CURRENT_DELTA_CONNECTED,
+};
+
 enum class TubeStopReason {
   NONE,
   INVALID_PATH,
@@ -86,6 +99,8 @@ struct TubeRawSample {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   double w = 0.0;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
   Eigen::Vector3d p = Eigen::Vector3d::Zero();
   Eigen::Vector3d N = Eigen::Vector3d::Zero();
   double raw_lower = 0.0;
@@ -143,6 +158,9 @@ struct TubeRawSample {
   double cell_geometry_inset = 0.0;
   bool filter_input_contains_zero = false;
   bool filtered_contains_zero = false;
+  double regularity_speed_min = 0.0;
+  double regularity_speed_at_delta = 0.0;
+  TubeProofLevel proof_level = TubeProofLevel::NONE;
   TubeCrossSectionReason cross_section_reason = TubeCrossSectionReason::NONE;
   TubeRayTermination positive_ray_termination = TubeRayTermination::UNAVAILABLE;
   TubeRayTermination negative_ray_termination = TubeRayTermination::UNAVAILABLE;
@@ -206,10 +224,28 @@ struct TubeProfile {
   TubeStopReason first_truncated_reason = TubeStopReason::NONE;
   std::uint64_t source_revision = 0U;
   std::uint64_t tube_revision = 0U;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
+  std::uint64_t map_revision = 0U;
+  std::uint64_t profile_revision = 0U;
+  std::string obstacle_contract_id;
+  TubeProofLevel proof_level = TubeProofLevel::NONE;
+  TubeComponentSelection selected_component = TubeComponentSelection::NONE;
+  double current_delta = 0.0;
+  bool current_delta_valid = false;
+  bool current_component_contains_delta = false;
+  bool zero_component_contains_zero = false;
+  bool zero_only = false;
   std::uint64_t snapshot_sequence = 0U;
   double snapshot_resolution = 0.0;
   bool snapshot_provenance_is_immutable = false;
   bool cell_geometry_certified = false;
+  // True only after Builder has combined each cell's frame bounds with the
+  // actual admissible delta interval and verified the configured m_r.
+  bool combined_regularity_proof_complete = false;
+  // Conservative minimum of inf||p_w|| - sup||N_w||*max|delta| over the
+  // certified cells used by this profile.
+  double combined_regularity_speed_min = 0.0;
   std::size_t certified_cell_count = 0U;
   bool raw_complete = false;
   bool filtered_complete = false;
@@ -258,5 +294,7 @@ struct TubeRuntimeStatus {
 
 const char* tubeSourceName(TubeSource source);
 const char* tubeStopReasonName(TubeStopReason reason);
+const char* tubeProofLevelName(TubeProofLevel level);
+const char* tubeComponentSelectionName(TubeComponentSelection selection);
 
 }  // namespace phase_offset_navigation

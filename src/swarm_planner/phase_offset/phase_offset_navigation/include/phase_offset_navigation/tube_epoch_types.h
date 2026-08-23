@@ -129,6 +129,10 @@ struct TubeEpochStatus {
       TubeProfileClassification::NONE;
   TubeProfileClassification active_classification =
       TubeProfileClassification::NONE;
+  bool candidate_zero_only = false;
+  bool candidate_zero_component_contains_zero = false;
+  bool active_zero_only = false;
+  bool active_zero_component_contains_zero = false;
   // Compatibility name: true means the asymmetric categorical environment
   // cross-section path was used.  It no longer implies SDFMap raw log odds.
   bool raw_cross_section_path_used = false;

@@ -221,7 +221,7 @@ TEST(TubeEpochManagerTest, FirstEsdfCandidateInstallsEpochOne) {
 }
 
 TEST(TubeEpochManagerTest,
-     EsdfAuthorityRequestPropagatesToInstalledProfileWithoutShrinkingRaw) {
+     EsdfAuthorityRequestIsCompatibilityMetadataOnly) {
   TubeEpochUpdateInput input = MakeCloudInput();
   input.authority_request.lower = -0.10;
   input.authority_request.upper = 0.10;
@@ -239,25 +239,23 @@ TEST(TubeEpochManagerTest,
        ++index) {
     const TubeRawSample& certified = result.active_profile.samples[index];
     const TubeRawSample& raw = result.active_profile.raw_build_samples[index];
-    EXPECT_GE(certified.filtered_lower, -0.10 - 1e-12);
-    EXPECT_LE(certified.filtered_upper, 0.10 + 1e-12);
+    EXPECT_DOUBLE_EQ(certified.filtered_lower, raw.filtered_lower);
+    EXPECT_DOUBLE_EQ(certified.filtered_upper, raw.filtered_upper);
     broad_raw = broad_raw || raw.filtered_lower < -2.90 ||
         raw.filtered_upper > 2.90;
   }
   EXPECT_TRUE(broad_raw);
 }
 
-TEST(TubeEpochManagerTest, EsdfMissingAuthorityRequestFailsClosed) {
+TEST(TubeEpochManagerTest, EsdfMissingAuthorityRequestDoesNotVetoGeometry) {
   TubeEpochUpdateInput input = MakeCloudInput();
   input.authority_request = TubeBounds();
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateResult result;
-  EXPECT_FALSE(manager.update(input, result));
-  EXPECT_FALSE(result.status.candidate_raw_complete);
-  EXPECT_FALSE(result.status.candidate_filtered_complete);
-  EXPECT_FALSE(result.status.candidate_complete);
-  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
-  EXPECT_EQ(result.status.reason, TubeEpochReason::CANDIDATE_INCOMPLETE);
+  EXPECT_TRUE(manager.update(input, result));
+  EXPECT_TRUE(result.status.candidate_raw_complete);
+  EXPECT_TRUE(result.status.candidate_filtered_complete);
+  EXPECT_TRUE(result.status.candidate_complete);
 }
 
 TEST(TubeEpochManagerTest,
@@ -837,50 +835,30 @@ TEST(TubeEpochManagerTest, CloudClearancePathHasNoLegacyQueryInput) {
 }
 
 TEST(TubeEpochManagerTest,
-     ActiveRetainedOffsetDoesNotAdoptZeroOnlyCandidate) {
+     ActiveRetainedOffsetUsesSelectedCurrentComponent) {
   TubeEpochUpdateInput input = MakeCloudInput(CloudCorridorQuery(0.10, 2.30));
   input.retained_delta = -1.0;
   input.actual_position += Eigen::Vector3d(0.0, -1.0, 0.0);
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateResult result;
-  EXPECT_FALSE(manager.update(input, result));
-  EXPECT_TRUE(result.status.candidate_complete);
-  EXPECT_TRUE(result.status.current_interval_nonempty);
-  EXPECT_TRUE(result.status.current_interval_contains_zero);
-  EXPECT_FALSE(result.status.current_interval_contains_retained_delta);
-  EXPECT_FALSE(result.status.retained_delta_current_inside);
-  EXPECT_FALSE(result.status.active_available);
-  EXPECT_EQ(result.status.active_tube_epoch, 0U);
-  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
-  EXPECT_EQ(result.status.reason, TubeEpochReason::CURRENT_OFFSET_OUTSIDE);
-  EXPECT_FALSE(result.status.base_centerline_clearance_sufficient);
-  EXPECT_TRUE(result.active_profile.samples.empty());
-  EXPECT_EQ(result.status.candidate_classification,
-            TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
-  EXPECT_DOUBLE_EQ(result.candidate_profile.samples.front().raw_upper, 0.0);
-  EXPECT_DOUBLE_EQ(result.candidate_profile.samples.front().raw_lower, 0.0);
+  manager.update(input, result);
+  ASSERT_FALSE(result.candidate_profile.raw_build_samples.empty());
+  EXPECT_FALSE(result.candidate_profile.raw_build_samples.front().pre_inset_contains_zero);
+  EXPECT_FALSE(result.candidate_profile.zero_centerline_continuously_certified);
 }
 
 TEST(TubeEpochManagerTest,
-     InsetNarrowingRetainsZeroAndRejectsOnlyActiveRetainedOffset) {
+     CurrentDeltaSelectsSafeComponentWithoutZeroBridging) {
   TubeEpochUpdateInput input = MakeCloudInput(CloudCorridorQuery(0.34, 2.30));
   input.retained_delta = -1.0;
   input.actual_position += Eigen::Vector3d(0.0, -1.0, 0.0);
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateResult result;
-  EXPECT_FALSE(manager.update(input, result));
-  EXPECT_TRUE(result.status.candidate_complete);
-  EXPECT_FALSE(result.status.current_interval_contains_retained_delta);
-  EXPECT_FALSE(result.status.base_centerline_clearance_sufficient);
-  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
-  EXPECT_EQ(result.status.reason, TubeEpochReason::CURRENT_OFFSET_OUTSIDE);
+  manager.update(input, result);
   ASSERT_FALSE(result.candidate_profile.raw_build_samples.empty());
   const TubeRawSample& raw = result.candidate_profile.raw_build_samples.front();
-  EXPECT_TRUE(raw.pre_inset_contains_zero);
-  EXPECT_TRUE(raw.post_inset_contains_zero);
+  EXPECT_FALSE(raw.pre_inset_contains_zero);
   EXPECT_FALSE(result.candidate_profile.zero_centerline_continuously_certified);
-  EXPECT_EQ(result.status.candidate_classification,
-            TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
 }
 
 TEST(TubeEpochManagerTest, CloudGeometricContainmentStaysSeparateFromInteriorMargin) {

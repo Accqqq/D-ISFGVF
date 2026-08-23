@@ -14,6 +14,9 @@ namespace phase_offset_navigation {
 struct TubeSurfaceValidatorConfig {
   int max_subdivision_depth = 12;
   std::size_t max_query_samples = 250000U;
+  // The configured lower bound on the active reference speed.  This is
+  // dimensionful and must match TubeCrossSectionConfig::minimum_reference_speed.
+  double minimum_reference_speed = 1e-8;
 };
 
 struct TubeSurfaceValidationResult {

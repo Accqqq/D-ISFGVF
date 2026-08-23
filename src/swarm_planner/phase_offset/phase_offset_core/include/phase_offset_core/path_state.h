@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 namespace phase_offset_core {
 
@@ -14,6 +15,19 @@ struct PathDifferentialState {
   Eigen::Vector3d p_w = Eigen::Vector3d::Zero();
   Eigen::Vector3d p_ww = Eigen::Vector3d::Zero();
   double w = 0.0;
+  // Immutable path/frame provenance. Zero denotes legacy synthetic input
+  // which has not yet been bound to a path owner.
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
+  Eigen::Vector3d T = Eigen::Vector3d::Zero();
+  Eigen::Vector3d N = Eigen::Vector3d::Zero();
+  Eigen::Vector3d N_w = Eigen::Vector3d::Zero();
+  bool frame_valid = false;
+  std::string frame_provenance;
+  // Optional owner-provided admissible range used only to scale adaptive
+  // refinement. The Tube remains authoritative for final bounds.
+  double admissible_delta_lower = 0.0;
+  double admissible_delta_upper = 0.0;
   bool valid = false;
 };
 
@@ -27,6 +41,8 @@ struct PathCellGeometryCertificate {
 
   double w0 = 0.0;
   double w1 = 0.0;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
   // Identifies the immutable ContinuousPhasePath segment which produced the
   // certificate.  Zero is reserved for an absent/unknown identity.
   std::uint64_t segment_identity = 0U;
@@ -55,6 +71,15 @@ struct PathCellGeometryCertificate {
   double midpoint_position_variation_bound = 0.0;
   double chord_deviation_bound = 0.0;
 
+  // Frame-bound and combined regularity evidence carried with the cell.
+  bool normal_frame_proof_complete = false;
+  bool combined_regularity_proof_complete = false;
+  double regularity_speed_min = 0.0;
+  double regularity_speed_max = 0.0;
+  double admissible_delta_lower = 0.0;
+  double admissible_delta_upper = 0.0;
+  std::string provenance;
+
   bool valid = false;
   bool complete = false;
 };
@@ -73,7 +98,7 @@ inline bool pathCellGeometryCertificateIsComplete(
       std::isfinite(certificate.inf_p_w_norm) &&
       certificate.inf_p_w_norm > 0.0 &&
       std::isfinite(certificate.inf_horizontal_p_w_norm) &&
-      certificate.inf_horizontal_p_w_norm > 0.0 &&
+      certificate.inf_horizontal_p_w_norm >= 0.0 &&
       std::isfinite(certificate.sup_p_w_norm) &&
       certificate.sup_p_w_norm >= certificate.inf_p_w_norm &&
       std::isfinite(certificate.sup_p_ww_norm) &&
@@ -91,7 +116,24 @@ inline bool pathCellGeometryCertificateIsComplete(
       std::isfinite(certificate.midpoint_position_variation_bound) &&
       certificate.midpoint_position_variation_bound >= 0.0 &&
       std::isfinite(certificate.chord_deviation_bound) &&
-      certificate.chord_deviation_bound >= 0.0;
+      certificate.chord_deviation_bound >= 0.0 &&
+      (certificate.path_revision == 0U ||
+       certificate.normal_frame_proof_complete);
+}
+
+inline bool pathCellGeometryCertificateMatches(
+    const PathCellGeometryCertificate& certificate,
+    const std::uint64_t path_revision,
+    const std::uint64_t frame_revision) {
+  if (!pathCellGeometryCertificateIsComplete(certificate)) return false;
+  // Legacy value-only certificates use zero revisions. Once either side is
+  // revision-bound, both identities must agree exactly.
+  if (path_revision == 0U && frame_revision == 0U &&
+      certificate.path_revision == 0U && certificate.frame_revision == 0U) {
+    return true;
+  }
+  return certificate.path_revision == path_revision &&
+      certificate.frame_revision == frame_revision;
 }
 
 }  // namespace phase_offset_core

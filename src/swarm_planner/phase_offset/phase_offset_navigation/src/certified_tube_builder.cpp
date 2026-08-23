@@ -43,6 +43,17 @@ enum class InwardFamily {
   NEGATIVE_ONLY,
 };
 
+TubeSurfaceValidatorConfig NormalizeValidatorConfig(
+    const TubeBuilderConfig& builder_config,
+    TubeSurfaceValidatorConfig validator_config) {
+  // A single configured m_r governs GeometryEvaluator, cross-section, Builder,
+  // and continuous validation.  Keep the validator's public config usable for
+  // standalone callers, but normalize the production composition boundary.
+  validator_config.minimum_reference_speed =
+      builder_config.cross_section.minimum_reference_speed;
+  return validator_config;
+}
+
 struct InwardCandidateSelection {
   TubeProfile profile;
   TubeSurfaceValidationResult validation;
@@ -328,9 +339,22 @@ void PreserveFullRibbonFailureProvenance(
       full_width_failure.diagnostics.first_stop_reason;
 }
 
+void PreserveValidationFailureProvenance(
+    TubeProfile& profile, const TubeSurfaceValidationResult& validation) {
+  profile.diagnostics.first_stop_reason =
+      static_cast<int>(validation.first_failure_reason);
+  profile.diagnostics.first_invalid_w = validation.first_failure_w;
+}
+
 void CollapseToPlannerZeroBaseline(
     TubeProfile& profile,
     const bool preserve_raw_environment_evidence = false) {
+  bool had_nonzero_capacity = false;
+  for (const TubeRawSample& sample : profile.samples) {
+    had_nonzero_capacity = had_nonzero_capacity ||
+        sample.filtered_lower < -kCapacityTolerance ||
+        sample.filtered_upper > kCapacityTolerance;
+  }
   for (TubeRawSample& sample : profile.samples) {
     if (!preserve_raw_environment_evidence) {
       sample.raw_lower = 0.0;
@@ -359,6 +383,11 @@ void CollapseToPlannerZeroBaseline(
   profile.filtered_complete = profile.raw_complete;
   profile.complete = profile.raw_complete;
   profile.obstacle_certified = false;
+  profile.current_component_contains_delta =
+      profile.current_delta_valid && std::abs(profile.current_delta) <= 1e-10;
+  profile.zero_component_contains_zero = profile.current_component_contains_delta;
+  profile.zero_only = profile.current_component_contains_delta &&
+      !had_nonzero_capacity;
   profile.zero_centerline_continuously_certified = false;
   profile.classification = TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
 }
@@ -370,8 +399,11 @@ CertifiedTubeBuilder::CertifiedTubeBuilder(
     const TubeFilterConfig& filter_config,
     const TubeSurfaceValidatorConfig& validator_config)
     : builder_(builder_config), filter_(filter_config),
-      surface_validator_(validator_config), builder_config_(builder_config),
-      validator_config_(validator_config) {}
+      surface_validator_(NormalizeValidatorConfig(builder_config,
+                                                  validator_config)),
+      builder_config_(builder_config),
+      validator_config_(NormalizeValidatorConfig(builder_config,
+                                                 validator_config)) {}
 
 bool CertifiedTubeBuilder::configurationValid() const {
   return builder_.configurationValid() && filter_.configurationValid() &&
@@ -385,18 +417,16 @@ bool CertifiedTubeBuilder::build(const CertifiedTubeBuildInput& input,
 
   TubeProfile candidate;
   const bool cloud_clearance_source = input.source == TubeSource::ESDF;
-  if (cloud_clearance_source &&
-      !AuthorityRequestValid(input.authority_request)) {
-    return false;
-  }
   const bool raw_complete = cloud_clearance_source
       ? builder_.buildCloudClearance(
             input.source, input.preview_path, input.cloud_clearance_query,
             input.path_state_query, input.path_cell_bound_query,
             input.cloud_snapshot_resolution, input.current_w,
-            input.path_source_revision, input.tube_revision, candidate)
+            input.path_source_revision, input.tube_revision, candidate,
+            input.current_delta)
       : builder_.build(input.source, input.preview_path, input.distance_query,
-                       input.path_source_revision, input.tube_revision, candidate);
+                       input.path_source_revision, input.tube_revision, candidate,
+                       input.current_delta);
   if (cloud_clearance_source) {
     // These labels describe the exact immutable observation used by the raw
     // build.  They are provenance, never a second query or profile identity.
@@ -404,271 +434,115 @@ bool CertifiedTubeBuilder::build(const CertifiedTubeBuildInput& input,
     candidate.snapshot_resolution = input.cloud_snapshot_resolution;
     candidate.snapshot_provenance_is_immutable =
         input.map_observation_is_snapshot && input.map_observation_sequence != 0U;
+    candidate.map_revision = input.map_observation_sequence;
   }
 
-  bool filtered_complete = raw_complete && filter_.filter(candidate, input.current_w);
-  if (filtered_complete) {
-    if (!HasNonzeroCapacity(candidate)) {
-      CollapseToPlannerZeroBaseline(candidate, cloud_clearance_source);
-    } else if (cloud_clearance_source) {
-      // Narrow only a post-Filter certification copy.  The raw/environment
-      // fields and raw_build_samples remain the complete I_geo evidence used
-      // by Candidate diagnostics and markers.
-      TubeProfile authority_candidate;
-      if (!PrepareNarrowedCandidate(
-              candidate, &input.authority_request, 1.0,
-              InwardFamily::BOTH_SIDED, true, authority_candidate)) {
-        candidate.diagnostics.invalid_reason =
-            "authority request intersection is invalid";
-        result.profile = candidate;
-        result.raw_complete = candidate.raw_complete;
-        result.filtered_complete = candidate.filtered_complete;
-        return false;
-      }
-      candidate = authority_candidate;
-      double authority_current_width = 0.0;
-      if (!CurrentIntervalWidth(candidate, input.current_w,
-                                authority_current_width)) {
-        candidate.diagnostics.invalid_reason =
-            "authority request current interval is invalid";
-        result.profile = candidate;
-        result.raw_complete = candidate.raw_complete;
-        result.filtered_complete = candidate.filtered_complete;
-        return false;
-      }
-      if (!HasNonzeroCapacity(candidate)) {
-        candidate.diagnostics.invalid_reason =
-            "authority request has no nonzero capacity; using planner zero baseline";
-        CollapseToPlannerZeroBaseline(candidate, true);
-        filtered_complete = candidate.complete;
-      } else {
-        // Keep the one immutable authority-intersected result as the source for
-        // every inward candidate.  The production Builder is deliberately not
-        // re-entered: all retries use this exact snapshot, path evaluator, and
-        // clearance query, and can never widen back to environmental I_geo.
-        const TubeProfile original_filtered_profile = candidate;
-        result.surface_validation_attempted = true;
-        const bool full_width_complete = surface_validator_.validate(
-            candidate, input.current_w, input.path_state_query,
-            input.path_cell_bound_query, input.cloud_clearance_query,
-            input.cloud_snapshot_resolution,
-            builder_config_.cross_section.planner_safe_distance,
-            builder_config_.cross_section.regularity_margin,
-            result.surface_validation);
-        filtered_complete = full_width_complete;
-        if (!full_width_complete) {
-        if (candidate.diagnostics.invalid_reason.empty()) {
-          candidate.diagnostics.invalid_reason =
-              result.surface_validation.limit_exceeded
-                  ? "nonzero surface validation limit; using planner zero baseline"
-                  : "nonzero surface validation failed; using planner zero baseline";
-        }
-        if (result.surface_validation.first_failure_reason !=
-            TubeStopReason::NONE) {
-          candidate.diagnostics.first_invalid_w =
-              result.surface_validation.first_failure_w;
-          candidate.diagnostics.first_stop_reason = static_cast<int>(
-              result.surface_validation.first_failure_reason);
-        }
-        const TubeProfile full_width_failure = candidate;
-        const TubeSurfaceValidationResult full_width_validation =
-            result.surface_validation;
-        const bool retryable_failure = RetryableValidationFailure(
-            result.surface_validation, validator_config_);
-        if (!retryable_failure) {
-          candidate.diagnostics.invalid_reason = FullWidthTerminalReason(
-              result.surface_validation, validator_config_);
-        }
-
-        // Query-limit, malformed-path, and configuration failures are
-        // terminal.  Other observed surface failures may be repaired only by
-        // a bounded inward candidate that is independently revalidated.  A
-        // successful candidate never inherits the failed geometry; it only
-        // inherits the original full-width failure provenance.
-        std::size_t inward_attempt_count = 0U;
-        bool have_last_inward_validation = false;
-        TubeSurfaceValidationResult last_inward_validation;
-        double current_width = 0.0;
-        const bool current_width_valid = CurrentIntervalWidth(
-            original_filtered_profile, input.current_w, current_width);
-        // If the immutable filtered profile already has zero current width,
-        // every permitted inward family/scale has the same exact current
-        // interval: PrepareNarrowedCandidate only scales bounds toward zero and
-        // never widens them.  No narrower candidate can therefore become an
-        // offset-certified current-connected ribbon.  This is a proof-local
-        // short circuit, not a new safety gate; nonzero current intervals keep
-        // the existing independently validated inward search unchanged.
-        const bool exact_current_zero_capacity = current_width_valid &&
-            current_width <= kCapacityTolerance;
-        bool zero_limit_termination = false;
-        TubeSurfaceValidationResult zero_limit_validation;
-        const bool zero_limit_eligible = retryable_failure &&
-            current_width_valid && current_width > kCapacityTolerance &&
-            original_filtered_profile.cell_geometry_certified &&
-            static_cast<bool>(input.path_cell_bound_query);
-        if (zero_limit_eligible) {
-          TubeProfile zero_limit;
-          if (PrepareNarrowedCandidate(
-                  original_filtered_profile, nullptr, 0.0,
-                  InwardFamily::BOTH_SIDED, true, zero_limit)) {
-            bool zero_limit_certificate_contract_valid = true;
-            const PathCellBoundQuery zero_limit_cell_bound_query =
-                [&](const double w0, const double w1,
-                    phase_offset_core::PathCellGeometryCertificate& certificate) {
-                  const bool complete = input.path_cell_bound_query(
-                      w0, w1, certificate);
-                  const bool matched = complete &&
-                      phase_offset_core::pathCellGeometryCertificateIsComplete(
-                          certificate) &&
-                      IsFinite(certificate.w0) && IsFinite(certificate.w1) &&
-                      std::abs(certificate.w0 - w0) <= 1e-8 &&
-                      std::abs(certificate.w1 - w1) <= 1e-8;
-                  if (!matched) zero_limit_certificate_contract_valid = false;
-                  return complete;
-                };
-            const bool zero_limit_complete = surface_validator_.validate(
-                zero_limit, input.current_w, input.path_state_query,
-                zero_limit_cell_bound_query, input.cloud_clearance_query,
-                input.cloud_snapshot_resolution,
-                builder_config_.cross_section.planner_safe_distance,
-                builder_config_.cross_section.regularity_margin,
-                zero_limit_validation);
-            zero_limit_termination = !zero_limit_complete &&
-                !QueryBudgetExhausted(zero_limit_validation, validator_config_) &&
-                zero_limit_certificate_contract_valid;
-          }
-        }
-        if (retryable_failure && !exact_current_zero_capacity &&
-            !zero_limit_termination) {
-          InwardCandidateSelection best;
-          const InwardFamily families[] = {
-              InwardFamily::BOTH_SIDED,
-              InwardFamily::POSITIVE_ONLY,
-              InwardFamily::NEGATIVE_ONLY,
-          };
-          const int family_count = static_cast<int>(sizeof(families) /
-                                                    sizeof(families[0]));
-          bool stop_search = false;
-          for (int family_index = 0;
-               family_index < family_count && !stop_search; ++family_index) {
-            const InwardFamily family = families[family_index];
-            double scale = family == InwardFamily::BOTH_SIDED ? 0.5 : 1.0;
-            std::size_t level = 0U;
-            while (IsFinite(scale) && scale > kCapacityTolerance) {
-              TubeProfile inward;
-              if (!PrepareNarrowedCandidate(
-                      original_filtered_profile, nullptr, scale, family,
-                      false, inward)) {
-                break;
-              }
-
-              TubeSurfaceValidationResult inward_validation;
-              ++inward_attempt_count;
-              const bool inward_complete = surface_validator_.validate(
-                  inward, input.current_w, input.path_state_query,
-                  input.path_cell_bound_query, input.cloud_clearance_query,
-                  input.cloud_snapshot_resolution,
-                  builder_config_.cross_section.planner_safe_distance,
-                  builder_config_.cross_section.regularity_margin,
-                  inward_validation);
-              last_inward_validation = inward_validation;
-              have_last_inward_validation = true;
-              if (!inward_complete) {
-                if (!RetryableValidationFailure(inward_validation,
-                                                validator_config_)) {
-                  stop_search = true;
-                  break;
-                }
-                scale *= 0.5;
-                ++level;
-                continue;
-              }
-
-              double current_width = 0.0;
-              const bool current_width_valid = CurrentIntervalWidth(
-                  inward, input.current_w, current_width);
-              if (!current_width_valid ||
-                  current_width <= kCapacityTolerance ||
-                  !HasNonzeroCapacity(inward) || !inward.obstacle_certified ||
-                  !inward.zero_centerline_continuously_certified) {
-                // A complete zero-only or non-current-connected result is not
-                // an OFFSET_CERTIFIED candidate.  It is not evidence that a
-                // smaller attempt is safe, so continue the fixed halving
-                // sequence for this family.
-                scale *= 0.5;
-                ++level;
-                continue;
-              }
-
-              InwardCandidateSelection selection;
-              selection.profile = inward;
-              selection.validation = inward_validation;
-              selection.current_width = current_width;
-              selection.certified_forward_horizon =
-                  CertifiedForwardHorizon(inward, input.current_w);
-              selection.family_order = family_index;
-              selection.level = level;
-              selection.valid = true;
-              if (BetterInwardCandidate(selection, best)) {
-                best = selection;
-              }
-              // More inward candidates in this family cannot improve the
-              // primary selection key (current interval width).  The other
-              // families still get their deterministic opportunity.
+  candidate.current_delta = input.current_delta;
+  candidate.current_delta_valid = IsFinite(input.current_delta);
+  bool filtered_complete = raw_complete &&
+      filter_.filter(candidate, input.current_w, input.current_delta);
+  if (filtered_complete && !HasNonzeroCapacity(candidate)) {
+    CollapseToPlannerZeroBaseline(candidate, cloud_clearance_source);
+  } else if (filtered_complete && cloud_clearance_source) {
+    const TubeProfile full_width_profile = candidate;
+    result.surface_validation_attempted = true;
+    const bool full_width_complete = surface_validator_.validate(
+        candidate, input.current_w, input.path_state_query,
+        input.path_cell_bound_query, input.cloud_clearance_query,
+        input.cloud_snapshot_resolution,
+        builder_config_.cross_section.planner_safe_distance,
+        builder_config_.cross_section.regularity_margin,
+        result.surface_validation);
+    filtered_complete = full_width_complete;
+    if (full_width_complete) {
+      candidate.classification = TubeProfileClassification::OFFSET_CERTIFIED;
+    } else {
+      PreserveValidationFailureProvenance(candidate,
+                                          result.surface_validation);
+      const TubeSurfaceValidationResult full_width_validation =
+          result.surface_validation;
+      const bool retryable = RetryableValidationFailure(
+          result.surface_validation, validator_config_);
+      InwardCandidateSelection best;
+      const InwardFamily families[] = {InwardFamily::BOTH_SIDED,
+                                       InwardFamily::POSITIVE_ONLY,
+                                       InwardFamily::NEGATIVE_ONLY};
+      std::size_t attempts = 0U;
+      TubeSurfaceValidationResult last_validation;
+      bool have_last = false;
+      if (retryable) {
+        for (int family_index = 0; family_index < 3; ++family_index) {
+          const InwardFamily family = families[family_index];
+          double scale = family == InwardFamily::BOTH_SIDED ? 0.5 : 1.0;
+          std::size_t level = 0U;
+          while (scale > kCapacityTolerance) {
+            TubeProfile inward;
+            if (!PrepareNarrowedCandidate(full_width_profile, nullptr, scale,
+                                           family, false, inward)) {
               break;
             }
-          }
-
-          if (best.valid) {
-            candidate = best.profile;
-            result.surface_validation = best.validation;
-            PreserveFullRibbonFailureProvenance(candidate, full_width_failure);
-            MarkInwardRepairOutcome(candidate, full_width_validation);
-            candidate.classification =
-                TubeProfileClassification::OFFSET_CERTIFIED;
-            filtered_complete = candidate.complete;
-          }
-        }
-        if (!filtered_complete) {
-          // Fail closed if no strict inward candidate was independently
-          // certified.  `raw_build_samples`, snapshot identity, and the
-          // original full-width Validator diagnostics remain attached.
-          candidate = full_width_failure;
-          if (retryable_failure) {
-            if (exact_current_zero_capacity) {
-              candidate.diagnostics.invalid_reason =
-                  InwardSearchSkippedForZeroCurrentReason(current_width);
-            } else if (zero_limit_termination) {
-              candidate.diagnostics.invalid_reason =
-                  InwardSearchSkippedForZeroLimitReason(zero_limit_validation);
-            } else {
-              candidate.diagnostics.invalid_reason = InwardSearchFailureReason(
-                  inward_attempt_count, have_last_inward_validation,
-                  last_inward_validation);
+            TubeSurfaceValidationResult validation;
+            ++attempts;
+            const bool valid = surface_validator_.validate(
+                inward, input.current_w, input.path_state_query,
+                input.path_cell_bound_query, input.cloud_clearance_query,
+                input.cloud_snapshot_resolution,
+                builder_config_.cross_section.planner_safe_distance,
+                builder_config_.cross_section.regularity_margin, validation);
+            last_validation = validation;
+            have_last = true;
+            if (valid) {
+              double width = 0.0;
+              if (CurrentIntervalWidth(inward, input.current_w, width) &&
+                  width > kCapacityTolerance && HasNonzeroCapacity(inward) &&
+                  inward.zero_centerline_continuously_certified) {
+                InwardCandidateSelection selection;
+                selection.profile = inward;
+                selection.validation = validation;
+                selection.current_width = width;
+                selection.certified_forward_horizon =
+                    CertifiedForwardHorizon(inward, input.current_w);
+                selection.family_order = family_index;
+                selection.level = level;
+                selection.valid = true;
+                if (BetterInwardCandidate(selection, best)) best = selection;
+                break;
+              }
+            } else if (!RetryableValidationFailure(validation,
+                                                   validator_config_)) {
+              break;
             }
-          } else {
-            candidate.diagnostics.invalid_reason = FullWidthTerminalReason(
-                full_width_validation, validator_config_);
+            scale *= 0.5;
+            ++level;
           }
-          CollapseToPlannerZeroBaseline(candidate, true);
-          filtered_complete = candidate.complete;
-        }
-        } else if (authority_current_width <= kCapacityTolerance) {
-          candidate.diagnostics.invalid_reason =
-              "authority request has exact-current zero capacity; using planner zero baseline";
-          CollapseToPlannerZeroBaseline(candidate, true);
-          filtered_complete = candidate.complete;
-        } else {
-          candidate.classification = HasNonzeroCapacity(candidate)
-              ? TubeProfileClassification::OFFSET_CERTIFIED
-              : TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
         }
       }
-    } else {
-      candidate.classification = HasNonzeroCapacity(candidate)
-          ? TubeProfileClassification::OFFSET_CERTIFIED
-          : TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+      if (best.valid) {
+        candidate = best.profile;
+        result.surface_validation = best.validation;
+        PreserveFullRibbonFailureProvenance(candidate, full_width_profile);
+        PreserveValidationFailureProvenance(candidate,
+                                            full_width_validation);
+        candidate.diagnostics.invalid_reason =
+            "full-width surface failed; retained inward certified ribbon";
+        candidate.classification = TubeProfileClassification::OFFSET_CERTIFIED;
+        filtered_complete = true;
+      } else {
+        candidate = full_width_profile;
+        PreserveValidationFailureProvenance(candidate,
+                                            result.surface_validation);
+        candidate.diagnostics.invalid_reason = retryable
+            ? InwardSearchFailureReason(attempts, have_last, last_validation)
+            : FullWidthTerminalReason(result.surface_validation,
+                                       validator_config_);
+        CollapseToPlannerZeroBaseline(candidate, true);
+        filtered_complete = candidate.complete;
+      }
     }
+  } else if (filtered_complete) {
+    candidate.classification = HasNonzeroCapacity(candidate)
+        ? TubeProfileClassification::OFFSET_CERTIFIED
+        : TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
   }
 
   result.profile = candidate;

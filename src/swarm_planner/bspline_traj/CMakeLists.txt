@@ -43,6 +43,7 @@ include_directories(
 add_library(continuous_phase_path
   src/UniformBspline_3d.cpp
   src/continuous_phase_path.cpp
+  src/continuous_phase_normal_frame.cpp
 )
 target_link_libraries(continuous_phase_path
   ${catkin_LIBRARIES}
@@ -64,6 +65,15 @@ add_library(phase_offset_active_adapter
 target_link_libraries(phase_offset_active_adapter
   phase_offset_core
   isf_reference_kernel
+)
+
+add_library(phase_offset_executed_reference_query
+  src/integration/phase_offset_executed_reference_query.cpp
+)
+target_link_libraries(phase_offset_executed_reference_query
+  continuous_phase_path
+  phase_offset_core
+  phase_offset_navigation
 )
 
 add_library(phase_offset_environment_evidence_query
@@ -97,6 +107,7 @@ add_library(phase_offset_matched_adapter
 )
 target_link_libraries(phase_offset_matched_adapter
   continuous_phase_path
+  phase_offset_executed_reference_query
   phase_offset_core
   phase_offset_navigation
   plan_env
@@ -134,6 +145,14 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(gvf_switch_policy_test test/gvf_switch_policy_test.cpp)
   catkin_add_gtest(gvf_lifted_visualization_test test/gvf_lifted_visualization_test.cpp)
   catkin_add_gtest(continuous_phase_path_test test/continuous_phase_path_test.cpp)
+  catkin_add_gtest(continuous_phase_normal_frame_test
+    test/continuous_phase_normal_frame_test.cpp)
+  # Test-only legacy planar geometry coverage.  Keep this target distinct from
+  # phase_offset_core's phase_offset_geometry_test; phase_offset_geometry.cpp
+  # is intentionally linked here only and is not a production library source.
+  catkin_add_gtest(bspline_race_phase_offset_geometry_test
+    test/phase_offset_geometry_test.cpp
+    src/phase_offset_geometry.cpp)
   catkin_add_gtest(fastplanner_parameterization_test
     test/fastplanner_parameterization_test.cpp)
   catkin_add_gtest(phase_offset_shadow_adapter_test
@@ -170,6 +189,8 @@ if(CATKIN_ENABLE_TESTING)
     plan_env
     ${catkin_LIBRARIES}
   )
+  catkin_add_gtest(phase_offset_executed_reference_query_test
+    test/phase_offset_executed_reference_query_test.cpp)
   if(TARGET phase_offset_shadow_adapter_test)
     target_link_libraries(phase_offset_shadow_adapter_test
       phase_offset_shadow_adapter
@@ -187,6 +208,14 @@ if(CATKIN_ENABLE_TESTING)
       isf_reference_kernel
       phase_offset_core
       ${catkin_LIBRARIES}
+    )
+  endif()
+  if(TARGET phase_offset_executed_reference_query_test)
+    target_link_libraries(phase_offset_executed_reference_query_test
+      phase_offset_executed_reference_query
+      continuous_phase_path
+      phase_offset_core
+      phase_offset_navigation
     )
   endif()
   if(TARGET phase_offset_matched_adapter_test)
@@ -289,6 +318,13 @@ if(CATKIN_ENABLE_TESTING)
       bspline_gvf
       ${catkin_LIBRARIES}
       ${NLOPT_LIBRARIES}
+    )
+  endif()
+  if(TARGET continuous_phase_normal_frame_test)
+    target_link_libraries(continuous_phase_normal_frame_test
+      continuous_phase_path
+      phase_offset_core
+      ${catkin_LIBRARIES}
     )
   endif()
   if(TARGET gvf_switch_policy_test)

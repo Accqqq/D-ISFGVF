@@ -1,6 +1,8 @@
 #include "bspline_race/integration/phase_offset_matched_adapter.h"
 #include "bspline_race/integration/phase_offset_tube_epoch_diagnostics.h"
 #include "bspline_race/integration/phase_offset_tube_markers.h"
+#include <bspline_race/continuous_phase_normal_frame.h>
+#include <bspline_race/integration/phase_offset_executed_reference_query.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -79,6 +81,13 @@ bool IsOffsetCertifiedProfile(
       phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
 }
 
+bool FrameMatchesRevision(
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame,
+    const std::uint64_t revision) {
+  return frame && revision != 0U && frame->pathRevision() == revision &&
+      frame->frameRevision() != 0U;
+}
+
 constexpr double kPreparedCoverageTolerance = 1e-10;
 // Must remain aligned with TubeBuilder's frozen current-anchor contract.  It
 // is used only to prove that this adapter-side partition contains exactly one
@@ -147,10 +156,21 @@ bool PathStatesEquivalent(
 
 bool PathStateMatchesOwner(
     const phase_offset_core::PathDifferentialState& state,
-    const std::shared_ptr<const ContinuousPhasePath>& owner) {
+    const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   if (!StateFiniteAndValid(state) || !owner || owner->empty()) return false;
   ContinuousPhasePathState evaluated;
-  return owner->evaluate(state.w, evaluated, false) && evaluated.valid &&
+  // A missing shared frame is accepted only for legacy synthetic fixtures;
+  // production owner/profile checks pass the handoff frame explicitly.
+  const bool evaluated_ok = shared_frame
+      ? shared_frame->evaluatePathState(state.w, evaluated)
+      : (owner->pathRevision() == 0U
+          ? owner->evaluate(state.w, evaluated, false)
+          : ContinuousPhaseNormalFrame(
+                owner, owner->pathRevision(), owner->pathRevision())
+                .evaluatePathState(state.w, evaluated));
+  return evaluated_ok && evaluated.valid &&
       IsFinite(evaluated.p) && IsFinite(evaluated.dp_dw) &&
       IsFinite(evaluated.d2p_dw2) &&
       (evaluated.p - state.p).norm() <= kPreparedCoverageTolerance &&
@@ -161,10 +181,20 @@ bool PathStateMatchesOwner(
 bool EvaluateOwnerState(
     const std::shared_ptr<const ContinuousPhasePath>& owner,
     const double w,
-    phase_offset_core::PathDifferentialState& state) {
+    phase_offset_core::PathDifferentialState& state,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   if (!owner || owner->empty() || !IsFinite(w)) return false;
   ContinuousPhasePathState evaluated;
-  if (!owner->evaluate(w, evaluated, false)) return false;
+  if (shared_frame) {
+    if (!shared_frame->evaluatePathState(w, evaluated)) return false;
+  } else if (owner->pathRevision() == 0U) {
+    if (!owner->evaluate(w, evaluated, false)) return false;
+  } else {
+    const ContinuousPhaseNormalFrame frame(
+        owner, owner->pathRevision(), owner->pathRevision());
+    if (!frame.evaluatePathState(w, evaluated)) return false;
+  }
   state = ConvertContinuousPhasePathStateForActive(evaluated, w);
   return StateFiniteAndValid(state);
 }
@@ -178,6 +208,7 @@ bool CaptureMatchesPair(const PathTubePairPinCapture& capture,
       capture.map_observation_sequence == pair->map_observation_sequence &&
       capture.map_observation_is_snapshot == pair->map_observation_is_snapshot &&
       capture.path_owner == pair->path_owner &&
+      capture.frame_owner == pair->frame_owner &&
       capture.frozen_cloud_occupancy_snapshot ==
           pair->frozen_cloud_occupancy_snapshot &&
       capture.full_path_samples == pair->full_path_samples &&
@@ -203,6 +234,7 @@ MakeFutureStepContract(
     const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile,
     const guidance::IsfGains& gains,
     const double regularity_margin,
+    const double minimum_reference_speed,
     const double tube_update_period,
     const double min_certified_forward_w) {
   phase_offset_navigation::RuntimeFutureStepContract contract;
@@ -213,7 +245,9 @@ MakeFutureStepContract(
       profile->samples.size() < 2U || !std::isfinite(tube_update_period) ||
       tube_update_period <= 0.0 || !std::isfinite(min_certified_forward_w) ||
       min_certified_forward_w < 0.0 || !std::isfinite(regularity_margin) ||
-      regularity_margin <= 0.0 || regularity_margin >= 1.0) {
+      regularity_margin <= 0.0 || regularity_margin >= 1.0 ||
+      !std::isfinite(minimum_reference_speed) ||
+      minimum_reference_speed <= 0.0) {
     return contract;
   }
   contract.tube_update_period = tube_update_period;
@@ -272,7 +306,8 @@ MakeFutureStepContract(
       return StateFiniteAndValid(state);
     };
   }
-  contract.evaluate = [state_query, gains, regularity_margin](
+  contract.evaluate = [state_query, gains, regularity_margin,
+                       minimum_reference_speed](
       const phase_offset_navigation::RuntimeFutureStepInput& input,
       phase_offset_navigation::RuntimeFutureStepResult& output) {
     output = phase_offset_navigation::RuntimeFutureStepResult();
@@ -294,6 +329,7 @@ MakeFutureStepContract(
     // Runtime independently rechecks this exact reference against its own
     // evaluator, so this only binds the owner/guidance side of the contract.
     geometry_params.regularity_margin = regularity_margin;
+    geometry_params.minimum_reference_speed = minimum_reference_speed;
     phase_offset_core::GeometryEvaluator evaluator(geometry_params);
     phase_offset_core::PhaseOffsetGeometryState geometry;
     if (!evaluator.evaluate(output.path, input.matched_position, input.delta,
@@ -339,12 +375,14 @@ bool PreparedSamplesOrderedAndFinite(const MatchedAdapterPathSamples& samples) {
 
 bool PreparedSamplesMatchOwner(
     const MatchedAdapterPathSamples& samples,
-    const std::shared_ptr<const ContinuousPhasePath>& owner) {
+    const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   if (!owner || owner->empty() || !PreparedSamplesOrderedAndFinite(samples)) {
     return false;
   }
   for (const phase_offset_core::PathDifferentialState& sample : samples) {
-    if (!PathStateMatchesOwner(sample, owner)) {
+    if (!PathStateMatchesOwner(sample, owner, shared_frame)) {
       return false;
     }
   }
@@ -411,20 +449,29 @@ bool ProfileStructurallyCoversPreparedRange(
 bool ProfileSamplesMatchOwner(
     const phase_offset_navigation::TubeProfile& profile,
     const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const double regularity_margin) {
+    const double regularity_margin,
+    const double minimum_reference_speed,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   if (!PreparedProfileSamplesOrderedAndComplete(profile) || !owner ||
       owner->empty() || !IsFinite(regularity_margin) ||
-      regularity_margin <= 0.0 || regularity_margin >= 1.0) {
+      regularity_margin <= 0.0 || regularity_margin >= 1.0 ||
+      !IsFinite(minimum_reference_speed) || minimum_reference_speed <= 0.0) {
     return false;
   }
   phase_offset_core::GeometryParams params;
   params.regularity_margin = regularity_margin;
+  params.minimum_reference_speed = minimum_reference_speed;
   phase_offset_core::GeometryEvaluator evaluator(params);
   for (const phase_offset_navigation::TubeRawSample& sample : profile.samples) {
     phase_offset_core::PathDifferentialState owner_state;
     phase_offset_core::PhaseOffsetGeometryState geometry;
-    if (!EvaluateOwnerState(owner, sample.w, owner_state) ||
-        !evaluator.evaluate(owner_state, owner_state.p, 0.0, geometry) ||
+    const double probe_delta = sample.filtered_lower <= 0.0 &&
+            sample.filtered_upper >= 0.0
+        ? 0.0 : sample.filtered_lower;
+    if (!EvaluateOwnerState(owner, sample.w, owner_state, shared_frame) ||
+        !IsFinite(probe_delta) ||
+        !evaluator.evaluate(owner_state, owner_state.p, probe_delta, geometry) ||
         !geometry.valid || (geometry.p - sample.p).norm() >
             kPreparedCoverageTolerance ||
         (geometry.N - sample.N).norm() > kPreparedCoverageTolerance) {
@@ -456,6 +503,8 @@ bool LatestCategoricalUnsafe(
   }
   phase_offset_core::GeometryParams geometry_params;
   geometry_params.regularity_margin = config.tube.cross_section.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      config.tube.cross_section.minimum_reference_speed;
   phase_offset_core::GeometryEvaluator evaluator(geometry_params);
   phase_offset_core::PhaseOffsetGeometryState geometry;
   if (!evaluator.evaluate(current_path, position, retained_delta, geometry) ||
@@ -511,6 +560,8 @@ phase_offset_navigation::PhaseOffsetRuntimeConfig MakeRuntimeConfig(const PhaseO
   runtime.tube.regularity_margin = categorical_environment
       ? config.tube.cross_section.regularity_margin
       : config.tube.regularity_margin;
+  runtime.tube.minimum_reference_speed =
+      config.tube.cross_section.minimum_reference_speed;
   return runtime;
 }
 
@@ -555,12 +606,28 @@ int CountAsInt(std::uint64_t value) {
 
 phase_offset_navigation::PathStateQuery MakeTimerPathStateQuery(
     const std::shared_ptr<const ContinuousPhasePath>& semantic_path_owner,
-    const std::shared_ptr<const MatchedAdapterPathSamples>& samples) {
+    const std::shared_ptr<const MatchedAdapterPathSamples>& samples,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   if (semantic_path_owner) {
-    return [semantic_path_owner](const double w,
+    // Production requests carry shared_frame; this construction is only the
+    // legacy synthetic-owner fallback.
+    const std::shared_ptr<const ContinuousPhaseNormalFrame> immutable_frame =
+        shared_frame ? shared_frame :
+        (semantic_path_owner->pathRevision() == 0U
+        ? std::shared_ptr<const ContinuousPhaseNormalFrame>()
+        : std::shared_ptr<const ContinuousPhaseNormalFrame>(
+              new ContinuousPhaseNormalFrame(
+                  semantic_path_owner, semantic_path_owner->pathRevision(),
+                  semantic_path_owner->pathRevision())));
+    return [semantic_path_owner, immutable_frame](const double w,
                                  phase_offset_core::PathDifferentialState& state) {
       ContinuousPhasePathState continuous;
-      if (!semantic_path_owner->evaluate(w, continuous, false)) return false;
+      if (immutable_frame) {
+        if (!immutable_frame->evaluatePathState(w, continuous)) return false;
+      } else if (!semantic_path_owner->evaluate(w, continuous, false)) {
+        return false;
+      }
       state = ConvertContinuousPhasePathStateForActive(continuous, w);
       return state.valid;
     };
@@ -600,17 +667,45 @@ phase_offset_navigation::PathStateQuery MakeTimerPathStateQuery(
 }
 
 phase_offset_navigation::PathCellBoundQuery MakeTimerPathCellBoundQuery(
-    const std::shared_ptr<const ContinuousPhasePath>& semantic_path_owner) {
+    const std::shared_ptr<const ContinuousPhasePath>& semantic_path_owner,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   if (!semantic_path_owner || semantic_path_owner->empty()) {
     return phase_offset_navigation::PathCellBoundQuery();
   }
   // Both pure queries capture the same immutable owner.  A query crossing
   // source segments, or touching an unsupported/low-speed evaluator, returns
   // false and the navigation layer retains the fixed inset.
-  return [semantic_path_owner](
+  // Production requests carry shared_frame; the construction below is only a
+  // legacy synthetic-owner fallback.
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> immutable_frame =
+      shared_frame ? shared_frame :
+      (semantic_path_owner->pathRevision() == 0U
+      ? std::shared_ptr<const ContinuousPhaseNormalFrame>()
+      : std::shared_ptr<const ContinuousPhaseNormalFrame>(
+            new ContinuousPhaseNormalFrame(
+                semantic_path_owner, semantic_path_owner->pathRevision(),
+                semantic_path_owner->pathRevision())));
+  return [semantic_path_owner, immutable_frame](
       const double w0, const double w1,
       phase_offset_core::PathCellGeometryCertificate& certificate) {
-    return semantic_path_owner->cellBounds(w0, w1, certificate);
+    if (!semantic_path_owner->cellBounds(w0, w1, certificate)) return false;
+    if (immutable_frame) {
+      phase_offset_core::NormalFrameCellProof frame_proof;
+      if (!immutable_frame->certifyCell(w0, w1, frame_proof) ||
+          !phase_offset_core::normalFrameCellProofIsComplete(frame_proof)) {
+        return false;
+      }
+      certificate.path_revision = immutable_frame->pathRevision();
+      certificate.frame_revision = immutable_frame->frameRevision();
+      certificate.normal_frame_proof_complete = true;
+      // The frame certifies path-speed/normal variation only.  The combined
+      // ||p_w + N_w*delta|| bound is deliberately left unset until Builder
+      // has the actual admissible delta interval for this cell.
+      certificate.combined_regularity_proof_complete = false;
+      certificate.provenance = "ContinuousPhaseNormalFrame/BishopTransport";
+    }
+    return phase_offset_core::pathCellGeometryCertificateIsComplete(certificate);
   };
 }
 
@@ -624,6 +719,7 @@ phase_offset_navigation::PathCellBoundQuery MakeTimerPathCellBoundQuery(
 // any runtime acceptance predicate.
 bool BuildOwnerAlignedTubePreview(
     const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame,
     const MatchedAdapterPathSamples& supplied_samples,
     const double start_w,
     const double end_w,
@@ -648,7 +744,7 @@ bool BuildOwnerAlignedTubePreview(
       ExactDoubleBits(canonical_owner_state->state.w, required_current_w)) {
     required_current_state = canonical_owner_state->state;
   } else if (!EvaluateOwnerState(owner, required_current_w,
-                                 required_current_state)) {
+                                 required_current_state, shared_frame)) {
     return false;
   }
   std::vector<double> knots;
@@ -807,8 +903,12 @@ bool BuildOwnerAlignedTubePreview(
       bool reused = false;
       for (const auto& supplied : supplied_samples) {
         if (ExactDoubleBits(supplied.w, w)) {
-          output.push_back(supplied);
-          reused = true;
+          if (!shared_frame ||
+              (supplied.path_revision == shared_frame->pathRevision() &&
+               supplied.frame_revision == shared_frame->frameRevision())) {
+            output.push_back(supplied);
+            reused = true;
+          }
           break;
         }
       }
@@ -820,12 +920,13 @@ bool BuildOwnerAlignedTubePreview(
       output.push_back(canonical_owner_state->state);
       continue;
     }
-    ContinuousPhasePathState state;
-    if (!owner->evaluate(w, state, false) || !state.valid) {
+    phase_offset_core::PathDifferentialState owner_state;
+    if (!EvaluateOwnerState(owner, w, owner_state, shared_frame) ||
+        !owner_state.valid) {
       output.clear();
       return false;
     }
-    output.push_back(ConvertContinuousPhasePathStateForActive(state, w));
+    output.push_back(owner_state);
   }
   std::size_t current_anchor_count = 0U;
   for (std::size_t index = 0U; index < output.size(); ++index) {
@@ -1130,6 +1231,7 @@ PhaseOffsetMatchedAdapter::captureAndAcquirePathTubePairPin() {
   capture.map_observation_sequence = pair->map_observation_sequence;
   capture.map_observation_is_snapshot = pair->map_observation_is_snapshot;
   capture.path_owner = pair->path_owner;
+  capture.frame_owner = pair->frame_owner;
   capture.frozen_cloud_occupancy_snapshot =
       pair->frozen_cloud_occupancy_snapshot;
   capture.full_path_samples = pair->full_path_samples;
@@ -1448,6 +1550,30 @@ std::shared_ptr<const TubeBuildRequest> PhaseOffsetMatchedAdapter::makeBuildRequ
       std::memory_order_acquire);
   request->stamp = input.stamp;
   request->semantic_path_owner = input.semantic_path_owner;
+  request->frame_owner = input.frame_owner;
+  if (!request->frame_owner && request->semantic_path_owner &&
+      source_revision != 0U) {
+    const std::shared_ptr<const TubeBuildRequest> latest =
+        std::atomic_load(&latest_build_request_);
+    if (latest && latest->semantic_path_owner == request->semantic_path_owner &&
+        latest->source_revision == source_revision &&
+        FrameMatchesRevision(latest->frame_owner, source_revision)) {
+      request->frame_owner = latest->frame_owner;
+    } else {
+      const std::shared_ptr<const PathTubePair> pair =
+          std::atomic_load(&authoritative_path_tube_pair_);
+      if (pair && pair->path_owner == request->semantic_path_owner &&
+          pair->source_revision == source_revision &&
+          FrameMatchesRevision(pair->frame_owner, source_revision)) {
+        request->frame_owner = pair->frame_owner;
+      }
+    }
+    if (!request->frame_owner) {
+      request->frame_owner = std::shared_ptr<const ContinuousPhaseNormalFrame>(
+          new ContinuousPhaseNormalFrame(request->semantic_path_owner,
+                                         source_revision, source_revision));
+    }
+  }
   request->semantic_path_start_w = input.semantic_path_start_w;
   request->semantic_path_end_w = input.semantic_path_end_w;
   if (!input.sampled_path.empty()) {
@@ -1622,10 +1748,13 @@ bool PhaseOffsetMatchedAdapter::prepareTimerPairRefresh(
       epoch->epoch_status.active_path_source_revision !=
           request->base_path_tube_pair->source_revision ||
       !PreparedSamplesMatchOwner(*epoch->full_path_samples,
-                                 request->base_path_tube_pair->path_owner) ||
+                                 request->base_path_tube_pair->path_owner,
+                                 request->base_path_tube_pair->frame_owner) ||
       !ProfileSamplesMatchOwner(*epoch->active_profile,
                                 request->base_path_tube_pair->path_owner,
-                                runtime_config.tube.regularity_margin)) {
+                                runtime_config.tube.regularity_margin,
+                                runtime_config.tube.minimum_reference_speed,
+                                request->base_path_tube_pair->frame_owner)) {
     return false;
   }
 
@@ -1690,6 +1819,7 @@ bool PhaseOffsetMatchedAdapter::prepareTimerPairRefresh(
       request->base_path_tube_pair->path_owner, epoch->full_path_samples,
       epoch->active_profile, latest_request->gains,
       runtime_snapshot.config().tube.regularity_margin,
+      runtime_snapshot.config().tube.minimum_reference_speed,
       config_.tube_update_period, config_.tube.min_certified_forward_w);
   // The proof checks existing port viability independently of control arming;
   // the following normal command retains the only selection decision.
@@ -1697,6 +1827,8 @@ bool PhaseOffsetMatchedAdapter::prepareTimerPairRefresh(
   phase_offset_core::GeometryParams geometry_params;
   geometry_params.regularity_margin =
       runtime_snapshot.config().tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      runtime_snapshot.config().tube.minimum_reference_speed;
   phase_offset_core::GeometryEvaluator evaluator(geometry_params);
   phase_offset_core::PhaseOffsetGeometryState geometry;
   guidance::ReferenceGeometry reference;
@@ -1824,6 +1956,9 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
       request->task_generation != timer_task_generation_ ||
       request->task_generation !=
           task_generation_.load(std::memory_order_acquire) ||
+      (request->semantic_path_owner &&
+       !FrameMatchesRevision(request->frame_owner,
+                             request->source_revision)) ||
       (!pair_refresh && !tube_epoch_manager_)) {
     return false;
   }
@@ -1868,7 +2003,8 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
           request->current_path.w + config_.tube.lookahead_w);
       MatchedAdapterPathSamples aligned_preview;
       if (BuildOwnerAlignedTubePreview(
-              request->semantic_path_owner, sampled, preview_start,
+              request->semantic_path_owner, request->frame_owner, sampled,
+              preview_start,
               preview_end, request->current_path.w, aligned_preview)) {
         preview = std::move(aligned_preview);
         owner_aligned_preview = true;
@@ -1888,9 +2024,10 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
   epoch_input.authority_request = request->authority_request;
   epoch_input.path_source_revision = request->source_revision;
   epoch_input.path_state_query = MakeTimerPathStateQuery(
-      request->semantic_path_owner, snapshot.full_path_samples);
+      request->semantic_path_owner, snapshot.full_path_samples,
+      request->frame_owner);
   epoch_input.path_cell_bound_query = MakeTimerPathCellBoundQuery(
-      request->semantic_path_owner);
+      request->semantic_path_owner, request->frame_owner);
 
   bool raw_query_injected = false;
   phase_offset_navigation::RawOccupancyQuery categorical_query;
@@ -2021,7 +2158,9 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
       existing_future_horizon_end_w < future_seam_w -
           kPreparedCoverageTolerance ||
       existing_future_horizon_end_w > prepared_end_w +
-          kPreparedCoverageTolerance) {
+          kPreparedCoverageTolerance ||
+      (request.semantic_path_owner &&
+       !FrameMatchesRevision(request.frame_owner, request.source_revision))) {
     if (temporary_failure_layer) {
       *temporary_failure_layer = "tube_build_input_precondition";
     }
@@ -2050,7 +2189,7 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
   if (canonical_reuse_valid) {
     owner_current_path = canonical_owner_state->state;
   } else if (!EvaluateOwnerState(request.semantic_path_owner, captured_w0,
-                                 owner_current_path) ||
+                                 owner_current_path, request.frame_owner) ||
              !PathStatesEquivalent(request.current_path,
                                    owner_current_path)) {
     if (temporary_failure_layer) {
@@ -2081,7 +2220,8 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
       canonical_reuse_valid ? canonical_owner_state : nullptr;
   if (!canonical_reuse_valid) {
     if (!PreparedSamplesMatchOwner(prepared_path,
-                                   request.semantic_path_owner)) {
+                                   request.semantic_path_owner,
+                                   request.frame_owner)) {
       if (temporary_failure_layer) {
         *temporary_failure_layer = "tube_build_owner_evaluate";
       }
@@ -2107,7 +2247,8 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
   // silently replace the existing lookahead semantics with a whole-path one.
   MatchedAdapterPathSamples prepared_preview;
   if (!BuildOwnerAlignedTubePreview(
-          request.semantic_path_owner, prepared_path, captured_w0,
+          request.semantic_path_owner, request.frame_owner, prepared_path,
+          captured_w0,
           existing_future_horizon_end_w, captured_w0, prepared_preview,
           preview_owner_reuse)) {
     if (temporary_failure_layer) {
@@ -2131,9 +2272,9 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
   const std::shared_ptr<const MatchedAdapterPathSamples> owned_samples(
       new MatchedAdapterPathSamples(prepared_path));
   epoch_input.path_state_query = MakeTimerPathStateQuery(
-      request.semantic_path_owner, owned_samples);
+      request.semantic_path_owner, owned_samples, request.frame_owner);
   epoch_input.path_cell_bound_query = MakeTimerPathCellBoundQuery(
-      request.semantic_path_owner);
+      request.semantic_path_owner, request.frame_owner);
   if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
     epoch_input.cloud_clearance_query = makeCloudOccupancyClearanceQuery(
         request.cloud_snapshot, cloud_occupancy_query_config_);
@@ -2173,7 +2314,9 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
           existing_future_horizon_end_w) &&
       ProfileSamplesMatchOwner(
           staged.active_profile, request.semantic_path_owner,
-          MakeRuntimeConfig(config_).tube.regularity_margin);
+          MakeRuntimeConfig(config_).tube.regularity_margin,
+          MakeRuntimeConfig(config_).tube.minimum_reference_speed,
+          request.frame_owner);
   if (!update_status_ok) {
     if (temporary_failure_layer) {
       if (!staged_update_ok || !staged.status.candidate_complete ||
@@ -2208,6 +2351,7 @@ bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
   result.map_observation_sequence = request.map_observation_sequence;
   result.map_observation_is_snapshot = request.map_observation_is_snapshot;
   result.semantic_path_owner = request.semantic_path_owner;
+  result.frame_owner = request.frame_owner;
   result.frozen_cloud_occupancy_snapshot = request.cloud_snapshot;
   result.prepared_start_w = prepared_path.front().w;
   result.prepared_end_w = prepared_path.back().w;
@@ -2274,6 +2418,11 @@ bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
   if (!runtime_snapshot.configurationValid() || !prepared_tube.complete ||
       !prepared_tube.full_path_samples ||
       !prepared_tube.active_profile || !prepared_tube.semantic_path_owner ||
+      ((prepared_tube.frame_owner == nullptr) &&
+       (prepared_tube.active_profile->frame_revision != 0U)) ||
+      (prepared_tube.frame_owner &&
+       !FrameMatchesRevision(prepared_tube.frame_owner,
+                             prepared_tube.source_revision)) ||
       current_path.w < prepared_tube.prepared_start_w -
           kPreparedCoverageTolerance ||
       current_path.w >= prepared_tube.future_seam_w ||
@@ -2282,7 +2431,7 @@ bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
     return false;
   }
   if (!EvaluateOwnerState(prepared_tube.semantic_path_owner, current_path.w,
-                          owner_current_path) ||
+                          owner_current_path, prepared_tube.frame_owner) ||
       !PathStatesEquivalent(current_path, owner_current_path)) {
     return false;
   }
@@ -2301,7 +2450,9 @@ bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
           prepared_tube.existing_future_horizon_end_w) ||
       !ProfileSamplesMatchOwner(*prepared_tube.active_profile,
                                 prepared_tube.semantic_path_owner,
-                                runtime_snapshot.config().tube.regularity_margin)) {
+                                runtime_snapshot.config().tube.regularity_margin,
+                                runtime_snapshot.config().tube.minimum_reference_speed,
+                                prepared_tube.frame_owner)) {
     return false;
   }
   if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
@@ -2335,6 +2486,7 @@ bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
       prepared_tube.semantic_path_owner, prepared_tube.full_path_samples,
       prepared_tube.active_profile, gains,
       runtime_snapshot.config().tube.regularity_margin,
+      runtime_snapshot.config().tube.minimum_reference_speed,
       config_.tube_update_period, config_.tube.min_certified_forward_w);
   // Staging must evaluate the exact existing port independently of selection;
   // the caller performs the real gate/commit decision later.
@@ -2344,6 +2496,8 @@ bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
   phase_offset_core::GeometryParams geometry_params;
   geometry_params.regularity_margin =
       runtime_snapshot.config().tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      runtime_snapshot.config().tube.minimum_reference_speed;
   phase_offset_core::GeometryEvaluator evaluator(geometry_params);
   if (!evaluator.evaluate(owner_current_path, position,
                           runtime_snapshot.retainedDelta(), geometry)) {
@@ -2495,8 +2649,12 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
         expected_pair ? expected_pair->source_revision : 0U) + 1U;
   }
 
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame_owner(
+      new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
+                                     staged_revision));
   phase_offset_core::PathDifferentialState captured_path;
-  if (!EvaluateOwnerState(new_path_owner, captured_w0, captured_path)) {
+  if (!EvaluateOwnerState(new_path_owner, captured_w0, captured_path,
+                          new_frame_owner)) {
     if (temporary_failure) {
       *temporary_failure = PathTubePairStageFailure::OWNER_EVALUATE;
     }
@@ -2508,6 +2666,7 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   request.authority_session = captured_authority_session;
   request.source_revision = staged_revision;
   request.semantic_path_owner = new_path_owner;
+  request.frame_owner = new_frame_owner;
   request.semantic_path_start_w = new_path_owner->startW();
   request.semantic_path_end_w = new_path_owner->endW();
   request.current_path = captured_path;
@@ -2596,15 +2755,31 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
 
   std::shared_ptr<PathTubePair> candidate(new PathTubePair());
   candidate->source_revision = prepared.source_revision;
+  candidate->path_revision = prepared.active_profile
+      ? prepared.active_profile->path_revision : prepared.source_revision;
+  candidate->frame_revision = prepared.active_profile
+      ? prepared.active_profile->frame_revision : 0U;
   candidate->authority_session = request.authority_session;
   candidate->map_observation_sequence = prepared.map_observation_sequence;
   candidate->map_observation_is_snapshot =
       prepared.map_observation_is_snapshot;
   candidate->path_owner = prepared.semantic_path_owner;
+  candidate->frame_owner = prepared.frame_owner;
   candidate->frozen_cloud_occupancy_snapshot =
       prepared.frozen_cloud_occupancy_snapshot;
   candidate->full_path_samples = prepared.full_path_samples;
   candidate->active_profile = prepared.active_profile;
+  candidate->executed_reference_query =
+      std::shared_ptr<const phase_offset_navigation::ImmutableExecutedReferenceQuery>(
+          new PhaseOffsetExecutedReferenceQuery(
+              candidate->path_owner, retained_delta,
+              candidate->frame_owner,
+              candidate->active_profile
+                  ? candidate->active_profile->path_revision
+                  : candidate->source_revision,
+              candidate->active_profile
+                  ? candidate->active_profile->frame_revision : 0U,
+              candidate->source_revision, candidate->source_revision));
   candidate->epoch_status = prepared.epoch_status;
   candidate->captured_w0 = captured_w0;
   candidate->future_seam_w = future_seam_w;
@@ -2662,7 +2837,9 @@ bool PhaseOffsetMatchedAdapter::preparePathTubePairCommit(
           candidate->existing_future_horizon_end_w) ||
       !ProfileSamplesMatchOwner(
           *candidate->active_profile, candidate->path_owner,
-          MakeRuntimeConfig(config_).tube.regularity_margin)) {
+          MakeRuntimeConfig(config_).tube.regularity_margin,
+          MakeRuntimeConfig(config_).tube.minimum_reference_speed,
+          candidate->frame_owner)) {
     return false;
   }
   if (replacement &&
@@ -2739,7 +2916,7 @@ bool PhaseOffsetMatchedAdapter::preparePathTubePairCommit(
   // a stale old-path state with coincident phase alone.
   phase_offset_core::PathDifferentialState owner_current;
   if (!EvaluateOwnerState(candidate->path_owner, current_w,
-                          owner_current)) {
+                          owner_current, candidate->frame_owner)) {
     return false;
   }
   PreparedTubeBuildResult prepared;
@@ -2748,6 +2925,7 @@ bool PhaseOffsetMatchedAdapter::preparePathTubePairCommit(
   prepared.map_observation_sequence = candidate->map_observation_sequence;
   prepared.map_observation_is_snapshot = candidate->map_observation_is_snapshot;
   prepared.semantic_path_owner = candidate->path_owner;
+  prepared.frame_owner = candidate->frame_owner;
   prepared.frozen_cloud_occupancy_snapshot =
       candidate->frozen_cloud_occupancy_snapshot;
   prepared.prepared_start_w = candidate->full_path_samples->front().w;
@@ -3292,6 +3470,7 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
     request->authority_session = pair->authority_session;
     request->stamp = input.stamp;
     request->semantic_path_owner = pair->path_owner;
+    request->frame_owner = pair->frame_owner;
     request->base_path_tube_pair = pair;
     request->base_path_tube_pair_generation = pair->generation;
     request->base_retained_delta = runtime_->retainedDelta();
@@ -3353,7 +3532,9 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
     runtime_input.future_step = MakeFutureStepContract(
         pair->path_owner, pair->full_path_samples, pair->active_profile,
         input.gains,
-        runtime_->config().tube.regularity_margin, config_.tube_update_period,
+        runtime_->config().tube.regularity_margin,
+        runtime_->config().tube.minimum_reference_speed,
+        config_.tube_update_period,
         config_.tube.min_certified_forward_w);
     // A pending manual profile may execute only through a matching immutable
     // pair.  If the pair was retired during a neutral planner handoff, keep
@@ -3533,6 +3714,7 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
           request->semantic_path_owner, runtime_epoch->full_path_samples,
           runtime_epoch->active_profile, input.gains,
           runtime_->config().tube.regularity_margin,
+          runtime_->config().tube.minimum_reference_speed,
           config_.tube_update_period, config_.tube.min_certified_forward_w);
     }
     runtime_input.dt = input.dt;
@@ -3647,7 +3829,12 @@ bool PhaseOffsetMatchedAdapter::buildMarkers(
     markers.active_path = MakeDelete(control.stamp, config_.frame_id,
                                      "phase_offset_manual_active", 0);
   } else {
-    phase_offset_core::GeometryEvaluator evaluator; bool active_complete = true;
+    phase_offset_core::GeometryParams geometry_params;
+    geometry_params.regularity_margin = config_.tube.regularity_margin;
+    geometry_params.minimum_reference_speed =
+        config_.tube.cross_section.minimum_reference_speed;
+    phase_offset_core::GeometryEvaluator evaluator(geometry_params);
+    bool active_complete = true;
     for (const auto& path : *control.full_path_samples) {
       markers.base_path.points.push_back(ToPoint(path.p));
       phase_offset_core::PhaseOffsetGeometryState geometry;

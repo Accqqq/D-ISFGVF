@@ -70,6 +70,52 @@ bool ClearanceSafe(const ClearanceQueryResult& result,
       result.clearance >= required_radius;
 }
 
+bool IntersectFull3DRegularity(const TubeCrossSectionInput& input,
+                               const TubeCrossSectionConfig& config,
+                               const double selected_delta,
+                               double& lower, double& upper) {
+  const bool bound = IsFinite(input.minimum_reference_speed) &&
+      input.minimum_reference_speed > 0.0 && IsFinite(input.p_w) &&
+      IsFinite(input.N_w) && input.p_w.norm() > kNormalEpsilon;
+  if (!bound) return true;
+  const double minimum = input.minimum_reference_speed;
+  const double a = input.N_w.squaredNorm();
+  const double b = 2.0 * input.p_w.dot(input.N_w);
+  const double c = input.p_w.squaredNorm() - minimum * minimum;
+  if (!IsFinite(a) || !IsFinite(b) || !IsFinite(c)) return false;
+  if (a <= 1e-14) {
+    if (c >= 0.0) return true;
+    if (std::abs(b) <= 1e-14) return false;
+    const double root = -c / b;
+    if (!IsFinite(root)) return false;
+    const double value = b * selected_delta + c;
+    if (value < 0.0) return false;
+    if (b > 0.0) lower = std::max(lower, root);
+    else upper = std::min(upper, root);
+    return lower <= upper + config.boundary_tolerance;
+  }
+  const double discriminant = b * b - 4.0 * a * c;
+  if (!IsFinite(discriminant)) return false;
+  if (discriminant <= 0.0) {
+    if (c >= 0.0) return true;
+    return false;
+  }
+  const double root = std::sqrt(discriminant);
+  double r0 = (-b - root) / (2.0 * a);
+  double r1 = (-b + root) / (2.0 * a);
+  if (!IsFinite(r0) || !IsFinite(r1)) return false;
+  if (r0 > r1) std::swap(r0, r1);
+  // Retain exactly the safe connected component containing the selected
+  // current delta.  For c<0 the interval between roots is unsafe; for c>=0
+  // it is the unsafe interval when the discriminant is positive.  Never
+  // convexify the two outside components.
+  const bool selected_in_unsafe = selected_delta > r0 && selected_delta < r1;
+  if (selected_in_unsafe) return false;
+  if (selected_delta <= r0) upper = std::min(upper, r0);
+  else lower = std::max(lower, r1);
+  return lower <= upper + config.boundary_tolerance;
+}
+
 // Returns the safe side of a safe/unsafe transition.  The query's bounded
 // ball contract means an UNKNOWN result is never crossed as if it were free.
 double RefineSafeBoundary(const Eigen::Vector3d& origin,
@@ -131,6 +177,7 @@ RayExpansion ExpandFromZero(const Eigen::Vector3d& origin,
                             const Eigen::Vector3d& normal,
                             const ClearanceQuery& query,
                             const double required_radius,
+                            const double seed_delta,
                             const double direction,
                             const double extent,
                             const double step,
@@ -142,11 +189,11 @@ RayExpansion ExpandFromZero(const Eigen::Vector3d& origin,
   while (safe_distance < extent) {
     const double next_distance = std::min(extent, safe_distance + step);
     if (next_distance <= safe_distance) break;
-    const double next_delta = direction * next_distance;
+    const double next_delta = seed_delta + direction * next_distance;
     const ClearanceQueryResult sample = query(
         origin + normal * next_delta, required_radius);
     if (!ClearanceSafe(sample, required_radius)) {
-      const double safe_delta = direction * safe_distance;
+      const double safe_delta = seed_delta + direction * safe_distance;
       expansion.boundary = RefineSafeBoundary(
           origin, normal, query, required_radius, next_delta, safe_delta,
           tolerance);
@@ -156,7 +203,7 @@ RayExpansion ExpandFromZero(const Eigen::Vector3d& origin,
     safe_distance = next_distance;
   }
 
-  expansion.boundary = direction * safe_distance;
+  expansion.boundary = seed_delta + direction * safe_distance;
   return expansion;
 }
 
@@ -191,7 +238,9 @@ bool TubeCrossSectionSolver::configurationValid() const {
       config_.regularity_margin <= 0.0 || config_.regularity_margin >= 1.0 ||
       !IsFinite(config_.curvature_epsilon) || config_.curvature_epsilon < 0.0 ||
       !IsFinite(config_.planner_safe_distance) ||
-      config_.planner_safe_distance < 0.0) {
+      config_.planner_safe_distance < 0.0 ||
+      !IsFinite(config_.minimum_reference_speed) ||
+      config_.minimum_reference_speed <= 0.0) {
     return false;
   }
   const double count = std::ceil(2.0 * config_.search_extent / config_.ray_step);
@@ -227,9 +276,26 @@ TubeCrossSectionResult TubeCrossSectionSolver::solve(
   }
 
   const Eigen::Vector3d normal = input.N / normal_norm;
+  const double selected_delta = input.current_delta_valid
+      ? input.current_delta : 0.0;
   result.lower_curvature = -config_.search_extent;
   result.upper_curvature = config_.search_extent;
-  if (input.curvature > config_.curvature_epsilon) {
+  if (IsFinite(input.minimum_reference_speed) &&
+      input.minimum_reference_speed > 0.0 && IsFinite(input.p_w) &&
+      IsFinite(input.N_w) && input.p_w.norm() > kNormalEpsilon) {
+    if (!IntersectFull3DRegularity(input, config_, selected_delta,
+                                   result.lower_curvature,
+                                   result.upper_curvature)) {
+      result.reason = selected_delta == 0.0
+          ? TubeCrossSectionReason::REGULARITY_ZERO_UNSAFE
+          : TubeCrossSectionReason::EMPTY_AFTER_CURVATURE_INTERSECTION;
+      result.valid = false;
+      return result;
+    }
+    result.regularity_proven = true;
+    result.regularity_speed_at_zero = input.p_w.norm();
+    result.regularity_speed_min = input.minimum_reference_speed;
+  } else if (input.curvature > config_.curvature_epsilon) {
     result.upper_curvature =
         (1.0 - config_.regularity_margin) / input.curvature;
   } else if (input.curvature < -config_.curvature_epsilon) {
@@ -242,39 +308,45 @@ TubeCrossSectionResult TubeCrossSectionSolver::solve(
   }
 
   const ClearanceQueryResult centre = input.clearance_query(
-      input.p, result.residual_effective_radius);
+      input.p + normal * selected_delta, result.residual_effective_radius);
   if (!ClearanceSafe(centre, result.residual_effective_radius)) {
     // The planner remains authoritative for delta = 0.  A stale, unavailable,
     // or stricter Tube snapshot therefore removes only offset capacity.
-    SetZeroOnly(CenterReason(centre.status), ToTermination(centre.status), result);
+    if (selected_delta == 0.0) {
+      SetZeroOnly(CenterReason(centre.status), ToTermination(centre.status), result);
+    } else {
+      result.reason = CenterReason(centre.status);
+      result.positive_termination = ToTermination(centre.status);
+      result.negative_termination = ToTermination(centre.status);
+      result.valid = false;
+    }
     return result;
   }
 
   const double positive_extent = std::min(
-      config_.search_extent, std::max(0.0, result.upper_curvature));
+      config_.search_extent, std::max(0.0, result.upper_curvature - selected_delta));
   const double negative_extent = std::min(
-      config_.search_extent, std::max(0.0, -result.lower_curvature));
+      config_.search_extent, std::max(0.0, selected_delta - result.lower_curvature));
   const RayExpansion positive = ExpandFromZero(
       input.p, normal, input.clearance_query, result.residual_effective_radius,
-      1.0, positive_extent, config_.ray_step, config_.boundary_tolerance);
+      selected_delta, 1.0, positive_extent, config_.ray_step,
+      config_.boundary_tolerance);
   const RayExpansion negative = ExpandFromZero(
       input.p, normal, input.clearance_query, result.residual_effective_radius,
-      -1.0, negative_extent, config_.ray_step, config_.boundary_tolerance);
+      selected_delta, -1.0, negative_extent, config_.ray_step,
+      config_.boundary_tolerance);
 
   result.lower_obstacle = negative.boundary;
   result.upper_obstacle = positive.boundary;
   result.lower_final = std::max(result.lower_obstacle, result.lower_curvature);
   result.upper_final = std::min(result.upper_obstacle, result.upper_curvature);
-  if (result.lower_final > 0.0 || result.upper_final < 0.0 ||
-      result.lower_final > result.upper_final) {
-    SetZeroOnly(TubeCrossSectionReason::EMPTY_AFTER_CURVATURE_INTERSECTION,
-                TubeRayTermination::UNAVAILABLE, result);
+  if (result.lower_final > result.upper_final ||
+      selected_delta < result.lower_final - config_.boundary_tolerance ||
+      selected_delta > result.upper_final + config_.boundary_tolerance) {
+    result.reason = TubeCrossSectionReason::EMPTY_AFTER_CURVATURE_INTERSECTION;
+    result.valid = false;
     return result;
   }
-  // A ray may stop immediately, which produces a valid one-sided or zero-only
-  // interval.  The bounds deliberately never bridge past that first stop.
-  result.lower_final = std::min(0.0, result.lower_final);
-  result.upper_final = std::max(0.0, result.upper_final);
   result.c_plus_raw = std::max(0.0, result.upper_final);
   result.c_minus_raw = std::max(0.0, -result.lower_final);
   result.positive_termination = positive.termination;

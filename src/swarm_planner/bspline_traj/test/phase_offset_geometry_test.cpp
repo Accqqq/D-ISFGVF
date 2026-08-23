@@ -31,6 +31,20 @@ ContinuousPhasePathState makeCircleState(double w, double R)
   return s;
 }
 
+ContinuousPhasePathState makeFrameBoundQuadraticState(double w)
+{
+  ContinuousPhasePathState s;
+  s.p = Eigen::Vector3d(w, 0.0, 1.0);
+  s.dp_dw = Eigen::Vector3d(0.20, 0.0, 0.0);
+  s.d2p_dw2 = Eigen::Vector3d::Zero();
+  s.T = Eigen::Vector3d::UnitX();
+  s.N = Eigen::Vector3d::UnitY();
+  s.N_w = Eigen::Vector3d::UnitX();
+  s.frame_valid = true;
+  s.valid = true;
+  return s;
+}
+
 // Lemniscate: x = R sin(w), y = (R/2) sin(2w).  p(0) == p(pi) == center,
 // but the tangents are opposite -> the branch is distinguished by w.
 ContinuousPhasePathState makeFigureEightState(double w, double R)
@@ -121,6 +135,22 @@ TEST(PhaseOffsetGeometry, DegenerateRegularityDetected)
                            Eigen::Vector3d(0.0, 0.0, 1.0), R + 1.0,
                            makeParams(), out));
   EXPECT_FALSE(out.valid);
+}
+
+TEST(PhaseOffsetGeometry, ConfiguredMinimumReferenceSpeedMatchesFrameQuadratic)
+{
+  PhaseOffsetGeometryEvaluator ev;
+  PhaseOffsetGeometryParams params = makeParams();
+  params.minimum_reference_speed = 0.50;
+  PhaseOffsetGeometry out;
+  // ||p_w + N_w*delta|| is 0.6 at -0.8, but only 0.2 at zero.
+  ASSERT_TRUE(ev.evaluate(makeFrameBoundQuadraticState(0.0),
+                          Eigen::Vector3d(0.0, -0.8, 1.0), -0.8,
+                          params, out));
+  EXPECT_NEAR(0.60, out.r_w.norm(), 1e-12);
+  EXPECT_FALSE(ev.evaluate(makeFrameBoundQuadraticState(0.0),
+                           Eigen::Vector3d::Zero(), 0.0,
+                           params, out));
 }
 
 TEST(PhaseOffsetGeometry, ErrorDecompositionOnActiveReference)

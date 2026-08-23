@@ -89,7 +89,8 @@ bool ProfileFinite(const TubeProfile& profile) {
       !IsFinite(profile.certified_segment_start_w) ||
       !IsFinite(profile.certified_segment_end_w) ||
       profile.certified_segment_end_w < profile.certified_segment_start_w ||
-      !IsFinite(profile.first_truncated_w)) {
+      !IsFinite(profile.first_truncated_w) ||
+      !IsFinite(profile.combined_regularity_speed_min)) {
     return false;
   }
   for (const TubeRawSample& sample : profile.samples) {
@@ -186,6 +187,8 @@ TubeEpochManager::TubeEpochManager(const TubeEpochManagerConfig& config)
                                           config.surface_validator) {
   phase_offset_core::GeometryParams geometry_config;
   geometry_config.regularity_margin = config_.builder.regularity_margin;
+  geometry_config.minimum_reference_speed =
+      config_.builder.cross_section.minimum_reference_speed;
   geometry_evaluator_ = phase_offset_core::GeometryEvaluator(geometry_config);
   configuration_valid_ = certified_builder_.configurationValid() &&
       IsFinite(config_.profile_equivalence_tolerance) &&
@@ -225,6 +228,10 @@ bool TubeEpochManager::profilesEquivalent(const TubeProfile& first,
       first.filtered_complete != second.filtered_complete ||
       first.complete != second.complete ||
       first.obstacle_certified != second.obstacle_certified ||
+      first.combined_regularity_proof_complete !=
+          second.combined_regularity_proof_complete ||
+      !NearlyEqual(first.combined_regularity_speed_min,
+                   second.combined_regularity_speed_min, tolerance) ||
       first.classification != second.classification) {
     return false;
   }
@@ -242,6 +249,9 @@ void TubeEpochManager::copyPersistentStatus(TubeEpochStatus& status) const {
   status.active_available = active_available_;
   status.active_classification = active_available_
       ? active_profile_.classification : TubeProfileClassification::NONE;
+  status.active_zero_only = active_available_ && active_profile_.zero_only;
+  status.active_zero_component_contains_zero = active_available_ &&
+      active_profile_.zero_component_contains_zero;
   status.active_current_validation_valid = active_current_validation_valid_;
   status.active_path_source_revision = active_path_source_revision_;
   status.active_map_observation_sequence = active_map_observation_sequence_;
@@ -337,6 +347,7 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
   build_input.path_cell_bound_query = input.path_cell_bound_query;
   build_input.cloud_snapshot_resolution = input.cloud_snapshot_resolution;
   build_input.current_w = input.current_path.w;
+  build_input.current_delta = input.retained_delta;
   build_input.path_source_revision = input.path_source_revision;
   build_input.tube_revision = candidate_sequence_;
   build_input.map_observation_sequence = input.map_observation_sequence;
@@ -349,6 +360,9 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
   status.candidate_filtered_complete = build_result.filtered_complete;
   status.candidate_complete = build_result.complete;
   status.candidate_classification = candidate.classification;
+  status.candidate_zero_only = candidate.zero_only;
+  status.candidate_zero_component_contains_zero =
+      candidate.zero_component_contains_zero;
   if (!status.candidate_complete) {
     // An incomplete/unknown candidate normally leaves the installed active
     // profile alone.  It is only allowed to revoke that ownership when the
@@ -358,6 +372,8 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
     geometry_params.regularity_margin = cloud_clearance_source
         ? config_.builder.cross_section.regularity_margin
         : config_.builder.regularity_margin;
+    geometry_params.minimum_reference_speed =
+        config_.builder.cross_section.minimum_reference_speed;
     phase_offset_core::GeometryEvaluator evaluator(geometry_params);
     phase_offset_core::PhaseOffsetGeometryState geometry;
     status.current_geometry_valid = evaluator.evaluate(
@@ -409,6 +425,8 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
   current_geometry_params.regularity_margin = cloud_clearance_source
       ? config_.builder.cross_section.regularity_margin
       : config_.builder.regularity_margin;
+  current_geometry_params.minimum_reference_speed =
+      config_.builder.cross_section.minimum_reference_speed;
   phase_offset_core::GeometryEvaluator current_geometry_evaluator(
       current_geometry_params);
   status.current_geometry_valid = current_geometry_evaluator.evaluate(

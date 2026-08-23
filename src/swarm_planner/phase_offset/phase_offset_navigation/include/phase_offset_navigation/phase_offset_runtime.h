@@ -44,6 +44,9 @@ struct RuntimeTubeExecutionConfig {
   double interior_margin = 0.0;
   double tracking_error_bound = 0.15;
   double regularity_margin = 0.1;
+  // Physical active-reference speed threshold.  Frame-bound geometry uses
+  // this value; regularity_margin remains only for revision-0 planar data.
+  double minimum_reference_speed = 1e-8;
 };
 
 struct PhaseOffsetRuntimeConfig {
@@ -192,6 +195,7 @@ struct RuntimePreparedStep {
   // evaluation.
   bool zero_gate_open = false;
   bool requires_base_guidance = false;
+  bool frame_bound = false;
   bool valid = false;
   std::string invalid_reason;
 };

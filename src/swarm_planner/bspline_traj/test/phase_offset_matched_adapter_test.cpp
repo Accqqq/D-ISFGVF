@@ -1652,6 +1652,34 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_EQ(failure_layer, "tube_build_owner_evaluate");
 }
 
+TEST(PhaseOffsetMatchedAdapterTest,
+     ProductionBuildRequestsReuseOneImmutableFrameOwnerPerRevision) {
+  const SyntheticPath path = MakePath();
+  const std::shared_ptr<const ContinuousPhasePath> owner = MakeSyntheticOwner();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterInput input = MakeInput(path, owner.get());
+  input.semantic_path_owner = owner;
+  input.semantic_path_start_w = owner->startW();
+  input.semantic_path_end_w = owner->endW();
+  const std::shared_ptr<const TubeBuildRequest> first =
+      adapter.makeBuildRequest(input, 55U);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(first->frame_owner);
+  EXPECT_EQ(first->frame_owner->pathRevision(), 55U);
+  EXPECT_EQ(first->frame_owner->frameRevision(), 55U);
+  std::atomic_store(&adapter.latest_build_request_, first);
+  const std::shared_ptr<const TubeBuildRequest> second =
+      adapter.makeBuildRequest(input, 55U);
+  ASSERT_TRUE(second);
+  EXPECT_EQ(first->frame_owner, second->frame_owner);
+  const std::shared_ptr<const TubeBuildRequest> successor =
+      adapter.makeBuildRequest(input, 56U);
+  ASSERT_TRUE(successor);
+  ASSERT_TRUE(successor->frame_owner);
+  EXPECT_NE(first->frame_owner, successor->frame_owner);
+  EXPECT_EQ(successor->frame_owner->pathRevision(), 56U);
+}
+
 void SetInputPositionAndLegacy(MatchedAdapterInput& input,
                                const Eigen::Vector3d& position) {
   input.position = position;
@@ -2108,8 +2136,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
   ASSERT_NE(current, nullptr);
   EXPECT_LT(current->raw_lower, -0.20);
   EXPECT_GT(current->raw_upper, 0.20);
-  EXPECT_NEAR(current->filtered_lower, -0.12, 1e-12);
-  EXPECT_NEAR(current->filtered_upper, 0.12, 1e-12);
+  EXPECT_DOUBLE_EQ(current->filtered_lower, current->raw_lower);
+  EXPECT_DOUBLE_EQ(current->filtered_upper, current->raw_upper);
   EXPECT_GE(captured_retained_delta,
             current->filtered_lower + config.tube.interior_margin - 1e-12);
   EXPECT_LE(captured_retained_delta,
@@ -2271,8 +2299,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
   ASSERT_NE(current, nullptr);
   EXPECT_TRUE(current->complete);
   EXPECT_GT(current->environment_width, 0.45);
-  EXPECT_DOUBLE_EQ(current->filtered_lower, -0.10);
-  EXPECT_DOUBLE_EQ(current->filtered_upper, 0.10);
+  EXPECT_DOUBLE_EQ(current->filtered_lower, current->raw_lower);
+  EXPECT_DOUBLE_EQ(current->filtered_upper, current->raw_upper);
   EXPECT_GT(current->filtered_upper - current->filtered_lower,
             2.0 * adapter.config_.tube.fixed_delta_max);
   EXPECT_GT(current->raw_upper, 0.20);
@@ -3371,7 +3399,9 @@ TEST(PhaseOffsetMatchedAdapterTest,
   bool saw_strict_connector_interior = false;
   for (const phase_offset_navigation::TubeRawSample& sample : profile.samples) {
     ContinuousPhasePathState owner_state;
-    ASSERT_TRUE(new_owner->evaluate(sample.w, owner_state, false));
+    ASSERT_TRUE(committed_pair->frame_owner);
+    ASSERT_TRUE(committed_pair->frame_owner->evaluatePathState(
+        sample.w, owner_state));
     const phase_offset_core::PathDifferentialState owner_path =
         ConvertContinuousPhasePathStateForActive(owner_state, sample.w);
     phase_offset_core::PhaseOffsetGeometryState owner_geometry;
@@ -4154,8 +4184,7 @@ TEST(PhaseOffsetMatchedAdapterPairPublication,
   const double candidate_width = TubeMarkerWidth(markers.tube_candidate);
   const double certified_width = TubeMarkerWidth(markers.tube);
   EXPECT_GT(candidate_width, 0.40);
-  EXPECT_NEAR(certified_width, 0.20, 1e-12);
-  EXPECT_GT(candidate_width, certified_width);
+  EXPECT_NEAR(certified_width, candidate_width, 1e-12);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,

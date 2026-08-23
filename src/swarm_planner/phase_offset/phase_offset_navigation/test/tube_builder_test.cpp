@@ -28,6 +28,25 @@ PathSamples Line(const double end = 0.40, const double step = 0.10) {
   return path;
 }
 
+PathSamples FrameBoundQuadraticLine(const double tangent_x = 0.20,
+                                    const double normal_w_x = 1.0) {
+  PathSamples path;
+  for (double w = 0.0; w <= 0.20 + 1e-12; w += 0.10) {
+    phase_offset_core::PathDifferentialState state;
+    state.p = Eigen::Vector3d(w, 0.0, 1.0);
+    state.p_w = Eigen::Vector3d(tangent_x, 0.0, 0.0);
+    state.p_ww = Eigen::Vector3d::Zero();
+    state.T = Eigen::Vector3d::UnitX();
+    state.N = Eigen::Vector3d::UnitY();
+    state.N_w = Eigen::Vector3d(normal_w_x, 0.0, 0.0);
+    state.frame_valid = true;
+    state.w = w;
+    state.valid = true;
+    path.push_back(state);
+  }
+  return path;
+}
+
 PathStateQuery ExactLine() {
   return [](const double w, phase_offset_core::PathDifferentialState& state) {
     state = State(w);
@@ -140,6 +159,48 @@ TEST(TubeBuilderTest, FixedAndLegacyDistanceRegressionRemainSeparate) {
   EXPECT_TRUE(legacy.obstacle_certified);
 }
 
+TEST(TubeBuilderTest, FixedUsesFull3DRegularityForSelectedCurrentComponent) {
+  TubeBuilderConfig config = Config();
+  config.fixed_delta_max = 1.0;
+  config.cross_section.minimum_reference_speed = 0.50;
+  TubeProfile left;
+  ASSERT_TRUE(TubeBuilder(config).build(
+      TubeSource::FIXED, FrameBoundQuadraticLine(), DistanceQuery(), 1U, 2U,
+      left, -0.80));
+  ASSERT_FALSE(left.samples.empty());
+  EXPECT_LE(left.samples.front().raw_upper, -0.70 + 1e-6);
+
+  TubeProfile unsafe;
+  EXPECT_FALSE(TubeBuilder(config).build(
+      TubeSource::FIXED, FrameBoundQuadraticLine(), DistanceQuery(), 1U, 3U,
+      unsafe, 0.0));
+}
+
+TEST(TubeBuilderTest, FixedLinearRegularityUsesCorrectHalfLineAndRetainsOutsideDelta) {
+  TubeBuilderConfig config = Config();
+  config.fixed_delta_max = 1.0;
+  config.cross_section.minimum_reference_speed = 0.200000005;
+  TubeProfile positive_b;
+  ASSERT_TRUE(TubeBuilder(config).build(
+      TubeSource::FIXED, FrameBoundQuadraticLine(0.20, 1e-8), DistanceQuery(), 1U,
+      4U, positive_b, 0.60));
+  ASSERT_FALSE(positive_b.samples.empty());
+  EXPECT_GE(positive_b.samples.front().raw_lower, 0.49);
+
+  TubeProfile negative_b;
+  ASSERT_TRUE(TubeBuilder(config).build(
+      TubeSource::FIXED, FrameBoundQuadraticLine(-0.20, 1e-8), DistanceQuery(), 1U,
+      5U, negative_b, -0.60));
+  ASSERT_FALSE(negative_b.samples.empty());
+  EXPECT_LE(negative_b.samples.front().raw_upper, -0.49);
+
+  TubeProfile outside;
+  ASSERT_TRUE(TubeBuilder(Config()).build(
+      TubeSource::FIXED, Line(), DistanceQuery(), 1U, 6U, outside, 0.20));
+  EXPECT_DOUBLE_EQ(outside.current_delta, 0.20);
+  EXPECT_TRUE(outside.current_delta_valid);
+}
+
 TEST(TubeBuilderTest, CloudClearanceUsesPlannerSafeDistanceWithoutDoubleErosion) {
   TubeProfile profile;
   ASSERT_TRUE(TubeBuilder(Config()).buildCloudClearance(
@@ -164,12 +225,19 @@ TEST(TubeBuilderTest, CloudClearanceUsesPlannerSafeDistanceWithoutDoubleErosion)
 }
 
 TEST(TubeBuilderTest, CertifiedStraightCellUsesZeroLocalInsetWithoutLosingZero) {
+  phase_offset_core::PathCellGeometryCertificate pre_range;
+  ASSERT_TRUE(CertifiedLineCells()(0.0, 0.1, pre_range));
+  EXPECT_TRUE(phase_offset_core::pathCellGeometryCertificateIsComplete(
+      pre_range));
+  EXPECT_FALSE(pre_range.combined_regularity_proof_complete);
   TubeProfile profile;
   ASSERT_TRUE(TubeBuilder(Config()).buildCloudClearance(
       TubeSource::ESDF, Line(), Open(), ExactLine(), CertifiedLineCells(), 0.05,
       0.0, 3U, 4U, profile));
   ASSERT_TRUE(profile.raw_complete);
   EXPECT_TRUE(profile.cell_geometry_certified);
+  EXPECT_TRUE(profile.combined_regularity_proof_complete);
+  EXPECT_NEAR(profile.combined_regularity_speed_min, 1.0, 1e-12);
   EXPECT_EQ(profile.certified_cell_count, profile.raw_build_samples.size() - 1U);
   for (const TubeRawSample& sample : profile.raw_build_samples) {
     EXPECT_TRUE(sample.cell_geometry_certificate_used);
@@ -211,6 +279,8 @@ TEST(TubeBuilderTest,
       TubeSource::ESDF, Line(), Open(), ExactLine(),
       invalid_offset_certificate, 0.05, 0.0, 3U, 4U, profile));
   EXPECT_FALSE(profile.cell_geometry_certified);
+  EXPECT_FALSE(profile.combined_regularity_proof_complete);
+  EXPECT_DOUBLE_EQ(profile.combined_regularity_speed_min, 0.0);
   EXPECT_EQ(profile.certified_cell_count, 0U);
   ASSERT_FALSE(profile.raw_build_samples.empty());
   EXPECT_DOUBLE_EQ(profile.raw_build_samples.front().continuous_inset, 0.05);

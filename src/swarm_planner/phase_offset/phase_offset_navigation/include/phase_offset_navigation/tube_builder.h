@@ -27,7 +27,8 @@ class TubeBuilder {
       const DistanceQuery& distance_query,
       std::uint64_t source_revision,
       std::uint64_t tube_revision,
-      TubeProfile& profile) const;
+      TubeProfile& profile,
+      double current_delta = 0.0) const;
 
   // Deprecated categorical compatibility entry point.  G2g does not allow
   // its result to establish a Candidate, Active, or clearance certificate.
@@ -40,7 +41,8 @@ class TubeBuilder {
       double current_w,
       std::uint64_t source_revision,
       std::uint64_t tube_revision,
-      TubeProfile& profile) const;
+      TubeProfile& profile,
+      double current_delta = 0.0) const;
 
   // G2g production path: direct occupied-voxel-volume clearance at every
   // cross-section centre, with adaptive exact path samples.  The categorical
@@ -57,7 +59,8 @@ class TubeBuilder {
       double current_w,
       std::uint64_t source_revision,
       std::uint64_t tube_revision,
-      TubeProfile& profile) const;
+      TubeProfile& profile,
+      double current_delta = 0.0) const;
 
   // Certified variant.  The cell query must share the immutable owner of the
   // point query.  An absent or failed certificate retains the legacy fixed
@@ -74,7 +77,8 @@ class TubeBuilder {
       double current_w,
       std::uint64_t source_revision,
       std::uint64_t tube_revision,
-      TubeProfile& profile) const;
+      TubeProfile& profile,
+      double current_delta = 0.0) const;
 
   // Kept only for source compatibility with G2a pure-navigation callers.  New
   // runtime callers must pass the explicit current phase above.
@@ -86,7 +90,8 @@ class TubeBuilder {
       const RawOccupancyQuery& occupancy_query,
       std::uint64_t source_revision,
       std::uint64_t tube_revision,
-      TubeProfile& profile) const;
+      TubeProfile& profile,
+      double current_delta = 0.0) const;
 
   const TubeBuilderConfig& config() const { return config_; }
 

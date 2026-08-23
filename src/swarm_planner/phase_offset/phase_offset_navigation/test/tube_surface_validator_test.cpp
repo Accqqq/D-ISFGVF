@@ -96,6 +96,22 @@ PathStateQuery UnitCirclePath() {
   };
 }
 
+PathStateQuery SlowFrameBoundPath() {
+  return [](const double w, phase_offset_core::PathDifferentialState& state) {
+    state = phase_offset_core::PathDifferentialState();
+    state.p = Eigen::Vector3d(w, 0.0, 0.0);
+    state.p_w = Eigen::Vector3d(0.20, 0.0, 0.0);
+    state.p_ww = Eigen::Vector3d::Zero();
+    state.T = Eigen::Vector3d::UnitX();
+    state.N = Eigen::Vector3d::UnitY();
+    state.N_w = Eigen::Vector3d::UnitX();
+    state.frame_valid = true;
+    state.w = w;
+    state.valid = std::isfinite(w);
+    return state.valid;
+  };
+}
+
 ClearanceQuery OpenQuery() {
   return [](const Eigen::Vector3d&, const double required) {
     ClearanceQueryResult result;
@@ -241,6 +257,17 @@ TEST(TubeSurfaceValidatorTest, OpenRibbonIsCertifiedAndQueriesResidualPlusCover)
   }
 }
 
+TEST(TubeSurfaceValidatorTest, ConfiguredMinimumReferenceSpeedIsEnforced) {
+  TubeSurfaceValidatorConfig config;
+  config.minimum_reference_speed = 0.50;
+  TubeProfile profile = MakeProfile({0.0, 0.20}, -0.10, 0.10);
+  TubeSurfaceValidationResult result;
+  EXPECT_FALSE(TubeSurfaceValidator(config).validate(
+      profile, 0.0, SlowFrameBoundPath(), OpenQuery(), 0.05, 0.0, 0.1,
+      result));
+  EXPECT_EQ(result.first_failure_reason, TubeStopReason::REGULARITY);
+}
+
 TEST(TubeSurfaceValidatorTest,
      ExactCurrentAnchorSampledCoverOmitsOnlyFixedHalfVoxel) {
   TubeProfile profile = MakeExactCurrentAnchorProfile();
@@ -348,6 +375,8 @@ TEST(TubeSurfaceValidatorTest,
 TEST(TubeSurfaceValidatorTest,
      NondegenerateSampledFallbackRetainsFixedHalfVoxel) {
   TubeProfile profile = MakeProfile({0.0, 0.20}, -0.10, 0.10);
+  // A caller cannot carry a stale continuous label through sampled fallback.
+  profile.proof_level = TubeProofLevel::CONTINUOUS_COVER_PROOF;
   std::vector<Eigen::Vector3d> points;
   std::vector<double> requested;
   const ClearanceQuery query = [&points, &requested](
@@ -374,6 +403,7 @@ TEST(TubeSurfaceValidatorTest,
   const double expected_cover = 1.1 * sampled_radius + 0.025;
   EXPECT_NEAR(requested[9U], 0.40 + expected_cover + 1e-6, 1e-12);
   EXPECT_NEAR(result.max_cover_radius, expected_cover, 1e-12);
+  EXPECT_NE(profile.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
 }
 
 TEST(TubeSurfaceValidatorTest, CertifiedCellCoverUsesAnalyticRadiusAndKeepsZero) {
@@ -386,6 +416,77 @@ TEST(TubeSurfaceValidatorTest, CertifiedCellCoverUsesAnalyticRadiusAndKeepsZero)
   EXPECT_TRUE(result.complete);
   EXPECT_TRUE(result.zero_centerline_continuously_certified);
   EXPECT_LT(result.max_cover_radius, 0.50);
+  EXPECT_NE(profile.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
+}
+
+TEST(TubeSurfaceValidatorTest,
+     MissingOrMismatchedCellEvidenceCannotUpgradeContinuousProof) {
+  TubeProfile missing = MakeProfile({0.0, 0.20}, -0.10, 0.10);
+  missing.cell_geometry_certified = true;
+  missing.combined_regularity_proof_complete = true;
+  TubeSurfaceValidationResult missing_result;
+  ASSERT_TRUE(TubeSurfaceValidator().validate(
+      missing, 0.0, LinePath(), OpenQuery(), 0.05, 0.40, 0.10,
+      missing_result));
+  EXPECT_NE(missing.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
+
+  TubeProfile mismatched = MakeProfile({0.0, 0.20}, -0.10, 0.10);
+  mismatched.cell_geometry_certified = true;
+  mismatched.combined_regularity_proof_complete = true;
+  mismatched.path_revision = 11U;
+  mismatched.frame_revision = 12U;
+  const PathCellBoundQuery wrong_revision =
+      [](const double w0, const double w1,
+         phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 1.0;
+    certificate.segment_identity = 1U;
+    certificate.path_revision = 99U;
+    certificate.frame_revision = 100U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.valid = true;
+    certificate.complete = true;
+    certificate.normal_frame_proof_complete = true;
+    return true;
+  };
+  TubeSurfaceValidationResult mismatched_result;
+  ASSERT_TRUE(TubeSurfaceValidator().validate(
+      mismatched, 0.0, LinePath(), wrong_revision, OpenQuery(), 0.05,
+      0.40, 0.10, mismatched_result));
+  EXPECT_NE(mismatched.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
+
+  TubeProfile unbound = MakeProfile({0.0, 0.20}, -0.10, 0.10);
+  unbound.cell_geometry_certified = true;
+  unbound.combined_regularity_proof_complete = true;
+  unbound.path_revision = 11U;
+  unbound.frame_revision = 12U;
+  const PathCellBoundQuery unbound_revision =
+      [](const double w0, const double w1,
+         phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 1.0;
+    certificate.segment_identity = 1U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.valid = true;
+    certificate.complete = true;
+    certificate.normal_frame_proof_complete = true;
+    return true;
+  };
+  TubeSurfaceValidationResult unbound_result;
+  ASSERT_TRUE(TubeSurfaceValidator().validate(
+      unbound, 0.0, LinePath(), unbound_revision, OpenQuery(), 0.05,
+      0.40, 0.10, unbound_result));
+  EXPECT_NE(unbound.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
 }
 
 TEST(TubeSurfaceValidatorTest,
@@ -395,7 +496,7 @@ TEST(TubeSurfaceValidatorTest,
     profile.cell_geometry_certified = true;
     TubeSurfaceValidationResult result;
     EXPECT_FALSE(TubeSurfaceValidator().validate(
-        profile, 0.0, LinePath(), CertifiedLineCells(1.0, 0.0, 10.0),
+        profile, 0.0, LinePath(), CertifiedLineCells(0.1, 2.0, 0.0),
         OpenQuery(), 0.05, 0.20, 0.10, result));
     EXPECT_LE(result.query_sample_count, 27U);
     EXPECT_EQ(result.first_failure_reason, TubeStopReason::REGULARITY);

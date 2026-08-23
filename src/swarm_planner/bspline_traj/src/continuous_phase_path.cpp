@@ -223,30 +223,28 @@ bool MakeCertificate(const double w0, const double w1,
     if (!differential.valid || !std::isfinite(w0) || !std::isfinite(w1) ||
         h <= kDomainEps ||
         differential.inf_speed <= kCertificateSpeedEps ||
-        differential.inf_horizontal_speed <= kCertificateSpeedEps ||
         !std::isfinite(differential.sup_speed) ||
         !std::isfinite(differential.sup_acceleration) ||
-        !std::isfinite(differential.sup_horizontal_acceleration) ||
-        !std::isfinite(differential.sup_jerk) ||
-        !std::isfinite(differential.sup_horizontal_jerk)) {
+        !std::isfinite(differential.sup_jerk)) {
         return false;
     }
+    // Full 3D bounds are authoritative for frame-bound production paths.
+    // Horizontal projections remain diagnostics only and may be exactly zero
+    // on a near-vertical path.  For T=p_w/||p_w||,
+    // ||T_w|| <= ||p_ww||/inf||p_w||; Bishop transport gives the same bound
+    // for ||N_w||.  These are closed-cell conservative bounds, not endpoint
+    // samples.
     const double normal_w = UpperBound(
-        differential.sup_horizontal_acceleration /
-        differential.inf_horizontal_speed);
+        differential.sup_acceleration / differential.inf_speed);
     const double curvature = UpperBound(
-        differential.sup_horizontal_acceleration /
-        (differential.inf_horizontal_speed *
-         differential.inf_horizontal_speed));
+        differential.sup_acceleration /
+            (differential.inf_speed * differential.inf_speed));
     const double curvature_w = UpperBound(
-        differential.sup_horizontal_jerk /
-            (differential.inf_horizontal_speed *
-             differential.inf_horizontal_speed) +
-        3.0 * differential.sup_horizontal_acceleration *
-            differential.sup_horizontal_acceleration /
-            (differential.inf_horizontal_speed *
-             differential.inf_horizontal_speed *
-             differential.inf_horizontal_speed));
+        differential.sup_jerk /
+            (differential.inf_speed * differential.inf_speed) +
+        3.0 * differential.sup_acceleration * differential.sup_acceleration /
+            (differential.inf_speed * differential.inf_speed *
+             differential.inf_speed));
     certificate.w0 = w0;
     certificate.w1 = w1;
     certificate.inf_p_w_norm = differential.inf_speed;
@@ -1043,9 +1041,13 @@ bool ContinuousPhasePath::cellBounds(
     }
     certificate.w0 = w0;
     certificate.w1 = w1;
+    certificate.path_revision = path_revision_;
     certificate.segment_identity = selected->identity;
     certificate.segment_w0 = selected->w0;
     certificate.segment_w1 = selected->w1;
+    if (certificate.path_revision == 0U) {
+        certificate.path_revision = path_revision_;
+    }
     if (!phase_offset_core::pathCellGeometryCertificateIsComplete(certificate)) {
         certificate = phase_offset_core::PathCellGeometryCertificate();
         return false;
@@ -1083,6 +1085,7 @@ bool ContinuousPhasePath::evaluate(
     const double bounded_w = std::max(selected->w0, std::min(query_w, selected->w1));
     if (!selected->evaluate(bounded_w, state)) return false;
     state.valid = finiteState(state);
+    state.path_revision = path_revision_;
     return state.valid;
 }
 

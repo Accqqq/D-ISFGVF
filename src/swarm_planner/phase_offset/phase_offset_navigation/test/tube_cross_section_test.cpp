@@ -151,6 +151,109 @@ TEST(TubeCrossSectionTest, DisconnectedNonzeroRegionIsIgnored) {
   EXPECT_EQ(result.negative_termination, TubeRayTermination::OCCUPIED);
 }
 
+TEST(TubeCrossSectionTest, SelectedCurrentComponentIsNotConvexified) {
+  const ClearanceQuery query = [](const Eigen::Vector3d& point,
+                                  const double) {
+    ClearanceQueryResult result;
+    const double magnitude = std::abs(point.y());
+    if (magnitude > 0.20 && magnitude < 0.50) {
+      result.status = DistanceStatus::OCCUPIED;
+      result.clearance = 0.0;
+      return result;
+    }
+    result.status = DistanceStatus::KNOWN_FREE;
+    result.clearance = 10.0;
+    result.clearance_certified = true;
+    return result;
+  };
+  TubeCrossSectionInput input = MakeInput(query);
+  input.current_delta = 0.60;
+  input.current_delta_valid = true;
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(MakeConfig()).solve(input);
+  ASSERT_TRUE(result.valid);
+  EXPECT_GE(result.lower_final, 0.49);
+  EXPECT_LE(result.upper_final, 1.0);
+  EXPECT_GE(input.current_delta, result.lower_final);
+  EXPECT_LE(input.current_delta, result.upper_final);
+}
+
+TEST(TubeCrossSectionTest, UnsafeCurrentComponentFailsClosed) {
+  const ClearanceQuery query = [](const Eigen::Vector3d& point,
+                                  const double) {
+    ClearanceQueryResult result;
+    if (point.y() > 0.20 && point.y() < 0.50) {
+      result.status = DistanceStatus::OCCUPIED;
+      result.clearance = 0.0;
+      return result;
+    }
+    result.status = DistanceStatus::KNOWN_FREE;
+    result.clearance = 10.0;
+    result.clearance_certified = true;
+    return result;
+  };
+  TubeCrossSectionInput input = MakeInput(query);
+  input.current_delta = 0.30;
+  input.current_delta_valid = true;
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(MakeConfig()).solve(input);
+  EXPECT_FALSE(result.valid);
+  EXPECT_EQ(result.reason, TubeCrossSectionReason::CENTER_OCCUPIED);
+}
+
+TubeCrossSectionInput QuadraticInput(const double selected_delta,
+                                     const double tangent_x = 0.20,
+                                     const double normal_w_x = 1.0,
+                                     const double minimum = 0.50) {
+  TubeCrossSectionInput input = MakeInput(OpenSpace());
+  input.p_w = Eigen::Vector3d(tangent_x, 0.0, 0.0);
+  input.N_w = Eigen::Vector3d(normal_w_x, 0.0, 0.0);
+  input.minimum_reference_speed = minimum;
+  input.current_delta = selected_delta;
+  input.current_delta_valid = true;
+  return input;
+}
+
+TEST(TubeCrossSectionTest, QuadraticNegativeCSelectsLeftSafeComponent) {
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(MakeConfig()).solve(QuadraticInput(-0.90));
+  ASSERT_TRUE(result.valid);
+  // (0.2 + delta)^2 >= 0.5^2 has roots -0.7 and 0.3; retain the left
+  // connected component containing the selected current delta.
+  EXPECT_NEAR(result.upper_curvature, -0.70, 1e-12);
+  EXPECT_LE(result.upper_final, -0.70 + 1e-6);
+}
+
+TEST(TubeCrossSectionTest, QuadraticNegativeCSelectsRightSafeComponent) {
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(MakeConfig()).solve(QuadraticInput(0.60));
+  ASSERT_TRUE(result.valid);
+  EXPECT_NEAR(result.lower_curvature, 0.30, 1e-12);
+  EXPECT_GE(result.lower_final, 0.30 - 1e-6);
+  EXPECT_FALSE(result.contains_zero);
+}
+
+TEST(TubeCrossSectionTest, QuadraticNegativeCRejectsUnsafeRootComponent) {
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(MakeConfig()).solve(QuadraticInput(0.0));
+  EXPECT_FALSE(result.valid);
+  EXPECT_EQ(result.reason, TubeCrossSectionReason::REGULARITY_ZERO_UNSAFE);
+}
+
+TEST(TubeCrossSectionTest, LinearRegularityPositiveBUsesLowerLimit) {
+  const TubeCrossSectionResult result = TubeCrossSectionSolver(MakeConfig()).solve(
+      QuadraticInput(0.60, 0.20, 1e-8, 0.200000005));
+  ASSERT_TRUE(result.valid);
+  EXPECT_GE(result.lower_curvature, 0.49);
+}
+
+TEST(TubeCrossSectionTest, LinearRegularityNegativeBUsesUpperLimit) {
+  const TubeCrossSectionResult result = TubeCrossSectionSolver(MakeConfig()).solve(
+      QuadraticInput(-0.60, -0.20, 1e-8, 0.200000005));
+  ASSERT_TRUE(result.valid);
+  EXPECT_LE(result.upper_curvature, -0.49);
+}
+
 TEST(TubeCrossSectionTest, PlannerSafeDistanceIsTheOnlyGeometryClearance) {
   TubeCrossSectionConfig config = MakeConfig();
   config.planner_safe_distance = 0.45;

@@ -47,7 +47,9 @@ bool ValidTubeExecution(const RuntimeTubeExecutionConfig& tube) {
       IsFinite(tube.interior_margin) && tube.interior_margin >= 0.0 &&
       IsFinite(tube.tracking_error_bound) && tube.tracking_error_bound >= 0.0 &&
       IsFinite(tube.regularity_margin) && tube.regularity_margin > 0.0 &&
-      tube.regularity_margin < 1.0;
+      tube.regularity_margin < 1.0 &&
+      IsFinite(tube.minimum_reference_speed) &&
+      tube.minimum_reference_speed > 0.0;
 }
 
 phase_offset_core::PortProjectionLimits MakeProjectionLimits(
@@ -343,6 +345,8 @@ PhaseOffsetRuntime::PhaseOffsetRuntime(const PhaseOffsetRuntimeConfig& config)
     : config_(config) {
   phase_offset_core::GeometryParams geometry_params;
   geometry_params.regularity_margin = config_.tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      config_.tube.minimum_reference_speed;
   geometry_evaluator_ = phase_offset_core::GeometryEvaluator(geometry_params);
   configuration_valid_ = ValidManual(config_.manual) && ValidTubeExecution(config_.tube);
 }
@@ -401,8 +405,11 @@ bool PhaseOffsetRuntime::runPreflightCandidate(const RuntimePathSamples& samples
     }
     if (first_reason.empty()) first_reason = reason;
   };
-  phase_offset_core::GeometryEvaluator evaluator(
-      phase_offset_core::GeometryParams{1e-8, 1e-8, config_.tube.regularity_margin});
+  phase_offset_core::GeometryParams geometry_params;
+  geometry_params.regularity_margin = config_.tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      config_.tube.minimum_reference_speed;
+  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
   for (double sign : {-1.0, 1.0}) {
     for (const auto& path : samples) {
       ++result.sample_count;
@@ -501,6 +508,7 @@ bool PhaseOffsetRuntime::makePrepared(const RuntimePrepareInput& input,
   prepared.active_profile = input.tube_view.active_profile;
   prepared.epoch_status = input.tube_view.epoch_status;
   prepared.future_step = input.future_step;
+  prepared.frame_bound = input.current_path.frame_valid;
   prepared.preflight = preflight_;
   prepared.delta = delta_;
   prepared.dt = input.dt;
@@ -692,8 +700,11 @@ bool PhaseOffsetRuntime::buildContinuousExactPwlWitness(
     return fail(0U, "profile domain", "active profile PWL cells are invalid");
   }
 
+  const double regularity_threshold = prepared.frame_bound
+      ? config_.tube.minimum_reference_speed
+      : config_.tube.regularity_margin;
   const phase_offset_core::PortProjectionLimits limits = MakeProjectionLimits(
-      config_.manual, config_.tube.regularity_margin, nonnegative_progress);
+      config_.manual, regularity_threshold, nonnegative_progress);
   std::function<bool(std::size_t, double, double, const Eigen::Vector3d&,
                      const phase_offset_core::PortCommand&,
                      const phase_offset_core::PhaseOffsetGeometryState&,
@@ -900,7 +911,10 @@ bool PhaseOffsetRuntime::complete(const RuntimePreparedStep& prepared,
     projection_input.raw = raw;
     return phase_offset_core::PortProjector::project(
         projection_input, MakeProjectionLimits(
-            config_.manual, config_.tube.regularity_margin,
+            config_.manual,
+            prepared.frame_bound
+                ? config_.tube.minimum_reference_speed
+                : config_.tube.regularity_margin,
             nonnegative_progress), projection);
   };
 

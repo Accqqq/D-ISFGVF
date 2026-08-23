@@ -26,6 +26,24 @@ RuntimePathSamples MakePath() {
   return samples;
 }
 
+RuntimePathSamples MakeFrameBoundPath(const double tangent_speed) {
+  RuntimePathSamples samples;
+  for (int index = 0; index <= 4; ++index) {
+    phase_offset_core::PathDifferentialState state;
+    state.w = 0.1 * index;
+    state.p = Eigen::Vector3d(state.w, 0.0, 1.0);
+    state.p_w = Eigen::Vector3d(tangent_speed, 0.0, 0.0);
+    state.p_ww = Eigen::Vector3d::Zero();
+    state.T = Eigen::Vector3d::UnitX();
+    state.N = Eigen::Vector3d::UnitY();
+    state.N_w = Eigen::Vector3d::Zero();
+    state.frame_valid = true;
+    state.valid = true;
+    samples.push_back(state);
+  }
+  return samples;
+}
+
 std::shared_ptr<const TubeProfile> FinalizeProfile(
     const std::shared_ptr<TubeProfile>& profile) {
   if (profile && !profile->samples.empty()) {
@@ -380,6 +398,23 @@ TEST(PhaseOffsetRuntimeTest, PreflightIsExplicitAndRevisionScoped) {
   EXPECT_FALSE(runtime.refreshPreflight(changed));
   EXPECT_FALSE(runtime.prepare(MakeInput(path, RuntimeInstalledTubeView()), prepared));
   EXPECT_FALSE(prepared.execution.fatal_control_failure);
+}
+
+TEST(PhaseOffsetRuntimeTest, ConfiguredMinimumReferenceSpeedAgreesWithFramePreflight) {
+  PhaseOffsetRuntimeConfig config = MakeConfig(TubeSource::NONE);
+  config.tube.minimum_reference_speed = 0.50;
+  PhaseOffsetRuntime slow(config);
+  RuntimePreflightInput slow_input;
+  slow_input.path = MakeFrameBoundPath(0.20);
+  slow_input.position = slow_input.path.front().p;
+  slow_input.path_source_revision = 1U;
+  EXPECT_FALSE(slow.refreshPreflight(slow_input));
+
+  PhaseOffsetRuntime fast(config);
+  RuntimePreflightInput fast_input = slow_input;
+  fast_input.path = MakeFrameBoundPath(0.80);
+  fast_input.position = fast_input.path.front().p;
+  EXPECT_TRUE(fast.refreshPreflight(fast_input));
 }
 
 TEST(PhaseOffsetRuntimeTest, GateClosedEvaluatesExactPortButCannotSelectOrCommit) {

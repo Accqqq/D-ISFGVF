@@ -1,4 +1,5 @@
 #include "phase_offset_core/geometry.h"
+#include "phase_offset_core/normal_frame.h"
 
 #include <Eigen/Geometry>
 
@@ -35,6 +36,7 @@ struct TerminalGeometry {
   Eigen::Vector3d r_w = Eigen::Vector3d::Zero();
   Eigen::Vector3d error = Eigen::Vector3d::Zero();
   Eigen::Vector3d e_perp = Eigen::Vector3d::Zero();
+  Eigen::Matrix<double, 3, 2> J = Eigen::Matrix<double, 3, 2>::Zero();
   double regularity = 0.0;
   double e_parallel = 0.0;
 };
@@ -77,6 +79,7 @@ void EnsureFiniteOutput(PhaseOffsetGeometryState& output) {
   ResetIfNotFinite(output.curvature);
   ResetIfNotFinite(output.regularity);
   ResetIfNotFinite(output.e_parallel);
+  if (!output.J.allFinite()) output.J.setZero();
 }
 
 bool Invalidate(PhaseOffsetGeometryState& output, const char* reason) {
@@ -119,7 +122,9 @@ bool HasValidParameters(const GeometryParams& params) {
   return IsFinite(params.tangent_epsilon) && params.tangent_epsilon > 0.0 &&
          IsFinite(params.horizontal_tangent_epsilon) &&
          params.horizontal_tangent_epsilon > 0.0 &&
-         IsFinite(params.regularity_margin) && params.regularity_margin > 0.0;
+         IsFinite(params.regularity_margin) && params.regularity_margin > 0.0 &&
+         IsFinite(params.minimum_reference_speed) &&
+         params.minimum_reference_speed > 0.0;
 }
 
 const char* PrePointFailure(const PathDifferentialState& path,
@@ -146,14 +151,13 @@ void BuildPreparedPathFromValidatedPath(const PathDifferentialState& path,
   output.p_w = path.p_w;
   output.p_ww = path.p_ww;
   output.w = path.w;
+  output.path_revision = path.path_revision;
+  output.frame_revision = path.frame_revision;
+  output.frame_bound = path.frame_valid;
+  output.frame_provenance = path.frame_provenance;
   output.pre_point_valid = true;
   output.pre_point_reason = kNoReason;
   output.delayed_path_reason = kNoReason;
-
-  const Eigen::Vector3d gravity_axis(0.0, 0.0, 1.0);
-  const Eigen::Vector3d horizontal_tangent = gravity_axis.cross(path.p_w);
-  const Eigen::Vector3d horizontal_tangent_derivative =
-      gravity_axis.cross(path.p_ww);
 
   output.path_speed = path.p_w.norm();
   if (!IsFinite(output.path_speed)) {
@@ -165,28 +169,53 @@ void BuildPreparedPathFromValidatedPath(const PathDifferentialState& path,
     return;
   }
 
+  const Eigen::Vector3d gravity_axis(0.0, 0.0, 1.0);
+  const Eigen::Vector3d horizontal_tangent = gravity_axis.cross(path.p_w);
   output.horizontal_path_speed = horizontal_tangent.norm();
   if (!IsFinite(output.horizontal_path_speed)) {
     output.delayed_path_reason = kHorizontalPathSpeedNotFinite;
     return;
   }
-  if (output.horizontal_path_speed <= params.horizontal_tangent_epsilon) {
-    output.delayed_path_reason = kHorizontalPathSpeedTooSmall;
+  output.T = path.p_w / output.path_speed;
+  if (path.frame_valid && IsFinite(path.T) && IsFinite(path.N) &&
+      IsFinite(path.N_w) && path.T.norm() > params.tangent_epsilon &&
+      path.N.norm() > params.tangent_epsilon) {
+    output.T = path.T.normalized();
+    output.N = path.N.normalized();
+    output.N_w = path.N_w;
+    output.frame_bound = true;
+  } else {
+    // Compatibility fallback for synthetic callers. Production adapters pass
+    // frame_valid=true, so no production consumer reconstructs N/N_w.
+    if (!IsFinite(output.horizontal_path_speed) ||
+        output.horizontal_path_speed <= params.horizontal_tangent_epsilon) {
+      output.delayed_path_reason = kHorizontalPathSpeedTooSmall;
+      return;
+    }
+    output.N = horizontal_tangent / output.horizontal_path_speed;
+    const Eigen::Vector3d horizontal_tangent_derivative =
+        gravity_axis.cross(path.p_ww);
+    const Eigen::Vector3d projected_horizontal_tangent_derivative =
+        horizontal_tangent_derivative -
+        output.N * output.N.dot(horizontal_tangent_derivative);
+    output.N_w = projected_horizontal_tangent_derivative /
+        output.horizontal_path_speed;
+  }
+  if (!IsFinite(output.T) || !IsFinite(output.N) || !IsFinite(output.N_w) ||
+      std::abs(output.T.norm() - 1.0) > 1e-6 ||
+      std::abs(output.N.norm() - 1.0) > 1e-6 ||
+      std::abs(output.T.dot(output.N)) > 1e-6) {
+    output.delayed_path_reason = kComputedGeometryNotFinite;
     return;
   }
-
-  output.N = horizontal_tangent / output.horizontal_path_speed;
-  const Eigen::Vector3d projected_horizontal_tangent_derivative =
-      horizontal_tangent_derivative -
-      output.N * output.N.dot(horizontal_tangent_derivative);
-  output.N_w = projected_horizontal_tangent_derivative /
-      output.horizontal_path_speed;
   const double curvature_numerator =
       path.p_w.x() * path.p_ww.y() - path.p_w.y() * path.p_ww.x();
   const double speed_cubed =
       output.horizontal_path_speed * output.horizontal_path_speed *
       output.horizontal_path_speed;
-  output.curvature = curvature_numerator / speed_cubed;
+  output.curvature = output.horizontal_path_speed >
+          params.horizontal_tangent_epsilon
+      ? curvature_numerator / speed_cubed : 0.0;
   output.delayed_path_valid = true;
 }
 
@@ -202,7 +231,11 @@ void CopyPreparedPrefix(const PreparedPathGeometry& prepared,
   output.horizontal_path_speed = prepared.horizontal_path_speed;
   output.N = prepared.N;
   output.N_w = prepared.N_w;
+  output.T = prepared.T;
   output.curvature = prepared.curvature;
+  output.path_revision = prepared.path_revision;
+  output.frame_revision = prepared.frame_revision;
+  output.provenance = prepared.frame_provenance;
 }
 
 template <typename TerminalOutput>
@@ -228,16 +261,21 @@ const char* EvaluateTerminal(const PreparedPathGeometry& prepared,
   // All callers hand us a freshly value-initialized TerminalGeometry.
   // Preserving that initial zero state retains failure diagnostics while
   // avoiding a second fixed-size zero fill for every evaluated delta.
-  output.regularity = 1.0 - prepared.curvature * delta;
+  output.r = prepared.p + prepared.N * delta;
+  output.r_w = prepared.p_w + prepared.N_w * delta;
+  const double legacy_regularity = 1.0 - prepared.curvature * delta;
+  output.regularity = prepared.frame_bound ? output.r_w.norm()
+                                           : legacy_regularity;
   if (!IsFinite(prepared.curvature) || !IsFinite(output.regularity)) {
     return kCurvatureOrRegularityNotFinite;
   }
-  if (output.regularity < params.regularity_margin) {
-    return kOffsetRegularityMarginViolated;
+  if ((!prepared.frame_bound &&
+       output.regularity < params.regularity_margin) ||
+      (prepared.frame_bound &&
+       output.regularity < params.minimum_reference_speed)) {
+    if (!prepared.frame_bound) return kOffsetRegularityMarginViolated;
+    return kActiveReferenceSpeedTooSmall;
   }
-
-  output.r = prepared.p + prepared.N * delta;
-  output.r_w = prepared.p_w + prepared.N_w * delta;
   const double active_path_speed = output.r_w.norm();
   if (!IsFinite(active_path_speed)) {
     return kActiveReferenceSpeedNotFinite;
@@ -249,6 +287,8 @@ const char* EvaluateTerminal(const PreparedPathGeometry& prepared,
   output.error = position - output.r;
   output.e_parallel = output.T.dot(output.error);
   output.e_perp = output.error - output.e_parallel * output.T;
+  output.J.col(0) = output.r_w;
+  output.J.col(1) = prepared.N;
 
   if (!HasFiniteTerminal(prepared, delta, output)) {
     return kComputedGeometryNotFinite;

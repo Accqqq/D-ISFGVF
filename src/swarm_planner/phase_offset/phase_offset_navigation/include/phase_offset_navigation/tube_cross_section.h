@@ -5,6 +5,8 @@
 #include <Eigen/Core>
 
 #include <functional>
+#include <cstdint>
+#include <cstdint>
 
 namespace phase_offset_navigation {
 
@@ -36,6 +38,7 @@ struct TubeCrossSectionConfig {
   // The planner-authoritative clearance contract.  This is the sole
   // production clearance requested from the immutable Tube snapshot.
   double planner_safe_distance = 0.4;
+  double minimum_reference_speed = 1e-8;
   // Deprecated diagnostic accounting retained only while downstream schemas
   // are migrated.  These values never determine cross-section geometry.
   RobustTubeMargins margins;
@@ -52,6 +55,7 @@ enum class TubeCrossSectionReason {
   EMPTY_AFTER_OBSTACLE_BOUNDS,
   CURVATURE_NUMERICAL_FAILURE,
   EMPTY_AFTER_CURVATURE_INTERSECTION,
+  REGULARITY_ZERO_UNSAFE,
 };
 
 enum class TubeRayTermination {
@@ -66,6 +70,13 @@ struct TubeCrossSectionInput {
   Eigen::Vector3d p = Eigen::Vector3d::Zero();
   Eigen::Vector3d N = Eigen::Vector3d::Zero();
   double curvature = 0.0;
+  Eigen::Vector3d p_w = Eigen::Vector3d::Zero();
+  Eigen::Vector3d N_w = Eigen::Vector3d::Zero();
+  double minimum_reference_speed = 0.0;
+  double current_delta = 0.0;
+  bool current_delta_valid = false;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
   // The safety-producing input.  It directly certifies clearance of the
   // candidate centre p + N * delta against occupied voxel volumes.
   ClearanceQuery clearance_query;
@@ -90,6 +101,9 @@ struct TubeCrossSectionResult {
   double upper_final = 0.0;
   double width = 0.0;
   bool contains_zero = false;
+  bool regularity_proven = false;
+  double regularity_speed_at_zero = 0.0;
+  double regularity_speed_min = 0.0;
   // A valid result always describes the planner-authoritative zero-connected
   // interval.  When the immutable snapshot cannot establish non-zero space,
   // that interval is the valid zero-only fallback [0, 0].

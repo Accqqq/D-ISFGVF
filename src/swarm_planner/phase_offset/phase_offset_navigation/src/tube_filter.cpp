@@ -63,6 +63,11 @@ bool TubeFilter::configurationValid() const {
 }
 
 bool TubeFilter::filter(TubeProfile& profile, const double current_w) const {
+  return filter(profile, current_w, 0.0);
+}
+
+bool TubeFilter::filter(TubeProfile& profile, const double current_w,
+                        const double current_delta) const {
   profile.filtered_complete = false;
   profile.complete = false;
   if (!configurationValid() || !profile.raw_complete ||
@@ -74,6 +79,11 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w) const {
     if (!ValidRawSample(sample)) return false;
   }
   if (FindAnchor(profile, current_w) >= profile.samples.size()) return false;
+  profile.current_delta = current_delta;
+  profile.current_delta_valid = IsFinite(current_delta);
+  profile.selected_component = std::abs(current_delta) <= kEpsilon
+      ? TubeComponentSelection::ZERO_CONNECTED
+      : TubeComponentSelection::CURRENT_DELTA_CONNECTED;
 
   // Each knot remains exactly the complete raw Builder interval.  A cell is
   // represented by the affine interpolation between its two endpoints; this
@@ -115,6 +125,12 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w) const {
     profile.diagnostics.min_width = 0.0;
   }
 
+  // Keep the complete geometric candidate independent of current-delta
+  // containment.  The EpochManager performs the current-state containment
+  // check and reports CURRENT_OFFSET_OUTSIDE while retaining this candidate
+  // evidence.  Filtering must not silently truncate a valid corridor (or
+  // turn an offset rejection into CANDIDATE_INCOMPLETE).
+
   // The Filter does not create truncation provenance.  Any pre-existing
   // before/after truncation and reason belong to the Builder/Validator and are
   // intentionally preserved verbatim.
@@ -125,6 +141,33 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w) const {
   profile.certified_segment_end_w = profile.preview_end_w;
   profile.filtered_complete = true;
   profile.complete = true;
+  profile.current_component_contains_delta = false;
+  TubeBounds selected;
+  if (query(profile, current_w, selected)) {
+    profile.current_component_contains_delta =
+        selected.lower <= current_delta + kEpsilon &&
+        selected.upper >= current_delta - kEpsilon;
+  }
+  // This is evidence about the component actually represented by the
+  // filtered intervals, not an unconditional claim that zero is connected.
+  // A selected nonzero component may exclude zero entirely.
+  bool all_knots_contain_zero = true;
+  bool has_nonzero_capacity = false;
+  for (const TubeRawSample& sample : profile.samples) {
+    const bool contains_zero = sample.filtered_lower <= kEpsilon &&
+        sample.filtered_upper >= -kEpsilon;
+    all_knots_contain_zero = all_knots_contain_zero && contains_zero;
+    has_nonzero_capacity = has_nonzero_capacity ||
+        sample.filtered_lower < -kEpsilon || sample.filtered_upper > kEpsilon;
+  }
+  profile.zero_component_contains_zero = all_knots_contain_zero;
+  // ZERO_ONLY is reserved for the authoritative neutral [0,0] interval, and
+  // only when the complete retained component has no nonzero capacity.
+  profile.zero_only = profile.current_component_contains_delta &&
+      std::abs(current_delta) <= kEpsilon &&
+      std::abs(selected.upper) <= kEpsilon &&
+      std::abs(selected.lower) <= kEpsilon &&
+      !has_nonzero_capacity && profile.zero_component_contains_zero;
   return true;
 }
 

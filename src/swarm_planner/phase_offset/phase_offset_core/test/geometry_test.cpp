@@ -365,6 +365,27 @@ TEST(GeometryEvaluatorTest, RegularityMarginStillRejectsHorizontalOffsetFold) {
   ExpectInvalid(evaluator, MakeCircle(1.0, 0.0), Eigen::Vector3d::Zero(), 0.95);
 }
 
+TEST(GeometryEvaluatorTest, ConfiguredMinimumReferenceSpeedUsesFull3DFrameBound) {
+  GeometryParams params;
+  params.minimum_reference_speed = 0.50;
+  PathDifferentialState frame_bound = MakeLine();
+  frame_bound.p_w = Eigen::Vector3d(0.20, 0.0, 0.0);
+  frame_bound.T = Eigen::Vector3d::UnitX();
+  frame_bound.N = Eigen::Vector3d::UnitY();
+  frame_bound.N_w = Eigen::Vector3d::UnitX();
+  frame_bound.frame_valid = true;
+  const GeometryEvaluator evaluator(params);
+  PhaseOffsetGeometryState safe;
+  const bool safe_ok = evaluator.evaluate(
+      frame_bound, Eigen::Vector3d::Zero(), -0.80, safe);
+  EXPECT_TRUE(safe_ok) << safe.invalid_reason;
+  EXPECT_NEAR(safe.r_w.norm(), 0.60, 1e-12);
+  PhaseOffsetGeometryState unsafe;
+  EXPECT_FALSE(evaluator.evaluate(frame_bound, Eigen::Vector3d::Zero(), 0.0,
+                                  unsafe));
+  EXPECT_FALSE(unsafe.valid);
+}
+
 TEST(GeometryEvaluatorTest, VerticalOrNearVerticalPathsAreRejectedSafely) {
   const GeometryEvaluator evaluator;
   PathDifferentialState near_vertical = MakeSlopedLine(1.0, 0.0);
