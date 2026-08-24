@@ -44,6 +44,14 @@ class ContinuousPhaseNormalFrame final
                 Eigen::Vector3d& tangent_w) const;
   bool seedNormal(const Eigen::Vector3d& tangent,
                   Eigen::Vector3d& normal) const;
+  // Builds the immutable represented N(w) and its derivative from the same
+  // smooth, projected interpolation.  Keeping this calculation together is
+  // essential: an analytically transported N_w cannot be paired with a
+  // discretely projected N without violating the frame contract.
+  bool representedNormalAt(double w, Eigen::Vector3d& tangent,
+                           Eigen::Vector3d& tangent_w,
+                           Eigen::Vector3d& normal,
+                           Eigen::Vector3d& normal_w) const;
   bool transportTo(double w, Eigen::Vector3d& tangent,
                    Eigen::Vector3d& normal) const;
 

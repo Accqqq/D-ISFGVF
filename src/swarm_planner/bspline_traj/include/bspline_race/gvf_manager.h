@@ -131,6 +131,11 @@ class gvf_manager
         Eigen::Vector3d last_governor_cmd_pos_ = Eigen::Vector3d::Zero();
         Eigen::Vector3d last_governor_cmd_vel_ = Eigen::Vector3d::Zero();
         bool has_last_governor_cmd_ = false;
+        // Yaw history is part of the same command transaction as the
+        // PositionCommand publication.  The callback computes a candidate;
+        // this value is installed only after the adapter/authority commit.
+        double pending_last_yaw_ = 0.0;
+        bool pending_last_yaw_valid_ = false;
         Eigen::Vector3d cmd_governor_normal_state_ = Eigen::Vector3d::Zero();
         bool cmd_governor_initialized_ = false;
         double cmd_governor_last_l_ = 0.0;
@@ -336,6 +341,11 @@ class gvf_manager
             // completion from overwriting an FSM reset/initialization.
             std::uint64_t generation = 0U;
         };
+        struct AuthoritativePhaseCommitToken {
+            AuthoritativePhaseSnapshot expected;
+            AuthoritativePhaseSnapshot committed;
+            bool valid = false;
+        };
         // Per-call bootstrap attribution only.  This is deliberately not an
         // authority, gate, latch, mailbox, or Runtime value: it records the
         // one first-false outcome of a single timer activation attempt.
@@ -384,6 +394,12 @@ class gvf_manager
             const AuthoritativePhaseSnapshot& captured,
             double w, bool acquire_closed_phase,
             AuthoritativePhaseSnapshot& committed);
+        bool prepareAuthoritativePhaseCommitLocked(
+            const AuthoritativePhaseSnapshot& captured,
+            double w, bool acquire_closed_phase,
+            AuthoritativePhaseCommitToken& token) const;
+        void commitAuthoritativePhaseNoFailLocked(
+            const AuthoritativePhaseCommitToken& token) noexcept;
         struct CallbackTimingSample {
             std::uint64_t sequence = 0U;
             std::uint64_t steady_duration_ns = 0U;
@@ -391,6 +407,8 @@ class gvf_manager
         };
         std::unique_ptr<PhaseOffsetMatchedAdapter> phase_offset_matched_adapter_;
         std::unique_ptr<PhaseOffsetShadowAdapter> phase_offset_shadow_adapter_;
+        phase_offset_navigation::RecoveryStepStatus last_recovery_status_ =
+            phase_offset_navigation::RecoveryStepStatus::NONE;
         struct PendingPathTubeFrontend {
             PathTubePairTransaction transaction;
             std::shared_ptr<const PathTubePair> candidate_pair;
@@ -598,6 +616,7 @@ class gvf_manager
             double selected_l = 0.0;
             bool command_valid = false;
             bool selected_valid_for_state = false;
+            bool reset_state_after_publish = false;
             std::string final_cmd_source = "GOVERNOR_INVALID_HOLD";
             std::string fallback_reason = "none";
         };
@@ -684,9 +703,9 @@ class gvf_manager
         bool stageCurrentStateRecoveryRequest(
             const MatchedAdapterOutput& output,
             const std::shared_ptr<const PathTubePair>& owner_pair);
-        // P2a deliberately leaves this seam unwired in production: there is
-        // no authorised physical recovery owner yet.  P2b may call it only
-        // from FSM after it has supplied a route-specific recovery contract.
+        // FSM consumes this owner/session-bound mailbox and routes it into
+        // the adapter's existing Preview/Handoff/RecoveryOwner chain.  It
+        // never manufactures a generic HOLD or a second authority.
         bool consumeCurrentStateRecoveryRequestForFsm(
             const std::shared_ptr<const PathTubePair>& active_pair,
             PendingCurrentStateRecoveryRequest& request);
@@ -812,7 +831,10 @@ class gvf_manager
                                                           double reference_delta,
                                                           double dt,
                                                           double kp_equiv,
-                                                          GovernorCommandDebug& dbg);
+                                                          GovernorCommandDebug& dbg,
+                                                          const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr&
+                                                              executed_reference_query =
+                                                                  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr());
         void updateGovernorCommandHistory(const Eigen::Vector3d& pos,
                                           const Eigen::Vector3d& cmd_pos,
                                           double dt,
@@ -823,7 +845,7 @@ class gvf_manager
                                 double real_dis_to_goal,
                                 double kp_equiv,
                                 bool switch_active) const;
-        void publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
+        bool publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
                                             const Eigen::Vector3d& yaw_cmd_vec);
         void recordCallbackTiming(std::uint64_t steady_duration_ns,
                                   std::uint64_t ros_stamp_ns);

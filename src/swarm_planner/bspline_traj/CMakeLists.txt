@@ -101,6 +101,7 @@ target_link_libraries(phase_offset_clearance_audit
 add_library(phase_offset_matched_adapter
   src/integration/phase_offset_cloud_occupancy_query.cpp
   src/integration/phase_offset_matched_adapter.cpp
+  src/integration/phase_offset_recovery_continuation_provider.cpp
   src/integration/phase_offset_raw_candidate_diagnostics.cpp
   src/integration/phase_offset_tube_epoch_diagnostics.cpp
   src/integration/phase_offset_tube_markers.cpp
@@ -179,6 +180,8 @@ if(CATKIN_ENABLE_TESTING)
     test/phase_offset_tube_epoch_diagnostics_test.cpp)
   catkin_add_gtest(phase_offset_tube_epoch_integration_test
     test/phase_offset_tube_epoch_integration_test.cpp)
+  catkin_add_gtest(phase_offset_recovery_continuation_provider_test
+    test/phase_offset_recovery_continuation_provider_test.cpp)
   # G2d removes this raw-log-odds bridge from all production targets.  Keep a
   # test-only target so the deprecated reference remains independently
   # exercisable without a path from formation_planning to raw occupancy.
@@ -288,6 +291,16 @@ if(CATKIN_ENABLE_TESTING)
       phase_offset_matched_adapter
       phase_offset_active_adapter
       isf_reference_kernel
+      continuous_phase_path
+      phase_offset_core
+      phase_offset_navigation
+      ${catkin_LIBRARIES}
+    )
+  endif()
+  if(TARGET phase_offset_recovery_continuation_provider_test)
+    target_link_libraries(phase_offset_recovery_continuation_provider_test
+      phase_offset_matched_adapter
+      phase_offset_executed_reference_query
       continuous_phase_path
       phase_offset_core
       phase_offset_navigation

@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -72,6 +74,15 @@ class GvfManagerS4AnchorTestAccess {
                                   const std::uint64_t session) {
     std::lock_guard<std::mutex> lock(manager.path_tube_handoff_mutex_);
     manager.path_tube_authority_session_ = session;
+  }
+
+  static void setAuthoritySessionForE2E(gvf_manager& manager,
+                                        const std::uint64_t session) {
+    setAuthoritySession(manager, session);
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->authority_session_.store(
+          session, std::memory_order_release);
+    }
   }
 
   static void occupyBootstrapSlot(gvf_manager& manager) {
@@ -369,6 +380,179 @@ class GvfManagerS4AnchorTestAccess {
   static void markNonzeroHandoffRecoveryRequired(gvf_manager& manager) {
     std::lock_guard<std::mutex> lock(manager.path_tube_handoff_mutex_);
     manager.nonzero_handoff_recovery_required_reported_ = true;
+  }
+
+  static gvf_manager::GovernorCommandResult invalidHold(
+      gvf_manager& manager, const Eigen::Vector3d& position,
+      const std::string& reason) {
+    gvf_manager::GovernorCommandDebug debug;
+    return manager.makeGovernorInvalidHold(position, reason, debug);
+  }
+
+  static bool publishGovernorCandidate(gvf_manager& manager,
+                                        const Eigen::Vector3d& position,
+                                        const Eigen::Vector3d& yaw) {
+    return manager.publishGovernorPositionCommand(position, yaw);
+  }
+
+  struct GovernorProbe {
+    Eigen::Vector3d cmd_pos = Eigen::Vector3d::Zero();
+    bool command_valid = false;
+  };
+
+  static bool advertiseProductionSeams(gvf_manager& manager,
+                                       ros::NodeHandle& nh,
+                                       const std::string& command_topic) {
+    if (!manager.phase_offset_matched_adapter_) return false;
+    manager.cmd_topic_ = command_topic;
+    manager.cmd_pub = nh.advertise<quadrotor_msgs::PositionCommand>(
+        command_topic, 10);
+    manager.phase_offset_matched_adapter_->advertise(nh);
+    return static_cast<bool>(manager.cmd_pub);
+  }
+
+  static bool updateAdapter(gvf_manager& manager,
+                            const MatchedAdapterInput& input,
+                            MatchedAdapterOutput& output) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->update(input, output);
+  }
+
+  static PendingPositionCommandCapture pendingCommand(
+      gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_
+        ? manager.phase_offset_matched_adapter_->capturePendingPositionCommand()
+        : PendingPositionCommandCapture();
+  }
+
+  static bool publishPendingCommand(gvf_manager& manager,
+                                    const std::function<bool()>& local_publish,
+                                    const std::uint64_t identity) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->publishPendingPositionCommand(
+            local_publish, identity);
+  }
+
+  static phase_offset_navigation::ActiveReferenceSnapshot authoritySnapshot(
+      gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_
+        ? manager.phase_offset_matched_adapter_->execution_authority_.snapshot()
+        : phase_offset_navigation::ActiveReferenceSnapshot();
+  }
+
+  static phase_offset_navigation::ActiveReferenceSnapshot pendingAuthoritySnapshot(
+      gvf_manager& manager) {
+    if (!manager.phase_offset_matched_adapter_ ||
+        !manager.phase_offset_matched_adapter_->pending_authority_valid_ ||
+        !manager.phase_offset_matched_adapter_->pending_authority_prepared_
+             .committed_snapshot) {
+      return phase_offset_navigation::ActiveReferenceSnapshot();
+    }
+    return *manager.phase_offset_matched_adapter_->pending_authority_prepared_
+                  .committed_snapshot;
+  }
+
+  static double retainedDelta(gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_ &&
+            manager.phase_offset_matched_adapter_->runtime_
+        ? manager.phase_offset_matched_adapter_->runtime_->retainedDelta()
+        : 0.0;
+  }
+
+  static void setTestOnlyRuntimeOwnerAllowed(gvf_manager& manager,
+                                             const bool allowed) {
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->execution_authority_
+          .setTestOnlyRuntimeOwnerAllowed(allowed);
+    }
+  }
+
+  static void setAdapterAdvertised(gvf_manager& manager, const bool advertised) {
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->advertised_ = advertised;
+    }
+  }
+
+  static void openManualGate(gvf_manager& manager) {
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->zero_gate_open_ = true;
+      manager.phase_offset_matched_adapter_->zero_gate_consecutive_count_ =
+          100;
+    }
+  }
+
+  static const phase_offset_navigation::RecoveryOwnerStatus& recoveryStatus(
+      gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_->recovery_owner_.status();
+  }
+
+  static bool stageSuccessorPair(
+      gvf_manager& manager,
+      const std::shared_ptr<const PathTubePair>& expected_pair,
+      const std::shared_ptr<const ContinuousPhasePath>& successor_owner,
+      const MatchedAdapterPathSamples& successor_samples,
+      const double captured_w0,
+      const double future_seam_w,
+      const double existing_future_horizon_end_w,
+      const Eigen::Vector3d& position,
+      const guidance::IsfGains& gains,
+      const double dt,
+      PathTubePairTransaction& transaction,
+      PathTubePairStageFailure* stage_failure = nullptr) {
+    if (!manager.phase_offset_matched_adapter_ || !expected_pair) return false;
+    std::unique_ptr<PathTubePairPin> pin =
+        manager.phase_offset_matched_adapter_->captureAndAcquirePathTubePairPin();
+    if (!pin || !pin->valid() || pin->capture().pair != expected_pair) {
+      return false;
+    }
+    const bool staged = manager.phase_offset_matched_adapter_->stagePathTubePair(
+        expected_pair, successor_owner, successor_samples, captured_w0,
+        future_seam_w, existing_future_horizon_end_w, position, gains, dt,
+        std::shared_ptr<const plan_env::CloudOccupancySnapshot>(), transaction,
+        expected_pair->authority_session, &pin->capture(), pin->leaseId(),
+        stage_failure);
+    if (!staged || !transaction.candidate_pair) return false;
+    std::shared_ptr<gvf_manager::PendingPathTubeFrontend> frontend(
+        new gvf_manager::PendingPathTubeFrontend());
+    frontend->candidate_pair = transaction.candidate_pair;
+    frontend->transaction = transaction;
+    frontend->authority_session = expected_pair->authority_session;
+    frontend->transaction_pin = std::move(pin);
+    {
+      std::lock_guard<std::mutex> lock(manager.path_tube_handoff_mutex_);
+      if (manager.path_tube_authority_session_ != expected_pair->authority_session ||
+          manager.pending_path_tube_handoff_ ||
+          manager.completed_path_tube_handoff_) {
+        return false;
+      }
+      manager.pending_path_tube_handoff_ = frontend;
+    }
+    return true;
+  }
+
+  static GovernorProbe runGovernorCandidate(
+      gvf_manager& manager,
+      const std::shared_ptr<const ContinuousPhasePath>& path,
+      const gvf::LiftedGuidanceResult& out,
+      const Eigen::Vector3d& position,
+      const double progress_w,
+      const double reference_delta,
+      const double dt,
+      const double kp_equiv,
+      const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr& query) {
+    manager.cmd_governor_l_min_ = 0.50;
+    manager.cmd_governor_l_max_ = 0.50;
+    manager.cmd_governor_l_step_ = 0.05;
+    manager.cmd_governor_normal_max_ = 0.0;
+    gvf_manager::GovernorCommandDebug debug;
+    const gvf_manager::GovernorCommandResult result =
+        manager.runVelocityMatchingGovernor(
+            path, out, position, progress_w, reference_delta, dt, kp_equiv,
+            debug, query);
+    GovernorProbe probe;
+    probe.cmd_pos = result.cmd_pos;
+    probe.command_valid = result.command_valid;
+    return probe;
   }
 
   struct NeutralCommitProbe {
@@ -738,11 +922,6 @@ class GvfManagerS4AnchorTestAccess {
     return probe;
   }
 
-  struct GovernorProbe {
-    Eigen::Vector3d cmd_pos = Eigen::Vector3d::Zero();
-    bool command_valid = false;
-  };
-
   static bool point(
                     const gvf_manager& manager,
                     const std::shared_ptr<const ContinuousPhasePath>& path,
@@ -894,6 +1073,48 @@ std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeH2OldSeamPath() {
   return path;
 }
 
+std::shared_ptr<const FLAG_Race::ContinuousPhasePath>
+makeSeededRecoveryCompositeSuccessor(
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& old_owner,
+    const double captured_w0, const double future_seam_w,
+    const double join_w, const double end_w) {
+  if (!old_owner) return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  FLAG_Race::ContinuousPhasePathState old_seam;
+  if (!old_owner->evaluate(future_seam_w, old_seam, false)) {
+    return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  }
+  FLAG_Race::ContinuousPhasePathState mapped_tail_join;
+  mapped_tail_join.p = Eigen::Vector3d(join_w, 1.60, 1.0);
+  mapped_tail_join.dp_dw = Eigen::Vector3d(1.0, -0.40, 0.0);
+  mapped_tail_join.d2p_dw2 = Eigen::Vector3d(0.0, -0.20, 0.0);
+  mapped_tail_join.vel = mapped_tail_join.dp_dw;
+  mapped_tail_join.valid = true;
+  const auto connector = FLAG_Race::ContinuousPhasePath::makeQuinticHermite(
+      future_seam_w, join_w, old_seam, mapped_tail_join);
+  if (!connector) return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  auto owner = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  if (!owner->appendSlice(*old_owner, captured_w0, future_seam_w) ||
+      !owner->appendSegment(future_seam_w, join_w, "c2_quintic", connector) ||
+      !owner->appendSegment(
+          join_w, end_w, "mapped_tail",
+          [mapped_tail_join, join_w](
+              const double w, FLAG_Race::ContinuousPhasePathState& state) {
+            const double dw = w - join_w;
+            state = mapped_tail_join;
+            state.p = mapped_tail_join.p + dw * mapped_tail_join.dp_dw +
+                0.5 * dw * dw * mapped_tail_join.d2p_dw2;
+            state.dp_dw = mapped_tail_join.dp_dw +
+                dw * mapped_tail_join.d2p_dw2;
+            state.vel = state.dp_dw;
+            state.valid = state.p.allFinite() && state.dp_dw.allFinite() &&
+                state.d2p_dw2.allFinite() && state.vel.allFinite();
+            return state.valid;
+          })) {
+    return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  }
+  return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(owner);
+}
+
 std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeTimerBootstrapPath(
     const std::function<void()>& on_first_evaluation) {
   auto fired = std::make_shared<std::atomic<bool>>(false);
@@ -930,6 +1151,45 @@ std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeShortTimerBootstrapPat
         return true;
       }));
   return path;
+}
+
+void ensureRosInitializedForSeededRecoveryE2E() {
+  if (ros::isInitialized()) return;
+  int argc = 1;
+  char node_name[] = "gvf_seeded_recovery_e2e";
+  char* argv[] = {node_name, nullptr};
+  ros::init(argc, argv, node_name,
+            ros::init_options::AnonymousName |
+                ros::init_options::NoSigintHandler);
+}
+
+struct PositionCommandCapture {
+  mutable std::mutex mutex;
+  std::vector<quadrotor_msgs::PositionCommand> messages;
+
+  void callback(const quadrotor_msgs::PositionCommand::ConstPtr& message) {
+    if (!message) return;
+    std::lock_guard<std::mutex> lock(mutex);
+    messages.push_back(*message);
+  }
+
+  std::size_t size() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return messages.size();
+  }
+};
+
+bool waitForPositionCommandCount(const PositionCommandCapture& capture,
+                                 const std::size_t expected,
+                                 const double timeout_sec) {
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration<double>(timeout_sec);
+  while (capture.size() < expected &&
+         std::chrono::steady_clock::now() < deadline) {
+    ros::spinOnce();
+    ros::WallDuration(0.005).sleep();
+  }
+  return capture.size() >= expected;
 }
 
 std::shared_ptr<const FLAG_Race::PathTubePair> makeCertifiedH2Pair(
@@ -1020,6 +1280,37 @@ FLAG_Race::MatchedAdapterOutput observeOnlyOutput() {
   output.runtime_execution.mode =
       phase_offset_navigation::RuntimeExecutionMode::WAITING_FOR_CANDIDATE;
   return output;
+}
+
+TEST(GvfRecoveryMailbox, RecoveryReplanRequiredIsRoutedOnceToFsm) {
+  FLAG_Race::gvf_manager manager;
+  const std::shared_ptr<const FLAG_Race::PathTubePair> pair =
+      makeRecoveryPair(7U, 9U, 11U);
+  ASSERT_TRUE(pair);
+  FLAG_Race::MatchedAdapterOutput output;
+  output.selected = false;
+  output.valid = false;
+  output.recovery_status =
+      phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+  output.recovery_replan_required = true;
+
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::recoveryRequired(output));
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::stageRecovery(
+      manager, output, pair));
+  // Repeated command ticks for the same owner/session are idempotent.
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::stageRecovery(
+      manager, output, pair));
+  const auto mailbox =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::recoveryMailbox(manager);
+  ASSERT_TRUE(mailbox.pending);
+  ASSERT_EQ(mailbox.pending_session, pair->authority_session);
+
+  std::uint64_t ticket = 0U;
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::consumeRecovery(
+      manager, pair, ticket));
+  EXPECT_EQ(ticket, mailbox.pending_ticket);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::consumeRecovery(
+      manager, pair, ticket));
 }
 }
 
@@ -2023,6 +2314,43 @@ TEST(GvfAuthoritativePhaseCommit, HoldsForEveryGovernorInvalidReason)
   }
 }
 
+TEST(GvfGovernorPublication, ActiveFailureProducesPositionHoldNotCenterline)
+{
+  FLAG_Race::gvf_manager manager;
+  manager.cmd_governor_initialized_ = true;
+  manager.cmd_governor_normal_state_ = Eigen::Vector3d(0.3, -0.2, 0.1);
+  manager.cmd_governor_last_l_ = 0.25;
+  const Eigen::Vector3d position(4.0, -1.0, 2.0);
+  const auto result = FLAG_Race::GvfManagerS4AnchorTestAccess::invalidHold(
+      manager, position, "active_nonzero_recovery_denied");
+  EXPECT_FALSE(result.command_valid);
+  EXPECT_FALSE(result.selected_valid_for_state);
+  EXPECT_TRUE(result.reset_state_after_publish);
+  EXPECT_EQ(result.final_cmd_source, "GOVERNOR_INVALID_HOLD");
+  EXPECT_EQ(result.fallback_reason, "active_nonzero_recovery_denied");
+  EXPECT_EQ(0, std::memcmp(result.cmd_pos.data(), position.data(),
+                           3U * sizeof(double)));
+  // Constructing the invalid result is side-effect free; reset/last-yaw
+  // mutation belongs after successful PositionCommand publication.
+  EXPECT_TRUE(manager.cmd_governor_initialized_);
+  EXPECT_NEAR(manager.cmd_governor_normal_state_.norm(),
+              Eigen::Vector3d(0.3, -0.2, 0.1).norm(), 1e-12);
+  EXPECT_DOUBLE_EQ(manager.cmd_governor_last_l_, 0.25);
+}
+
+TEST(GvfGovernorPublication, FailedPublicationDoesNotAdvanceYawCandidate)
+{
+  FLAG_Race::gvf_manager manager;
+  manager.last_yaw = 0.35;
+  manager.pending_last_yaw_valid_ = false;
+  const bool published = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      publishGovernorCandidate(manager, Eigen::Vector3d(1.0, 2.0, 3.0),
+                                Eigen::Vector3d(0.0, 1.0, 0.0));
+  EXPECT_FALSE(published);
+  EXPECT_DOUBLE_EQ(manager.last_yaw, 0.35);
+  EXPECT_FALSE(manager.pending_last_yaw_valid_);
+}
+
 TEST(GvfAuthoritativePhaseCommit, GoalPositionOverrideFreezesCandidate)
 {
   const auto decision = FLAG_Race::gvf_manager::decideAuthoritativePhaseCommit(
@@ -2308,6 +2636,370 @@ TEST(GvfPlannerAuthority,
   EXPECT_TRUE(result.installed_new_owner);
   EXPECT_FALSE(result.pair_present);
   EXPECT_GT(result.session_after, result.session_before);
+}
+
+TEST(SeededRecoveryE2E,
+     SeededNonzeroAuthorityUsesSuccessorRecoveryAndAtomicNeutralHandoff) {
+  ensureRosInitializedForSeededRecoveryE2E();
+  ros::Time::init();
+  ros::NodeHandle nh;
+  constexpr char kCommandTopic[] = "/gvf_seeded_recovery_e2e/position_command";
+
+  FLAG_Race::gvf_manager manager;
+  const auto owner = makeTimerBootstrapPath(std::function<void()>());
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::installTimerBootstrapFixture(
+      manager, owner));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setAuthoritySessionForE2E(manager, 1U);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, 0.4, true, false);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setOdom(
+      manager, Eigen::Vector3d(0.4, 0.10, 1.10));
+
+  auto& frontend = manager.swarmParticlesManager.front();
+  frontend.receive_goal = true;
+  frontend.goal_pt = Eigen::Vector3d(20.0, 0.0, 1.0);
+  frontend.gvf_->gvf_.K1_ = 2.0;
+  frontend.gvf_->gvf_.K2_ = -2.2;
+  frontend.gvf_->gvf_.convergence_bandwidth_ = 0.1;
+  frontend.gvf_->progress_rho0_ = 0.5;
+  frontend.gvf_->progress_delta_ = 0.3;
+  frontend.gvf_->alpha_min_ = 0.05;
+
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::advertiseProductionSeams(
+      manager, nh, kCommandTopic));
+  // The first nonzero seed is deliberately established through the ordinary
+  // adapter/authority path before advertisement.  Subsequent recovery ticks
+  // must use the publication-owned transaction below.
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setAdapterAdvertised(manager, false);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setTestOnlyRuntimeOwnerAllowed(
+      manager, true);
+
+  const auto bootstrap = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      activateTimerBootstrapAttempt(manager);
+  ASSERT_TRUE(bootstrap.committed) << bootstrap.outcome << ": "
+                                   << bootstrap.stage_failure;
+  const auto old_pair = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      bootstrapAuthority(manager);
+  ASSERT_TRUE(old_pair);
+  ASSERT_TRUE(old_pair->active_profile);
+  EXPECT_NE(0U, old_pair->source_revision);
+  EXPECT_NE(0U, old_pair->path_revision);
+  EXPECT_NE(0U, old_pair->frame_revision);
+  EXPECT_NE(0U, old_pair->active_profile->profile_revision);
+
+  auto make_input = [&](const std::shared_ptr<const FLAG_Race::PathTubePair>& pair,
+                        const phase_offset_navigation::ActiveReferenceSnapshot& authority,
+                        const double stamp,
+                        const std::shared_ptr<const FLAG_Race::PathTubePair>& successor)
+      -> FLAG_Race::MatchedAdapterInput {
+    FLAG_Race::MatchedAdapterInput input =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::timerBootstrapGateInput(stamp);
+    const double w = authority.valid ? authority.proposed_next_w : 0.4;
+    FLAG_Race::ContinuousPhasePathState state;
+    EXPECT_TRUE(pair && pair->path_owner &&
+                pair->path_owner->evaluate(w, state, false));
+    input.path = FLAG_Race::ConvertContinuousPhasePathStateForActive(state, w);
+    input.path_state_query = [owner = pair->path_owner](
+        const double query_w,
+        phase_offset_core::PathDifferentialState& query_state) {
+      FLAG_Race::ContinuousPhasePathState state;
+      if (!owner || !owner->evaluate(query_w, state, false)) return false;
+      query_state = FLAG_Race::ConvertContinuousPhasePathStateForActive(
+          state, query_w);
+      return true;
+    };
+    input.semantic_path_owner = pair->path_owner;
+    input.frame_owner = pair->frame_owner;
+    input.semantic_path_start_w = pair->path_owner->startW();
+    input.semantic_path_end_w = pair->path_owner->endW();
+    input.path_tube_pair = pair;
+    input.successor_path_tube_pair = successor;
+    input.position = Eigen::Vector3d(w, 0.10, 1.10);
+    input.stamp = ros::Time(stamp);
+    FLAG_Race::PhaseOffsetActiveAdapter zero;
+    FLAG_Race::ActiveAdapterInput zero_input;
+    zero_input.path = input.path;
+    zero_input.position = input.position;
+    zero_input.gains = input.gains;
+    FLAG_Race::ActiveAdapterOutput zero_output;
+    EXPECT_TRUE(zero.evaluate(zero_input, zero_output));
+    input.legacy = FLAG_Race::LegacyGuidanceSnapshot(
+        zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+        zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+        zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+        zero_output.guidance.valid);
+    return input;
+  };
+
+  FLAG_Race::MatchedAdapterOutput output;
+  auto authority = FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(
+      manager);
+  ASSERT_FALSE(authority.valid);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::openManualGate(manager);
+  auto seed_input = make_input(old_pair, authority, 1.0,
+                               std::shared_ptr<const FLAG_Race::PathTubePair>());
+  seed_input.dt = 0.02;
+  // The bootstrap pair is the real activation edge.  The first update is
+  // selected by the adapter and commits a normal, nonzero predecessor.
+  seed_input.path_tube_pair = old_pair;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::updateAdapter(
+      manager, seed_input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.valid);
+  auto seeded = FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(
+      manager);
+  for (int seed_tick = 0; seed_tick < 32 && std::abs(seeded.delta) <= 1e-6;
+       ++seed_tick) {
+    seed_input = make_input(old_pair, seeded, 1.02 + 0.02 * seed_tick,
+                            std::shared_ptr<const FLAG_Race::PathTubePair>());
+    seed_input.dt = 0.02;
+    ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::updateAdapter(
+        manager, seed_input, output)) << output.invalid_reason;
+    ASSERT_TRUE(output.selected);
+    seeded = FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+  }
+  ASSERT_TRUE(seeded.valid);
+  EXPECT_EQ(phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL,
+            seeded.owner_mode);
+  ASSERT_GT(std::abs(seeded.delta), 1e-6);
+  EXPECT_EQ("PhaseOffsetMatchedAdapterRuntime", seeded.selected_u_owner);
+
+  // Rebase the exact immutable predecessor and advance once more through the
+  // unadvertised path, keeping the seed comfortably nonzero.
+  authority = seeded;
+  seed_input = make_input(old_pair, authority, 1.02,
+                          std::shared_ptr<const FLAG_Race::PathTubePair>());
+  seed_input.dt = 0.02;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::updateAdapter(
+      manager, seed_input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  authority = FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+  ASSERT_TRUE(authority.valid);
+  ASSERT_GT(std::abs(authority.delta), 1e-6);
+
+  // Advertisement switches the adapter to the production publication-owned
+  // transaction.  Keep the already authenticated nonzero predecessor intact.
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setAdapterAdvertised(manager, true);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setTestOnlyRuntimeOwnerAllowed(
+      manager, false);
+  const double captured_w0 = authority.w;
+  ASSERT_TRUE(std::isfinite(captured_w0));
+  ASSERT_TRUE(std::isfinite(old_pair->future_seam_w));
+  ASSERT_TRUE(std::isfinite(old_pair->existing_future_horizon_end_w));
+  ASSERT_LT(captured_w0, old_pair->future_seam_w)
+      << "w=" << captured_w0 << " seam=" << old_pair->future_seam_w
+      << " horizon=" << old_pair->existing_future_horizon_end_w
+      << " end=" << old_pair->path_owner->endW();
+  const auto successor_owner = makeSeededRecoveryCompositeSuccessor(
+      old_pair->path_owner, captured_w0, 1.0, 1.6, 20.0);
+  ASSERT_TRUE(successor_owner);
+  std::vector<double> successor_sample_w;
+  std::vector<FLAG_Race::ContinuousPhasePathState> successor_states;
+  ASSERT_TRUE(successor_owner->sample(0.10, successor_sample_w,
+                                      successor_states));
+  ASSERT_EQ(successor_sample_w.size(), successor_states.size());
+  FLAG_Race::MatchedAdapterPathSamples successor_samples;
+  successor_samples.reserve(successor_sample_w.size());
+  for (std::size_t index = 0U; index < successor_sample_w.size(); ++index) {
+    successor_samples.push_back(
+        FLAG_Race::ConvertContinuousPhasePathStateForActive(
+            successor_states[index], successor_sample_w[index]));
+  }
+  ASSERT_GE(successor_samples.size(), 2U);
+  ASSERT_GT(successor_owner->segments().size(), 1U);
+  ASSERT_TRUE(successor_owner->segments()[1].label == "c2_quintic");
+  ASSERT_TRUE(successor_owner->segments().back().label == "mapped_tail");
+  FLAG_Race::ContinuousPhasePathState seam_state;
+  FLAG_Race::ContinuousPhasePathState old_seam_state;
+  ASSERT_TRUE(successor_owner->evaluate(1.0, seam_state, false));
+  ASSERT_TRUE(old_pair->path_owner->evaluate(1.0, old_seam_state, false));
+  EXPECT_NEAR((seam_state.p - old_seam_state.p).norm(), 0.0, 1e-10);
+  EXPECT_NEAR((seam_state.dp_dw - old_seam_state.dp_dw).norm(), 0.0, 1e-10);
+  EXPECT_NEAR((seam_state.d2p_dw2 - old_seam_state.d2p_dw2).norm(), 0.0,
+              1e-10);
+  FLAG_Race::ContinuousPhasePathState tail_state;
+  ASSERT_TRUE(successor_owner->evaluate(2.0, tail_state, false));
+  EXPECT_GT((tail_state.p - old_seam_state.p).norm(), 1e-3);
+  const Eigen::Vector3d successor_stage_position(captured_w0, 0.10, 1.10);
+  FLAG_Race::PathTubePairTransaction successor_transaction;
+  FLAG_Race::PathTubePairStageFailure successor_failure =
+      FLAG_Race::PathTubePairStageFailure::NONE;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::stageSuccessorPair(
+      manager, old_pair, successor_owner, successor_samples, captured_w0,
+      std::max(1.0, captured_w0 + 0.40),
+      std::max(2.4, captured_w0 + 1.6),
+      successor_stage_position, seed_input.gains, 0.02,
+      successor_transaction, &successor_failure))
+      << FLAG_Race::GvfManagerS4AnchorTestAccess::stageFailureName(
+             successor_failure)
+      << " w=" << captured_w0 << " seam=" << old_pair->future_seam_w
+      << " horizon=" << old_pair->existing_future_horizon_end_w
+      << " sample_front=" << successor_samples.front().w
+      << " sample_back=" << successor_samples.back().w
+      << " source=" << old_pair->source_revision
+      << " path=" << old_pair->path_revision
+      << " frame=" << old_pair->frame_revision;
+  const auto successor_pair = successor_transaction.candidate_pair;
+  ASSERT_TRUE(successor_pair);
+  ASSERT_TRUE(successor_pair->active_profile);
+  EXPECT_NE(successor_pair->path_revision, old_pair->path_revision);
+  EXPECT_NE(successor_pair->generation, old_pair->generation);
+  EXPECT_EQ(successor_pair->source_revision,
+            successor_pair->active_profile->source_revision);
+  EXPECT_EQ(successor_pair->path_revision,
+            successor_pair->active_profile->path_revision);
+  EXPECT_EQ(successor_pair->frame_revision,
+            successor_pair->active_profile->frame_revision);
+  EXPECT_NE(old_pair.get(), successor_pair.get());
+
+  PositionCommandCapture command_capture;
+  ros::Subscriber command_sub = nh.subscribe<quadrotor_msgs::PositionCommand>(
+      kCommandTopic, 10, &PositionCommandCapture::callback, &command_capture);
+  const auto connection_deadline = std::chrono::steady_clock::now() +
+      std::chrono::seconds(2);
+  while (manager.cmd_pub.getNumSubscribers() == 0U &&
+         std::chrono::steady_clock::now() < connection_deadline) {
+    ros::spinOnce();
+    ros::WallDuration(0.01).sleep();
+  }
+  ASSERT_GT(manager.cmd_pub.getNumSubscribers(), 0U);
+  const auto old_authority = authority;
+  std::vector<double> delta_history;
+  std::vector<std::uint64_t> revision_history;
+  bool saw_recovery_owner = false;
+  bool saw_query = false;
+  bool saw_publish_before_commit = false;
+  bool terminal = false;
+  std::size_t successful_publishes = 0U;
+  std::size_t committed_recovery_ticks = 0U;
+  for (std::size_t tick = 0U; tick < 128U; ++tick) {
+    authority = FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+    ASSERT_TRUE(authority.valid);
+    auto input = make_input(old_pair, authority, 2.0 + 0.02 * tick,
+                            successor_pair);
+    ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::updateAdapter(
+        manager, input, output)) << output.invalid_reason;
+    ASSERT_TRUE(output.selected) << output.invalid_reason;
+    const auto capture = FLAG_Race::GvfManagerS4AnchorTestAccess::
+        pendingCommand(manager);
+    ASSERT_TRUE(capture.pending);
+    ASSERT_TRUE(capture.valid);
+    ASSERT_TRUE(capture.reference_query);
+    saw_query = true;
+    const auto live_before_publish =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+    EXPECT_EQ(live_before_publish.snapshotId(), authority.snapshotId());
+    const auto after_update =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::pendingAuthoritySnapshot(manager);
+    ASSERT_TRUE(after_update.valid);
+    if (after_update.owner_mode ==
+        phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY) {
+      EXPECT_EQ(output.recovery_status,
+                phase_offset_navigation::RecoveryStepStatus::PREPARED);
+      EXPECT_EQ(after_update.selected_u_owner, "PhaseOffsetRecoveryOwner");
+      EXPECT_EQ(after_update.executed_path_revision,
+                successor_pair->path_revision);
+      EXPECT_EQ(after_update.frame_revision, successor_pair->frame_revision);
+      EXPECT_EQ(after_update.tube_revision,
+                successor_pair->active_profile->tube_revision);
+      EXPECT_EQ(after_update.profile_revision,
+                successor_pair->active_profile->profile_revision);
+      EXPECT_EQ(capture.reference_query->pathRevision(),
+                successor_pair->path_revision);
+      EXPECT_EQ(after_update.handoff_state, "RECOVERY_OWNER");
+      saw_recovery_owner = true;
+    } else {
+      EXPECT_EQ(after_update.owner_mode,
+                phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY);
+      EXPECT_EQ(after_update.selected_u_owner, "PlannerOwner");
+      EXPECT_DOUBLE_EQ(0.0, after_update.delta);
+    }
+    EXPECT_TRUE(after_update.governorViewValid());
+    EXPECT_TRUE(after_update.selectedUConsistent());
+    delta_history.push_back(std::abs(after_update.delta));
+    revision_history.push_back(after_update.executed_path_revision);
+
+    FLAG_Race::gvf::LiftedGuidanceResult governor_input;
+    governor_input.v_cmd = output.guidance.v_cmd;
+    governor_input.w_dot = output.guidance.w_dot;
+    governor_input.e_parallel = output.guidance.e_parallel;
+    governor_input.e_perp = output.guidance.e_perp;
+    governor_input.ref_pt = output.guidance.ref_pt;
+    governor_input.tangent = output.guidance.tangent;
+    governor_input.valid = output.guidance.valid;
+    const auto governor = FLAG_Race::GvfManagerS4AnchorTestAccess::
+        runGovernorCandidate(manager, old_pair->path_owner, governor_input,
+                              input.position, after_update.w,
+                              after_update.delta, input.dt, 1.0,
+                              capture.reference_query);
+    ASSERT_TRUE(governor.command_valid);
+    const auto before_publish = live_before_publish;
+    const double before_delta =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::retainedDelta(manager);
+    bool callback_saw_uncommitted = false;
+    ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPendingCommand(
+        manager,
+        [&]() {
+          callback_saw_uncommitted =
+              FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager)
+                  .snapshotId() == before_publish.snapshotId() &&
+              std::abs(FLAG_Race::GvfManagerS4AnchorTestAccess::retainedDelta(
+                           manager) - before_delta) <= 1e-12;
+          return FLAG_Race::GvfManagerS4AnchorTestAccess::publishGovernorCandidate(
+              manager, governor.cmd_pos, output.guidance.tangent);
+        },
+        capture.identity));
+    EXPECT_TRUE(callback_saw_uncommitted);
+    saw_publish_before_commit = saw_publish_before_commit || callback_saw_uncommitted;
+    ++successful_publishes;
+    ASSERT_TRUE(waitForPositionCommandCount(command_capture,
+                                            successful_publishes, 1.0));
+    const auto committed_after_publish =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+    EXPECT_EQ(committed_after_publish.snapshotId(), after_update.snapshotId());
+    if (committed_after_publish.owner_mode ==
+        phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY) {
+      ++committed_recovery_ticks;
+    }
+    if (committed_after_publish.owner_mode ==
+        phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY) {
+      terminal = true;
+      break;
+    }
+    const auto recovery_selected =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::recoveryStatus(manager)
+            .selected_u;
+    const auto authority_selected =
+        FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager)
+            .selected_u;
+    EXPECT_DOUBLE_EQ(recovery_selected.u_w, authority_selected.u_w);
+    EXPECT_DOUBLE_EQ(recovery_selected.u_delta, authority_selected.u_delta);
+  }
+  EXPECT_TRUE(old_authority.valid);
+  EXPECT_GT(std::abs(old_authority.delta), 1e-6);
+  EXPECT_TRUE(saw_recovery_owner);
+  EXPECT_GT(committed_recovery_ticks, 1U);
+  EXPECT_TRUE(saw_query);
+  EXPECT_TRUE(saw_publish_before_commit);
+  EXPECT_TRUE(terminal);
+  const auto terminal_authority = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      authoritySnapshot(manager);
+  EXPECT_EQ(phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY,
+            terminal_authority.owner_mode);
+  EXPECT_EQ("PlannerOwner", terminal_authority.selected_u_owner);
+  EXPECT_DOUBLE_EQ(0.0, terminal_authority.delta);
+  EXPECT_DOUBLE_EQ(0.0,
+                   FLAG_Race::GvfManagerS4AnchorTestAccess::retainedDelta(manager));
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::recoveryStatus(manager)
+                  .exact_terminal_predicate);
+  EXPECT_EQ(command_capture.size(), successful_publishes);
+  ASSERT_FALSE(delta_history.empty());
+  for (std::size_t index = 1U; index < delta_history.size(); ++index) {
+    EXPECT_LE(delta_history[index], delta_history[index - 1U] + 1e-5);
+  }
+  EXPECT_NE(std::find(revision_history.begin(), revision_history.end(),
+                      successor_pair->path_revision), revision_history.end());
 }
 
 int main(int argc, char** argv) {

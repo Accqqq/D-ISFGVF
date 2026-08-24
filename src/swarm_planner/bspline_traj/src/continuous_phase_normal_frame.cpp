@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <vector>
 
 namespace FLAG_Race {
 namespace {
@@ -120,13 +122,113 @@ bool ContinuousPhaseNormalFrame::transportTo(double w, Eigen::Vector3d& t,
   return finite(t) && finite(n);
 }
 
+bool ContinuousPhaseNormalFrame::representedNormalAt(
+    const double w, Eigen::Vector3d& tangent, Eigen::Vector3d& tangent_w,
+    Eigen::Vector3d& normal, Eigen::Vector3d& normal_w) const {
+  if (!path_ || path_->empty() || !finite(w)) return false;
+  const double begin = startW();
+  const double end = endW();
+  if (!finite(begin) || !finite(end) || end < begin) return false;
+  const double target = std::max(begin, std::min(end, w));
+  if (!tangentAt(target, tangent, tangent_w)) return false;
+
+  // The transport nodes are immutable functions of the path and the
+  // constructor seed.  Between nodes we represent the normal by a cubic
+  // Hermite curve, then project/normalise that curve in the current tangent
+  // plane.  N_w is differentiated from that exact represented curve, rather
+  // than being an unrelated ideal Bishop derivative.
+  const double span = std::max(0.0, end - begin);
+  const std::size_t segment_count = span <= kEpsilon
+      ? 1U : static_cast<std::size_t>(std::ceil(span / kTransportStep));
+  const double h = span <= kEpsilon
+      ? 1.0 : span / static_cast<double>(segment_count);
+  std::vector<Eigen::Vector3d> nodes(segment_count + 1U,
+                                     Eigen::Vector3d::Zero());
+  Eigen::Vector3d node_t;
+  Eigen::Vector3d node_tw;
+  if (!tangentAt(begin, node_t, node_tw) || !seedNormal(node_t, nodes[0U])) {
+    return false;
+  }
+  for (std::size_t index = 1U; index <= segment_count; ++index) {
+    const double node_w = begin + h * static_cast<double>(index);
+    Eigen::Vector3d current_t;
+    Eigen::Vector3d current_tw;
+    if (!tangentAt(node_w, current_t, current_tw)) return false;
+    Eigen::Vector3d projected = nodes[index - 1U] - current_t *
+        current_t.dot(nodes[index - 1U]);
+    const double projected_norm = projected.norm();
+    if (!finite(projected_norm) || projected_norm <= kEpsilon) {
+      projected = leastParallelAxis(current_t);
+    } else {
+      projected /= projected_norm;
+    }
+    if (!finite(projected) || projected.norm() <= kEpsilon) return false;
+    if (projected.dot(nodes[index - 1U]) < 0.0) projected = -projected;
+    nodes[index] = projected;
+  }
+
+  std::size_t segment = 0U;
+  double alpha = 0.0;
+  if (span > kEpsilon) {
+    const double coordinate = (target - begin) / h;
+    segment = static_cast<std::size_t>(std::floor(coordinate));
+    if (segment >= segment_count) segment = segment_count - 1U;
+    alpha = std::max(0.0, std::min(1.0,
+        coordinate - static_cast<double>(segment)));
+  }
+  const auto nodeDerivative = [&](const std::size_t index) -> Eigen::Vector3d {
+    if (segment_count == 1U) return (nodes[1U] - nodes[0U]) / h;
+    if (index == 0U) return (nodes[1U] - nodes[0U]) / h;
+    if (index == segment_count) {
+      return (nodes[segment_count] - nodes[segment_count - 1U]) / h;
+    }
+    return (nodes[index + 1U] - nodes[index - 1U]) / (2.0 * h);
+  };
+  const Eigen::Vector3d d0 = nodeDerivative(segment);
+  const Eigen::Vector3d d1 = nodeDerivative(segment + 1U);
+  const Eigen::Vector3d& n0 = nodes[segment];
+  const Eigen::Vector3d& n1 = nodes[segment + 1U];
+  const double a2 = alpha * alpha;
+  const double a3 = a2 * alpha;
+  const double h00 = 2.0 * a3 - 3.0 * a2 + 1.0;
+  const double h10 = a3 - 2.0 * a2 + alpha;
+  const double h01 = -2.0 * a3 + 3.0 * a2;
+  const double h11 = a3 - a2;
+  const Eigen::Vector3d raw = h00 * n0 + h10 * h * d0 +
+      h01 * n1 + h11 * h * d1;
+  const double dh00 = 6.0 * a2 - 6.0 * alpha;
+  const double dh10 = 3.0 * a2 - 4.0 * alpha + 1.0;
+  const double dh01 = -dh00;
+  const double dh11 = 3.0 * a2 - 2.0 * alpha;
+  const Eigen::Vector3d raw_w = (dh00 * n0 + dh10 * h * d0 +
+      dh01 * n1 + dh11 * h * d1) / h;
+  const double tangent_projection = raw.dot(tangent);
+  const double tangent_projection_w = raw_w.dot(tangent) +
+      raw.dot(tangent_w);
+  const Eigen::Vector3d projected = raw - tangent * tangent_projection;
+  const Eigen::Vector3d projected_w = raw_w - tangent_w * tangent_projection -
+      tangent * tangent_projection_w;
+  const double norm = projected.norm();
+  if (!finite(norm) || norm <= kEpsilon || !finite(projected_w)) return false;
+  normal = projected / norm;
+  normal_w = (projected_w - normal * normal.dot(projected_w)) / norm;
+  if (!finite(normal) || !finite(normal_w) ||
+      std::abs(normal.norm() - 1.0) > 1e-6 ||
+      std::abs(tangent.dot(normal)) > 1e-6) return false;
+  // A sign flip here would change the represented N(w) after its derivative
+  // was computed.  Preserve the immutable Hermite representation and fail
+  // closed if its projected polynomial crossed the inherited orientation.
+  if (normal.dot(n0) < -1e-8) return false;
+  return true;
+}
+
 bool ContinuousPhaseNormalFrame::query(
     double w, phase_offset_core::NormalFrameQuery& result) const {
   result = phase_offset_core::NormalFrameQuery();
   result.w = w;
   result.path_revision = path_revision_;
   result.frame_revision = frame_revision_;
-  result.provenance = "ContinuousPhaseNormalFrame/BishopTransport";
+  result.provenance = "ContinuousPhaseNormalFrame/ProjectedHermiteTransport";
   if (!path_ || path_->empty() || !finite(w) || w < startW() - kEpsilon || w > endW() + kEpsilon) {
     result.invalid_reason = "normal frame query is outside immutable domain";
     return false;
@@ -135,11 +237,11 @@ bool ContinuousPhaseNormalFrame::query(
   Eigen::Vector3d t;
   Eigen::Vector3d n;
   Eigen::Vector3d t_w;
-  if (!transportTo(bounded_w, t, n) || !tangentAt(bounded_w, t, t_w)) {
+  Eigen::Vector3d n_w;
+  if (!representedNormalAt(bounded_w, t, t_w, n, n_w)) {
     result.invalid_reason = "normal frame transport failed";
     return false;
   }
-  const Eigen::Vector3d n_w = -t_w.dot(n) * t;
   if (!finite(t) || !finite(n) || !finite(n_w) || std::abs(t.norm() - 1.0) > 1e-6 ||
       std::abs(n.norm() - 1.0) > 1e-6 || std::abs(t.dot(n)) > 1e-6) {
     result.invalid_reason = "normal frame result is not orthonormal";
@@ -177,7 +279,9 @@ bool ContinuousPhaseNormalFrame::certifyCell(
   proof.w1 = w1;
   proof.path_revision = path_revision_;
   proof.frame_revision = frame_revision_;
-  proof.provenance = "ContinuousPhaseNormalFrame/BishopTransport";
+  proof.provenance =
+      "ContinuousPhaseNormalFrame/ProjectedHermiteTransport/"
+      "CertifiedProjectedRawNormLowerBound";
   phase_offset_core::PathCellGeometryCertificate path_proof;
   if (!path_ || !path_->cellBounds(w0, w1, path_proof) ||
       !phase_offset_core::pathCellGeometryCertificateIsComplete(path_proof)) return false;
@@ -187,15 +291,101 @@ bool ContinuousPhaseNormalFrame::certifyCell(
   proof.sup_path_speed = path_proof.sup_p_w_norm;
   proof.sup_path_acceleration = path_proof.sup_p_ww_norm;
   proof.sup_path_jerk = path_proof.sup_p_www_norm;
-  // The path certificate supplies closed-cell derivative bounds.  Endpoint
-  // samples are queried only to validate that this immutable frame is defined
-  // on the cell; their maxima are never promoted to a continuous proof.
-  proof.sup_normal_derivative = std::max(
-      path_proof.sup_N_w_norm,
-      path_proof.sup_p_ww_norm / path_proof.inf_p_w_norm);
-  proof.normal_variation_bound = std::max(
-      path_proof.normal_variation_bound,
-      proof.sup_normal_derivative * (w1 - w0));
+  // Prove the derivative of the exact projected-Hermite representation.  For
+  // each transport cell, the cubic Hermite coefficients give a closed bound
+  // on raw/raw_w.  The tangent derivative is bounded by the immutable path
+  // certificate.  A deterministic quarter-cell cover plus the resulting
+  // Lipschitz bound proves a positive lower bound for the projected raw norm;
+  // without that lower bound this cell is not frame-proof complete.
+  const double begin = startW();
+  const double end = endW();
+  if (!finite(begin) || !finite(end) || end < begin) return false;
+  const double full_span = std::max(0.0, end - begin);
+  const std::size_t segment_count = full_span <= kEpsilon
+      ? 1U : static_cast<std::size_t>(std::ceil(full_span / kTransportStep));
+  const double h = full_span <= kEpsilon
+      ? 1.0 : full_span / static_cast<double>(segment_count);
+  std::vector<Eigen::Vector3d> nodes(segment_count + 1U,
+                                     Eigen::Vector3d::Zero());
+  Eigen::Vector3d node_t;
+  Eigen::Vector3d node_tw;
+  if (!tangentAt(begin, node_t, node_tw) || !seedNormal(node_t, nodes[0U])) {
+    return false;
+  }
+  for (std::size_t index = 1U; index <= segment_count; ++index) {
+    Eigen::Vector3d current_t;
+    Eigen::Vector3d current_tw;
+    if (!tangentAt(begin + h * static_cast<double>(index), current_t,
+                   current_tw)) {
+      return false;
+    }
+    Eigen::Vector3d projected = nodes[index - 1U] - current_t *
+        current_t.dot(nodes[index - 1U]);
+    const double projected_norm = projected.norm();
+    if (!finite(projected_norm) || projected_norm <= kEpsilon) {
+      projected = leastParallelAxis(current_t);
+    } else {
+      projected /= projected_norm;
+    }
+    if (!finite(projected) || projected.norm() <= kEpsilon) return false;
+    if (projected.dot(nodes[index - 1U]) < 0.0) projected = -projected;
+    nodes[index] = projected;
+  }
+  const auto nodeDerivative = [&](const std::size_t index) {
+    if (segment_count == 1U) return (nodes[1U] - nodes[0U]) / h;
+    if (index == 0U) return (nodes[1U] - nodes[0U]) / h;
+    if (index == segment_count) {
+      return (nodes[segment_count] - nodes[segment_count - 1U]) / h;
+    }
+    return (nodes[index + 1U] - nodes[index - 1U]) / (2.0 * h);
+  };
+  double represented_sup_derivative = 0.0;
+  const double tangent_derivative_bound =
+      path_proof.sup_p_ww_norm / path_proof.inf_p_w_norm;
+  for (std::size_t index = 0U; index < segment_count; ++index) {
+    const double local_start = begin + h * static_cast<double>(index);
+    const double local_end = local_start + h;
+    const double overlap_start = std::max(w0, local_start);
+    const double overlap_end = std::min(w1, local_end);
+    if (overlap_end <= overlap_start + kEpsilon) continue;
+    const Eigen::Vector3d d0 = nodeDerivative(index);
+    const Eigen::Vector3d d1 = nodeDerivative(index + 1U);
+    const Eigen::Vector3d c0 = nodes[index];
+    const Eigen::Vector3d c1 = h * d0;
+    const Eigen::Vector3d c2 = -3.0 * nodes[index] +
+        3.0 * nodes[index + 1U] - 2.0 * h * d0 - h * d1;
+    const Eigen::Vector3d c3 = 2.0 * nodes[index] -
+        2.0 * nodes[index + 1U] + h * d0 + h * d1;
+    const double raw_upper = c0.norm() + c1.norm() + c2.norm() + c3.norm();
+    const double raw_w_upper = (c1.norm() + 2.0 * c2.norm() +
+                                3.0 * c3.norm()) / h;
+    const double projected_w_upper = 2.0 * raw_w_upper +
+        2.0 * raw_upper * tangent_derivative_bound;
+    const double local_span = overlap_end - overlap_start;
+    double min_projected_norm = std::numeric_limits<double>::infinity();
+    for (int sample_index = 0; sample_index <= 4; ++sample_index) {
+      const double sample_w = overlap_start + local_span *
+          static_cast<double>(sample_index) / 4.0;
+      const double alpha = (sample_w - local_start) / h;
+      const Eigen::Vector3d raw = c0 + alpha * c1 + alpha * alpha * c2 +
+          alpha * alpha * alpha * c3;
+      Eigen::Vector3d sample_t;
+      Eigen::Vector3d sample_tw;
+      if (!tangentAt(sample_w, sample_t, sample_tw)) return false;
+      const Eigen::Vector3d projected = raw - sample_t * raw.dot(sample_t);
+      min_projected_norm = std::min(min_projected_norm, projected.norm());
+    }
+    const double projected_lower = min_projected_norm -
+        projected_w_upper * (local_span / 8.0);
+    if (!finite(projected_lower) || projected_lower <= 1e-8) return false;
+    represented_sup_derivative = std::max(represented_sup_derivative,
+        projected_w_upper / projected_lower);
+  }
+  if (!finite(represented_sup_derivative) || represented_sup_derivative < 0.0) {
+    return false;
+  }
+  proof.sup_normal_derivative = represented_sup_derivative;
+  proof.normal_variation_bound = proof.sup_normal_derivative * (w1 - w0);
   proof.tangent_variation_bound = proof.normal_variation_bound;
   proof.valid = finite(proof.sup_normal_derivative) &&
       finite(proof.normal_variation_bound) &&

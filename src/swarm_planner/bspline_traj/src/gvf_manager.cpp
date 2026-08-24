@@ -3,6 +3,7 @@
 #include <phase_offset_core/geometry.h>
 
 #include <chrono>
+#include <exception>
 #include <fstream>
 
 namespace FLAG_Race
@@ -128,6 +129,38 @@ namespace FLAG_Race
         committed.closed_acquired = closed_phase_acquired_;
         committed.generation = authoritative_phase_generation_;
         return true;
+    }
+
+    bool gvf_manager::prepareAuthoritativePhaseCommitLocked(
+        const AuthoritativePhaseSnapshot& captured, const double w,
+        const bool acquire_closed_phase,
+        AuthoritativePhaseCommitToken& token) const
+    {
+        token = AuthoritativePhaseCommitToken();
+        if (!std::isfinite(w) ||
+            authoritative_phase_generation_ != captured.generation ||
+            phase_w_ != captured.w ||
+            phase_initialized_ != captured.initialized ||
+            closed_phase_acquired_ != captured.closed_acquired) {
+            return false;
+        }
+        token.expected = captured;
+        token.committed.w = w;
+        token.committed.initialized = captured.initialized;
+        token.committed.closed_acquired = captured.closed_acquired ||
+            acquire_closed_phase;
+        token.committed.generation = captured.generation + 1U;
+        token.valid = true;
+        return true;
+    }
+
+    void gvf_manager::commitAuthoritativePhaseNoFailLocked(
+        const AuthoritativePhaseCommitToken& token) noexcept
+    {
+        phase_w_ = token.committed.w;
+        phase_initialized_ = token.committed.initialized;
+        closed_phase_acquired_ = token.committed.closed_acquired;
+        authoritative_phase_generation_ = token.committed.generation;
     }
 
     gvf_manager::gvf_manager(ros::NodeHandle &nh)
@@ -719,8 +752,8 @@ gvf_manager::makeGovernorInvalidHold(const Eigen::Vector3d& pos,
     result.yaw_cmd_vec.setZero();
     result.final_cmd_source = "GOVERNOR_INVALID_HOLD";
     result.fallback_reason = reason;
+    result.reset_state_after_publish = true;
     dbg.fallback_hold_pos = true;
-    resetGovernorState();
     dbg.normal_state_norm = 0.0;
     return result;
 }
@@ -734,7 +767,8 @@ gvf_manager::runVelocityMatchingGovernor(
                                          double reference_delta,
                                          double dt,
                                          double kp_equiv,
-                                         GovernorCommandDebug& dbg)
+                                         GovernorCommandDebug& dbg,
+                                         const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr& executed_reference_query)
 {
     GovernorCommandResult result;
     result.cmd_pos = pos;
@@ -745,11 +779,19 @@ gvf_manager::runVelocityMatchingGovernor(
     const Eigen::Vector3d raw_v = out.v_cmd;
     dbg.raw_v_norm = raw_v.norm();
     const double tangent_norm = out.tangent.norm();
-    const bool path_ready = authoritative_path &&
+    double executed_domain_start = 0.0;
+    double executed_domain_end = 0.0;
+    const bool executed_domain_ready = executed_reference_query &&
+        executed_reference_query->domain(executed_domain_start,
+                                         executed_domain_end) &&
+        std::isfinite(executed_domain_start) &&
+        std::isfinite(executed_domain_end) &&
+        executed_domain_end > executed_domain_start;
+    const bool path_ready = executed_domain_ready || (authoritative_path &&
         !authoritative_path->empty() &&
         std::isfinite(authoritative_path->startW()) &&
         std::isfinite(authoritative_path->endW()) &&
-        authoritative_path->endW() > authoritative_path->startW();
+        authoritative_path->endW() > authoritative_path->startW());
     if (!path_ready)
     {
         return makeGovernorInvalidHold(pos, "path_invalid", dbg);
@@ -827,23 +869,24 @@ gvf_manager::runVelocityMatchingGovernor(
     dbg.l_ff = std::max(l_min, std::min(dbg.v_tau_intent / kp_equiv, l_max));
 
     const bool was_initialized = cmd_governor_initialized_;
-    if (!cmd_governor_initialized_)
-    {
-        cmd_governor_last_l_ = dbg.l_ff;
-        cmd_governor_normal_state_.setZero();
-        cmd_governor_initialized_ = true;
-    }
+    // Governor candidate generation is side-effect free.  These local
+    // values are committed only after the corresponding PositionCommand has
+    // published successfully at the command boundary.
+    const double prior_governor_l = was_initialized
+        ? cmd_governor_last_l_ : dbg.l_ff;
+    const Eigen::Vector3d prior_governor_normal = was_initialized
+        ? cmd_governor_normal_state_ : Eigen::Vector3d::Zero();
 
     const double l_rate_max = std::max(0.0, cmd_governor_l_rate_max_);
-    const double rate_lower = std::max(l_min, cmd_governor_last_l_ - l_rate_max * dt);
-    const double rate_upper = std::min(l_max, cmd_governor_last_l_ + l_rate_max * dt);
+    const double rate_lower = std::max(l_min, prior_governor_l - l_rate_max * dt);
+    const double rate_upper = std::min(l_max, prior_governor_l + l_rate_max * dt);
     std::vector<double> l_candidates;
     for (double l = l_min; l <= l_max + 0.5 * l_step; l += l_step)
     {
         l_candidates.push_back(std::max(l_min, std::min(l, l_max)));
     }
     l_candidates.push_back(dbg.l_ff);
-    l_candidates.push_back(cmd_governor_last_l_);
+    l_candidates.push_back(prior_governor_l);
     l_candidates.push_back(rate_lower);
     l_candidates.push_back(rate_upper);
     for (double& l : l_candidates)
@@ -889,12 +932,21 @@ gvf_manager::runVelocityMatchingGovernor(
     const double path_end_eps = 1e-6;
     double phase_per_meter = 1.0;
     if (closedPhaseV2Active()) {
+        if (executed_domain_ready) {
+            phase_offset_navigation::ExecutedReferenceQueryResult phase_reference;
+            if (executed_reference_query->query(progress_w_after,
+                                                phase_reference) &&
+                phase_reference.valid && phase_reference.r_w.norm() > 1e-6) {
+                phase_per_meter = 1.0 / phase_reference.r_w.norm();
+            }
+        } else {
         ContinuousPhasePathState phase_state;
         if (authoritative_path->evaluate(progress_w_after, phase_state, true)) {
             const double dpdw_norm = phase_state.dp_dw.norm();
             if (dpdw_norm > 1e-6) {
                 phase_per_meter = 1.0 / dpdw_norm;
             }
+        }
         }
     }
 
@@ -912,10 +964,22 @@ gvf_manager::runVelocityMatchingGovernor(
         double candidate_path_w_start = 0.0;
         double candidate_path_w_end = 0.0;
         const double query_w = progress_w_after + l * phase_per_meter;
-        if (!pathPointAtW(authoritative_path, query_w, reference_delta, reference_l,
-                          clamped_to_end,
-                          candidate_path_w_start, candidate_path_w_end))
-        {
+        if (executed_domain_ready) {
+            candidate_path_w_start = executed_domain_start;
+            candidate_path_w_end = executed_domain_end;
+            clamped_to_end = query_w > candidate_path_w_end;
+            phase_offset_navigation::ExecutedReferenceQueryResult reference;
+            if (query_w < candidate_path_w_start ||
+                query_w > candidate_path_w_end ||
+                !executed_reference_query->query(query_w, reference) ||
+                !reference.valid || !reference.r.allFinite() ||
+                !reference.r_w.allFinite()) {
+                continue;
+            }
+            reference_l = reference.r;
+        } else if (!pathPointAtW(authoritative_path, query_w, reference_delta,
+                                 reference_l, clamped_to_end,
+                                 candidate_path_w_start, candidate_path_w_end)) {
             continue;
         }
         dbg.path_w_start = candidate_path_w_start;
@@ -928,9 +992,19 @@ gvf_manager::runVelocityMatchingGovernor(
 
         Eigen::Vector3d t_l = t_current;
         Eigen::Vector3d target_tangent = Eigen::Vector3d::Zero();
-        if (pathTangentAtW(authoritative_path, query_w, reference_delta,
-                           target_tangent))
-        {
+        if (executed_domain_ready) {
+            phase_offset_navigation::ExecutedReferenceQueryResult reference;
+            if (executed_reference_query->query(query_w, reference) &&
+                reference.valid && reference.r_w.allFinite() &&
+                reference.r_w.norm() > 1e-6) {
+                target_tangent = reference.r_w;
+            }
+        } else if (pathTangentAtW(authoritative_path, query_w, reference_delta,
+                                  target_tangent)) {
+            // Legacy neutral/observe-only path.  Production offset commands
+            // use the immutable executed query branch above.
+        }
+        if (target_tangent.norm() > 1e-6) {
             t_l = target_tangent.normalized();
         }
 
@@ -946,12 +1020,12 @@ gvf_manager::runVelocityMatchingGovernor(
 
         if (was_initialized && normal_rate_max > 1e-6 && dt > 1e-6)
         {
-            Eigen::Vector3d d_n = c.n - cmd_governor_normal_state_;
+            Eigen::Vector3d d_n = c.n - prior_governor_normal;
             const double max_dn = normal_rate_max * dt;
             const double dn_norm = d_n.norm();
             if (dn_norm > max_dn && dn_norm > 1e-6)
             {
-                c.n = cmd_governor_normal_state_ + d_n * (max_dn / dn_norm);
+                c.n = prior_governor_normal + d_n * (max_dn / dn_norm);
                 c.normal_rate_limited = true;
             }
         }
@@ -994,9 +1068,9 @@ gvf_manager::runVelocityMatchingGovernor(
         if (was_initialized)
         {
             c.normal_rate_cost = std::max(0.0, cmd_governor_normal_rate_weight_) *
-                                 (kp_equiv * (c.n - cmd_governor_normal_state_)).squaredNorm();
+                                 (kp_equiv * (c.n - prior_governor_normal)).squaredNorm();
             c.l_rate_cost = std::max(0.0, cmd_governor_l_rate_weight_) *
-                            std::pow(kp_equiv * (l - cmd_governor_last_l_), 2);
+                            std::pow(kp_equiv * (l - prior_governor_l), 2);
         }
         c.cost = c.vel_cost + c.normal_cost + c.l_ff_cost +
                  c.normal_rate_cost + c.l_rate_cost;
@@ -1143,9 +1217,10 @@ void gvf_manager::logGovernorCommand(const GovernorCommandResult& result,
         cmd_governor_normal_state_.norm());
 }
 
-void gvf_manager::publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
+bool gvf_manager::publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
                                                  const Eigen::Vector3d& yaw_cmd_vec)
 {
+    if (!cmd_pub) return false;
     quadrotor_msgs::PositionCommand cmd;
     cmd.header.stamp = ros::Time::now();
     cmd.header.frame_id = "world";
@@ -1162,11 +1237,21 @@ void gvf_manager::publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
         arg_ = atan2(-yaw_cmd_vec.x(), yaw_cmd_vec.y()) + (PI/2.0f);
     }
     std::pair<double, double> yaw_all = calculate_yaw(last_yaw, arg_);
-    last_yaw = yaw_all.first;
     cmd.yaw = yaw_all.first;
     cmd.yaw_dot = 0.0f;
 
-    cmd_pub.publish(cmd);
+    try {
+        cmd_pub.publish(cmd);
+    } catch (const std::exception&) {
+        return false;
+    }
+    // Keep manager state transactional with the software publication.  The
+    // callback installs this candidate only after the adapter/authority
+    // commit has succeeded; a rejected/throwing publisher leaves last_yaw
+    // untouched.
+    pending_last_yaw_ = yaw_all.first;
+    pending_last_yaw_valid_ = true;
+    return true;
 }
 
 const char* gvf_manager::offsetBootstrapAttemptOutcomeName(
@@ -1383,6 +1468,7 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     const Eigen::Vector3d goal = pm.goal_pt;
     const double dt = 0.02;
     const ros::Time now = ros::Time::now();
+    pending_last_yaw_valid_ = false;
     const double kp_equiv = std::max(0.1, cmd_pos_gain_equiv_);
     const double real_dis_to_goal = (goal - pos).head<2>().norm();
     // One immutable H2 phase tuple for this whole command.  Guidance,
@@ -1412,6 +1498,7 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     }
     bool have_phase_candidate = false;
     double phase_candidate = phase_before;
+    bool legacy_progress_candidate_valid = false;
     bool will_acquire_closed_phase = false;
     bool initial_closed_phase_acquisition_used = false;
 
@@ -1426,6 +1513,8 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
 
     gvf::LiftedGuidanceResult out;
     double governor_reference_delta = 0.0;
+    std::uint64_t pending_position_command_identity = 0U;
+    bool command_published_and_committed = false;
     if (!pm.gvf_)
     {
         deactivate_phase_offset();
@@ -1503,12 +1592,33 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     matched_input.semantic_path_start_w = command_path->startW();
                     matched_input.semantic_path_end_w = command_path->endW();
                     matched_input.path_tube_pair = command_pair;
+                    // Preserve the exact staged successor as evidence for a
+                    // recovery/preview tick when the command-boundary CAS
+                    // could not install it yet.  The candidate remains
+                    // uncommitted; the current pair is still the sole owner.
+                    if (phase_offset_matched_adapter_) {
+                        std::lock_guard<std::mutex> handoff_lock(
+                            path_tube_handoff_mutex_);
+                        const std::uint64_t command_session =
+                            captured_command_pair
+                                ? captured_command_pair->authority_session
+                                : 0U;
+                        if (pending_path_tube_handoff_ &&
+                            pending_path_tube_handoff_->candidate_pair &&
+                            command_session != 0U &&
+                            pending_path_tube_handoff_->authority_session ==
+                                command_session) {
+                            matched_input.successor_path_tube_pair =
+                                pending_path_tube_handoff_->candidate_pair;
+                        }
+                    }
                     matched_input.cloud_occupancy_snapshot =
                         command_cloud_snapshot;
                     MatchedAdapterOutput matched_output;
                     const bool adapter_update_success =
                         phase_offset_matched_adapter_->update(
                             matched_input, matched_output);
+                    last_recovery_status_ = matched_output.recovery_status;
                     // A reset can retire a pair after command captured it but
                     // before Runtime update acquires its lock.  Do not retain
                     // legacy guidance from that retired authority; the next
@@ -1517,6 +1627,16 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     const bool command_pair_still_live = command_pair ==
                         phase_offset_matched_adapter_->capturePathTubePair();
                     if (!command_pair_still_live)
+                    {
+                        out.valid = false;
+                    }
+                    // An active nonzero authority may not silently fall back
+                    // to the planner/base centerline when its matched or
+                    // recovery step is denied.  Retain the authoritative
+                    // owner and fail closed for this command tick; the FSM
+                    // recovery mailbox remains the only recovery route.
+                    if (command_pair_still_live && command_offset_authority &&
+                        (!adapter_update_success || !matched_output.selected))
                     {
                         out.valid = false;
                     }
@@ -1675,6 +1795,12 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         }
         else
         {
+            const PendingPositionCommandCapture pending_capture =
+                phase_offset_matched_adapter_
+                    ? phase_offset_matched_adapter_->capturePendingPositionCommand()
+                    : PendingPositionCommandCapture();
+            pending_position_command_identity = pending_capture.pending
+                ? pending_capture.identity : 0U;
             if (unifiedPhaseV2Active() && command_phase.initialized)
             {
                 const double requested_phase = phase_before + out.w_dot * dt;
@@ -1703,8 +1829,8 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
             }
             else
             {
-                progress_w_ = out.w_proj + out.w_dot * dt;
-                progress_initialized_ = true;
+                phase_candidate = out.w_proj + out.w_dot * dt;
+                legacy_progress_candidate_valid = true;
             }
             if (shouldRunInitialClosedPhaseAcquisition(
                     closedPhaseV2Active(), command_phase.closed_acquired,
@@ -1720,13 +1846,13 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                 }
                 else
                 {
-                    resetGovernorState();
                     result.cmd_pos = pos + delta;
                     result.yaw_cmd_vec = delta;
                     result.final_cmd_source = "GVF_INITIAL_ACQUISITION";
                     result.fallback_reason = "none";
                     result.command_valid = true;
                     result.selected_valid_for_state = false;
+                    result.reset_state_after_publish = true;
 
                     dbg.guidance_valid = true;
                     dbg.fallback_hold_pos = false;
@@ -1747,11 +1873,26 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
             }
             else
             {
-                result = runVelocityMatchingGovernor(
-                    command_path, out, pos,
-                    have_phase_candidate ? phase_candidate : phase_before,
-                    governor_reference_delta,
-                    dt, kp_equiv, dbg);
+                const bool pending_ready = !pending_capture.pending ||
+                    pending_capture.valid;
+                if (!pending_ready) {
+                    if (phase_offset_matched_adapter_ && pending_capture.pending) {
+                        phase_offset_matched_adapter_->discardPendingPositionCommand();
+                    }
+                    out.valid = false;
+                    result = makeGovernorInvalidHold(
+                        pos, "phase_offset_final_validation_failed", dbg);
+                } else {
+                    // Final validated ImmutableExecutedReferenceQuery is now
+                    // the input boundary for the existing governor call.
+                    const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
+                        pending_reference_query = pending_capture.reference_query;
+                    result = runVelocityMatchingGovernor(
+                        command_path, out, pos,
+                        have_phase_candidate ? phase_candidate : phase_before,
+                        governor_reference_delta,
+                        dt, kp_equiv, dbg, pending_reference_query);
+                }
             }
         }
     }
@@ -1760,11 +1901,15 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     const bool force_goal_position = !circle_mode_active && real_dis_to_goal < stop_radius;
     if (force_goal_position)
     {
-        deactivate_phase_offset();
+        // The explicit goal override replaces any staged offset result.  The
+        // Keep the staged offset transaction intact until the replacement
+        // PositionCommand has actually published.  The adapter prepares an
+        // immutable deactivation token and commits it only on publish success.
+        pending_position_command_identity = 0U;
         dbg.final_cmd_overridden = result.command_valid;
         dbg.state_reset_due_to_override = true;
-        resetGovernorState();
         result.selected_valid_for_state = false;
+        result.reset_state_after_publish = true;
         result.cmd_pos = goal;
         result.yaw_cmd_vec.setZero();
         dbg.cmd_dist = (result.cmd_pos - pos).norm();
@@ -1782,43 +1927,78 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
             initial_closed_phase_acquisition_used, phase_before, phase_candidate,
             command_phase.closed_acquired,
             will_acquire_closed_phase);
-    if (phase_decision.commit)
-    {
-        AuthoritativePhaseSnapshot committed_phase;
-        if (commitAuthoritativePhase(command_phase,
-                                     phase_decision.phase_after,
-                                     phase_decision.acquire_closed_phase,
-                                     committed_phase))
-        {
-            progress_w_ = committed_phase.w;
-            progress_initialized_ = true;
-            if (phase_decision.acquire_closed_phase)
-            {
-                last_replan_time_ = now;
-                ROS_WARN("[GVF][CLOSED_PHASE_V2][ACQUIRED] phase_w=%.3f error=%.3f",
-                         committed_phase.w, out.e_perp.norm());
-            }
+    // Prepare the phase publication token before any PositionCommand can be
+    // emitted.  Holding this existing phase mutex through publication and the
+    // no-fail commit serializes the token against reset/goal retirement.
+    std::unique_lock<std::mutex> phase_transaction_lock;
+    AuthoritativePhaseCommitToken phase_commit_token;
+    bool phase_commit_ready = true;
+    if (phase_decision.commit) {
+        phase_transaction_lock = std::unique_lock<std::mutex>(
+            authoritative_phase_mutex_);
+        phase_commit_ready = prepareAuthoritativePhaseCommitLocked(
+            command_phase, phase_decision.phase_after,
+            phase_decision.acquire_closed_phase, phase_commit_token);
+        if (!phase_commit_ready && phase_offset_matched_adapter_) {
+            phase_offset_matched_adapter_->discardPendingPositionCommand();
         }
     }
-    if (out.valid && pm.gvf_)
-    {
-        pm.gvf_->setVisualizationProgressW(
-            unifiedPhaseV2Active() && command_phase.initialized
-                ? phase_before : activeTrackingPhase());
-    }
-
-    if (result.selected_valid_for_state)
-    {
-        cmd_governor_normal_state_ = result.selected_n;
-        cmd_governor_last_l_ = result.selected_l;
-        cmd_governor_initialized_ = true;
-        dbg.normal_state_norm = cmd_governor_normal_state_.norm();
-    }
-
-    updateGovernorCommandHistory(pos, result.cmd_pos, dt, dbg);
+    // Phase, governor-state and command-history mutation is intentionally
+    // deferred until the local PositionCommand publication and any pending
+    // authority/runtime transaction have both committed.
     const bool switch_active = now < cmd_switch_motion_limit_until_;
     logGovernorCommand(result, dbg, result.cmd_pos, real_dis_to_goal, kp_equiv, switch_active);
-    publishGovernorPositionCommand(result.cmd_pos, result.yaw_cmd_vec);
+    if (phase_commit_ready && phase_offset_matched_adapter_) {
+        // The adapter serializes final validation, the actual cmd_pub.publish
+        // invocation, and the no-fail authority/token commit against task
+        // reset and pair retirement.
+            command_published_and_committed =
+            phase_offset_matched_adapter_->publishPendingPositionCommand(
+            [this, &result]() {
+                return publishGovernorPositionCommand(
+                    result.cmd_pos, result.yaw_cmd_vec);
+            }, pending_position_command_identity, force_goal_position);
+    } else if (phase_commit_ready) {
+        command_published_and_committed =
+            publishGovernorPositionCommand(result.cmd_pos, result.yaw_cmd_vec);
+    }
+    if (command_published_and_committed) {
+        if (pending_last_yaw_valid_) {
+            last_yaw = pending_last_yaw_;
+            pending_last_yaw_valid_ = false;
+        }
+        if (result.reset_state_after_publish) {
+            resetGovernorState();
+        }
+        if (phase_decision.commit && phase_commit_token.valid) {
+            commitAuthoritativePhaseNoFailLocked(phase_commit_token);
+            progress_w_ = phase_commit_token.committed.w;
+            progress_initialized_ = true;
+            if (phase_decision.acquire_closed_phase) {
+                last_replan_time_ = now;
+                ROS_WARN(
+                    "[GVF][CLOSED_PHASE_V2][ACQUIRED] phase_w=%.3f error=%.3f",
+                    phase_commit_token.committed.w, out.e_perp.norm());
+            }
+        } else if (!unifiedPhaseV2Active() &&
+                   legacy_progress_candidate_valid) {
+            // Legacy progress is also a command-owned state transition.
+            progress_w_ = phase_candidate;
+            progress_initialized_ = true;
+        }
+        if (out.valid && pm.gvf_) {
+            pm.gvf_->setVisualizationProgressW(
+                unifiedPhaseV2Active() && command_phase.initialized
+                    ? phase_before : activeTrackingPhase());
+        }
+        if (result.selected_valid_for_state) {
+            cmd_governor_normal_state_ = result.selected_n;
+            cmd_governor_last_l_ = result.selected_l;
+            cmd_governor_initialized_ = true;
+            dbg.normal_state_norm = cmd_governor_normal_state_.norm();
+        }
+        updateGovernorCommandHistory(pos, result.cmd_pos, dt, dbg);
+    }
     finish_callback_timing();
 }
 
@@ -3838,6 +4018,15 @@ bool gvf_manager::consumeFrontendClearMailbox(gvfManager& pm)
 bool gvf_manager::requiresCurrentStateRecovery(
     const MatchedAdapterOutput& output)
 {
+    // RECOVERY_REPLAN_REQUIRED is an evidence-renewal request, not a
+    // planner/HOLD result.  Route it through the existing owner/session-bound
+    // FSM mailbox so requestRecenter() can drive the established
+    // Preview/Handoff/RecoveryOwner flow on the next tick.
+    if (output.recovery_replan_required ||
+        output.recovery_status ==
+            phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED) {
+        return true;
+    }
     // P2a consumes only existing, explicit current-state denial facts.  A
     // Runtime witness denial can follow a valid current executable port, so
     // CERTIFICATE_DENIED deliberately does not require executable=false.
@@ -7150,16 +7339,34 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
     consumeFrontendClearMailbox(pm);
     consumeCompletedPathTubeHandoff(pm, current_time);
     // P2a's sole production consumer is FSM.  There is intentionally no
-    // dispatch action here: P2b has not supplied an authorised physical
-    // recovery owner, so changing exec_state_ or publishing a generic HOLD
-    // would invent recovery behavior.  This consume point exists so P2b can
-    // attach its route-specific action without moving ownership back into a
-    // command/timer callback.
+    // generic HOLD dispatch.  Route a valid request into the existing
+    // adapter-owned Preview/Handoff/RecoveryOwner chain; the request remains
+    // owner/session-bound and does not create a second FSM or authority.
     if (phase_offset_matched_adapter_) {
-        PendingCurrentStateRecoveryRequest ignored_request;
-        consumeCurrentStateRecoveryRequestForFsm(
-            phase_offset_matched_adapter_->capturePathTubePair(),
-            ignored_request);
+        PendingCurrentStateRecoveryRequest recovery_request;
+        if (consumeCurrentStateRecoveryRequestForFsm(
+                phase_offset_matched_adapter_->capturePathTubePair(),
+                recovery_request)) {
+            // The command-side recovery_replan_required flag is consumed at
+            // this owner/session-bound FSM handoff; it is not a storage-only
+            // latch.  The mailbox ticket prevents duplicate routing.
+            const bool recenter_routed =
+                phase_offset_matched_adapter_->requestRecenter();
+            if (!recenter_routed) {
+                ROS_WARN_THROTTLE(
+                    1.0,
+                    "[GVF][PHASE_OFFSET][RECOVERY] owner-bound request could not be routed");
+            } else if (exec_state_ == EXEC_TRAJ) {
+                // A recovery replan request must renew successor/planner
+                // evidence; merely setting the inward lifecycle bit would
+                // retry the same failed continuation on the same pair.
+                // Reuse the existing FSM REPLAN_TRAJ path, with the mailbox
+                // ticket providing single-consumption/idempotence.
+                changeFSMExecState(
+                    REPLAN_TRAJ,
+                    "phase-offset recovery evidence renewal");
+            }
+        }
     }
     // A replan intentionally retains this captured w0 through its expensive
     // work.  The command-boundary pair commit revalidates the live phase
@@ -7437,6 +7644,18 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                         }
 
                         if (!connector_ready) {
+                            // A future exact-port/Tube denial is preview or
+                            // handoff evidence, not planner invalidity.  Keep
+                            // the old immutable owner and ask Runtime to
+                            // recenter continuously; neutral CAS remains the
+                            // only path to planner-only installation.
+                            if (path_tube_handoff_required &&
+                                replan_handoff.executed_authority &&
+                                phase_offset_matched_adapter_->requestRecenter()) {
+                                ROS_WARN_THROTTLE(
+                                    1.0,
+                                    "[GVF][H2][RECOVERY] successor denied; continuous recenter requested");
+                            }
                             // A failed Tube stage may still have produced the
                             // accepted planner frontend in this callback.  Let
                             // the existing neutral commit path decide whether
@@ -7600,6 +7819,13 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                     install_time, install_w,
                                     install_continuous_path,
                                     &h2_stage_failure);
+                                if (!frontend_ready &&
+                                    replan_handoff.executed_authority &&
+                                    phase_offset_matched_adapter_->requestRecenter()) {
+                                    ROS_WARN_THROTTLE(
+                                        1.0,
+                                        "[GVF][H2][RECOVERY] point successor stage denied; continuous recenter requested");
+                                }
                                 if (replan_handoff.captured_pair &&
                                     path_tube_replan_logged_generation_.exchange(
                                         replan_handoff.captured_pair->generation,
@@ -7673,6 +7899,13 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                             } else if (!frontend_ready &&
                                        !install_w.empty() &&
                                        install_continuous_path) {
+                                if (path_tube_handoff_required &&
+                                    replan_handoff.executed_authority &&
+                                    phase_offset_matched_adapter_->requestRecenter()) {
+                                    ROS_WARN_THROTTLE(
+                                        1.0,
+                                        "[GVF][H2][RECOVERY] point successor denied; continuous recenter requested");
+                                }
                                 // Preserve the accepted planner payload from
                                 // this callback.  The existing neutral commit
                                 // predicate is the sole authority for whether

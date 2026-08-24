@@ -1164,6 +1164,33 @@ TEST(PhaseOffsetRuntimeTest, ImmutableActiveViewIsConsumedReadOnly) {
   EXPECT_EQ(prepared.active_profile.get(), profile.get());
 }
 
+TEST(PhaseOffsetRuntimeTest, RecenterIsContinuousAndDoesNotResetBeforeCommit) {
+  const RuntimePathSamples path = MakePath();
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  Refresh(runtime, path);
+  RuntimePreparedStep prepared;
+  RuntimeStepOutput output;
+  ASSERT_TRUE(runtime.prepare(MakeInput(path, RuntimeInstalledTubeView()), prepared));
+  ASSERT_TRUE(Complete(runtime, prepared, output));
+  ASSERT_TRUE(runtime.prepare(MakeInput(path, RuntimeInstalledTubeView()), prepared));
+  ASSERT_TRUE(Complete(runtime, prepared, output));
+  const double nonzero = runtime.retainedDelta();
+  ASSERT_GT(std::abs(nonzero), 0.0);
+  runtime.requestRecenter();
+  EXPECT_TRUE(runtime.recenterRequested());
+  ASSERT_TRUE(runtime.prepare(MakeInput(path, RuntimeInstalledTubeView()), prepared));
+  EXPECT_DOUBLE_EQ(nonzero, prepared.delta);
+  ASSERT_TRUE(Complete(runtime, prepared, output));
+  EXPECT_LT(std::abs(runtime.retainedDelta()), std::abs(nonzero));
+  for (int index = 0; index < 80 && runtime.hasExecutedOffsetAuthority(); ++index) {
+    ASSERT_TRUE(runtime.prepare(MakeInput(path, RuntimeInstalledTubeView()), prepared));
+    ASSERT_TRUE(Complete(runtime, prepared, output));
+  }
+  EXPECT_NEAR(runtime.retainedDelta(), 0.0, 1e-3);
+  EXPECT_FALSE(runtime.recenterRequested());
+  EXPECT_FALSE(runtime.hasExecutedOffsetAuthority());
+}
+
 }  // namespace
 }  // namespace phase_offset_navigation
 

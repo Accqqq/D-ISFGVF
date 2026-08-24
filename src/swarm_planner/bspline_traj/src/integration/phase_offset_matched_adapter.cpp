@@ -3,6 +3,7 @@
 #include "bspline_race/integration/phase_offset_tube_markers.h"
 #include <bspline_race/continuous_phase_normal_frame.h>
 #include <bspline_race/integration/phase_offset_executed_reference_query.h>
+#include <bspline_race/integration/phase_offset_recovery_continuation_provider.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -31,6 +32,7 @@ namespace {
 // for an already published certificate frame.  This is transport buffering
 // only; it does not change geometry, certification, or control selection.
 constexpr std::uint32_t kManualEvidenceQueueSize = 10U;
+constexpr double kRecoveryNonzeroDeltaTolerance = 1e-3;
 
 bool IsFinite(double value) { return std::isfinite(value); }
 bool IsFinite(const Eigen::Vector3d& value) { return value.allFinite(); }
@@ -698,12 +700,19 @@ phase_offset_navigation::PathCellBoundQuery MakeTimerPathCellBoundQuery(
       }
       certificate.path_revision = immutable_frame->pathRevision();
       certificate.frame_revision = immutable_frame->frameRevision();
+      certificate.sup_N_w_norm = frame_proof.sup_normal_derivative;
+      certificate.normal_variation_bound = frame_proof.normal_variation_bound;
+      certificate.curvature_variation_bound =
+          std::max(certificate.curvature_variation_bound,
+                   frame_proof.tangent_variation_bound);
       certificate.normal_frame_proof_complete = true;
       // The frame certifies path-speed/normal variation only.  The combined
       // ||p_w + N_w*delta|| bound is deliberately left unset until Builder
       // has the actual admissible delta interval for this cell.
       certificate.combined_regularity_proof_complete = false;
-      certificate.provenance = "ContinuousPhaseNormalFrame/BishopTransport";
+      certificate.provenance =
+          "ContinuousPhaseNormalFrame/ProjectedHermiteTransport/"
+          "CertifiedProjectedRawNormLowerBound";
     }
     return phase_offset_core::pathCellGeometryCertificateIsComplete(certificate);
   };
@@ -1051,6 +1060,11 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
 PhaseOffsetMatchedAdapter::PhaseOffsetMatchedAdapter(const PhaseOffsetMatchedAdapterConfig& config)
     : config_(config), path_tube_pin_registry_(
           std::make_shared<PathTubePairPinRegistry>()) {
+  // Unadvertised adapter instances are deterministic unit/observe fixtures.
+  // They may exercise the legacy Runtime path, but this exception is removed
+  // at advertise() so production can never substitute Runtime for the sole
+  // PhaseOffsetAllocator owner.
+  execution_authority_.setTestOnlyRuntimeOwnerAllowed(true);
   measurement_tube_due_enabled_ = config_.measurement_enabled &&
       !config_.measurement_tube_due_csv_path.empty();
   if (measurement_tube_due_enabled_) {
@@ -1135,7 +1149,16 @@ bool PhaseOffsetMatchedAdapter::requiresAuthoritativeOffsetHandoffLocked() const
       config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
     return false;
   }
-  return runtime_->hasExecutedOffsetAuthority();
+  if (runtime_->hasExecutedOffsetAuthority()) return true;
+  // A committed RECOVERY tick may have reached neutral while the immutable
+  // authority snapshot still names RecoveryOwner.  Keep the pair on the
+  // command path until the explicit atomic neutral handoff is published.
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      execution_authority_.snapshot();
+  return authority.valid &&
+      authority.owner_mode ==
+          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY &&
+      authority.proposed_next_delta == 0.0;
 }
 
 bool PhaseOffsetMatchedAdapter::requiresPathTubePairBootstrap() const {
@@ -1170,6 +1193,22 @@ bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPair(
     const std::shared_ptr<const PathTubePair>& pair) const {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
   return hasPendingOffsetActivationPairLocked(pair);
+}
+
+bool PhaseOffsetMatchedAdapter::requestRecenter() {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  if (!runtime_ || !configuration_valid_ || config_.observe_only ||
+      config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
+      !runtime_->hasExecutedOffsetAuthority()) {
+    return false;
+  }
+  runtime_->requestRecenter();
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::recenterRequested() const {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  return runtime_ && runtime_->recenterRequested();
 }
 
 bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPairLocked(
@@ -1264,6 +1303,22 @@ void PhaseOffsetMatchedAdapter::shutdown() {
     std::this_thread::yield();
   }
   std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
+  pending_authority_prepared_ =
+      phase_offset_navigation::AuthorityPreparedStep();
+  pending_authority_session_ = 0U;
+  pending_authority_valid_ = false;
+  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
+  pending_recovery_step_valid_ = false;
+  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
+  pending_handoff_valid_ = false;
+  pending_recovery_source_pair_.reset();
+  pending_recovery_execution_pair_.reset();
+  pending_recovery_target_pair_.reset();
+  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
+  recovery_deadline_session_ = 0U;
+  recovery_deadline_target_revision_ = 0U;
   const std::shared_ptr<const ControlPublishSnapshot> control =
       std::atomic_load(&latest_control_snapshot_);
   if (control && control->active) publishManualDelete(*control);
@@ -1343,6 +1398,23 @@ bool PhaseOffsetMatchedAdapter::resetForNewNavigationTask(
   have_preflight_revision_ = false;
   last_consumed_epoch_build_sequence_ = 0U;
   runtime_->resetForNewNavigationTask();
+  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
+  pending_authority_prepared_ =
+      phase_offset_navigation::AuthorityPreparedStep();
+  pending_authority_session_ = 0U;
+  pending_authority_valid_ = false;
+  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
+  pending_recovery_step_valid_ = false;
+  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
+  pending_handoff_valid_ = false;
+  pending_recovery_source_pair_.reset();
+  pending_recovery_execution_pair_.reset();
+  pending_recovery_target_pair_.reset();
+  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
+  recovery_deadline_session_ = 0U;
+  recovery_deadline_target_revision_ = 0U;
+  execution_authority_.resetForNewTask(retired_authority_session);
   return true;
 }
 
@@ -1371,6 +1443,22 @@ std::uint64_t PhaseOffsetMatchedAdapter::retirePathTubeAuthorityLocked(
   have_source_identity_ = false;
   have_preflight_revision_ = false;
   command_active_ = false;
+  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
+  pending_authority_prepared_ =
+      phase_offset_navigation::AuthorityPreparedStep();
+  pending_authority_session_ = 0U;
+  pending_authority_valid_ = false;
+  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
+  pending_recovery_step_valid_ = false;
+  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
+  pending_handoff_valid_ = false;
+  pending_recovery_source_pair_.reset();
+  pending_recovery_execution_pair_.reset();
+  pending_recovery_target_pair_.reset();
+  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
+  recovery_deadline_session_ = 0U;
+  recovery_deadline_target_revision_ = 0U;
   return retired_session;
 }
 
@@ -1389,6 +1477,7 @@ bool PhaseOffsetMatchedAdapter::retirePathTubeAuthorityIfNeutral(
     return false;
   }
   retired_session = retirePathTubeAuthorityLocked(authority_session);
+  execution_authority_.resetForNewTask(retired_session);
   return true;
 }
 
@@ -1404,10 +1493,31 @@ void PhaseOffsetMatchedAdapter::deactivateLocked(
     const ros::Time& stamp, const std::uint64_t expected_task_generation) {
   if (shutdown_requested_.load(std::memory_order_acquire) ||
       expected_task_generation !=
-          task_generation_.load(std::memory_order_acquire) ||
-      !command_active_) {
+          task_generation_.load(std::memory_order_acquire)) {
     return;
   }
+  // Deactivation invalidates any staged PositionCommand transaction.  In
+  // particular, a goal override or an explicit planner handoff may occur
+  // after the adapter prepared a recovery/runtime step but before the manager
+  // reaches publication.  Never let that stale staged step commit against the
+  // replacement command; retain only the last already-committed authority.
+  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
+  pending_authority_prepared_ =
+      phase_offset_navigation::AuthorityPreparedStep();
+  pending_authority_session_ = 0U;
+  pending_authority_valid_ = false;
+  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
+  pending_recovery_step_valid_ = false;
+  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
+  pending_handoff_valid_ = false;
+  pending_recovery_source_pair_.reset();
+  pending_recovery_execution_pair_.reset();
+  pending_recovery_target_pair_.reset();
+  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
+  recovery_deadline_session_ = 0U;
+  recovery_deadline_target_revision_ = 0U;
+  if (!command_active_) return;
   command_active_ = false;
   std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
   request->active = false;
@@ -1430,8 +1540,74 @@ void PhaseOffsetMatchedAdapter::deactivateLocked(
   std::atomic_store(&latest_control_snapshot_,
                     std::shared_ptr<const ControlPublishSnapshot>(control));
 }
+
+bool PhaseOffsetMatchedAdapter::prepareDeactivationLocked(
+    const ros::Time& stamp, const std::uint64_t expected_task_generation,
+    DeactivationCommitToken& token) const {
+  token = DeactivationCommitToken();
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      expected_task_generation !=
+          task_generation_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  token.task_generation = expected_task_generation;
+  token.next_control_sequence = control_sequence_ + 1U;
+  token.command_active_before = command_active_;
+  if (command_active_) {
+    try {
+      std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
+      request->active = false;
+      request->task_generation = expected_task_generation;
+      request->control_sequence = token.next_control_sequence;
+      request->stamp = stamp;
+      token.inactive_request =
+          std::shared_ptr<const TubeBuildRequest>(std::move(request));
+      std::shared_ptr<ControlPublishSnapshot> control(
+          new ControlPublishSnapshot());
+      control->active = false;
+      control->task_generation = expected_task_generation;
+      control->control_sequence = token.next_control_sequence;
+      control->stamp = stamp;
+      token.inactive_control =
+          std::shared_ptr<const ControlPublishSnapshot>(std::move(control));
+    } catch (const std::bad_alloc&) {
+      return false;
+    }
+  }
+  token.valid = true;
+  return true;
+}
+
+void PhaseOffsetMatchedAdapter::commitDeactivationNoFailLocked(
+    const DeactivationCommitToken& token) noexcept {
+  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
+  pending_authority_prepared_ =
+      phase_offset_navigation::AuthorityPreparedStep();
+  pending_authority_session_ = 0U;
+  pending_authority_valid_ = false;
+  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
+  pending_recovery_step_valid_ = false;
+  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
+  pending_handoff_valid_ = false;
+  pending_recovery_source_pair_.reset();
+  pending_recovery_execution_pair_.reset();
+  pending_recovery_target_pair_.reset();
+  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
+  recovery_deadline_session_ = 0U;
+  recovery_deadline_target_revision_ = 0U;
+  if (!token.command_active_before) return;
+  command_active_ = false;
+  control_sequence_ = token.next_control_sequence;
+  std::atomic_store(&latest_build_request_, token.inactive_request);
+  std::atomic_store(&latest_candidate_epoch_snapshot_,
+                    token.inactive_candidate_snapshot);
+  std::atomic_store(&latest_epoch_snapshot_, token.inactive_epoch_snapshot);
+  std::atomic_store(&latest_control_snapshot_, token.inactive_control);
+}
 void PhaseOffsetMatchedAdapter::advertise(ros::NodeHandle& nh) {
   if (!configuration_valid_ || advertised_) return;
+  execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
   if (config_.mode == PhaseOffsetMatchedMode::ACTIVE) {
     active_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>("phase_offset_active/diagnostics", 1);
   } else {
@@ -2588,6 +2764,15 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   std::uint64_t staged_revision = 0U;
   phase_offset_navigation::PhaseOffsetRuntime runtime_snapshot(
       MakeRuntimeConfig(config_));
+  // A replacement successor must inherit the exact predecessor authority's
+  // executed_N.  The seed is projected in the successor composite's start
+  // plane (the captured predecessor state), sign-aligned to that immutable
+  // predecessor vector, and only then used to construct one immutable
+  // successor frame.  The future seam is not the predecessor chaining point.
+  Eigen::Vector3d executed_seed = Eigen::Vector3d::Zero();
+  bool have_executed_seed = false;
+  std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
+      successor_seed_authority;
   {
     std::lock_guard<std::mutex> lock(runtime_command_mutex_);
     const std::shared_ptr<const PathTubePair> live =
@@ -2643,15 +2828,118 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
     }
     previous_port = runtime_->previousFinalPort();
     runtime_snapshot = *runtime_;
+    if (expected_pair) {
+      successor_seed_authority = execution_authority_.snapshotPtr();
+      const bool authority_is_active = successor_seed_authority &&
+          successor_seed_authority->valid &&
+          successor_seed_authority->owner_mode !=
+              phase_offset_navigation::ActiveReferenceOwnerMode::NONE &&
+          successor_seed_authority->owner_mode !=
+              phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+      // Bootstrap and planner-only replacement have no authenticated
+      // predecessor normal.  They intentionally use the deterministic
+      // least-parallel-axis seed in ContinuousPhaseNormalFrame.  Only an
+      // active immutable authority is subject to the strict predecessor
+      // identity checks below.
+      if (authority_is_active) {
+        if (successor_seed_authority->authority_session !=
+                captured_authority_session ||
+            successor_seed_authority->sequence == 0U ||
+            successor_seed_authority->planner_path_revision !=
+                expected_pair->source_revision ||
+            successor_seed_authority->executed_path_revision !=
+                expected_pair->path_revision ||
+            successor_seed_authority->frame_revision !=
+                expected_pair->frame_revision ||
+            std::abs(successor_seed_authority->w - captured_w0) > 1e-12 ||
+            !(std::abs(successor_seed_authority->delta - retained_delta) <=
+                  1e-12 ||
+              std::abs(successor_seed_authority->proposed_next_delta -
+                       retained_delta) <= 1e-12) ||
+            !(std::abs(successor_seed_authority->u_prev.u_w -
+                       previous_port.u_w) <= 1e-12 ||
+              std::abs(successor_seed_authority->proposed_next_u_prev.u_w -
+                       previous_port.u_w) <= 1e-12) ||
+            !(std::abs(successor_seed_authority->u_prev.u_delta -
+                       previous_port.u_delta) <= 1e-12 ||
+              std::abs(successor_seed_authority->proposed_next_u_prev.u_delta -
+                       previous_port.u_delta) <= 1e-12)) {
+          if (temporary_failure) *temporary_failure =
+              PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
+          return stage_first_false("successor_frame_seed_provenance", nullptr);
+        }
+        ContinuousPhasePathState predecessor_state;
+        phase_offset_core::NormalFrameQuery predecessor_frame;
+        if (!expected_pair->path_owner->evaluate(captured_w0,
+                                                 predecessor_state, false) ||
+            !expected_pair->frame_owner->query(captured_w0, predecessor_frame) ||
+            !predecessor_state.valid || !predecessor_frame.valid ||
+            (predecessor_state.p + predecessor_frame.N *
+                 successor_seed_authority->delta -
+             successor_seed_authority->r).norm() > 1e-8 ||
+            (predecessor_state.dp_dw + predecessor_frame.N_w *
+                 successor_seed_authority->delta -
+             successor_seed_authority->r_w).norm() > 1e-8 ||
+            !successor_seed_authority->executed_N.allFinite() ||
+            successor_seed_authority->executed_N.norm() <= 1e-10 ||
+            (predecessor_frame.N - successor_seed_authority->executed_N).norm() >
+                1e-7) {
+          if (temporary_failure) *temporary_failure =
+              PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
+          return stage_first_false("successor_frame_predecessor_state", nullptr);
+        }
+        ContinuousPhasePathState successor_start_state;
+        if (!new_path_owner->evaluate(captured_w0,
+                                      successor_start_state, false) ||
+            !successor_start_state.valid ||
+            successor_start_state.dp_dw.norm() <= 1e-10) {
+          if (temporary_failure) *temporary_failure =
+              PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
+          return stage_first_false("successor_frame_seed_start_query", nullptr);
+        }
+        const Eigen::Vector3d tangent =
+            successor_start_state.dp_dw.normalized();
+        executed_seed = successor_seed_authority->executed_N -
+            tangent * successor_seed_authority->executed_N.dot(tangent);
+        // A valid authority can still carry a normal nearly parallel to the
+        // successor composite-start tangent.  In that genuinely unusable
+        // start-plane case leave the explicit seed absent so the immutable
+        // frame constructor uses its deterministic least-parallel fallback.
+        if (executed_seed.allFinite() && executed_seed.norm() > 1e-10) {
+          executed_seed.normalize();
+          if (executed_seed.dot(successor_seed_authority->executed_N) < 0.0) {
+            executed_seed = -executed_seed;
+          }
+          have_executed_seed = true;
+        }
+      }
+    }
     // This is transaction-local provenance only.  It becomes live source
     // bookkeeping exclusively in commitPathTubePair after the same CAS.
     staged_revision = std::max(source_revision_,
         expected_pair ? expected_pair->source_revision : 0U) + 1U;
   }
 
-  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame_owner(
-      new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
-                                     staged_revision));
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame_owner =
+      have_executed_seed
+      ? std::shared_ptr<const ContinuousPhaseNormalFrame>(
+            new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
+                                            staged_revision, executed_seed))
+      : std::shared_ptr<const ContinuousPhaseNormalFrame>(
+            new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
+                                            staged_revision));
+  if (have_executed_seed && successor_seed_authority) {
+    phase_offset_core::NormalFrameQuery successor_start_frame;
+    if (!new_frame_owner->query(captured_w0, successor_start_frame) ||
+        !successor_start_frame.valid ||
+        (successor_start_frame.N - successor_seed_authority->executed_N).norm() >
+            1e-7) {
+      if (temporary_failure) {
+        *temporary_failure = PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
+      }
+      return stage_first_false("successor_frame_start_binding", nullptr);
+    }
+  }
   phase_offset_core::PathDifferentialState captured_path;
   if (!EvaluateOwnerState(new_path_owner, captured_w0, captured_path,
                           new_frame_owner)) {
@@ -2780,6 +3068,7 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
               candidate->active_profile
                   ? candidate->active_profile->frame_revision : 0U,
               candidate->source_revision, candidate->source_revision));
+  candidate->successor_seed_authority = successor_seed_authority;
   candidate->epoch_status = prepared.epoch_status;
   candidate->captured_w0 = captured_w0;
   candidate->future_seam_w = future_seam_w;
@@ -3060,6 +3349,7 @@ void PhaseOffsetMatchedAdapter::makeControlPublishSnapshot(
   control->epoch_snapshot = epoch;
   control->full_path_samples = epoch ? epoch->full_path_samples
                                      : std::shared_ptr<const PathSamples>();
+  control->authority_snapshot = execution_authority_.snapshotPtr();
   control->output = output;
   std::atomic_store(&latest_control_snapshot_,
                     std::shared_ptr<const ControlPublishSnapshot>(control));
@@ -3398,6 +3688,1385 @@ void PhaseOffsetMatchedAdapter::fillManualDiagnostics(MatchedAdapterOutput& outp
   for (double& value : d) value = FiniteOrZero(value);
 }
 
+bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const PathTubePair>& pair,
+    const std::shared_ptr<const TubeBuildRequest>& request,
+    const std::shared_ptr<const TubeEpochSnapshot>& epoch,
+    const phase_offset_navigation::RuntimePreparedStep& prepared,
+    const Eigen::Vector3d& base_v_cmd,
+    const double base_w_dot,
+    const bool base_guidance_valid,
+    phase_offset_navigation::RuntimeStepOutput& output) {
+  output = phase_offset_navigation::RuntimeStepOutput();
+  if (!runtime_) return false;
+
+  // `prepare` is side-effect free.  Complete the exact port only on a local
+  // value copy; the live Runtime is replaced inside the authority publisher
+  // callback after selected-u/revision validation succeeds.
+  phase_offset_navigation::PhaseOffsetRuntime staged_runtime(*runtime_);
+  const phase_offset_core::PortCommand previous_final_port =
+      staged_runtime.previousFinalPort();
+  if (!staged_runtime.complete(prepared, base_v_cmd, base_w_dot,
+                               base_guidance_valid, output)) {
+    return false;
+  }
+  if (!output.selected) {
+    // A gate-closed but otherwise valid step has no execution-state mutation.
+    return true;
+  }
+  if (!output.valid || !output.projection.valid || !output.matched.valid) {
+    output.selected = false;
+    output.valid = false;
+    if (output.invalid_reason.empty()) {
+      output.invalid_reason = "selected runtime output is invalid";
+    }
+    return false;
+  }
+
+  const std::shared_ptr<const ContinuousPhasePath> path_owner = pair
+      ? pair->path_owner
+      : (request ? request->semantic_path_owner : input.semantic_path_owner);
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner = pair
+      ? pair->frame_owner
+      : (request ? request->frame_owner : input.frame_owner);
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile> profile =
+      pair ? pair->active_profile : (epoch ? epoch->active_profile
+                                           : std::shared_ptr<const phase_offset_navigation::TubeProfile>());
+  const std::uint64_t source_revision = request
+      ? request->source_revision
+      : (pair ? pair->source_revision : prepared.geometry.path_revision);
+  if (!IsFinite(source_revision) || source_revision == 0U ||
+      !IsFinite(prepared.geometry.w) || !IsFinite(prepared.dt) ||
+      prepared.dt <= 0.0) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = "execution authority input provenance is invalid";
+    return false;
+  }
+
+  const std::uint64_t path_revision = profile && profile->path_revision != 0U
+      ? profile->path_revision
+      : (prepared.geometry.path_revision != 0U
+          ? prepared.geometry.path_revision : source_revision);
+  const std::uint64_t frame_revision = profile && profile->frame_revision != 0U
+      ? profile->frame_revision
+      : (frame_owner ? frame_owner->frameRevision()
+                     : prepared.geometry.frame_revision);
+  const std::uint64_t query_revision = profile && profile->profile_revision != 0U
+      ? profile->profile_revision : source_revision;
+
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr reference_query;
+  if (path_owner) {
+    reference_query =
+        phase_offset_navigation::ImmutableExecutedReferenceQueryPtr(
+            new PhaseOffsetExecutedReferenceQuery(
+                path_owner, prepared.delta, frame_owner, path_revision,
+                frame_revision, source_revision, query_revision));
+  } else if (input.path_state_query) {
+    // Legacy synthetic adapter callers have no ContinuousPhasePath owner, but
+    // still provide the same immutable path-state query used by Runtime.
+    // Bind that query into the authority-facing reference view rather than
+    // weakening the execution contract or fabricating a path owner.
+    const phase_offset_navigation::PathStateQuery path_query =
+        input.path_state_query;
+    const phase_offset_core::GeometryParams geometry_params = [&]() {
+      phase_offset_core::GeometryParams params;
+      params.regularity_margin = runtime_->config().tube.regularity_margin;
+      params.minimum_reference_speed =
+          runtime_->config().tube.minimum_reference_speed;
+      return params;
+    }();
+    const double domain_start = input.semantic_path_start_w;
+    const double domain_end = input.semantic_path_end_w;
+    reference_query =
+        phase_offset_navigation::ImmutableExecutedReferenceQueryPtr(
+            new phase_offset_navigation::CallbackExecutedReferenceQuery(
+                [path_query, geometry_params,
+                 delta = prepared.delta](
+                    const double w,
+                    phase_offset_navigation::ExecutedReferenceQueryResult& result) {
+                  phase_offset_core::PathDifferentialState state;
+                  if (!path_query(w, state) || !state.valid) return false;
+                  if (state.frame_valid && state.N.allFinite() &&
+                      state.N_w.allFinite()) {
+                    result.r = state.p + state.N * delta;
+                    result.r_w = state.p_w + state.N_w * delta;
+                  } else {
+                    phase_offset_core::GeometryEvaluator evaluator(
+                        geometry_params);
+                    phase_offset_core::PhaseOffsetGeometryState geometry;
+                    if (!evaluator.evaluate(state, Eigen::Vector3d::Zero(),
+                                            delta, geometry) || !geometry.valid) {
+                      return false;
+                    }
+                    result.r = geometry.r;
+                    result.r_w = geometry.r_w;
+                  }
+                  result.r_ww.setZero();
+                  result.r_ww_valid = false;
+                  result.valid = result.r.allFinite() && result.r_w.allFinite();
+                  return result.valid;
+                },
+                domain_start, domain_end, path_revision, frame_revision,
+                source_revision, query_revision,
+                "PhaseOffsetMatchedAdapter/runtime-path-query"));
+  }
+  if (!reference_query) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason =
+        "immutable executed-reference query is unavailable";
+    return false;
+  }
+
+  phase_offset_navigation::ExecutedReferenceQueryResult reference_result;
+  if (!reference_query->query(prepared.geometry.w, reference_result) ||
+      !reference_result.valid) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = "immutable executed-reference query failed";
+    return false;
+  }
+
+  phase_offset_navigation::ActiveReferenceSnapshot candidate;
+  const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
+      execution_authority_.snapshot();
+  candidate.authority_session = current_authority.valid
+      ? current_authority.authority_session
+      : authority_session_.load(std::memory_order_acquire);
+  candidate.planner_path_revision = source_revision;
+  candidate.executed_path_revision = reference_query->pathRevision();
+  candidate.frame_revision = reference_query->frameRevision();
+  candidate.tube_revision = profile ? profile->tube_revision : 0U;
+  candidate.profile_revision = profile ? profile->profile_revision : 0U;
+  candidate.map_revision = profile ? profile->map_revision : 0U;
+  candidate.owner_mode =
+      phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL;
+  candidate.selected_u_owner = "PhaseOffsetMatchedAdapterRuntime";
+  candidate.w = prepared.geometry.w;
+  candidate.delta = prepared.delta;
+  candidate.dt = prepared.dt;
+  candidate.u_prev = previous_final_port;
+  candidate.selected_u = output.projection.final_port;
+  candidate.proposed_next_w =
+      prepared.geometry.w + prepared.dt * output.projection.final_w_dot;
+  candidate.proposed_next_delta = output.projection.next_delta;
+  candidate.proposed_next_u_prev = output.projection.final_port;
+  candidate.r = prepared.geometry.r;
+  candidate.r_w = prepared.geometry.r_w;
+  candidate.r_ww = prepared.geometry.p_ww;
+  candidate.r_ww_valid = false;
+  candidate.matched_base_v_cmd = base_v_cmd;
+  candidate.matched_base_w_dot = base_w_dot;
+  candidate.executed_N = prepared.geometry.N;
+  candidate.executed_reference_query = reference_query;
+  candidate.reference_query_revision = reference_query->queryRevision();
+  candidate.provenance = pair
+      ? "PhaseOffsetMatchedAdapter/path-tube-runtime"
+      : "PhaseOffsetMatchedAdapter/planner-runtime";
+  candidate.safety_status = output.execution.certificate_denied
+      ? "CERTIFICATE_DENIED" : "SAFE";
+  candidate.handoff_state = pair ? "PATH_TUBE_PAIR" : "PLANNER_ONLY";
+  candidate.valid = true;
+  candidate.selected_u_w = candidate.selected_u.u_w;
+  candidate.selected_u_delta = candidate.selected_u.u_delta;
+
+  phase_offset_navigation::AuthorityPrepareInput authority_input;
+  authority_input.candidate = candidate;
+  if (current_authority.valid) {
+    authority_input.expected_authority_session =
+        current_authority.authority_session;
+    authority_input.expected_sequence = current_authority.sequence;
+  }
+  authority_input.matched_output_valid = output.valid && output.matched.valid;
+  authority_input.reference_valid = candidate.governorViewValid();
+  authority_input.provenance = candidate.provenance;
+  phase_offset_navigation::AuthorityPreparedStep authority_prepared;
+  if (!execution_authority_.prepare(authority_input, authority_prepared)) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = authority_prepared.failure_reason.empty()
+        ? "execution authority rejected selected runtime step"
+        : authority_prepared.failure_reason;
+    return false;
+  }
+
+  // Production publication is performed by gvf_manager after the governor
+  // has emitted the local PositionCommand.  Keep both the exact prepared
+  // snapshot and the staged Runtime private until that publication reports
+  // success; no authority or live Runtime state is changed here.
+  if (advertised_) {
+    if (pending_authority_valid_) {
+      output.selected = false;
+      output.valid = false;
+      output.invalid_reason =
+          "previous PositionCommand transaction is still pending";
+      return false;
+    }
+    if (!staged_runtime.makeCommitToken(prepared, output,
+                                        pending_runtime_commit_)) {
+      output.selected = false;
+      output.valid = false;
+      output.invalid_reason =
+          "selected Runtime step cannot form a bounded commit token";
+      return false;
+    }
+    pending_authority_prepared_ = authority_prepared;
+    pending_authority_session_ = authority_prepared.candidate.authority_session;
+    pending_authority_valid_ = true;
+    return true;
+  }
+
+  phase_offset_navigation::AuthorityCommitResult authority_result;
+  const bool committed = execution_authority_.commit(
+      authority_prepared,
+      [this, &staged_runtime, &output](
+          const phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        const double epsilon = execution_authority_.config().comparison_epsilon;
+        if (!snapshot.selectedUConsistent(epsilon) ||
+            std::abs(snapshot.selected_u.u_w - output.projection.final_port.u_w) >
+                epsilon ||
+            std::abs(snapshot.selected_u.u_delta -
+                     output.projection.final_port.u_delta) > epsilon ||
+            std::abs(snapshot.proposed_next_delta -
+                     output.projection.next_delta) > epsilon) {
+          return false;
+        }
+        *runtime_ = staged_runtime;
+        return true;
+      },
+      authority_result);
+  if (!committed) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = authority_result.failure_reason.empty()
+        ? "execution authority commit failed" : authority_result.failure_reason;
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::completeAtomicNeutralHandoff(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const PathTubePair>& pair,
+    const phase_offset_navigation::RuntimePreparedStep& prepared,
+    const Eigen::Vector3d& base_v_cmd,
+    const double base_w_dot,
+    const bool base_guidance_valid,
+    phase_offset_navigation::RuntimeStepOutput& output) {
+  output = phase_offset_navigation::RuntimeStepOutput();
+  const phase_offset_navigation::ActiveReferenceSnapshot current =
+      execution_authority_.snapshot();
+  if (!runtime_ || !pair || !pair->path_owner || !pair->frame_owner ||
+      !base_guidance_valid || !prepared.geometry.valid ||
+      !current.valid ||
+      current.owner_mode !=
+          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY ||
+      prepared.delta != 0.0 ||
+      !recovery_owner_.status().exact_terminal_predicate ||
+      current.proposed_next_delta != 0.0) {
+    return false;
+  }
+  phase_offset_core::PathDifferentialState neutral_path;
+  phase_offset_core::PhaseOffsetGeometryState neutral_geometry;
+  if (!EvaluateOwnerState(pair->path_owner, prepared.geometry.w,
+                          neutral_path, pair->frame_owner)) {
+    return false;
+  }
+  phase_offset_core::GeometryParams neutral_params;
+  neutral_params.regularity_margin = runtime_->config().tube.regularity_margin;
+  neutral_params.minimum_reference_speed =
+      runtime_->config().tube.minimum_reference_speed;
+  phase_offset_core::GeometryEvaluator neutral_evaluator(neutral_params);
+  if (!neutral_evaluator.evaluate(neutral_path, input.position, 0.0,
+                                  neutral_geometry) ||
+      !neutral_geometry.valid) {
+    return false;
+  }
+  const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr query(
+      new PhaseOffsetExecutedReferenceQuery(
+          pair->path_owner, 0.0, pair->frame_owner, pair->path_revision,
+          pair->frame_revision, pair->source_revision, pair->source_revision));
+  phase_offset_navigation::ExecutedReferenceQueryResult reference;
+  if (!query->query(prepared.geometry.w, reference) || !reference.valid) {
+    return false;
+  }
+  phase_offset_core::MatchedPortInput matched_input;
+  matched_input.geometry = neutral_geometry;
+  matched_input.base_v_cmd = base_v_cmd;
+  matched_input.base_w_dot = base_w_dot;
+  matched_input.final_port = phase_offset_core::PortCommand();
+  if (!phase_offset_core::MatchedPort::evaluate(matched_input,
+                                                 output.matched) ||
+      !output.matched.valid) {
+    return false;
+  }
+  output.geometry = neutral_geometry;
+  output.raw_port = phase_offset_core::PortCommand();
+  output.projection.final_port = phase_offset_core::PortCommand();
+  output.projection.final_w_dot = base_w_dot;
+  output.projection.next_delta = 0.0;
+  output.projection.valid = true;
+  output.current_bounds = prepared.current_bounds;
+  output.next_bounds = prepared.current_bounds;
+  output.execution = prepared.execution;
+  output.execution.mode = phase_offset_navigation::RuntimeExecutionMode::NO_TUBE_REQUIRED;
+  output.execution.executable = true;
+  output.delta = 0.0;
+  output.delta_ref = 0.0;
+  output.profile_active = false;
+  output.selected = true;
+  output.valid = true;
+
+  phase_offset_navigation::ActiveReferenceSnapshot candidate;
+  candidate.authority_session = current.authority_session;
+  candidate.planner_path_revision = pair->source_revision;
+  candidate.executed_path_revision = pair->path_revision;
+  candidate.frame_revision = pair->frame_revision;
+  candidate.tube_revision = pair->active_profile
+      ? pair->active_profile->tube_revision : 0U;
+  candidate.profile_revision = pair->active_profile
+      ? pair->active_profile->profile_revision : 0U;
+  candidate.map_revision = pair->active_profile
+      ? pair->active_profile->map_revision : 0U;
+  candidate.owner_mode = phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+  candidate.selected_u_owner = "PlannerOwner";
+  candidate.w = prepared.geometry.w;
+  candidate.delta = 0.0;
+  candidate.dt = prepared.dt;
+  candidate.u_prev = runtime_->previousFinalPort();
+  candidate.selected_u = phase_offset_core::PortCommand();
+  candidate.selected_u_w = 0.0;
+  candidate.selected_u_delta = 0.0;
+  candidate.proposed_next_w = prepared.geometry.w + prepared.dt * base_w_dot;
+  candidate.proposed_next_delta = 0.0;
+  candidate.proposed_next_u_prev = candidate.selected_u;
+  candidate.r = reference.r;
+  candidate.r_w = reference.r_w;
+  candidate.r_ww = reference.r_ww;
+  candidate.r_ww_valid = reference.r_ww_valid;
+  candidate.matched_base_v_cmd = base_v_cmd;
+  candidate.matched_base_w_dot = base_w_dot;
+  phase_offset_core::NormalFrameQuery neutral_frame;
+  if (!pair->frame_owner->query(prepared.geometry.w, neutral_frame) ||
+      !neutral_frame.valid) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = "neutral handoff frame query failed";
+    return false;
+  }
+  candidate.executed_N = neutral_frame.N;
+  candidate.executed_reference_query = query;
+  candidate.reference_query_revision = query->queryRevision();
+  candidate.provenance = "PhaseOffsetMatchedAdapter/atomic-neutral-handoff";
+  candidate.safety_status = "NEUTRAL_HANDOFF";
+  candidate.handoff_state = "PLANNER_ONLY";
+  candidate.valid = true;
+  phase_offset_navigation::AuthorityPrepareInput authority_input;
+  authority_input.candidate = candidate;
+  authority_input.expected_authority_session = current.authority_session;
+  authority_input.expected_sequence = current.sequence;
+  authority_input.matched_output_valid = true;
+  authority_input.reference_valid = candidate.governorViewValid();
+  authority_input.provenance = candidate.provenance;
+  phase_offset_navigation::AuthorityPreparedStep prepared_authority;
+  if (!execution_authority_.prepare(authority_input, prepared_authority)) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = prepared_authority.failure_reason;
+    return false;
+  }
+  phase_offset_navigation::RuntimeCommitToken token;
+  token.expected_previous_final_port = runtime_->previousFinalPort();
+  token.expected_delta = runtime_->retainedDelta();
+  token.next_previous_final_port = phase_offset_core::PortCommand();
+  token.next_delta = 0.0;
+  token.dt = prepared.dt;
+  token.selected = true;
+  token.valid = true;
+  token.complete_profile = true;
+  // The neutral planner-only publication is reached only after the preceding
+  // RecoveryOwner step proved an exact selected-ZOH arrival.  Carry that
+  // immutable terminal proof into Runtime's no-fail commit token so the
+  // profile lifecycle retires together with the authority handoff.
+  token.exact_terminal_predicate = true;
+  if (advertised_) {
+    if (pending_authority_valid_) return false;
+    pending_runtime_commit_ = token;
+    pending_authority_prepared_ = prepared_authority;
+    pending_authority_session_ = prepared_authority.candidate.authority_session;
+    pending_authority_valid_ = true;
+    pending_recovery_step_valid_ = false;
+    pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+    pending_handoff_input_.owner_mode =
+        phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+    pending_handoff_input_.delta = 0.0;
+    pending_handoff_input_.neutral_handoff_committed = true;
+    pending_handoff_input_.event =
+        phase_offset_navigation::HandoffEvent::ATOMIC_NEUTRAL_HANDOFF;
+    if (!handoff_state_machine_.evaluate(
+            pending_handoff_input_, pending_handoff_decision_)) {
+      clearPendingPositionCommandLocked();
+      return false;
+    }
+    pending_handoff_valid_ = true;
+    return true;
+  }
+  phase_offset_navigation::AuthorityCommitResult authority_result;
+  if (!execution_authority_.commit(
+          prepared_authority,
+          [this, token](const phase_offset_navigation::ActiveReferenceSnapshot&) {
+            runtime_->commitTokenNoFail(token);
+            phase_offset_navigation::HandoffStateInput handoff_input;
+            handoff_input.owner_mode =
+                phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+            handoff_input.delta = 0.0;
+            handoff_input.neutral_handoff_committed = true;
+            handoff_input.event =
+                phase_offset_navigation::HandoffEvent::ATOMIC_NEUTRAL_HANDOFF;
+            phase_offset_navigation::HandoffDecision decision;
+            return handoff_state_machine_.transition(handoff_input, decision);
+          },
+          authority_result)) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = authority_result.failure_reason;
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const PathTubePair>& pair,
+    const std::shared_ptr<const PathTubePair>& successor_pair,
+    const phase_offset_navigation::RuntimePreparedStep& prepared,
+    const Eigen::Vector3d& base_v_cmd,
+    const double base_w_dot,
+    const bool base_guidance_valid,
+    phase_offset_navigation::RuntimeStepOutput& output) {
+  output = phase_offset_navigation::RuntimeStepOutput();
+  const auto fail = [&output](const char* reason) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = reason ? reason : "recovery transaction rejected";
+    return false;
+  };
+  const bool has_staged_successor = successor_pair && successor_pair != pair;
+  const std::shared_ptr<const PathTubePair>& target_pair =
+      has_staged_successor ? successor_pair : pair;
+  if (!runtime_ || !pair || !pair->active_profile || !pair->path_owner ||
+      !pair->frame_owner || !target_pair || !target_pair->active_profile ||
+      !target_pair->path_owner || !target_pair->frame_owner ||
+      !base_guidance_valid ||
+      !prepared.geometry.valid || !IsFinite(prepared.delta) ||
+      prepared.delta == 0.0) {
+    return fail("recovery precondition is invalid");
+  }
+
+  // A production RECOVERY step is a continuation of an already committed
+  // authority.  It may not use the pair/session itself as a hidden bootstrap
+  // seed: doing so would let Runtime (or a freshly installed pair) mint a
+  // RECOVERY owner without an authoritative predecessor.  Unadvertised
+  // fixtures retain the explicit seed-only setup used by unit tests.
+  const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
+      execution_authority_.snapshot();
+  if (advertised_) {
+    const double epsilon = execution_authority_.config().comparison_epsilon;
+    const std::uint64_t live_session =
+        authority_session_.load(std::memory_order_acquire);
+    const bool owner_mode_compatible =
+        current_authority.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
+        current_authority.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION ||
+        current_authority.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+    const phase_offset_core::PortCommand runtime_previous =
+        runtime_->previousFinalPort();
+    const bool runtime_state_compatible =
+        std::abs(current_authority.proposed_next_delta - prepared.delta) <=
+            epsilon &&
+        std::abs(current_authority.proposed_next_u_prev.u_w -
+                 runtime_previous.u_w) <= epsilon &&
+        std::abs(current_authority.proposed_next_u_prev.u_delta -
+                 runtime_previous.u_delta) <= epsilon;
+    const auto pair_revision_matches =
+        [&current_authority, &pair](
+            const std::shared_ptr<const PathTubePair>& candidate_pair) {
+      return candidate_pair && candidate_pair->active_profile &&
+          current_authority.planner_path_revision == pair->source_revision &&
+          current_authority.executed_path_revision == candidate_pair->path_revision &&
+          current_authority.frame_revision == candidate_pair->frame_revision &&
+          current_authority.tube_revision == candidate_pair->active_profile->tube_revision &&
+          current_authority.profile_revision ==
+              candidate_pair->active_profile->profile_revision &&
+          current_authority.map_revision == candidate_pair->active_profile->map_revision;
+    };
+    // After the first staged-successor tick, the target pair is the actual
+    // execution frame even though the old pair remains live until the CAS.
+    // Accept either exact immutable pair identity; never accept independent
+    // revisions assembled from unrelated slots.
+    const bool pair_revision_compatible = pair_revision_matches(pair) ||
+        pair_revision_matches(successor_pair);
+    if (!current_authority.valid ||
+        current_authority.authority_session == 0U ||
+        pair->authority_session == 0U ||
+        current_authority.authority_session != pair->authority_session ||
+        live_session != pair->authority_session || !owner_mode_compatible ||
+        !current_authority.governorViewValid() ||
+        !pair_revision_compatible || !runtime_state_compatible) {
+      return fail("recovery predecessor authority is stale or incompatible");
+    }
+  }
+
+  // Preview and Handoff are observational/lifecycle inputs only.  They do
+  // not choose a command or clear the existing owner.
+  phase_offset_navigation::PreviewFeasibilityInput preview_input;
+  preview_input.profile = target_pair->active_profile.get();
+  preview_input.current_w = prepared.geometry.w;
+  preview_input.current_delta = prepared.delta;
+  preview_input.target_w = prepared.geometry.w;
+  preview_input.target_delta = 0.0;
+  preview_input.dt = prepared.dt;
+  preview_input.horizon = std::max(prepared.dt, config_.tube_update_period);
+  preview_input.max_phase_rate = std::max(0.0, base_w_dot) +
+      config_.u_w_abs_max;
+  preview_input.max_delta_rate = config_.u_delta_abs_max;
+  preview_input.max_delta_slew = config_.u_delta_rate_max;
+  preview_input.previous_u = runtime_->previousFinalPort();
+  preview_input.path_revision = target_pair->path_revision;
+  preview_input.frame_revision = target_pair->frame_revision;
+  preview_input.profile_revision = target_pair->active_profile->profile_revision;
+  preview_input.expected_path_revision = target_pair->path_revision;
+  preview_input.expected_frame_revision = target_pair->frame_revision;
+  preview_input.expected_profile_revision =
+      target_pair->active_profile->profile_revision;
+  phase_offset_navigation::PreviewFeasibilityResult preview;
+  const bool preview_evaluated =
+      phase_offset_navigation::PreviewFeasibility::evaluate(
+          preview_input, preview);
+  if (!preview_evaluated &&
+      (preview.status == phase_offset_navigation::PreviewStatus::STALE ||
+       preview.status == phase_offset_navigation::PreviewStatus::CURRENT_STATE_UNSAFE)) {
+    return fail("recovery preview or handoff was vetoed");
+  }
+  phase_offset_navigation::TubeBounds target_bounds;
+  const bool target_contains_current =
+      phase_offset_navigation::TubeFilter::query(
+          *target_pair->active_profile, prepared.geometry.w, target_bounds) &&
+      target_bounds.valid &&
+      prepared.delta >= target_bounds.lower + config_.tube.interior_margin -
+          1e-10 &&
+      prepared.delta <= target_bounds.upper - config_.tube.interior_margin +
+          1e-10;
+  const bool target_zero_only = target_pair->active_profile->classification ==
+      phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+  const bool target_disconnected = has_staged_successor &&
+      (!target_pair->path_owner ||
+       prepared.geometry.w < target_pair->path_owner->startW() - 1e-10 ||
+       prepared.geometry.w > target_pair->path_owner->endW() + 1e-10 ||
+       !target_contains_current);
+  const bool target_domain_contains_current = target_pair->path_owner &&
+      prepared.geometry.w >= target_pair->path_owner->startW() - 1e-10 &&
+      prepared.geometry.w <= target_pair->path_owner->endW() + 1e-10;
+  // A staged ZERO_ONLY/disconnected successor is evidence for the handoff
+  // decision, not the geometry owner of the current recovery tick.  Recenter
+  // must stay inside the currently executed owner's connected component until
+  // a later tick can install a compatible successor.
+  const bool target_usable_for_current_tick = target_domain_contains_current &&
+      target_contains_current && !target_zero_only;
+  const std::shared_ptr<const PathTubePair> execution_pair =
+      target_usable_for_current_tick ? target_pair : pair;
+  phase_offset_navigation::HandoffStateInput handoff_input;
+  handoff_input.owner_mode =
+      phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+  handoff_input.delta = prepared.delta;
+  handoff_input.target_delta = 0.0;
+  handoff_input.successor_available = target_pair != nullptr;
+  handoff_input.successor_zero_only = target_zero_only;
+  handoff_input.successor_contains_current_delta = target_contains_current;
+  handoff_input.successor_disconnected = target_disconnected;
+  handoff_input.preview_feasible = preview_evaluated && preview.valid;
+  handoff_input.preview_target_overlap = preview.target_overlap;
+  if (target_zero_only) {
+    handoff_input.event = phase_offset_navigation::HandoffEvent::SUCCESSOR_ZERO_ONLY;
+  } else if (target_disconnected) {
+    handoff_input.event = phase_offset_navigation::HandoffEvent::SUCCESSOR_DISCONNECTED;
+  } else if (!preview.valid) {
+    handoff_input.event = phase_offset_navigation::HandoffEvent::PREVIEW_INFEASIBLE;
+  } else if (has_staged_successor) {
+    handoff_input.event = phase_offset_navigation::HandoffEvent::SUCCESSOR_COMPATIBLE;
+  } else {
+    handoff_input.event = phase_offset_navigation::HandoffEvent::RECENTER_PROGRESS;
+  }
+  phase_offset_navigation::HandoffDecision handoff;
+  if (!handoff_state_machine_.evaluate(handoff_input, handoff) ||
+      handoff.planner_veto) {
+    return fail("recovery handoff decision was vetoed");
+  }
+  pending_handoff_input_ = handoff_input;
+  pending_handoff_decision_ = handoff;
+  pending_handoff_valid_ = true;
+
+  // A staged successor is real immutable evidence, not a fabricated
+  // availability flag.  When it differs from the current owner, validate the
+  // inherited base-path C2 seam and the required first-order executed
+  // reference seam through the one protected continuation provider.  The
+  // optional higher-order r_ww capability is deliberately not requested.
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr source_query(
+      new PhaseOffsetExecutedReferenceQuery(
+          pair->path_owner, prepared.delta, pair->frame_owner,
+          pair->path_revision, pair->frame_revision, pair->source_revision,
+          pair->source_revision));
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr target_query(
+      new PhaseOffsetExecutedReferenceQuery(
+          target_pair->path_owner, prepared.delta, target_pair->frame_owner,
+          target_pair->path_revision, target_pair->frame_revision,
+          target_pair->source_revision, target_pair->source_revision));
+  if (!source_query || !target_query) return fail("recovery reference query unavailable");
+  PhaseOffsetRecoveryContinuationInput continuation_input;
+  bool continuation_input_valid = false;
+  if (has_staged_successor) {
+    const double seam_w = target_pair->future_seam_w;
+    if (!IsFinite(seam_w) || seam_w < pair->path_owner->startW() ||
+        seam_w > pair->path_owner->endW() ||
+        seam_w < target_pair->path_owner->startW() ||
+        seam_w > target_pair->path_owner->endW()) {
+      return fail("recovery seam is outside source/target domains");
+    }
+    phase_offset_navigation::RecoveryReferenceJet seam_jet;
+    if (!phase_offset_navigation::makeRecoveryReferenceJet(
+            *source_query, seam_w, prepared.delta, seam_jet)) {
+      return fail("recovery C2 seam proof failed");
+    }
+    continuation_input.source_path = pair->path_owner;
+    continuation_input.source_frame = pair->frame_owner;
+    continuation_input.target_path = target_pair->path_owner;
+    continuation_input.target_frame = target_pair->frame_owner;
+    continuation_input.source_jet = seam_jet;
+    continuation_input.source_w = seam_w;
+    continuation_input.target_w = seam_w;
+    continuation_input.delta = prepared.delta;
+    continuation_input.finite_domain_start_w =
+        target_pair->path_owner->startW();
+    continuation_input.finite_domain_end_w = target_pair->path_owner->endW();
+    continuation_input.recovery_session = pair->authority_session;
+    continuation_input.source_owner_revision = pair->source_revision;
+    continuation_input.target_owner_revision = target_pair->source_revision;
+    continuation_input.v_s_min = 1e-3;
+    continuation_input.min_time_progress = 0.0;
+    // The continuation provider validates immutable seam geometry here.  The
+    // actual selected-ZOH phase-rate witness is bound below, after
+    // RecoveryOwner has selected and PortProjector has reverified the command;
+    // a current/source guidance rate is never relabelled as target evidence.
+    continuation_input.validated_s_dot = 0.0;
+    continuation_input.s_dot_revision = 0U;
+    continuation_input.s_dot_provenance.clear();
+    continuation_input.actual_s_dot_valid = false;
+    continuation_input.require_time_progress = false;
+    continuation_input_valid = true;
+    PhaseOffsetRecoveryContinuationOutput continuation_output;
+    const bool continuation_valid =
+        PhaseOffsetRecoveryContinuationProvider::propose(
+            continuation_input, continuation_output);
+    if (!continuation_valid || !continuation_output.finite_domain) {
+      output.recovery_replan_required = true;
+      return fail(continuation_output.invalid_reason.empty()
+          ? "recovery continuation proof failed; renewed evidence required"
+          : continuation_output.invalid_reason.c_str());
+    }
+  }
+
+  phase_offset_core::PortProjectionInput projection_input;
+  projection_input.raw.u_w = 0.0;
+  projection_input.raw.u_delta = -prepared.delta / prepared.dt;
+  projection_input.previous_final = runtime_->previousFinalPort();
+  projection_input.dt = prepared.dt;
+  projection_input.delta = prepared.delta;
+  projection_input.curvature = prepared.geometry.curvature;
+  projection_input.r_w_norm = prepared.geometry.r_w.norm();
+  projection_input.phase = prepared.geometry.w;
+  projection_input.base_w_dot = base_w_dot;
+  projection_input.base_tangent_speed = prepared.geometry.T.dot(base_v_cmd);
+  const phase_offset_navigation::TubeBounds recovery_bounds =
+      target_usable_for_current_tick && target_bounds.valid
+          ? target_bounds : prepared.current_bounds;
+  projection_input.offset_constraint.lower = recovery_bounds.lower;
+  projection_input.offset_constraint.upper = recovery_bounds.upper;
+  projection_input.offset_constraint.lower_w = recovery_bounds.lower_w;
+  projection_input.offset_constraint.upper_w = recovery_bounds.upper_w;
+  projection_input.offset_constraint.invariant_gain = config_.tube.invariant_gain;
+  projection_input.offset_constraint.interior_margin = config_.tube.interior_margin;
+  projection_input.offset_constraint.enabled = recovery_bounds.valid;
+  projection_input.offset_constraint.valid = recovery_bounds.valid;
+  phase_offset_core::PortProjectionLimits limits;
+  limits.u_w_abs_max = config_.u_w_abs_max;
+  limits.u_delta_abs_max = config_.u_delta_abs_max;
+  limits.u_w_rate_max = config_.u_w_rate_max;
+  limits.u_delta_rate_max = config_.u_delta_rate_max;
+  limits.phase_dot_min = 0.0;
+  limits.tangent_speed_min = 0.0;
+  limits.regularity_margin = config_.tube.regularity_margin;
+  phase_offset_core::PortProjector::AdmissibleSet admissible;
+  if (!phase_offset_core::PortProjector::buildAdmissibleSet(
+          projection_input, limits, admissible) ||
+      !phase_offset_navigation::PhaseOffsetRecoveryOwner::verifyAdmissibleSet(
+          admissible)) {
+    return fail("recovery admissible set is not closed and bounded");
+  }
+
+  const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
+      execution_query = target_usable_for_current_tick ? target_query
+                                                       : source_query;
+  phase_offset_navigation::ExecutedReferenceQueryResult reference_result;
+  if (!execution_query->query(prepared.geometry.w, reference_result) ||
+      !reference_result.valid) {
+    return fail("recovery reference jet proof failed");
+  }
+  phase_offset_navigation::RecoveryReferenceJet reference_jet;
+  if (!phase_offset_navigation::makeRecoveryReferenceJet(
+          *execution_query, prepared.geometry.w,
+          prepared.delta, reference_jet)) {
+    return fail("recovery reference jet construction failed");
+  }
+
+  phase_offset_navigation::RecoveryPrepareInput recovery_input;
+  recovery_input.recovery_session = pair->authority_session;
+  recovery_input.source_path_revision = pair->path_revision;
+  recovery_input.target_path_revision = execution_pair->path_revision;
+  recovery_input.source_frame_revision = pair->frame_revision;
+  recovery_input.target_frame_revision = execution_pair->frame_revision;
+  recovery_input.source_owner_revision = pair->source_revision;
+  recovery_input.target_owner_revision = execution_pair->source_revision;
+  recovery_input.reference_jet = reference_jet;
+  recovery_input.u_prev = runtime_->previousFinalPort();
+  recovery_input.current_w = prepared.geometry.w;
+  recovery_input.current_delta = prepared.delta;
+  // RECOVERY's immutable target is the planner centreline.  Bind the owner
+  // measure to this exact closed interval so forged next-measure/progress
+  // scalars cannot influence ranking or terminal handoff.
+  recovery_input.target_delta_lower = 0.0;
+  recovery_input.target_delta_upper = 0.0;
+  recovery_input.target_interval_valid = true;
+  recovery_input.base_w_dot = base_w_dot;
+  recovery_input.base_w_dot_valid = IsFinite(base_w_dot);
+  recovery_input.dt = prepared.dt;
+  recovery_input.measure = std::abs(prepared.delta);
+  recovery_input.now = input.stamp.toSec();
+  if (!IsFinite(recovery_input.now)) recovery_input.now = 0.0;
+  recovery_input.v_s_min = 1e-3;
+  recovery_input.max_slew_rate = config_.u_delta_rate_max;
+  recovery_input.phase_rate_upper_bound = std::max(0.0, base_w_dot) +
+      config_.u_w_abs_max;
+  recovery_input.phase_rate_upper_bound_valid =
+      IsFinite(recovery_input.phase_rate_upper_bound) &&
+      recovery_input.phase_rate_upper_bound > 0.0;
+  // The guaranteed recovery-rate lower bound is a measure-progress fact
+  // owned by RecoveryOwner.  u_delta_abs_max is only an actuator capability
+  // upper bound and cannot certify a lower bound on |delta| reduction.
+  recovery_input.certified_recovery_rate = recovery_owner_.config().v_rec_min;
+  recovery_input.certified_recovery_rate_valid =
+      IsFinite(recovery_input.certified_recovery_rate) &&
+      recovery_input.certified_recovery_rate > 0.0;
+  recovery_input.phase_domain_start = prepared.geometry.w;
+  recovery_input.phase_domain_end = execution_pair->path_owner
+      ? execution_pair->path_owner->endW() : prepared.geometry.w;
+  recovery_input.admissible_set_closed_bounded = true;
+  recovery_input.finite_domain_valid =
+      IsFinite(recovery_input.phase_domain_start) &&
+      IsFinite(recovery_input.phase_domain_end) &&
+      recovery_input.phase_domain_end > recovery_input.phase_domain_start;
+  const double bounded_ramp_time = config_.u_delta_rate_max > 0.0
+      ? config_.u_delta_abs_max / config_.u_delta_rate_max : 0.0;
+  const double certified_recovery_duration =
+      recovery_input.measure / recovery_input.certified_recovery_rate +
+      bounded_ramp_time + std::max(prepared.dt, config_.tube_update_period);
+  recovery_input.required_domain_duration = certified_recovery_duration;
+  recovery_input.require_time_progress = true;
+  recovery_input.time_progress_valid = IsFinite(base_w_dot) &&
+      recovery_input.phase_rate_upper_bound_valid;
+  const std::uint64_t recovery_session = pair->authority_session;
+  if (recovery_deadline_session_ == recovery_session &&
+      recovery_deadline_target_revision_ != 0U &&
+      recovery_deadline_target_revision_ != target_pair->path_revision) {
+    return fail("recovery deadline target revision changed; replan required");
+  }
+  if (recovery_deadline_session_ != recovery_session ||
+      !IsFinite(recovery_deadline_)) {
+    recovery_deadline_ =
+        phase_offset_navigation::PhaseOffsetRecoveryOwner::computeBoundedDeadline(
+            recovery_input.now, recovery_input.measure,
+            recovery_input.certified_recovery_rate, 0.0,
+            bounded_ramp_time,
+            prepared.dt, config_.u_delta_abs_max,
+            config_.u_delta_rate_max,
+            recovery_input.phase_domain_start,
+            recovery_input.phase_domain_end);
+    recovery_deadline_session_ = recovery_session;
+    recovery_deadline_target_revision_ = target_pair->path_revision;
+  }
+  recovery_input.deadline = recovery_deadline_;
+  recovery_input.source_reference_matches = true;
+  recovery_input.provenance = "PhaseOffsetMatchedAdapter/Preview-Handoff-Recovery";
+
+  // PortProjector's local 2-D polygon is intentionally tiny.  Keep an
+  // explicit bound here so a malformed/custom kernel cannot turn recovery
+  // into an unbounded search on the control callback.
+  constexpr std::size_t kMaxRecoveryVertices = 64U;
+  if (admissible.vertices.size() > kMaxRecoveryVertices) {
+    return fail("recovery admissible set exceeds bounded vertex budget");
+  }
+  recovery_input.candidates.reserve(kMaxRecoveryVertices);
+  for (const phase_offset_core::PortCommand& command : admissible.vertices) {
+    phase_offset_core::PortProjectionResult checked;
+    if (!phase_offset_core::PortProjector::verify(
+            projection_input, limits, command, checked) || !checked.valid) {
+      continue;
+    }
+    phase_offset_navigation::RecoveryCandidate candidate;
+    candidate.command = command;
+    candidate.next_w = prepared.geometry.w + prepared.dt * checked.final_w_dot;
+    candidate.next_delta = checked.next_delta;
+    candidate.measure = recovery_input.measure;
+    candidate.next_measure_upper_bound = std::abs(checked.next_delta);
+    candidate.progress = candidate.measure - candidate.next_measure_upper_bound;
+    candidate.progress_bound_valid = true;
+    candidate.forward_progress = checked.final_w_dot;
+    candidate.slew_cost = config_.u_w_rate_max *
+        std::pow(command.u_w - recovery_input.u_prev.u_w, 2.0) +
+        config_.u_delta_rate_max *
+            std::pow(command.u_delta - recovery_input.u_prev.u_delta, 2.0);
+    candidate.admissible_u_w_lower = admissible.u_w.lower;
+    candidate.admissible_u_w_upper = admissible.u_w.upper;
+    candidate.admissible_u_delta_lower = admissible.u_delta.lower;
+    candidate.admissible_u_delta_upper = admissible.u_delta.upper;
+    candidate.command_membership_valid = admissible.contains(command);
+    candidate.closed_bounded_set_valid = admissible.closed && admissible.bounded;
+    candidate.phase_domain_start = recovery_input.phase_domain_start;
+    candidate.phase_domain_end = recovery_input.phase_domain_end;
+    candidate.reference_jet = reference_jet;
+    const bool strict_exact_arrival = std::abs(checked.next_delta) <= 1e-14;
+    candidate.provenance = strict_exact_arrival
+        ? "PortProjector/exact-selected-ZOH-arrival"
+        : "PortProjector/closed-bounded-membership";
+    candidate.progress_provenance = "RecoveryOwner/P_k=recomputed";
+    candidate.s_dot = checked.final_w_dot;
+    candidate.v_s_min = recovery_input.v_s_min;
+    candidate.minimum_time_progress = recovery_input.v_s_min * prepared.dt;
+    candidate.s_dot_revision = recovery_input.target_owner_revision;
+    candidate.actual_s_dot_valid = IsFinite(candidate.s_dot);
+    candidate.require_time_progress = recovery_input.require_time_progress;
+    candidate.s_dot_provenance = recovery_input.provenance;
+    candidate.exact_terminal_predicate = strict_exact_arrival;
+    candidate.terminal_predicate = candidate.exact_terminal_predicate;
+    candidate.time_progress_valid = candidate.s_dot >=
+        recovery_input.v_s_min && candidate.s_dot * prepared.dt >=
+        candidate.minimum_time_progress;
+    candidate.finite_domain_valid = candidate.next_w <=
+        recovery_input.phase_domain_end + 1e-10;
+    if (candidate.progress >= 0.0 && candidate.time_progress_valid &&
+        candidate.finite_domain_valid) {
+      recovery_input.candidates.push_back(candidate);
+    }
+  }
+  // When the remaining residual is reachable in one selected ZOH interval,
+  // include the exact-arrival command in the same deterministic candidate
+  // set.  This is not a tolerance snap: the recurrence is verified with the
+  // exact command and only the ranked immutable candidate may become owner.
+  if (std::abs(prepared.delta) <= config_.u_delta_abs_max * prepared.dt) {
+    for (const phase_offset_core::PortCommand& base_command :
+         admissible.vertices) {
+      phase_offset_core::PortCommand exact_command = base_command;
+      exact_command.u_delta = -prepared.delta / prepared.dt;
+      if (!admissible.contains(exact_command)) continue;
+      phase_offset_core::PortProjectionResult checked;
+      if (!phase_offset_core::PortProjector::verify(
+              projection_input, limits, exact_command, checked) ||
+          !checked.valid || std::abs(checked.next_delta) > 1e-14) {
+        continue;
+      }
+      phase_offset_navigation::RecoveryCandidate candidate;
+      candidate.command = exact_command;
+      candidate.next_w = prepared.geometry.w + prepared.dt * checked.final_w_dot;
+      candidate.next_delta = 0.0;
+      candidate.measure = recovery_input.measure;
+      candidate.next_measure_upper_bound = 0.0;
+      candidate.progress = candidate.measure;
+      candidate.progress_bound_valid = true;
+      candidate.forward_progress = checked.final_w_dot;
+      candidate.slew_cost = config_.u_w_rate_max *
+          std::pow(exact_command.u_w - recovery_input.u_prev.u_w, 2.0) +
+          config_.u_delta_rate_max *
+          std::pow(exact_command.u_delta - recovery_input.u_prev.u_delta, 2.0);
+      candidate.admissible_u_w_lower = admissible.u_w.lower;
+      candidate.admissible_u_w_upper = admissible.u_w.upper;
+      candidate.admissible_u_delta_lower = admissible.u_delta.lower;
+      candidate.admissible_u_delta_upper = admissible.u_delta.upper;
+      candidate.command_membership_valid = admissible.contains(exact_command);
+      candidate.closed_bounded_set_valid = admissible.closed && admissible.bounded;
+      candidate.phase_domain_start = recovery_input.phase_domain_start;
+      candidate.phase_domain_end = recovery_input.phase_domain_end;
+      candidate.reference_jet = reference_jet;
+      candidate.provenance = "PortProjector/exact-selected-ZOH-arrival";
+      candidate.progress_provenance = "RecoveryOwner/P_k=recomputed";
+      candidate.s_dot = checked.final_w_dot;
+      candidate.v_s_min = recovery_input.v_s_min;
+      candidate.minimum_time_progress = recovery_input.v_s_min * prepared.dt;
+      candidate.s_dot_revision = recovery_input.target_owner_revision;
+      candidate.actual_s_dot_valid = IsFinite(candidate.s_dot);
+      candidate.require_time_progress = recovery_input.require_time_progress;
+      candidate.s_dot_provenance = recovery_input.provenance;
+      candidate.exact_terminal_predicate = true;
+      candidate.terminal_predicate = true;
+      candidate.time_progress_valid = candidate.s_dot >= recovery_input.v_s_min &&
+          candidate.s_dot * prepared.dt >= candidate.minimum_time_progress;
+      candidate.finite_domain_valid = candidate.next_w <=
+          recovery_input.phase_domain_end + 1e-10;
+      if (candidate.time_progress_valid && candidate.finite_domain_valid) {
+        recovery_input.candidates.push_back(candidate);
+      }
+      break;
+    }
+  }
+  phase_offset_navigation::RecoveryPreparedStep recovery_step;
+  if (!recovery_owner_.prepare(recovery_input, recovery_step)) {
+    output.recovery_status = recovery_step.status;
+    output.recovery_replan_required =
+        recovery_step.status ==
+        phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+    return fail(recovery_step.proof.empty()
+        ? "recovery owner rejected progress/domain evidence"
+        : recovery_step.proof.c_str());
+  }
+  output.recovery_status = phase_offset_navigation::RecoveryStepStatus::PREPARED;
+
+  phase_offset_core::PortProjectionResult selected_projection;
+  if (!phase_offset_core::PortProjector::verify(
+          projection_input, limits, recovery_step.selected_u,
+          selected_projection) || !selected_projection.valid) {
+    return fail("recovery selected command failed exact projection verification");
+  }
+  if (has_staged_successor && execution_pair == target_pair &&
+      continuation_input_valid) {
+    // RecoveryOwner has now selected and PortProjector has reverified the
+    // exact ZOH command.  Close the time-progress contract with that actual
+    // selected s_dot and the target pair revision; the source guidance rate
+    // above was never accepted as target progress evidence.
+    const double selected_s_dot = selected_projection.final_w_dot;
+    PhaseOffsetRecoveryContinuationOutput selected_progress_output;
+    if (!PhaseOffsetRecoveryContinuationProvider::validateSelectedTimeProgress(
+            continuation_input, selected_s_dot,
+            execution_pair->source_revision, recovery_input.provenance,
+            selected_progress_output)) {
+      output.recovery_replan_required = true;
+      return fail(selected_progress_output.invalid_reason.empty()
+          ? "selected recovery time-progress proof failed"
+          : selected_progress_output.invalid_reason.c_str());
+    }
+  }
+  phase_offset_core::MatchedPortInput matched_input;
+  matched_input.geometry = prepared.geometry;
+  matched_input.base_v_cmd = base_v_cmd;
+  matched_input.base_w_dot = base_w_dot;
+  matched_input.final_port = recovery_step.selected_u;
+  if (!phase_offset_core::MatchedPort::evaluate(matched_input,
+                                                 output.matched) ||
+      !output.matched.valid) {
+    return fail("recovery matched output is invalid");
+  }
+  output.geometry = prepared.geometry;
+  output.projection = selected_projection;
+  output.current_bounds = recovery_bounds;
+  output.next_bounds = recovery_bounds;
+  output.execution = prepared.execution;
+  output.execution.mode = phase_offset_navigation::RuntimeExecutionMode::SAFETY_PRIORITY;
+  output.execution.executable = true;
+  output.delta = prepared.delta;
+  output.delta_ref = 0.0;
+  output.profile_active = false;
+  output.selected = true;
+  output.valid = true;
+
+  phase_offset_navigation::ActiveReferenceSnapshot candidate;
+  candidate.authority_session = current_authority.valid
+      ? current_authority.authority_session : pair->authority_session;
+  candidate.planner_path_revision = pair->source_revision;
+  candidate.executed_path_revision = execution_pair->path_revision;
+  candidate.frame_revision = execution_pair->frame_revision;
+  candidate.tube_revision = execution_pair->active_profile->tube_revision;
+  candidate.profile_revision = execution_pair->active_profile->profile_revision;
+  candidate.map_revision = execution_pair->active_profile->map_revision;
+  candidate.owner_mode =
+      phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+  candidate.selected_u_owner = "PhaseOffsetRecoveryOwner";
+  candidate.w = prepared.geometry.w;
+  candidate.delta = prepared.delta;
+  candidate.dt = prepared.dt;
+  candidate.u_prev = recovery_input.u_prev;
+  candidate.selected_u = recovery_step.selected_u;
+  candidate.selected_u_w = candidate.selected_u.u_w;
+  candidate.selected_u_delta = candidate.selected_u.u_delta;
+  candidate.proposed_next_w = recovery_step.next_w;
+  candidate.proposed_next_delta = recovery_step.next_delta;
+  candidate.proposed_next_u_prev = candidate.selected_u;
+  candidate.r = reference_result.r;
+  candidate.r_w = reference_result.r_w;
+  candidate.r_ww = reference_result.r_ww;
+  candidate.r_ww_valid = reference_result.r_ww_valid;
+  candidate.matched_base_v_cmd = base_v_cmd;
+  candidate.matched_base_w_dot = base_w_dot;
+  phase_offset_core::NormalFrameQuery execution_frame_query;
+  if (!execution_pair->frame_owner->query(prepared.geometry.w,
+                                           execution_frame_query) ||
+      !execution_frame_query.valid ||
+      (execution_pair == pair &&
+       (execution_frame_query.N - prepared.geometry.N).norm() > 1e-6)) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason =
+        "recovery executed frame is not bound to the selected immutable owner";
+    return fail("recovery executed frame is not bound to selected owner");
+  }
+  candidate.executed_N = execution_frame_query.N;
+  candidate.executed_reference_query = execution_query;
+  candidate.reference_query_revision = execution_query->queryRevision();
+  candidate.provenance = recovery_input.provenance;
+  candidate.safety_status = "RECOVERY";
+  candidate.handoff_state = "RECOVERY_OWNER";
+  candidate.valid = true;
+
+  phase_offset_navigation::AuthorityPrepareInput authority_input;
+  authority_input.candidate = candidate;
+  if (current_authority.valid) {
+    authority_input.expected_authority_session =
+        current_authority.authority_session;
+    authority_input.expected_sequence = current_authority.sequence;
+  }
+  authority_input.matched_output_valid = output.valid && output.matched.valid;
+  authority_input.reference_valid = candidate.governorViewValid();
+  authority_input.provenance = recovery_input.provenance;
+  phase_offset_navigation::AuthorityPreparedStep authority_prepared;
+  if (!execution_authority_.prepare(authority_input, authority_prepared)) {
+    output.selected = false;
+    output.valid = false;
+    output.invalid_reason = authority_prepared.failure_reason;
+    return fail("recovery authority preparation failed");
+  }
+  // The unadvertised fixture path uses the same prepare-before-publication
+  // contract as the production pending transaction.  Validate every
+  // fallible seam before authority publication; the callback below performs
+  // only no-fail state writes.
+  if (!recovery_owner_.validateCommit(recovery_step)) {
+    return fail("recovery owner commit token validation failed");
+  }
+  const phase_offset_navigation::HandoffDecision prepared_handoff = handoff;
+  phase_offset_navigation::RuntimeCommitToken token;
+  token.expected_previous_final_port = recovery_input.u_prev;
+  token.expected_delta = prepared.delta;
+  token.next_previous_final_port = recovery_step.selected_u;
+  token.next_delta = recovery_step.next_delta;
+  token.dt = prepared.dt;
+  token.selected = true;
+  token.valid = true;
+  token.safety_priority = true;
+  if (advertised_) {
+    if (pending_authority_valid_) return fail("previous PositionCommand transaction is pending");
+    pending_runtime_commit_ = token;
+    pending_recovery_step_ = recovery_step;
+    pending_recovery_step_valid_ = true;
+    pending_recovery_source_pair_ = pair;
+    pending_recovery_execution_pair_ = execution_pair;
+    pending_recovery_target_pair_ = target_pair;
+    pending_authority_prepared_ = authority_prepared;
+    pending_authority_session_ = authority_prepared.candidate.authority_session;
+    pending_authority_valid_ = true;
+  } else {
+    phase_offset_navigation::AuthorityCommitResult authority_result;
+    if (!execution_authority_.commit(
+            authority_prepared,
+            [this, token, recovery_step, prepared_handoff](
+                const phase_offset_navigation::ActiveReferenceSnapshot&) {
+              recovery_owner_.commitNoFail(recovery_step);
+              handoff_state_machine_.commitNoFail(prepared_handoff);
+              runtime_->commitTokenNoFail(token);
+              return true;
+            }, authority_result)) {
+      output.selected = false;
+      output.valid = false;
+      output.invalid_reason = authority_result.failure_reason;
+      return fail("recovery authority commit failed");
+    }
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::hasPendingPositionCommand() const {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  return pending_authority_valid_ && pending_runtime_commit_.valid;
+}
+
+void PhaseOffsetMatchedAdapter::clearPendingPositionCommandLocked() {
+  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
+  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
+  pending_recovery_step_valid_ = false;
+  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
+  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
+  pending_handoff_valid_ = false;
+  pending_recovery_source_pair_.reset();
+  pending_recovery_execution_pair_.reset();
+  pending_recovery_target_pair_.reset();
+  pending_authority_prepared_ =
+      phase_offset_navigation::AuthorityPreparedStep();
+  pending_authority_session_ = 0U;
+  pending_authority_valid_ = false;
+}
+
+bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
+    std::string* reason) const {
+  if (reason) reason->clear();
+  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) return true;
+  if (!execution_authority_.finalValidate(pending_authority_prepared_, reason)) {
+    return false;
+  }
+  const phase_offset_navigation::ActiveReferenceSnapshot current =
+      execution_authority_.snapshot();
+  if (!pending_authority_prepared_.committed_snapshot) {
+    if (reason) *reason = "pending authority snapshot is unavailable";
+    return false;
+  }
+  const phase_offset_navigation::ActiveReferenceSnapshot& candidate =
+      *pending_authority_prepared_.committed_snapshot;
+  const double epsilon = execution_authority_.config().comparison_epsilon;
+  if (pending_authority_session_ == 0U ||
+      pending_authority_session_ !=
+          authority_session_.load(std::memory_order_acquire)) {
+    if (reason) *reason = "pending authority session is stale";
+    return false;
+  }
+  const std::shared_ptr<const PathTubePair> live_pair =
+      std::atomic_load(&authoritative_path_tube_pair_);
+  if (candidate.owner_mode ==
+          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY) {
+    const auto pair_matches_candidate =
+        [&candidate, this](const std::shared_ptr<const PathTubePair>& pair) {
+          return pair && pair->authority_session == pending_authority_session_ &&
+              pair->path_revision == candidate.executed_path_revision &&
+              pair->frame_revision == candidate.frame_revision &&
+              pair->active_profile &&
+              pair->active_profile->profile_revision == candidate.profile_revision &&
+              pair->active_profile->tube_revision == candidate.tube_revision &&
+              pair->active_profile->map_revision == candidate.map_revision;
+        };
+    // The recovery candidate is bound to the exact immutable pair whose
+    // geometry/reference query produced it.  Revisions alone are not an
+    // identity: a same-revision clone in the live slot must fail closed.
+    if (!pending_recovery_execution_pair_ ||
+        !pair_matches_candidate(pending_recovery_execution_pair_) ||
+        !pending_recovery_source_pair_ ||
+        pending_recovery_source_pair_->authority_session !=
+            pending_authority_session_ ||
+        pending_recovery_source_pair_->source_revision !=
+            candidate.planner_path_revision) {
+      if (reason) *reason = "pending recovery execution pair is stale";
+      return false;
+    }
+    // A staged successor may not be live yet, so the exact source predecessor
+    // remains an allowed live identity.  No unrelated pair (including a clone
+    // with identical revisions) can satisfy this boundary.
+    if (live_pair != pending_recovery_execution_pair_ &&
+        live_pair != pending_recovery_source_pair_) {
+      if (reason) *reason = "pending recovery live pair identity changed";
+      return false;
+    }
+    if (live_pair == pending_recovery_source_pair_ &&
+        pending_recovery_execution_pair_ != pending_recovery_source_pair_ &&
+        pending_recovery_target_pair_ != pending_recovery_execution_pair_) {
+      if (reason) *reason = "pending recovery target identity changed";
+      return false;
+    }
+  }
+  if (current.snapshotId() != pending_authority_prepared_.expected_snapshot_id) {
+    if (reason) *reason = "pending authority snapshot changed";
+    return false;
+  }
+  if (std::abs(runtime_->retainedDelta() -
+               pending_runtime_commit_.expected_delta) > epsilon ||
+      std::abs(runtime_->previousFinalPort().u_w -
+               pending_runtime_commit_.expected_previous_final_port.u_w) >
+          epsilon ||
+      std::abs(runtime_->previousFinalPort().u_delta -
+               pending_runtime_commit_.expected_previous_final_port.u_delta) >
+          epsilon || !candidate.selectedUConsistent(epsilon)) {
+    if (reason) *reason = "pending Runtime state or exact selected-u changed";
+    return false;
+  }
+  return true;
+}
+
+void PhaseOffsetMatchedAdapter::discardPendingPositionCommand() {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  clearPendingPositionCommandLocked();
+}
+
+bool PhaseOffsetMatchedAdapter::validatePendingPositionCommand() const {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  return validatePendingPositionCommandLocked(nullptr);
+}
+
+PendingPositionCommandCapture
+PhaseOffsetMatchedAdapter::capturePendingPositionCommand() const {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  PendingPositionCommandCapture capture;
+  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
+    capture.valid = true;
+    return capture;
+  }
+  capture.pending = true;
+  if (pending_authority_prepared_.committed_snapshot) {
+    capture.identity =
+        pending_authority_prepared_.committed_snapshot->snapshotId();
+    capture.reference_query =
+        pending_authority_prepared_.committed_snapshot->executed_reference_query;
+  }
+  if (capture.identity == 0U) {
+    // Preserve the distinction between "no transaction" (identity zero) and
+    // a malformed/stale transaction that must suppress ordinary publication.
+    capture.identity = std::numeric_limits<std::uint64_t>::max();
+  }
+  capture.valid = capture.identity != 0U &&
+      static_cast<bool>(capture.reference_query) &&
+      validatePendingPositionCommandLocked(nullptr);
+  return capture;
+}
+
+phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
+PhaseOffsetMatchedAdapter::pendingExecutedReferenceQuery() const {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  if (!pending_authority_valid_ || !pending_runtime_commit_.valid ||
+      !pending_authority_prepared_.committed_snapshot) {
+    return phase_offset_navigation::ImmutableExecutedReferenceQueryPtr();
+  }
+  const std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>&
+      snapshot = pending_authority_prepared_.committed_snapshot;
+  return snapshot->executed_reference_query;
+}
+
+bool PhaseOffsetMatchedAdapter::publishPendingPositionCommand(
+    const std::function<bool()>& local_publish,
+    const std::uint64_t expected_identity,
+    const bool cancel_pending_for_goal_override) {
+  // Reset/new-task and timer publication take task_publication_mutex_ before
+  // runtime_command_mutex_.  Holding both through the local publish closes
+  // the validate→publish→commit race without adding a TransactionManager.
+  std::unique_lock<std::mutex> task_lock(task_publication_mutex_);
+  std::unique_lock<std::mutex> runtime_lock(runtime_command_mutex_);
+  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
+    // If a transaction was present before the governor ran, its disappearance
+    // is a fail-closed race outcome.  Ordinary publication is allowed only
+    // when the capture explicitly observed no pending transaction.
+    if (cancel_pending_for_goal_override) {
+      DeactivationCommitToken deactivation_token;
+      if (!prepareDeactivationLocked(
+              ros::Time::now(), task_generation_.load(std::memory_order_acquire),
+              deactivation_token)) {
+        return false;
+      }
+      if (!local_publish || !local_publish()) return false;
+      commitDeactivationNoFailLocked(deactivation_token);
+      return true;
+    }
+    return expected_identity == 0U && local_publish ? local_publish() : false;
+  }
+  if ((!cancel_pending_for_goal_override && expected_identity == 0U) ||
+      !pending_authority_prepared_.committed_snapshot ||
+      (!cancel_pending_for_goal_override &&
+       pending_authority_prepared_.committed_snapshot->snapshotId() !=
+           expected_identity)) {
+    clearPendingPositionCommandLocked();
+    return false;
+  }
+  std::string reason;
+  if (!validatePendingPositionCommandLocked(&reason)) {
+    clearPendingPositionCommandLocked();
+    return false;
+  }
+  if (pending_recovery_step_valid_ &&
+      !recovery_owner_.validateCommit(pending_recovery_step_)) {
+    clearPendingPositionCommandLocked();
+    return false;
+  }
+  if (pending_handoff_valid_ &&
+      (pending_handoff_decision_.previous_state !=
+           handoff_state_machine_.state() ||
+       pending_handoff_decision_.transition_sequence !=
+           handoff_state_machine_.transitionSequence() + 1U)) {
+    clearPendingPositionCommandLocked();
+    return false;
+  }
+
+  // Prepare the refreshed immutable control handoff before local publication.
+  // The post-publication path below performs only no-fail value/shared_ptr
+  // stores; it never allocates or copies strings after cmd_pub.publish().
+  std::shared_ptr<const ControlPublishSnapshot> refreshed_control;
+  const std::shared_ptr<const ControlPublishSnapshot> control =
+      std::atomic_load(&latest_control_snapshot_);
+  if (control && control->active &&
+      control->task_generation == task_generation_.load(
+          std::memory_order_acquire)) {
+    std::shared_ptr<ControlPublishSnapshot> refreshed(
+        new ControlPublishSnapshot(*control));
+    refreshed->authority_snapshot =
+        pending_authority_prepared_.committed_snapshot;
+    refreshed_control = std::shared_ptr<const ControlPublishSnapshot>(
+        refreshed);
+  }
+
+  const phase_offset_navigation::RuntimeCommitToken token =
+      pending_runtime_commit_;
+  const phase_offset_navigation::AuthorityPreparedStep prepared =
+      pending_authority_prepared_;
+  const phase_offset_navigation::RecoveryPreparedStep recovery_step =
+      pending_recovery_step_;
+  const bool recovery_step_valid = pending_recovery_step_valid_;
+  const bool handoff_input_valid = pending_handoff_valid_;
+  DeactivationCommitToken deactivation_token;
+  if (cancel_pending_for_goal_override) {
+    if (!prepareDeactivationLocked(
+            ros::Time::now(), task_generation_.load(std::memory_order_acquire),
+            deactivation_token)) {
+      return false;
+    }
+  }
+  const bool published = local_publish && local_publish();
+  if (!published) {
+    // A failed goal-override publication must preserve the staged authority
+    // and deactivation state for a retry; no state is retired at this seam.
+    if (!cancel_pending_for_goal_override) clearPendingPositionCommandLocked();
+    return false;
+  }
+  if (cancel_pending_for_goal_override) {
+    commitDeactivationNoFailLocked(deactivation_token);
+    return true;
+  }
+  // All fallible checks have completed before local publication.  The
+  // post-publication section is intentionally limited to no-fail value/state
+  // writes; it cannot allocate, revalidate, rank, or call a second owner.
+  execution_authority_.commitNoFail(prepared);
+  if (recovery_step_valid) recovery_owner_.commitNoFail(recovery_step);
+  if (handoff_input_valid) {
+    handoff_state_machine_.commitNoFail(pending_handoff_decision_);
+  }
+  runtime_->commitTokenNoFail(token);
+  const bool committed = true;
+  if (refreshed_control) {
+    std::atomic_store(&latest_control_snapshot_, refreshed_control);
+  }
+  clearPendingPositionCommandLocked();
+  return committed;
+}
+
 bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, MatchedAdapterOutput& output) {
   output = MatchedAdapterOutput();
   const std::uint64_t task_generation =
@@ -3454,8 +5123,15 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
         !pair->epoch_status.active_available ||
         !pair->epoch_status.active_current_validation_valid ||
         pair->active_profile->source_revision != pair->source_revision ||
-        !PathStateMatchesOwner(input.path, pair->path_owner)) {
+        !PathStateMatchesOwner(input.path, pair->path_owner,
+                               pair->frame_owner)) {
       output.invalid_reason = "captured path-tube pair is invalid";
+      return false;
+    }
+    phase_offset_core::PathDifferentialState authoritative_current_path;
+    if (!EvaluateOwnerState(pair->path_owner, input.path.w,
+                            authoritative_current_path, pair->frame_owner)) {
+      output.invalid_reason = "captured immutable pair frame query failed";
       return false;
     }
     // A same-path timer refresh is evidence-only until it atomically replaces
@@ -3478,7 +5154,7 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
     request->semantic_path_start_w = pair->path_owner->startW();
     request->semantic_path_end_w = pair->path_owner->endW();
     request->supplied_path_samples = pair->full_path_samples;
-    request->current_path = input.path;
+    request->current_path = authoritative_current_path;
     request->position = input.position;
     request->gains = input.gains;
     request->dt = input.dt;
@@ -3524,7 +5200,7 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       last_preflight_revision_ = pair->source_revision;
     }
     phase_offset_navigation::RuntimePrepareInput runtime_input;
-    runtime_input.current_path = input.path;
+    runtime_input.current_path = authoritative_current_path;
     runtime_input.position = input.position;
     runtime_input.tube_view.active_profile = pair->active_profile;
     runtime_input.tube_view.epoch_status = output.tube_epoch_status;
@@ -3566,9 +5242,34 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       guidance::IsfGuidance base;
       const bool base_ok = guidance::IsfReferenceKernel::evaluate(
           input.position, reference, input.gains, base);
-      runtime_->complete(
-          prepared, base.v_cmd, base.w_dot, base_ok && base.valid,
-          runtime_output);
+      const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
+          execution_authority_.snapshot();
+      bool authority_step_completed = false;
+      if (current_authority.valid &&
+          current_authority.owner_mode ==
+              phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY &&
+          prepared.delta == 0.0 &&
+          recovery_owner_.status().exact_terminal_predicate) {
+        authority_step_completed = completeAtomicNeutralHandoff(
+            input, pair, prepared, base.v_cmd, base.w_dot,
+            base_ok && base.valid, runtime_output);
+      } else {
+        authority_step_completed = completeThroughExecutionAuthority(
+            input, pair, request, pair->epoch_snapshot, prepared, base.v_cmd,
+            base.w_dot, base_ok && base.valid, runtime_output);
+      }
+      // A production NORMAL/COORDINATION Runtime candidate is deliberately
+      // rejected by ExecutionAuthority while Batch C is unauthorized.  An
+      // already-authoritative nonzero pair may instead enter the real
+      // Preview -> Handoff -> RecoveryOwner chain; the recovery owner owns
+      // the exact selected-u and the same authority transaction below.
+      if (!authority_step_completed && advertised_ && pair &&
+          prepared.delta != 0.0) {
+      authority_step_completed = completeThroughRecoveryOwner(
+            input, pair, input.successor_path_tube_pair, prepared,
+            base.v_cmd, base.w_dot,
+            base_ok && base.valid, runtime_output);
+      }
       completed = true;
       output.base_guidance = base;
       output.geometry = runtime_output.geometry;
@@ -3584,6 +5285,9 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       output.profile_active = runtime_output.profile_active;
       output.selected = runtime_output.selected;
       output.valid = runtime_output.valid;
+      output.recovery_status = runtime_output.recovery_status;
+      output.recovery_replan_required =
+          runtime_output.recovery_replan_required;
       output.invalid_reason = runtime_output.invalid_reason;
       if (output.selected) SetGuidance(base, output.matched, output.guidance);
     } else {
@@ -3748,8 +5452,10 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       guidance::IsfGuidance base;
       const bool base_ok = guidance::IsfReferenceKernel::evaluate(
           input.position, reference, input.gains, base);
-      runtime_->complete(prepared, base.v_cmd, base.w_dot,
-                         base_ok && base.valid, runtime_output);
+      completeThroughExecutionAuthority(
+          input, std::shared_ptr<const PathTubePair>(), request, runtime_epoch,
+          prepared, base.v_cmd, base.w_dot, base_ok && base.valid,
+          runtime_output);
       completed = true;
       output.base_guidance = base;
       output.geometry = runtime_output.geometry;

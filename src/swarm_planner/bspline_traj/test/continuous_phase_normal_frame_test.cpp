@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <string>
+
 #include <bspline_race/continuous_phase_normal_frame.h>
 
 namespace {
@@ -52,8 +54,15 @@ TEST(ContinuousPhaseNormalFrameTest, NearVerticalTangentHasFiniteNormal) {
   phase_offset_core::NormalFrameCellProof proof;
   ASSERT_TRUE(frame.certifyCell(0.25, 1.75, proof));
   EXPECT_TRUE(phase_offset_core::normalFrameCellProofIsComplete(proof));
+  EXPECT_NE(proof.provenance.find("ProjectedHermiteTransport"),
+            std::string::npos);
+  EXPECT_NE(proof.provenance.find("CertifiedProjectedRawNormLowerBound"),
+            std::string::npos);
   EXPECT_GT(proof.inf_path_speed, 0.0);
   EXPECT_GE(proof.sup_path_speed, proof.inf_path_speed);
+  EXPECT_GE(proof.sup_normal_derivative, 0.0);
+  EXPECT_GE(proof.normal_variation_bound, 0.0);
+  EXPECT_GE(proof.tangent_variation_bound, 0.0);
 }
 
 TEST(ContinuousPhaseNormalFrameTest, QueryOrderAndFiniteDifferenceDerivative) {

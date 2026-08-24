@@ -62,6 +62,28 @@ MatchedAdapterInput Input(const phase_offset_navigation::RuntimePathSamples& pat
   return input;
 }
 
+void RebaseInputToAuthority(PhaseOffsetMatchedAdapter& adapter,
+                            MatchedAdapterInput& input) {
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      adapter.execution_authority_.snapshot();
+  if (!authority.valid || !std::isfinite(authority.proposed_next_w)) return;
+  const Eigen::Vector3d position_offset = input.position - input.path.p;
+  input.path = State(authority.proposed_next_w);
+  input.position = input.path.p + position_offset;
+  ActiveAdapterInput zero_input;
+  zero_input.path = input.path;
+  zero_input.position = input.position;
+  zero_input.gains = input.gains;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterOutput zero_output;
+  EXPECT_TRUE(zero.evaluate(zero_input, zero_output));
+  input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+}
+
 PhaseOffsetMatchedAdapterConfig Config(TubeSource source) {
   PhaseOffsetMatchedAdapterConfig config;
   config.mode = PhaseOffsetMatchedMode::MANUAL; config.tube_source = source;
@@ -270,6 +292,7 @@ TEST(TubeEpochIntegrationTest,
       std::shared_ptr<const plan_env::CloudOccupancySnapshot>(), pair));
   MatchedAdapterInput activation = Input(path, &identity, 100.0 * kDt);
   activation.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, activation);
   ASSERT_TRUE(adapter.update(activation, output));
   ASSERT_TRUE(output.selected);
   const double delta_before_recovery = output.delta;
@@ -277,6 +300,7 @@ TEST(TubeEpochIntegrationTest,
   MatchedAdapterInput tracking = Input(path, &identity, 100.0 * kDt);
   tracking.position.y() += 0.20;
   tracking.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, tracking);
   PhaseOffsetActiveAdapter zero;
   ActiveAdapterInput zero_input;
   zero_input.path = tracking.path;
@@ -299,13 +323,17 @@ TEST(TubeEpochIntegrationTest,
   EXPECT_FALSE(output.failure_latched);
   EXPECT_NEAR(output.delta, delta_before_recovery, 0.10);
   MatchedAdapterMarkerBundle markers;
-  ASSERT_TRUE(adapter.buildMarkers(tracking, output, markers));
+  MatchedAdapterInput marker_tracking = Input(path, &identity, 100.0 * kDt);
+  marker_tracking.position = tracking.position;
+  marker_tracking.path_tube_pair = pair;
+  ASSERT_TRUE(adapter.buildMarkers(marker_tracking, output, markers));
   ExpectThreeActions(markers.tube_candidate, visualization_msgs::Marker::ADD);
   ExpectThreeActions(markers.tube, visualization_msgs::Marker::DELETE);
 
   for (int cycle = 101; cycle <= 105; ++cycle) {
     MatchedAdapterInput recovery = Input(path, &identity, cycle * kDt);
     recovery.path_tube_pair = pair;
+    RebaseInputToAuthority(adapter, recovery);
     ASSERT_TRUE(adapter.update(recovery, output));
   }
   EXPECT_TRUE(output.selected);
@@ -341,12 +369,14 @@ TEST(TubeEpochIntegrationTest,
   ASSERT_TRUE(BootstrapMatchingPair(adapter, path, &identity,
                                     map.cloudOccupancySnapshot(), pair));
   armed.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, armed);
   ASSERT_TRUE(adapter.update(armed, output));
   ASSERT_TRUE(output.selected);
 
   MatchedAdapterInput tracking = Input(path, &identity, 100.0 * kDt);
   tracking.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   tracking.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, tracking);
   tracking.position.y() += 0.20;
   PhaseOffsetActiveAdapter zero;
   ActiveAdapterInput zero_input;
@@ -370,7 +400,11 @@ TEST(TubeEpochIntegrationTest,
   EXPECT_FALSE(output.failure_latched);
   EXPECT_TRUE(output.tube_epoch_status.raw_cross_section_path_used);
   MatchedAdapterMarkerBundle markers;
-  ASSERT_TRUE(adapter.buildMarkers(tracking, output, markers));
+  MatchedAdapterInput marker_tracking = Input(path, &identity, 100.0 * kDt);
+  marker_tracking.position = tracking.position;
+  marker_tracking.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
+  marker_tracking.path_tube_pair = pair;
+  ASSERT_TRUE(adapter.buildMarkers(marker_tracking, output, markers));
   ExpectThreeActions(markers.tube_candidate, visualization_msgs::Marker::ADD);
   ExpectThreeActions(markers.tube, visualization_msgs::Marker::DELETE);
 }
@@ -454,12 +488,14 @@ TEST(TubeEpochIntegrationTest, GateOpeningDoesNotAdvanceAnEquivalentActiveEpoch)
       std::shared_ptr<const plan_env::CloudOccupancySnapshot>(), pair));
   MatchedAdapterInput activation = Input(path, &identity, 100.0 * kDt);
   activation.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, activation);
   ASSERT_TRUE(adapter.update(activation, output));
   EXPECT_TRUE(output.selected);
   EXPECT_EQ(output.tube_epoch_status.active_tube_epoch, before);
   adapter.timerTick();
   MatchedAdapterInput refresh = Input(path, &identity, 101.0 * kDt);
   refresh.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, refresh);
   ASSERT_TRUE(adapter.update(refresh, output));
   EXPECT_TRUE(output.selected);
   EXPECT_EQ(output.tube_epoch_status.active_tube_epoch, before);

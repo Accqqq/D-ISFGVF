@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <array>
 #include <atomic>
@@ -18,6 +19,7 @@
 #define private public
 #include "bspline_race/integration/phase_offset_matched_adapter.h"
 #undef private
+#include "bspline_race/integration/phase_offset_executed_reference_query.h"
 #include "bspline_race/integration/phase_offset_tube_epoch_diagnostics.h"
 
 namespace FLAG_Race {
@@ -56,10 +58,29 @@ phase_offset_core::PathDifferentialState MakeState(double w) {
   return state;
 }
 
+phase_offset_core::PathDifferentialState MakeStraightState(double w) {
+  phase_offset_core::PathDifferentialState state;
+  state.p = Eigen::Vector3d(w, 0.0, 1.0);
+  state.p_w = Eigen::Vector3d::UnitX();
+  state.p_ww.setZero();
+  state.w = w;
+  state.valid = true;
+  return state;
+}
+
 SyntheticPath MakePath() {
   SyntheticPath path;
   path.current = MakeState(0.4);
   for (int index = 0; index <= 30; ++index) path.samples.push_back(MakeState(0.1 * index));
+  return path;
+}
+
+SyntheticPath MakeStraightSyntheticPath() {
+  SyntheticPath path;
+  path.current = MakeStraightState(0.4);
+  for (int index = 0; index <= 30; ++index) {
+    path.samples.push_back(MakeStraightState(0.1 * index));
+  }
   return path;
 }
 
@@ -284,6 +305,31 @@ MatchedAdapterInput MakeInput(const SyntheticPath& path,
   return input;
 }
 
+// The authority transaction is a sequential state machine: once a tick has
+// committed, the next command's phase must begin at the predecessor's exact
+// proposed_next_w.  Rebuild the synthetic legacy guidance alongside the
+// rebased path so the gate remains a valid fixture rather than an authority
+// bypass.
+void RebaseInputToAuthority(PhaseOffsetMatchedAdapter& adapter,
+                            MatchedAdapterInput& input) {
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      adapter.execution_authority_.snapshot();
+  if (!authority.valid || !std::isfinite(authority.proposed_next_w)) return;
+  input.path = MakeState(authority.proposed_next_w);
+  ActiveAdapterInput zero_input;
+  zero_input.path = input.path;
+  zero_input.position = input.position;
+  zero_input.gains = input.gains;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterOutput zero_output;
+  EXPECT_TRUE(zero.evaluate(zero_input, zero_output));
+  input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+}
+
 PhaseOffsetMatchedAdapterConfig MakeManualConfig(TubeSource source = TubeSource::NONE) {
   PhaseOffsetMatchedAdapterConfig config;
   config.mode = PhaseOffsetMatchedMode::MANUAL; config.tube_source = source;
@@ -305,6 +351,78 @@ PhaseOffsetMatchedAdapterConfig MakeManualConfig(TubeSource source = TubeSource:
   config.tube.cross_section.margins.preincluded_map_uncertainty = 0.10;
   config.cloud_obstacle_set_complete = true;
   return config;
+}
+
+bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeSyntheticOwner();
+  if (!owner) return false;
+  const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr query(
+      new PhaseOffsetExecutedReferenceQuery(owner, 0.0, 1U, 1U, 1U, 4U));
+  phase_offset_navigation::ExecutedReferenceQueryResult reference;
+  if (!query->query(0.4, reference) || !reference.valid) return false;
+
+  adapter.advertised_ = true;
+  adapter.authority_session_.store(7U, std::memory_order_release);
+  phase_offset_navigation::ActiveReferenceSnapshot candidate;
+  candidate.authority_session = 7U;
+  candidate.sequence = 1U;
+  candidate.planner_path_revision = 1U;
+  candidate.executed_path_revision = 1U;
+  candidate.frame_revision = 1U;
+  candidate.tube_revision = 1U;
+  candidate.profile_revision = 1U;
+  candidate.map_revision = 1U;
+  candidate.owner_mode =
+      phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL;
+  candidate.selected_u_owner = "PhaseOffsetAllocator";
+  candidate.w = 0.4;
+  candidate.delta = 0.0;
+  candidate.dt = 0.1;
+  candidate.u_prev = adapter.runtime_->previousFinalPort();
+  candidate.selected_u.u_w = 0.01;
+  candidate.selected_u.u_delta = -0.02;
+  candidate.selected_u_w = candidate.selected_u.u_w;
+  candidate.selected_u_delta = candidate.selected_u.u_delta;
+  candidate.matched_base_v_cmd = Eigen::Vector3d::UnitX();
+  candidate.matched_base_w_dot = 1.0;
+  candidate.proposed_next_w = candidate.w + candidate.dt *
+      (candidate.matched_base_w_dot + candidate.selected_u.u_w);
+  candidate.proposed_next_delta = candidate.delta + candidate.dt *
+      candidate.selected_u.u_delta;
+  candidate.proposed_next_u_prev = candidate.selected_u;
+  candidate.r = reference.r;
+  candidate.r_w = reference.r_w;
+  candidate.r_ww.setZero();
+  candidate.r_ww_valid = false;
+  candidate.executed_reference_query = query;
+  candidate.reference_query_revision = query->queryRevision();
+  candidate.provenance = "test/pending-position-command";
+  candidate.valid = true;
+
+  phase_offset_navigation::AuthorityPrepareInput authority_input;
+  authority_input.candidate = candidate;
+  authority_input.matched_output_valid = true;
+  authority_input.reference_valid = candidate.governorViewValid();
+  authority_input.provenance = candidate.provenance;
+  phase_offset_navigation::AuthorityPreparedStep prepared;
+  if (!adapter.execution_authority_.prepare(authority_input, prepared) ||
+      !prepared.valid || !prepared.committed_snapshot) {
+    return false;
+  }
+  phase_offset_navigation::RuntimeCommitToken token;
+  token.expected_previous_final_port = adapter.runtime_->previousFinalPort();
+  token.expected_delta = adapter.runtime_->retainedDelta();
+  token.next_previous_final_port = candidate.selected_u;
+  token.next_delta = candidate.proposed_next_delta;
+  token.dt = candidate.dt;
+  token.selected = true;
+  token.valid = true;
+  adapter.pending_runtime_commit_ = token;
+  adapter.pending_authority_prepared_ = prepared;
+  adapter.pending_authority_session_ = prepared.candidate.authority_session;
+  adapter.pending_authority_valid_ = true;
+  return true;
 }
 
 bool PrepareAndFinalizePair(
@@ -1051,6 +1169,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_TRUE(adapter.hasPendingOffsetActivationPair(pair));
 
   input.path_tube_pair = pair;
+  RebaseInputToAuthority(adapter, input);
   EXPECT_TRUE(adapter.update(input, output)) << output.invalid_reason;
   EXPECT_TRUE(output.selected);
   EXPECT_TRUE(adapter.runtime_->hasExecutedOffsetAuthority());
@@ -1061,10 +1180,118 @@ TEST(PhaseOffsetMatchedAdapterTest,
   // selected projection must carry a significant post-commit retained delta.
   adapter.runtime_->profile_elapsed_ = 0.20;
   input.stamp = ros::Time(2.02);
+  RebaseInputToAuthority(adapter, input);
   ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
   ASSERT_TRUE(output.selected);
   ASSERT_TRUE(output.projection.valid);
   EXPECT_GT(std::abs(output.projection.next_delta), 1e-6);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     RequestRecenterKeepsPairAndOwnerUntilFiniteNeutralHandoff) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  // Prime the fixed-Tube sidecar once before the warm-up gate.  The helper's
+  // command-boundary bootstrap then consumes this immutable candidate epoch.
+  ASSERT_FALSE(adapter.update(MakeInput(path, &path, 0.0), output));
+  ASSERT_TRUE(adapter.timerTick());
+  OpenGate(adapter, path, output);
+  ASSERT_TRUE(output.selected) << output.invalid_reason;
+  ASSERT_TRUE(adapter.runtime_);
+  ASSERT_TRUE(adapter.runtime_->hasExecutedOffsetAuthority());
+  std::shared_ptr<const PathTubePair> pair = adapter.capturePathTubePair();
+  ASSERT_TRUE(pair);
+  const std::uint64_t session =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  EXPECT_EQ(pair->authority_session, session);
+
+  // Build the same command-owned input used by the activation edge.  Keep
+  // the immutable pair in every tick so the test observes the production
+  // authority path rather than a sidecar/profile-only shortcut.
+  MatchedAdapterInput input = MakeInput(path, pair->path_owner.get(), 2.02);
+  input.semantic_path_owner = pair->path_owner;
+  input.frame_owner = pair->frame_owner;
+  input.semantic_path_start_w = pair->path_owner->startW();
+  input.semantic_path_end_w = pair->path_owner->endW();
+  input.path_tube_pair = pair;
+  // Bind the command input's immutable frame fields to the exact frame owner
+  // carried by the pair.  This is the production frame-bound contract used by
+  // the authority query once delta is nonzero.
+  ContinuousPhasePathState framed_path;
+  ASSERT_TRUE(pair->frame_owner);
+  ASSERT_TRUE(pair->frame_owner->evaluatePathState(input.path.w, framed_path));
+  input.path.T = framed_path.T;
+  input.path.N = framed_path.N;
+  input.path.N_w = framed_path.N_w;
+  input.path.path_revision = framed_path.path_revision;
+  input.path.frame_revision = framed_path.frame_revision;
+  input.path.frame_valid = framed_path.frame_valid;
+  input.path.frame_provenance = framed_path.frame_provenance;
+
+  // Advance a few exact committed ticks until the smooth profile has a
+  // measurable nonzero executed delta.  The pair and authority remain the
+  // same throughout this precondition phase.
+  // The activation edge itself starts at the profile's zero crossing.  As in
+  // the existing production handoff fixture, advance the immutable profile
+  // clock to a post-crossing instant before the first nonzero command.
+  adapter.runtime_->profile_elapsed_ = 0.20;
+  bool nonzero_seen = std::abs(adapter.runtime_->retainedDelta()) > 1e-3;
+  for (int tick = 0; tick < 40 && !nonzero_seen; ++tick) {
+    input.stamp = ros::Time(2.02 + static_cast<double>(tick) * kDt);
+    RebaseInputToAuthority(adapter, input);
+    ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
+    ASSERT_TRUE(output.selected);
+    EXPECT_EQ(adapter.capturePathTubePair(), pair);
+    nonzero_seen = std::abs(adapter.runtime_->retainedDelta()) > 1e-3;
+  }
+  ASSERT_TRUE(nonzero_seen);
+  const double nonzero_delta = adapter.runtime_->retainedDelta();
+  ASSERT_GT(std::abs(nonzero_delta), 1e-3);
+  EXPECT_TRUE(adapter.requiresAuthoritativeOffsetHandoff());
+
+  ASSERT_TRUE(adapter.requestRecenter());
+  EXPECT_TRUE(adapter.recenterRequested());
+  EXPECT_TRUE(adapter.requiresAuthoritativeOffsetHandoff());
+  EXPECT_EQ(adapter.capturePathTubePair(), pair);
+
+  // Recenter is a continuous in-owner operation.  Before the exact accepted
+  // neutral step, Runtime and the pair remain authoritative and no planner
+  // centerline/path-only handoff is allowed.
+  bool reached_neutral = false;
+  for (int tick = 0; tick < 80; ++tick) {
+    input.stamp = ros::Time(3.0 + static_cast<double>(tick) * kDt);
+    RebaseInputToAuthority(adapter, input);
+    const double before_delta = adapter.runtime_->retainedDelta();
+    ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
+    ASSERT_TRUE(output.selected);
+    EXPECT_TRUE(output.valid);
+    EXPECT_EQ(adapter.capturePathTubePair(), pair);
+    if (std::abs(adapter.runtime_->retainedDelta()) > 1e-3) {
+      EXPECT_TRUE(adapter.requiresAuthoritativeOffsetHandoff());
+      EXPECT_TRUE(adapter.recenterRequested());
+      EXPECT_GT(std::abs(before_delta), 1e-3);
+    } else {
+      reached_neutral = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(reached_neutral);
+  EXPECT_LE(std::abs(adapter.runtime_->retainedDelta()), 1e-3);
+  EXPECT_FALSE(adapter.recenterRequested());
+  EXPECT_FALSE(adapter.requiresAuthoritativeOffsetHandoff());
+  EXPECT_EQ(adapter.capturePathTubePair(), pair);
+
+  // Only after the exact neutral command may the atomic planner-only
+  // retirement edge clear the pair and reset the execution authority.
+  std::uint64_t retired_session = 0U;
+  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+      session, retired_session));
+  EXPECT_EQ(retired_session,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_FALSE(adapter.requiresAuthoritativeOffsetHandoff());
+  EXPECT_FALSE(adapter.recenterRequested());
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -1082,6 +1309,18 @@ TEST(PhaseOffsetMatchedAdapterTest,
   ASSERT_TRUE(published);
   EXPECT_TRUE(published->output.selected);
   EXPECT_TRUE(published->output.valid);
+  ASSERT_TRUE(published->authority_snapshot);
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_snapshot =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(authority_snapshot.valid);
+  EXPECT_EQ(authority_snapshot.snapshotId(),
+            published->authority_snapshot->snapshotId());
+  EXPECT_DOUBLE_EQ(authority_snapshot.selected_u.u_w,
+                   output.projection.final_port.u_w);
+  EXPECT_DOUBLE_EQ(authority_snapshot.selected_u.u_delta,
+                   output.projection.final_port.u_delta);
+  EXPECT_DOUBLE_EQ(authority_snapshot.proposed_next_delta,
+                   adapter.runtime_->retainedDelta());
   EXPECT_DOUBLE_EQ(published->output.diagnostics[kSelectedManual], 1.0);
   EXPECT_DOUBLE_EQ(published->output.diagnostics[kManualValid], 1.0);
 }
@@ -1106,6 +1345,39 @@ TEST(PhaseOffsetMatchedAdapterTest,
   MatchedAdapterMarkerBundle markers;
   ASSERT_TRUE(adapter.buildMarkers(*published, markers));
   ExpectActions(markers.tube, visualization_msgs::Marker::ADD);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     ExecutionAuthorityReferenceFailureLeavesRuntimeAndSnapshotUntouched) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig());
+  MatchedAdapterOutput output;
+  OpenGate(adapter, path, output);
+  ASSERT_TRUE(output.selected) << output.invalid_reason;
+  const double retained_before = adapter.runtime_->retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      adapter.runtime_->previousFinalPort();
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_before =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(authority_before.valid);
+
+  MatchedAdapterInput invalid_query = MakeInput(path, &path, 3.0);
+  invalid_query.path_state_query =
+      [](double, phase_offset_core::PathDifferentialState&) { return false; };
+  EXPECT_FALSE(adapter.update(invalid_query, output));
+  EXPECT_FALSE(output.selected);
+  EXPECT_FALSE(output.valid);
+  EXPECT_NE(output.invalid_reason.find("reference"), std::string::npos);
+  EXPECT_DOUBLE_EQ(retained_before, adapter.runtime_->retainedDelta());
+  EXPECT_DOUBLE_EQ(previous_before.u_w,
+                   adapter.runtime_->previousFinalPort().u_w);
+  EXPECT_DOUBLE_EQ(previous_before.u_delta,
+                   adapter.runtime_->previousFinalPort().u_delta);
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_after =
+      adapter.execution_authority_.snapshot();
+  EXPECT_EQ(authority_before.snapshotId(), authority_after.snapshotId());
+  EXPECT_DOUBLE_EQ(authority_before.proposed_next_delta,
+                   authority_after.proposed_next_delta);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -1204,7 +1476,10 @@ TEST(PhaseOffsetMatchedAdapterTest, NoneRetainsA4ManualRecurrenceAndNoTube) {
   phase_offset_core::PortCommand previous = output.projection.final_port;
   for (int cycle = 0; cycle < 80; ++cycle) {
     expected_delta += kDt * previous.u_delta;
-    adapter.update(MakeInput(path, &path, (100 + cycle) * kDt), output);
+    MatchedAdapterInput input =
+        MakeInput(path, &path, (100 + cycle) * kDt);
+    RebaseInputToAuthority(adapter, input);
+    adapter.update(input, output);
     EXPECT_NEAR(output.delta, expected_delta, 1e-12);
     previous = output.projection.final_port;
   }
@@ -1765,6 +2040,105 @@ void ExpectCertifiedOwnerPartitionWithoutSeamCrossing(
     EXPECT_TRUE(sample.cell_geometry_certificate_used);
     EXPECT_DOUBLE_EQ(sample.continuous_inset, 0.0);
   }
+}
+
+phase_offset_navigation::PathCellBoundQuery
+ProjectedHermiteCertificateForTest(const double sup_normal_derivative) {
+  return [sup_normal_derivative](
+      const double w0, const double w1,
+      phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 0.4;
+    certificate.segment_identity = 17U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.sup_p_ww_norm = 0.0;
+    certificate.sup_p_www_norm = 0.0;
+    certificate.sup_N_w_norm = sup_normal_derivative;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound =
+        sup_normal_derivative * (w1 - w0);
+    certificate.curvature_variation_bound = 0.0;
+    certificate.midpoint_position_variation_bound = 0.0;
+    certificate.chord_deviation_bound = 0.0;
+    certificate.normal_frame_proof_complete = true;
+    certificate.provenance =
+        "ContinuousPhaseNormalFrame/ProjectedHermiteTransport/"
+        "CertifiedProjectedRawNormLowerBound";
+    certificate.valid = std::isfinite(w0) && std::isfinite(w1) &&
+        std::isfinite(sup_normal_derivative) && sup_normal_derivative >= 0.0 &&
+        w1 > w0;
+    certificate.complete = certificate.valid;
+    return certificate.valid;
+  };
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     TubeBuilderConsumesProjectedHermiteNormalDerivativeBound) {
+  MatchedAdapterPathSamples line;
+  for (int index = 0; index <= 4; ++index) {
+    phase_offset_core::PathDifferentialState state;
+    state.w = 0.1 * static_cast<double>(index);
+    state.p = Eigen::Vector3d(state.w, 0.0, 1.0);
+    state.p_w = Eigen::Vector3d::UnitX();
+    state.p_ww.setZero();
+    state.valid = true;
+    line.push_back(state);
+  }
+  const phase_offset_navigation::PathStateQuery exact_line =
+      [](const double w, phase_offset_core::PathDifferentialState& state) {
+        state = phase_offset_core::PathDifferentialState();
+        state.w = w;
+        state.p = Eigen::Vector3d(w, 0.0, 1.0);
+        state.p_w = Eigen::Vector3d::UnitX();
+        state.p_ww.setZero();
+        state.valid = true;
+        return std::isfinite(w) && w >= -1e-12 && w <= 0.4 + 1e-12;
+      };
+  const phase_offset_navigation::ClearanceQuery open =
+      [](const Eigen::Vector3d&, const double required) {
+        phase_offset_navigation::ClearanceQueryResult result;
+        result.status = phase_offset_navigation::DistanceStatus::KNOWN_FREE;
+        result.clearance = std::max(10.0, required);
+        result.clearance_certified = true;
+        return result;
+      };
+  const phase_offset_navigation::TubeBuilderConfig builder_config =
+      MakeManualConfig(TubeSource::ESDF).tube;
+
+  TubeProfile exact_bound;
+  ASSERT_TRUE(phase_offset_navigation::TubeBuilder(builder_config)
+      .buildCloudClearance(
+          TubeSource::ESDF, line, open, exact_line,
+          ProjectedHermiteCertificateForTest(0.0), 0.05, 0.0, 13U, 14U,
+          exact_bound));
+  ASSERT_TRUE(exact_bound.raw_complete);
+  EXPECT_TRUE(exact_bound.cell_geometry_certified);
+  EXPECT_TRUE(exact_bound.combined_regularity_proof_complete);
+  EXPECT_NEAR(exact_bound.combined_regularity_speed_min, 1.0, 1e-12);
+
+  // Every certificate fact except the represented frame derivative is kept
+  // identical.  A stale Bishop/default bound would incorrectly retain the
+  // zero-local-inset certificate for this unsafe projected-Hermite derivative.
+  TubeProfile unsafe_bound;
+  ASSERT_TRUE(phase_offset_navigation::TubeBuilder(builder_config)
+      .buildCloudClearance(
+          TubeSource::ESDF, line, open, exact_line,
+          ProjectedHermiteCertificateForTest(2.0), 0.05, 0.0, 13U, 15U,
+          unsafe_bound));
+  ASSERT_TRUE(unsafe_bound.raw_complete);
+  EXPECT_FALSE(unsafe_bound.cell_geometry_certified);
+  EXPECT_FALSE(unsafe_bound.combined_regularity_proof_complete);
+  EXPECT_EQ(unsafe_bound.certified_cell_count, 0U);
+  ASSERT_FALSE(unsafe_bound.raw_build_samples.empty());
+  EXPECT_DOUBLE_EQ(unsafe_bound.raw_build_samples.front().continuous_inset,
+                   0.05);
+  EXPECT_FALSE(unsafe_bound.raw_build_samples.front()
+                   .cell_geometry_certificate_used);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -2479,6 +2853,24 @@ TEST(PhaseOffsetMatchedAdapterTest, ActiveModeRetainsA3ZeroPortGateSemantics) {
   EXPECT_TRUE(output.zero_gate_open);
   EXPECT_TRUE(output.selected);
   EXPECT_NEAR((output.guidance.v_cmd - output.zero_port.guidance.v_cmd).norm(), 0.0, 1e-15);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     AdvertisedNormalRuntimeCandidateIsRejectedWithoutAllocator) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::NONE));
+  // The test does not need ROS transport; this flips the production boundary
+  // and disables the unadvertised Runtime fixture exception.
+  adapter.advertised_ = true;
+  adapter.execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
+  MatchedAdapterOutput output;
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    EXPECT_FALSE(adapter.update(MakeInput(path, &path, cycle * kDt), output));
+  }
+  EXPECT_TRUE(output.zero_gate_open);
+  EXPECT_FALSE(output.selected);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), 0.0);
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -3429,6 +3821,326 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_EQ(0, std::memcmp(&prepared_port.u_delta,
                            &previous_after.u_delta,
                            sizeof(prepared_port.u_delta)));
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     AdvertisedSeededRecoveryUsesStagedSuccessorAcrossMultipleTicks) {
+  const SyntheticPath path = MakeStraightSyntheticPath();
+  PhaseOffsetMatchedAdapterConfig recovery_config =
+      MakeManualConfig(TubeSource::FIXED);
+  // Keep the recovery witness comfortably inside a broad, valid fixed Tube;
+  // the test is about staged-owner continuity and publication, not an empty
+  // local polygon caused by an intentionally razor-thin profile.
+  recovery_config.tube.fixed_delta_max = 0.40;
+  recovery_config.tube.interior_margin = 0.0;
+  // Keep each ZOH recenter step below the seeded residual so the advertised
+  // successor path remains authoritative across multiple RECOVERY ticks.
+  recovery_config.u_delta_abs_max = 0.005;
+  recovery_config.u_delta_rate_max = 5.0;
+  PhaseOffsetMatchedAdapter adapter(recovery_config);
+  ASSERT_TRUE(adapter.runtime_);
+  const std::shared_ptr<const ContinuousPhasePath> old_owner =
+      MakeStraightSyntheticOwner();
+  ASSERT_TRUE(old_owner);
+  const MatchedAdapterPathSamples old_samples = SampleOwner(
+      old_owner, {0.4, 0.8, 1.0, 1.6, 2.0, 2.4, 2.8});
+  const Eigen::Vector3d position(0.4, 0.1, 1.1);
+  const guidance::IsfGains gains = MakeGains();
+  const std::shared_ptr<const plan_env::CloudOccupancySnapshot> no_snapshot;
+  // Production authority sessions are nonzero; seed the private lifecycle
+  // token before constructing the bootstrap pair so RecoveryOwner can bind
+  // every subsequent tick to one immutable session.
+  adapter.authority_session_.store(1U, std::memory_order_release);
+
+  PathTubePairTransaction bootstrap;
+  ASSERT_TRUE(adapter.stagePathTubePair(
+      std::shared_ptr<const PathTubePair>(), old_owner, old_samples, 0.4,
+      1.0, 2.4, position, gains, kDt, no_snapshot, bootstrap));
+  std::shared_ptr<const PathTubePair> old_pair;
+  ASSERT_TRUE(PrepareAndFinalizePair(
+      adapter, bootstrap, 0.4, position, gains, kDt, no_snapshot, old_pair));
+  ASSERT_TRUE(old_pair);
+
+  // Seed a real nonzero predecessor through the ordinary unadvertised
+  // Runtime path, then switch to the advertised owner contract.  This keeps
+  // the test focused on the production RecoveryOwner transaction rather than
+  // manufacturing a disconnected snapshot by hand.
+  adapter.zero_gate_open_ = true;
+  adapter.zero_gate_consecutive_count_ = 100;
+  MatchedAdapterInput input = MakeInput(path, old_owner.get());
+  input.path_state_query = [](const double w,
+                              phase_offset_core::PathDifferentialState& state) {
+    state = MakeStraightState(w);
+    return true;
+  };
+  input.semantic_path_owner = old_owner;
+  input.frame_owner = old_pair->frame_owner;
+  input.semantic_path_start_w = old_owner->startW();
+  input.semantic_path_end_w = old_owner->endW();
+  input.path_tube_pair = old_pair;
+  MatchedAdapterOutput bootstrap_output;
+  const auto rebase_straight_input = [&]() {
+    const phase_offset_navigation::ActiveReferenceSnapshot authority =
+        adapter.execution_authority_.snapshot();
+    if (!authority.valid || !std::isfinite(authority.proposed_next_w)) return;
+    input.path = MakeStraightState(authority.proposed_next_w);
+    ActiveAdapterInput zero_input;
+    zero_input.path = input.path;
+    zero_input.position = input.position;
+    zero_input.gains = input.gains;
+    PhaseOffsetActiveAdapter zero;
+    ActiveAdapterOutput zero_output;
+    EXPECT_TRUE(zero.evaluate(zero_input, zero_output));
+    input.legacy = LegacyGuidanceSnapshot(
+        zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+        zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+        zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+        zero_output.guidance.valid);
+  };
+  ASSERT_TRUE(adapter.update(input, bootstrap_output))
+      << bootstrap_output.invalid_reason;
+  ASSERT_TRUE(adapter.execution_authority_.snapshot().valid);
+  adapter.runtime_->profile_elapsed_ = 0.20;
+  // Build a residual larger than one bounded recovery increment while still
+  // using the ordinary unadvertised Runtime owner as the predecessor.
+  for (int index = 0; index < 8; ++index) {
+    rebase_straight_input();
+    ASSERT_TRUE(adapter.update(input, bootstrap_output))
+        << bootstrap_output.invalid_reason;
+  }
+  MatchedAdapterOutput output;
+  rebase_straight_input();
+  ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
+  ASSERT_GT(std::abs(adapter.runtime_->retainedDelta()), 1e-4);
+  ASSERT_EQ(adapter.execution_authority_.snapshot().owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+
+  adapter.advertised_ = true;
+  adapter.execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
+  std::unique_ptr<PathTubePairPin> pin =
+      adapter.captureAndAcquirePathTubePairPin();
+  ASSERT_TRUE(pin);
+  ASSERT_TRUE(pin->valid());
+  // H2 staging is bound to the exact authenticated predecessor command.  The
+  // warm-up ticks above advance that predecessor away from the original
+  // bootstrap anchor, so rebase the successor transaction's captured phase,
+  // path state, and display position to the immutable authority snapshot.
+  const phase_offset_navigation::ActiveReferenceSnapshot predecessor_authority =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(predecessor_authority.valid);
+  ASSERT_EQ(predecessor_authority.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  const double replacement_captured_w0 = predecessor_authority.w;
+  const double successor_end_w = 2.8;
+  const std::shared_ptr<const ContinuousPhasePath> successor_owner =
+      MakeH2ProductionNewOwner(old_owner, replacement_captured_w0,
+                               1.0, 1.6, successor_end_w);
+  ASSERT_TRUE(successor_owner);
+  std::vector<double> successor_sample_w;
+  for (int index = 0; index <= 6; ++index) {
+    successor_sample_w.push_back(replacement_captured_w0 +
+        (successor_end_w - replacement_captured_w0) *
+            static_cast<double>(index) / 6.0);
+  }
+  const MatchedAdapterPathSamples successor_samples = SampleOwner(
+      successor_owner, successor_sample_w);
+  ASSERT_FALSE(successor_samples.empty());
+  const phase_offset_core::PathDifferentialState replacement_path =
+      MakeStraightState(replacement_captured_w0);
+  const phase_offset_core::PathDifferentialState original_path =
+      MakeStraightState(0.4);
+  const Eigen::Vector3d replacement_position = replacement_path.p +
+      (position - original_path.p);
+  input.path = replacement_path;
+  input.position = replacement_position;
+  PhaseOffsetActiveAdapter replacement_zero;
+  ActiveAdapterInput replacement_zero_input;
+  replacement_zero_input.path = input.path;
+  replacement_zero_input.position = input.position;
+  replacement_zero_input.gains = input.gains;
+  ActiveAdapterOutput replacement_zero_output;
+  ASSERT_TRUE(replacement_zero.evaluate(replacement_zero_input,
+                                        replacement_zero_output));
+  input.legacy = LegacyGuidanceSnapshot(
+      replacement_zero_output.guidance.v_cmd,
+      replacement_zero_output.guidance.w_dot,
+      replacement_zero_output.guidance.e_parallel,
+      replacement_zero_output.guidance.e_perp,
+      replacement_zero_output.guidance.ref_pt,
+      replacement_zero_output.guidance.tangent,
+      replacement_zero_output.guidance.valid);
+  input.path_state_query = [](const double w,
+                              phase_offset_core::PathDifferentialState& state) {
+    state = MakeStraightState(w);
+    return true;
+  };
+  PathTubePairTransaction replacement;
+  ASSERT_TRUE(adapter.stagePathTubePair(
+      old_pair, successor_owner, successor_samples, replacement_captured_w0,
+      1.0, 2.4, replacement_position, gains, kDt, no_snapshot, replacement,
+      pin->capture().authority_session, &pin->capture(), pin->leaseId()));
+  ASSERT_TRUE(replacement.candidate_pair);
+  phase_offset_core::NormalFrameQuery successor_start_frame;
+  ASSERT_TRUE(replacement.candidate_pair->frame_owner->query(
+      replacement_captured_w0, successor_start_frame));
+  EXPECT_NEAR((successor_start_frame.N - predecessor_authority.executed_N).norm(),
+              0.0, 1e-7);
+  ContinuousPhasePathState successor_start_state;
+  ContinuousPhasePathState successor_future_state;
+  ASSERT_TRUE(successor_owner->evaluate(
+      replacement_captured_w0, successor_start_state, false));
+  ASSERT_TRUE(successor_owner->evaluate(1.3, successor_future_state, false));
+  EXPECT_LT(successor_start_state.dp_dw.normalized().dot(
+                successor_future_state.dp_dw.normalized()), 0.999999);
+  EXPECT_EQ(adapter.capturePathTubePair().get(), old_pair.get());
+  // A staged successor whose immutable frame fails the continuation seam
+  // proof must retain the current nonzero authority and surface a renewed
+  // recovery/replan request; no base-only seam fallback may publish.
+  auto bad_successor = std::make_shared<PathTubePair>(*replacement.candidate_pair);
+  bad_successor->frame_owner = std::shared_ptr<const ContinuousPhaseNormalFrame>(
+      new ContinuousPhaseNormalFrame(
+          bad_successor->path_owner, bad_successor->path_revision,
+          bad_successor->frame_revision, Eigen::Vector3d::UnitZ()));
+  input.successor_path_tube_pair = std::shared_ptr<const PathTubePair>(bad_successor);
+  rebase_straight_input();
+  MatchedAdapterOutput rejected_successor_output;
+  const double retained_before_rejected_successor =
+      adapter.runtime_->retainedDelta();
+  EXPECT_FALSE(adapter.update(input, rejected_successor_output));
+  EXPECT_TRUE(rejected_successor_output.recovery_replan_required)
+      << rejected_successor_output.invalid_reason;
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(),
+                   retained_before_rejected_successor);
+  EXPECT_EQ(adapter.execution_authority_.snapshot().owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  input.successor_path_tube_pair = replacement.candidate_pair;
+  // Exercise the ZERO_ONLY handoff branch once with a deliberately narrow
+  // staged target.  The current tick must continue projecting in the old
+  // owner's safe component; target bounds are evidence for lifecycle only.
+  auto zero_profile = std::make_shared<TubeProfile>(
+      *replacement.candidate_pair->active_profile);
+  zero_profile->classification =
+      phase_offset_navigation::TubeProfileClassification::
+          ZERO_ONLY_PLANNER_BASELINE;
+  for (TubeRawSample& sample : zero_profile->samples) {
+    sample.filtered_lower = -1e-4;
+    sample.filtered_upper = 1e-4;
+    sample.raw_lower = sample.filtered_lower;
+    sample.raw_upper = sample.filtered_upper;
+  }
+  auto zero_pair = std::make_shared<PathTubePair>(*replacement.candidate_pair);
+  zero_pair->active_profile = std::shared_ptr<const TubeProfile>(zero_profile);
+  input.successor_path_tube_pair =
+      std::shared_ptr<const PathTubePair>(zero_pair);
+  rebase_straight_input();
+  ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  phase_offset_navigation::TubeBounds old_owner_bounds;
+  ASSERT_TRUE(phase_offset_navigation::TubeFilter::query(
+      *old_pair->active_profile, input.path.w, old_owner_bounds));
+  EXPECT_TRUE(output.tube_current_bounds.valid);
+  EXPECT_NEAR(output.tube_current_bounds.lower, old_owner_bounds.lower, 1e-12);
+  EXPECT_NEAR(output.tube_current_bounds.upper, old_owner_bounds.upper, 1e-12);
+  EXPECT_FALSE(output.tube_current_bounds.lower >= -1e-4 &&
+              output.tube_current_bounds.upper <= 1e-4);
+  const PendingPositionCommandCapture zero_capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(zero_capture.pending);
+  EXPECT_EQ(adapter.pending_recovery_source_pair_.get(), old_pair.get());
+  EXPECT_EQ(adapter.pending_recovery_execution_pair_.get(), old_pair.get());
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, zero_capture.identity));
+  input.successor_path_tube_pair = replacement.candidate_pair;
+
+  std::size_t recovery_ticks = 0U;
+  bool clone_negative_checked = false;
+  double first_delta = std::abs(adapter.runtime_->retainedDelta());
+  std::vector<double> delta_history;
+  std::vector<std::uint64_t> executed_revision_history;
+  bool saw_target_revision = false;
+  bool terminal = false;
+  for (; recovery_ticks < 64U; ++recovery_ticks) {
+    rebase_straight_input();
+    ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
+    ASSERT_TRUE(output.selected) << output.invalid_reason;
+    const PendingPositionCommandCapture capture =
+        adapter.capturePendingPositionCommand();
+    ASSERT_TRUE(capture.pending);
+    ASSERT_TRUE(capture.valid);
+    PendingPositionCommandCapture publish_capture = capture;
+    if (!clone_negative_checked &&
+        adapter.pending_recovery_execution_pair_.get() ==
+            replacement.candidate_pair.get()) {
+      EXPECT_EQ(adapter.pending_recovery_source_pair_.get(), old_pair.get());
+      EXPECT_EQ(adapter.pending_recovery_target_pair_.get(),
+                replacement.candidate_pair.get());
+      // A same-revision clone in the live slot is not the immutable staged
+      // target that produced this candidate and must fail before publication.
+      const std::shared_ptr<const PathTubePair> target_clone(
+          new PathTubePair(*replacement.candidate_pair));
+      std::atomic_store(&adapter.authoritative_path_tube_pair_, target_clone);
+      int callback_count = 0;
+      EXPECT_FALSE(adapter.publishPendingPositionCommand(
+          [&callback_count]() {
+            ++callback_count;
+            return true;
+          }, capture.identity));
+      EXPECT_EQ(callback_count, 0);
+      EXPECT_FALSE(adapter.hasPendingPositionCommand());
+      EXPECT_EQ(adapter.capturePathTubePair().get(), target_clone.get());
+      std::atomic_store(&adapter.authoritative_path_tube_pair_, old_pair);
+
+      // Re-stage the exact same immutable target and prove the positive
+      // staged-successor path still publishes after the negative clone.
+      rebase_straight_input();
+      ASSERT_TRUE(adapter.update(input, output)) << output.invalid_reason;
+      const PendingPositionCommandCapture restaged =
+          adapter.capturePendingPositionCommand();
+      ASSERT_TRUE(restaged.pending);
+      ASSERT_TRUE(restaged.valid);
+      EXPECT_EQ(adapter.pending_recovery_execution_pair_.get(),
+                replacement.candidate_pair.get());
+      publish_capture = restaged;
+      clone_negative_checked = true;
+    }
+    ASSERT_TRUE(adapter.publishPendingPositionCommand(
+        []() { return true; }, publish_capture.identity));
+    const auto authority = adapter.execution_authority_.snapshot();
+    delta_history.push_back(adapter.runtime_->retainedDelta());
+    executed_revision_history.push_back(authority.executed_path_revision);
+    if (authority.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY) {
+      saw_target_revision = saw_target_revision ||
+          authority.executed_path_revision ==
+              replacement.candidate_pair->path_revision;
+      EXPECT_LT(std::abs(adapter.runtime_->retainedDelta()), first_delta +
+                1e-9);
+      first_delta = std::abs(adapter.runtime_->retainedDelta());
+      continue;
+    }
+    terminal = authority.owner_mode ==
+        phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+    break;
+  }
+  EXPECT_TRUE(terminal);
+  EXPECT_TRUE(clone_negative_checked);
+  EXPECT_GT(recovery_ticks, 1U);
+  EXPECT_TRUE(saw_target_revision);
+  EXPECT_NE(std::find(executed_revision_history.begin(),
+                      executed_revision_history.end(),
+                      replacement.candidate_pair->path_revision),
+            executed_revision_history.end());
+  ASSERT_FALSE(delta_history.empty());
+  for (std::size_t index = 1U; index < delta_history.size(); ++index) {
+    EXPECT_LE(std::abs(delta_history[index]),
+              std::abs(delta_history[index - 1U]) + 1e-9);
+  }
+  EXPECT_EQ(adapter.execution_authority_.snapshot().owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY);
+  EXPECT_FALSE(adapter.runtime_->hasExecutedOffsetAuthority());
+  EXPECT_FALSE(adapter.requiresAuthoritativeOffsetHandoff());
+  pin->release();
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -5188,6 +5900,167 @@ TEST(PhaseOffsetMatchedAdapterTest,
       adapter.timer_last_deactivate_sequence_;
   EXPECT_TRUE(adapter.timerTick());
   EXPECT_EQ(adapter.timer_last_deactivate_sequence_, deactivate_sequence);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     DeactivateDiscardsStagedPositionCommandWithoutResettingCommittedRuntime) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  adapter.command_active_ = true;
+  adapter.pending_authority_valid_ = true;
+  adapter.pending_authority_session_ = 17U;
+  adapter.pending_runtime_commit_.valid = true;
+  adapter.pending_authority_prepared_.valid = true;
+
+  adapter.deactivate(ros::Time(1.0));
+
+  EXPECT_FALSE(adapter.pending_authority_valid_);
+  EXPECT_EQ(adapter.pending_authority_session_, 0U);
+  EXPECT_FALSE(adapter.pending_runtime_commit_.valid);
+  EXPECT_FALSE(adapter.pending_authority_prepared_.valid);
+  EXPECT_FALSE(adapter.command_active_);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     PendingPositionCommandPublishesBeforeAuthorityAndRuntimeCommit) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+  std::shared_ptr<ControlPublishSnapshot> control(new ControlPublishSnapshot());
+  control->active = true;
+  control->task_generation = adapter.task_generation_.load(
+      std::memory_order_acquire);
+  std::atomic_store(&adapter.latest_control_snapshot_,
+                    std::shared_ptr<const ControlPublishSnapshot>(control));
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+
+  int callback_count = 0;
+  bool callback_saw_uncommitted_state = false;
+  EXPECT_TRUE(adapter.publishPendingPositionCommand(
+      [&]() {
+        ++callback_count;
+        callback_saw_uncommitted_state =
+            !adapter.execution_authority_.snapshot().valid &&
+            std::abs(adapter.runtime_->retainedDelta()) <= 1e-12 &&
+            adapter.pending_authority_valid_;
+        return true;
+      }, capture.identity));
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_TRUE(callback_saw_uncommitted_state);
+  EXPECT_TRUE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_NEAR(adapter.runtime_->retainedDelta(), -0.002, 1e-12);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  const std::shared_ptr<const ControlPublishSnapshot> published_control =
+      std::atomic_load(&adapter.latest_control_snapshot_);
+  ASSERT_TRUE(published_control);
+  ASSERT_TRUE(published_control->authority_snapshot);
+  EXPECT_EQ(published_control->authority_snapshot->snapshotId(),
+            adapter.execution_authority_.snapshot().snapshotId());
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     PendingPositionCommandPublishFailureDiscardsWithoutCommit) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  const double delta_before = adapter.runtime_->retainedDelta();
+  int callback_count = 0;
+  EXPECT_FALSE(adapter.publishPendingPositionCommand(
+      [&]() {
+        ++callback_count;
+        return false;
+      }, capture.identity));
+  EXPECT_EQ(callback_count, 1);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), delta_before);
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     PendingPositionCommandIdentityAndStateConflictsFailClosed) {
+  {
+    PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+    ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+    const PendingPositionCommandCapture capture =
+        adapter.capturePendingPositionCommand();
+    adapter.authority_session_.store(8U, std::memory_order_release);
+    int callback_count = 0;
+    EXPECT_FALSE(adapter.publishPendingPositionCommand(
+        [&]() { ++callback_count; return true; }, capture.identity));
+    EXPECT_EQ(callback_count, 0);
+    EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+    EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  }
+  {
+    PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+    ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+    const PendingPositionCommandCapture capture =
+        adapter.capturePendingPositionCommand();
+    adapter.pending_runtime_commit_.expected_delta = 0.5;
+    int callback_count = 0;
+    EXPECT_FALSE(adapter.publishPendingPositionCommand(
+        [&]() { ++callback_count; return true; }, capture.identity));
+    EXPECT_EQ(callback_count, 0);
+    EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), 0.0);
+    EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  }
+  {
+    PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+    ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+    const PendingPositionCommandCapture capture =
+        adapter.capturePendingPositionCommand();
+    phase_offset_navigation::ActiveReferenceSnapshot changed =
+        *adapter.pending_authority_prepared_.committed_snapshot;
+    changed.executed_path_revision = 2U;
+    adapter.pending_authority_prepared_.committed_snapshot =
+        std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+            changed);
+    int callback_count = 0;
+    EXPECT_FALSE(adapter.publishPendingPositionCommand(
+        [&]() { ++callback_count; return true; }, capture.identity));
+    EXPECT_EQ(callback_count, 0);
+    EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  }
+  {
+    PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+    ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+    const PendingPositionCommandCapture capture =
+        adapter.capturePendingPositionCommand();
+    phase_offset_navigation::ActiveReferenceSnapshot changed =
+        *adapter.pending_authority_prepared_.committed_snapshot;
+    changed.owner_mode =
+        phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+    changed.selected_u_owner = "PhaseOffsetRecoveryOwner";
+    adapter.pending_authority_prepared_.committed_snapshot =
+        std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+            changed);
+    int callback_count = 0;
+    EXPECT_FALSE(adapter.publishPendingPositionCommand(
+        [&]() { ++callback_count; return true; }, capture.identity));
+    EXPECT_EQ(callback_count, 0);
+    EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     ResetAfterPendingCaptureRejectsStalePositionPublication) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  std::uint64_t retired = 0U;
+  ASSERT_TRUE(adapter.resetForNewNavigationTask(
+      adapter.authority_session_.load(std::memory_order_acquire), retired));
+  int callback_count = 0;
+  EXPECT_FALSE(adapter.publishPendingPositionCommand(
+      [&]() { ++callback_count; return true; }, capture.identity));
+  EXPECT_EQ(callback_count, 0);
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,

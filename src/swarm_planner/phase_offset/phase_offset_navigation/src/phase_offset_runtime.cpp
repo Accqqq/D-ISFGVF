@@ -11,8 +11,6 @@ namespace {
 constexpr double kMinimumAcceptedAmplitude = 0.05;
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kTolerance = 1e-10;
-constexpr double kProfileCompletionDeltaTolerance = 1e-3;
-constexpr double kOffsetAuthorityNeutralTolerance = 1e-9;
 
 bool IsFinite(double value) { return std::isfinite(value); }
 bool IsFinite(const Eigen::Vector3d& value) { return value.allFinite(); }
@@ -24,7 +22,7 @@ bool IsFinite(const phase_offset_core::PortCommand& value) {
 bool HasExecutedOffsetAuthorityState(const double delta,
                                      const bool profile_started,
                                      const bool profile_completed) {
-  return std::abs(delta) > kOffsetAuthorityNeutralTolerance ||
+  return delta != 0.0 ||
       (profile_started && !profile_completed);
 }
 
@@ -352,7 +350,7 @@ PhaseOffsetRuntime::PhaseOffsetRuntime(const PhaseOffsetRuntimeConfig& config)
 }
 
 bool PhaseOffsetRuntime::hasPendingOrActiveOffsetIntent() const {
-  if (std::abs(delta_) > kOffsetAuthorityNeutralTolerance) return true;
+  if (delta_ != 0.0) return true;
   // A not-yet-started profile still needs a matching PathTubePair bootstrap;
   // otherwise the first selected nonzero port could execute through the
   // sidecar epoch without an authoritative owner.  Once the profile has
@@ -360,12 +358,19 @@ bool PhaseOffsetRuntime::hasPendingOrActiveOffsetIntent() const {
   // no longer an authority requirement.  A started-but-incomplete profile
   // retains authority through instantaneous zero crossings.
   if (profile_started_) return !profile_completed_;
-  return std::abs(config_.manual.amplitude) > kOffsetAuthorityNeutralTolerance;
+  return config_.manual.amplitude != 0.0;
 }
 
 bool PhaseOffsetRuntime::hasExecutedOffsetAuthority() const {
   return HasExecutedOffsetAuthorityState(
       delta_, profile_started_, profile_completed_);
+}
+
+void PhaseOffsetRuntime::requestRecenter() {
+  // This is a lifecycle intent, not a state reset.  The next prepare emits a
+  // bounded inward port through the existing active owner; complete() retires
+  // the profile only after the exact command reaches neutral.
+  returning_to_center_ = true;
 }
 
 bool PhaseOffsetRuntime::configurationValid() const { return configuration_valid_; }
@@ -546,12 +551,11 @@ bool PhaseOffsetRuntime::makePrepared(const RuntimePrepareInput& input,
     prepared.execution.retained_delta_current_inside = Inside(
         prepared.current_bounds, delta_, config_.tube.interior_margin);
   }
-  if (profile_started_ && !profile_completed_ &&
+  // Completion is a state transition owned by `complete`, not by prepare.
+  // Observe it locally so repeated prepares are side-effect free.
+  const bool completes_on_this_step = profile_started_ && !profile_completed_ &&
       profile_elapsed_ >= config_.manual.profile_period &&
-      std::abs(delta_) <= kProfileCompletionDeltaTolerance) {
-    profile_completed_ = true;
-    returning_to_center_ = false;
-  }
+      delta_ == 0.0;
   if (config_.tube.source == TubeSource::NONE) {
     if (!preflight_.complete && !returning_to_center_) {
       prepared.execution.mode = RuntimeExecutionMode::BLOCKED;
@@ -561,7 +565,7 @@ bool PhaseOffsetRuntime::makePrepared(const RuntimePrepareInput& input,
     }
     prepared.execution.mode = RuntimeExecutionMode::NO_TUBE_REQUIRED;
     prepared.execution.executable = true;
-    makeManualRawPort(prepared, true, false);
+    makeManualRawPort(prepared, true, completes_on_this_step);
   } else {
     const bool active_current_ok = prepared.active_profile &&
         prepared.active_profile->complete &&
@@ -585,8 +589,16 @@ bool PhaseOffsetRuntime::makePrepared(const RuntimePrepareInput& input,
     } else {
       prepared.execution.mode = RuntimeExecutionMode::NORMAL;
       prepared.execution.executable = true;
-      makeManualRawPort(prepared, true, false);
+      makeManualRawPort(prepared, true, completes_on_this_step);
     }
+  }
+  // Near neutral, choose the bounded inward command that reaches the neutral
+  // handoff at the end of this ZOH interval.  This is only enabled after an
+  // explicit recenter request and remains subject to PortProjector limits;
+  // it avoids an asymptotic residual keeping nonzero authority alive forever.
+  if (returning_to_center_ && delta_ != 0.0 && input.dt > 0.0) {
+    prepared.raw_port.u_delta = -delta_ / input.dt;
+    prepared.delta_ref = 0.0;
   }
   prepared.requires_base_guidance = prepared.execution.executable;
   prepared.valid = prepared.execution.executable;
@@ -608,6 +620,7 @@ void PhaseOffsetRuntime::fillOutput(const RuntimePreparedStep& prepared,
   output.preflight = prepared.preflight;
   output.epoch_status = prepared.epoch_status;
   output.execution = prepared.execution;
+  output.exact_terminal_predicate = false;
   output.delta = delta_;
   output.delta_ref = prepared.delta_ref;
   output.profile_active = prepared.profile_active;
@@ -980,6 +993,8 @@ bool PhaseOffsetRuntime::complete(const RuntimePreparedStep& prepared,
   output.selected = prepared.zero_gate_open;
   output.valid = true;
   output.invalid_reason.clear();
+  output.exact_terminal_predicate = output.projection.valid &&
+      output.projection.next_delta == 0.0;
   if (output.selected) {
     previous_final_port_ = output.projection.final_port;
     delta_ = output.projection.next_delta;
@@ -991,14 +1006,108 @@ bool PhaseOffsetRuntime::complete(const RuntimePreparedStep& prepared,
     if (prepared.profile_active && executed_manual_profile) {
       profile_elapsed_ += prepared.dt;
     }
-    if (profile_started_ && !profile_completed_ &&
-        profile_elapsed_ >= config_.manual.profile_period &&
-        std::abs(delta_) <= kProfileCompletionDeltaTolerance) {
+    if (returning_to_center_ && delta_ == 0.0) {
+      profile_completed_ = true;
+      returning_to_center_ = false;
+    } else if (profile_started_ && !profile_completed_ &&
+               profile_elapsed_ >= config_.manual.profile_period &&
+               delta_ == 0.0) {
       profile_completed_ = true;
       returning_to_center_ = false;
     }
   }
   return true;
+}
+
+bool PhaseOffsetRuntime::makeCommitToken(
+    const RuntimePreparedStep& prepared, const RuntimeStepOutput& output,
+    RuntimeCommitToken& token) const {
+  token = RuntimeCommitToken();
+  if (!prepared.valid || !prepared.requires_base_guidance ||
+      !output.selected || !output.valid || !output.projection.valid ||
+      !output.matched.valid || !IsFinite(output.projection.final_port) ||
+      !IsFinite(output.projection.next_delta) || !IsFinite(prepared.dt) ||
+      prepared.dt <= 0.0) {
+    return false;
+  }
+  token.expected_previous_final_port = previous_final_port_;
+  token.expected_delta = delta_;
+  token.next_previous_final_port = output.projection.final_port;
+  token.next_delta = output.projection.next_delta;
+  token.dt = prepared.dt;
+  token.selected = true;
+  token.valid = true;
+  token.safety_priority = output.execution.mode ==
+      RuntimeExecutionMode::SAFETY_PRIORITY;
+  token.should_start_profile = prepared.should_start_profile;
+  token.profile_active = prepared.profile_active;
+  token.exact_terminal_predicate = output.exact_terminal_predicate;
+  return true;
+}
+
+bool PhaseOffsetRuntime::commitToken(const RuntimeCommitToken& token) {
+  if (!configuration_valid_ || !token.valid || !token.selected ||
+      !IsFinite(token.expected_previous_final_port) ||
+      !IsFinite(token.expected_delta) ||
+      !IsFinite(token.next_previous_final_port) ||
+      !IsFinite(token.next_delta) || !IsFinite(token.dt) || token.dt <= 0.0) {
+    return false;
+  }
+  constexpr double kCommitTolerance = 1e-12;
+  if (std::abs(previous_final_port_.u_w - token.expected_previous_final_port.u_w) >
+          kCommitTolerance ||
+      std::abs(previous_final_port_.u_delta -
+               token.expected_previous_final_port.u_delta) > kCommitTolerance ||
+      std::abs(delta_ - token.expected_delta) > kCommitTolerance) {
+    return false;
+  }
+  previous_final_port_ = token.next_previous_final_port;
+  delta_ = token.next_delta;
+  if (token.should_start_profile && !token.safety_priority) {
+    profile_started_ = true;
+  }
+  if (token.profile_active && !token.safety_priority) {
+    profile_elapsed_ += token.dt;
+  }
+  if (returning_to_center_ && delta_ == 0.0) {
+    profile_completed_ = true;
+    returning_to_center_ = false;
+  } else if (token.complete_profile && token.exact_terminal_predicate &&
+             delta_ == 0.0) {
+    profile_completed_ = true;
+    returning_to_center_ = false;
+  } else if (profile_started_ && !profile_completed_ &&
+             profile_elapsed_ >= config_.manual.profile_period &&
+             delta_ == 0.0) {
+    profile_completed_ = true;
+    returning_to_center_ = false;
+  }
+  return true;
+}
+
+void PhaseOffsetRuntime::commitTokenNoFail(
+    const RuntimeCommitToken& token) noexcept {
+  previous_final_port_ = token.next_previous_final_port;
+  delta_ = token.next_delta;
+  if (token.should_start_profile && !token.safety_priority) {
+    profile_started_ = true;
+  }
+  if (token.profile_active && !token.safety_priority) {
+    profile_elapsed_ += token.dt;
+  }
+  if (returning_to_center_ && delta_ == 0.0) {
+    profile_completed_ = true;
+    returning_to_center_ = false;
+  } else if (token.complete_profile && token.exact_terminal_predicate &&
+             delta_ == 0.0) {
+    profile_completed_ = true;
+    returning_to_center_ = false;
+  } else if (profile_started_ && !profile_completed_ &&
+             profile_elapsed_ >= config_.manual.profile_period &&
+             delta_ == 0.0) {
+    profile_completed_ = true;
+    returning_to_center_ = false;
+  }
 }
 
 bool PhaseOffsetRuntime::dryRun(const RuntimeDryRunInput& input,

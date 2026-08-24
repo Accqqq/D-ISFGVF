@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,6 +28,10 @@
 #include <phase_offset_navigation/phase_offset_runtime.h>
 #include <phase_offset_navigation/immutable_executed_reference_query.h>
 #include <phase_offset_navigation/active_reference_snapshot.h>
+#include <phase_offset_navigation/active_reference_authority.h>
+#include <phase_offset_navigation/phase_offset_recovery_owner.h>
+#include <phase_offset_navigation/preview_feasibility.h>
+#include <phase_offset_navigation/handoff_state_machine.h>
 #include <phase_offset_navigation/tube_epoch_manager.h>
 
 namespace FLAG_Race {
@@ -116,6 +121,11 @@ struct PathTubePair {
   std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
   phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
       executed_reference_query;
+  // Exact predecessor authority used to seed a staged successor frame.  It
+  // is immutable provenance only; governor/reference consumers never read the
+  // stored executed_N as a control input.
+  std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
+      successor_seed_authority;
   phase_offset_navigation::TubeEpochStatus epoch_status;
   // The precommit facts are retained verbatim so a later command can reject
   // a stale stage before it exchanges authority.
@@ -286,6 +296,11 @@ struct MatchedAdapterInput {
   // control step.  It is intentionally immutable and never synthesized from
   // independent path/epoch slots inside update().
   std::shared_ptr<const PathTubePair> path_tube_pair;
+  // A manager-staged successor is transaction evidence only.  It is supplied
+  // from the exact pending PathTubePair handoff and is never installed or
+  // treated as authority by the adapter.  Recovery/Preview may validate it
+  // while the current pair remains the safe executed owner.
+  std::shared_ptr<const PathTubePair> successor_path_tube_pair;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       cloud_occupancy_snapshot;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
@@ -428,6 +443,9 @@ struct MatchedAdapterOutput {
       cloud_snapshot_diagnostics = {{0.0}};
   bool selected = false;
   bool valid = false;
+  phase_offset_navigation::RecoveryStepStatus recovery_status =
+      phase_offset_navigation::RecoveryStepStatus::NONE;
+  bool recovery_replan_required = false;
   std::string invalid_reason;
   std::array<double, kManualDiagnosticCount> diagnostics = {{0.0}};
 };
@@ -575,7 +593,37 @@ struct ControlPublishSnapshot {
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   std::shared_ptr<const TubeEpochSnapshot> epoch_snapshot;
   std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
+  // Command/diagnostic publication is tied to one immutable execution
+  // authority snapshot.  The timer consumes this value-only handoff and
+  // cannot observe a different selected-u transaction.
+  std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
+      authority_snapshot;
   MatchedAdapterOutput output;
+};
+
+struct DeactivationCommitToken {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  std::uint64_t task_generation = 0U;
+  std::uint64_t next_control_sequence = 0U;
+  bool command_active_before = false;
+  bool valid = false;
+  std::shared_ptr<const TubeBuildRequest> inactive_request;
+  std::shared_ptr<const TubeEpochSnapshot> inactive_candidate_snapshot;
+  std::shared_ptr<const TubeEpochSnapshot> inactive_epoch_snapshot;
+  std::shared_ptr<const ControlPublishSnapshot> inactive_control;
+};
+
+// Immutable command-side capture used to bind the governor's reference query
+// to the exact staged PositionCommand transaction that may publish it.  A
+// capture with pending=false/valid=true means no transaction was present at
+// capture time; pending=true requires the identity to remain unchanged until
+// publish.
+struct PendingPositionCommandCapture {
+  bool pending = false;
+  bool valid = false;
+  std::uint64_t identity = 0U;
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr reference_query;
 };
 
 struct MatchedAdapterMarkerBundle {
@@ -613,6 +661,11 @@ class PhaseOffsetMatchedAdapter {
   // command guidance remains on the planner owner until that commit occurs.
   bool hasPendingOffsetActivationPair(
       const std::shared_ptr<const PathTubePair>& pair) const;
+  // Begin bounded in-owner recentering after a successor denial.  This does
+  // not clear the pair, delta, or planner authority; Runtime retires the
+  // profile only after an exact accepted step reaches neutral.
+  bool requestRecenter();
+  bool recenterRequested() const;
   // A bootstrap has no old pair whose certified end can be retained.  Reuse
   // the existing manager installation horizon and cap it by the immutable
   // path; this is not a new handoff threshold.
@@ -643,6 +696,26 @@ class PhaseOffsetMatchedAdapter {
                                  std::uint64_t& retired_authority_session);
   void advertise(ros::NodeHandle& private_nh);
   bool update(const MatchedAdapterInput& input, MatchedAdapterOutput& output);
+  // Discard only a staged production transaction.  Authority/Runtime commit
+  // is intentionally unreachable through a public boolean bypass; production
+  // commit occurs only inside publishPendingPositionCommand() after the local
+  // PositionCommand publication succeeds.
+  void discardPendingPositionCommand();
+  bool hasPendingPositionCommand() const;
+  bool validatePendingPositionCommand() const;
+  PendingPositionCommandCapture capturePendingPositionCommand() const;
+  // Returns the immutable executed-reference query staged for the pending
+  // PositionCommand transaction.  The governor may consume this value only
+  // after validatePendingPositionCommand(); publication revalidates it again
+  // under the serialized task/runtime boundary.
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
+  pendingExecutedReferenceQuery() const;
+  // Serializes final validation, local PositionCommand publication and the
+  // no-fail authority/token commit against task reset and pair retirement.
+  bool publishPendingPositionCommand(
+      const std::function<bool()>& local_publish,
+      std::uint64_t expected_identity = 0U,
+      bool cancel_pending_for_goal_override = false);
   // Called only by the manager's 10 Hz MANUAL timer (or deterministically by
   // an owning test).  It is non-reentrant and owns all TubeEpochManager work.
   bool timerTick();
@@ -685,6 +758,11 @@ class PhaseOffsetMatchedAdapter {
       std::uint64_t& retired_session);
   void deactivateLocked(const ros::Time& stamp,
                         std::uint64_t expected_task_generation);
+  bool prepareDeactivationLocked(
+      const ros::Time& stamp, std::uint64_t expected_task_generation,
+      DeactivationCommitToken& token) const;
+  void commitDeactivationNoFailLocked(
+      const DeactivationCommitToken& token) noexcept;
   bool buildTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
                       TubeEpochSnapshot& snapshot);
   bool buildPreparedTubeEpoch(const TubeBuildRequest& request,
@@ -790,6 +868,39 @@ class PhaseOffsetMatchedAdapter {
   void fillLegacyTubeStatus(MatchedAdapterOutput& output) const;
   bool tubeDisplayCertified(const MatchedAdapterOutput& output) const;
   void fillManualDiagnostics(MatchedAdapterOutput& output) const;
+  // Runtime::complete is evaluated only on a local value copy.  The exact
+  // selected port and resulting state cross the serialized execution
+  // authority before the live Runtime is replaced; a rejected authority
+  // transaction therefore cannot mutate command state.
+  bool completeThroughExecutionAuthority(
+      const MatchedAdapterInput& input,
+      const std::shared_ptr<const PathTubePair>& pair,
+      const std::shared_ptr<const TubeBuildRequest>& request,
+      const std::shared_ptr<const TubeEpochSnapshot>& epoch,
+      const phase_offset_navigation::RuntimePreparedStep& prepared,
+      const Eigen::Vector3d& base_v_cmd,
+      double base_w_dot,
+      bool base_guidance_valid,
+      phase_offset_navigation::RuntimeStepOutput& output);
+  bool completeThroughRecoveryOwner(
+      const MatchedAdapterInput& input,
+      const std::shared_ptr<const PathTubePair>& pair,
+      const std::shared_ptr<const PathTubePair>& successor_pair,
+      const phase_offset_navigation::RuntimePreparedStep& prepared,
+      const Eigen::Vector3d& base_v_cmd,
+      double base_w_dot,
+      bool base_guidance_valid,
+      phase_offset_navigation::RuntimeStepOutput& output);
+  bool completeAtomicNeutralHandoff(
+      const MatchedAdapterInput& input,
+      const std::shared_ptr<const PathTubePair>& pair,
+      const phase_offset_navigation::RuntimePreparedStep& prepared,
+      const Eigen::Vector3d& base_v_cmd,
+      double base_w_dot,
+      bool base_guidance_valid,
+      phase_offset_navigation::RuntimeStepOutput& output);
+  void clearPendingPositionCommandLocked();
+  bool validatePendingPositionCommandLocked(std::string* reason) const;
   static bool exactLivePairPublicationControl(
       const ControlPublishSnapshot& control,
       const TubeBuildRequest& request,
@@ -823,6 +934,36 @@ class PhaseOffsetMatchedAdapter {
   // control-publication snapshot construction never run on the tube timer.
   PhaseOffsetActiveAdapter zero_port_adapter_;
   std::unique_ptr<phase_offset_navigation::PhaseOffsetRuntime> runtime_;
+  // Sole mutable execution-state authority for selected-u/runtime commits.
+  // H2 pair ownership remains a separate immutable handoff contract.
+  phase_offset_navigation::PhaseOffsetExecutionAuthority execution_authority_;
+  phase_offset_navigation::PhaseOffsetRecoveryOwner recovery_owner_;
+  phase_offset_navigation::HandoffStateMachine handoff_state_machine_;
+  // Deferred production transaction.  The token is a bounded value DTO,
+  // never a copied Runtime/path/profile, and remains staging only until a
+  // successful local PositionCommand publication is reported.
+  phase_offset_navigation::RuntimeCommitToken pending_runtime_commit_;
+  phase_offset_navigation::AuthorityPreparedStep pending_authority_prepared_;
+  phase_offset_navigation::RecoveryPreparedStep pending_recovery_step_;
+  bool pending_recovery_step_valid_ = false;
+  phase_offset_navigation::HandoffStateInput pending_handoff_input_;
+  phase_offset_navigation::HandoffDecision pending_handoff_decision_;
+  bool pending_handoff_valid_ = false;
+  // A RECOVERY snapshot may intentionally execute against a staged successor
+  // before the manager can install that pair.  Keep both immutable pair
+  // identities bound to the pending PositionCommand: the source is the exact
+  // live predecessor captured for this tick, while execution is the exact
+  // source/target pair whose geometry/query produced the candidate.  Final
+  // publication accepts only these shared_ptr identities, never a same-
+  // revision clone assembled from independent slots.
+  std::shared_ptr<const PathTubePair> pending_recovery_source_pair_;
+  std::shared_ptr<const PathTubePair> pending_recovery_execution_pair_;
+  std::shared_ptr<const PathTubePair> pending_recovery_target_pair_;
+  double recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t recovery_deadline_session_ = 0U;
+  std::uint64_t recovery_deadline_target_revision_ = 0U;
+  std::uint64_t pending_authority_session_ = 0U;
+  bool pending_authority_valid_ = false;
   // Runtime is command-owned.  Staging takes only a short snapshot/dry-run
   // lock; it never holds this lock while constructing a path or tube.
   mutable std::mutex runtime_command_mutex_;

@@ -23,6 +23,10 @@ add_library(phase_offset_navigation
   src/tube_surface_validator.cpp
   src/certified_tube_builder.cpp
   src/phase_offset_runtime.cpp
+  src/active_reference_authority.cpp
+  src/preview_feasibility.cpp
+  src/handoff_state_machine.cpp
+  src/phase_offset_recovery_owner.cpp
   src/tube_epoch_manager.cpp
 )
 target_include_directories(phase_offset_navigation
@@ -52,6 +56,14 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(phase_offset_certified_tube_builder_test
     test/certified_tube_builder_test.cpp)
   catkin_add_gtest(phase_offset_runtime_test test/runtime_test.cpp)
+  catkin_add_gtest(phase_offset_active_reference_authority_test
+    test/active_reference_authority_test.cpp)
+  catkin_add_gtest(phase_offset_preview_feasibility_test
+    test/preview_feasibility_test.cpp)
+  catkin_add_gtest(phase_offset_handoff_state_machine_test
+    test/handoff_state_machine_test.cpp)
+  catkin_add_gtest(phase_offset_recovery_owner_test
+    test/phase_offset_recovery_owner_test.cpp)
   catkin_add_gtest(phase_offset_tube_epoch_manager_test
     test/tube_epoch_manager_test.cpp)
   foreach(target
@@ -62,6 +74,10 @@ if(CATKIN_ENABLE_TESTING)
       phase_offset_tube_surface_validator_test
       phase_offset_certified_tube_builder_test
       phase_offset_runtime_test
+      phase_offset_active_reference_authority_test
+      phase_offset_preview_feasibility_test
+      phase_offset_handoff_state_machine_test
+      phase_offset_recovery_owner_test
       phase_offset_tube_epoch_manager_test)
     if(TARGET ${target})
       target_link_libraries(${target}

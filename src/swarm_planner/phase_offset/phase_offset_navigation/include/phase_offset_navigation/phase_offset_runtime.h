@@ -2,6 +2,7 @@
 
 #include "phase_offset_navigation/tube_epoch_types.h"
 #include "phase_offset_navigation/tube_filter.h"
+#include "phase_offset_navigation/recovery_prepared_step.h"
 
 #include <phase_offset_core/geometry.h>
 #include <phase_offset_core/matched_port.h>
@@ -196,6 +197,7 @@ struct RuntimePreparedStep {
   bool zero_gate_open = false;
   bool requires_base_guidance = false;
   bool frame_bound = false;
+  bool exact_terminal_predicate = false;
   bool valid = false;
   std::string invalid_reason;
 };
@@ -217,8 +219,34 @@ struct RuntimeStepOutput {
   double delta_ref = 0.0;
   bool profile_active = false;
   bool selected = false;
+  bool exact_terminal_predicate = false;
+  RecoveryStepStatus recovery_status = RecoveryStepStatus::NONE;
+  bool recovery_replan_required = false;
   bool valid = false;
   std::string invalid_reason;
+};
+
+// Minimal no-allocation commit token for the publish-then-commit boundary.
+// It carries only the exact next ZOH state and lifecycle facts; it never owns
+// a path/profile copy or a second Runtime authority.
+struct RuntimeCommitToken {
+  phase_offset_core::PortCommand expected_previous_final_port;
+  double expected_delta = 0.0;
+  phase_offset_core::PortCommand next_previous_final_port;
+  double next_delta = 0.0;
+  double dt = 0.0;
+  bool selected = false;
+  bool valid = false;
+  bool safety_priority = false;
+  bool should_start_profile = false;
+  bool profile_active = false;
+  // Explicit post-publication terminalization for an already validated
+  // atomic neutral handoff.  This is a value-only commit fact; completion is
+  // never inferred from a pre-publication tolerance check.
+  bool complete_profile = false;
+  // Explicit proof that the selected recurrence arrived exactly at neutral;
+  // this is never inferred from a tolerance in the commit seam.
+  bool exact_terminal_predicate = false;
 };
 
 // One-shot exact-port evaluation over a caller-owned staging copy.  It carries
@@ -253,6 +281,14 @@ class PhaseOffsetRuntime {
                 double base_w_dot,
                 bool base_guidance_valid,
                 RuntimeStepOutput& output);
+  bool makeCommitToken(const RuntimePreparedStep& prepared,
+                       const RuntimeStepOutput& output,
+                       RuntimeCommitToken& token) const;
+  bool commitToken(const RuntimeCommitToken& token);
+  // Called only after authority finalValidate() and successful local
+  // PositionCommand publication.  It performs bounded value writes and
+  // cannot reject, allocate, or run another proof.
+  void commitTokenNoFail(const RuntimeCommitToken& token) noexcept;
   // Runs refresh/prepare/complete on a local copy.  Live preflight, delta,
   // previous port and profile lifecycle remain unchanged on every outcome.
   bool dryRun(const RuntimeDryRunInput& input, RuntimeDryRunResult& result) const;
@@ -271,6 +307,12 @@ class PhaseOffsetRuntime {
   // incomplete, or while a nonzero retained offset is live.  This is the
   // predicate for requiring an atomic nonzero path--tube handoff.
   bool hasExecutedOffsetAuthority() const;
+  // Recovery/Handoff requests a continuous return through the currently
+  // authoritative owner.  It does not reset delta or swap to planner-only;
+  // completion is observed and committed only after an accepted exact step
+  // reaches neutral.
+  void requestRecenter();
+  bool recenterRequested() const { return returning_to_center_; }
   phase_offset_core::PortCommand previousFinalPort() const {
     return previous_final_port_;
   }
