@@ -1171,6 +1171,13 @@ bool PhaseOffsetMatchedAdapter::requiresPathTubePairBootstrapLocked() const {
       config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
     return false;
   }
+  // Runtime is a deterministic unadvertised fixture owner only.  The same
+  // existing authority capability is cleared by advertise() for production;
+  // do not let passive Runtime intent bootstrap a PathTubePair that cannot
+  // legally execute production NORMAL selected-u.
+  if (!execution_authority_.config().allow_test_only_runtime_owner) {
+    return false;
+  }
   // Configuration alone must never capture the planner frontend.  This is
   // intentionally the post-warm-up activation edge: the manager will build
   // and dry-run a same-owner pair before Runtime is allowed to start.
@@ -1215,6 +1222,12 @@ bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPairLocked(
     const std::shared_ptr<const PathTubePair>& pair) const {
   if (!pair || !requiresTubeTimer() || config_.observe_only || !runtime_ ||
       config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
+    return false;
+  }
+  // A Runtime-owned pending activation is valid only for the existing
+  // unadvertised test fixture capability.  In production, an already present
+  // never-executed Runtime pair must not block neutral planner retirement.
+  if (!execution_authority_.config().allow_test_only_runtime_owner) {
     return false;
   }
   return IsOffsetCertifiedProfile(pair->active_profile) &&
@@ -2146,6 +2159,7 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
   snapshot.map_observation_sequence = request->map_observation_sequence;
   snapshot.map_observation_is_snapshot = request->map_observation_is_snapshot;
   snapshot.request_stamp = request->stamp;
+  snapshot.candidate_build_w = request->current_path.w;
 
   PathSamples sampled;
   const bool sampled_ok = collectSamples(*request, sampled);
@@ -3081,6 +3095,7 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   epoch->source_revision = candidate->source_revision;
   epoch->map_observation_sequence = candidate->map_observation_sequence;
   epoch->map_observation_is_snapshot = candidate->map_observation_is_snapshot;
+  epoch->candidate_build_w = request.current_path.w;
   epoch->full_path_samples = candidate->full_path_samples;
   // The pair branch exposes this prepared profile as both Candidate and Active
   // evidence.  Keep its immutable epoch snapshot consistent for the existing
@@ -5523,6 +5538,16 @@ bool PhaseOffsetMatchedAdapter::buildMarkers(
     const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
         candidate_marker_profile,
     MatchedAdapterMarkerBundle& markers) const {
+  return buildMarkers(control, candidate_marker_profile, control.current_w,
+                      markers);
+}
+
+bool PhaseOffsetMatchedAdapter::buildMarkers(
+    const ControlPublishSnapshot& control,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
+        candidate_marker_profile,
+    const double candidate_anchor_w,
+    MatchedAdapterMarkerBundle& markers) const {
   markers = MatchedAdapterMarkerBundle();
   const MatchedAdapterOutput& output = control.output;
   markers.base_path = MakeLine(control.stamp, config_.frame_id,
@@ -5567,10 +5592,30 @@ bool PhaseOffsetMatchedAdapter::buildMarkers(
       ? *candidate_marker_profile : empty;
   const auto& active = output.active_profile ? *output.active_profile : empty;
   markers.tube_candidate = MakeCandidateTubeMarkers(control.stamp, config_.frame_id, candidate,
-      config_.mode == PhaseOffsetMatchedMode::MANUAL, control.current_w);
+      config_.mode == PhaseOffsetMatchedMode::MANUAL, candidate_anchor_w);
   markers.tube = MakeCertifiedTubeMarkers(control.stamp, config_.frame_id, active,
       tubeDisplayCertified(output));
   return output.geometry.valid;
+}
+
+bool PhaseOffsetMatchedAdapter::buildMarkers(
+    const ControlPublishSnapshot& control,
+    const std::shared_ptr<const TubeEpochSnapshot>& candidate_epoch,
+    MatchedAdapterMarkerBundle& markers) const {
+  // Production publication must keep Candidate profile and build anchor
+  // under one immutable epoch.  If that provenance is unavailable or not a
+  // finite build phase, fail closed to DELETE rather than guessing from the
+  // later command-cycle phase.
+  if (!candidate_epoch || !candidate_epoch->active ||
+      !candidate_epoch->candidate_profile ||
+      !std::isfinite(candidate_epoch->candidate_build_w)) {
+    return buildMarkers(
+        control, std::shared_ptr<const phase_offset_navigation::TubeProfile>(),
+        std::numeric_limits<double>::quiet_NaN(), markers);
+  }
+
+  return buildMarkers(control, candidate_epoch->candidate_profile,
+                      candidate_epoch->candidate_build_w, markers);
 }
 
 void PhaseOffsetMatchedAdapter::publishManualDelete(
@@ -5701,6 +5746,19 @@ bool PhaseOffsetMatchedAdapter::exactLivePairPublicationControl(
           epoch.epoch_status.candidate_map_observation_sequence;
 }
 
+std::shared_ptr<const TubeEpochSnapshot>
+PhaseOffsetMatchedAdapter::selectCandidateEpochForPublication(
+    const bool exact_live_pair_control,
+    const std::shared_ptr<const TubeEpochSnapshot>& authoritative_candidate,
+    const std::shared_ptr<const TubeEpochSnapshot>& control_epoch) {
+  // A newer authoritative Candidate wins when exact-live-pair publication has
+  // one.  Otherwise the exact live pair epoch remains the Candidate owner;
+  // never substitute the later command-cycle phase for either epoch.
+  return exact_live_pair_control && authoritative_candidate
+      ? authoritative_candidate
+      : control_epoch;
+}
+
 void PhaseOffsetMatchedAdapter::publishManual(
     const ControlPublishSnapshot& control) {
   if (!advertised_ || config_.mode != PhaseOffsetMatchedMode::MANUAL) return;
@@ -5818,7 +5876,7 @@ void PhaseOffsetMatchedAdapter::publishManual(
       authoritative_control.output.candidate_profile.reset();
       authoritative_control.output.active_profile.reset();
     }
-    buildMarkers(authoritative_control, markers);
+    buildMarkers(authoritative_control, authoritative_candidate, markers);
     markers.tube = MakeCertifiedTubeMarkers(
         control.stamp, config_.frame_id,
         phase_offset_navigation::TubeProfile(), false);
@@ -5831,12 +5889,20 @@ void PhaseOffsetMatchedAdapter::publishManual(
   }
 
   MatchedAdapterMarkerBundle markers;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>
-      candidate_marker_profile = exact_live_pair_control &&
-          authoritative_candidate && authoritative_candidate->candidate_profile
-      ? authoritative_candidate->candidate_profile
-      : control.output.candidate_profile;
-  buildMarkers(control, candidate_marker_profile, markers);
+  const std::shared_ptr<const TubeEpochSnapshot> candidate_epoch =
+      selectCandidateEpochForPublication(
+          exact_live_pair_control, authoritative_candidate,
+          control.epoch_snapshot);
+  if (candidate_epoch) {
+    buildMarkers(control, candidate_epoch, markers);
+  } else {
+    // No exact immutable Candidate epoch is available; retain the existing
+    // fail-closed DELETE behavior without using ControlPublishSnapshot::current_w.
+    buildMarkers(
+        control,
+        std::shared_ptr<const phase_offset_navigation::TubeProfile>(),
+        std::numeric_limits<double>::quiet_NaN(), markers);
+  }
   // Publication owns the one-shot 50-field "tube due" fact.  A later 50 Hz
   // command may overwrite its control snapshot before this tick, so command
   // output cannot be the authoritative pending bit.

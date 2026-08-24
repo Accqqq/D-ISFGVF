@@ -473,6 +473,11 @@ class GvfManagerS4AnchorTestAccess {
     }
   }
 
+  static bool requiresPathTubePairBootstrap(gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->requiresPathTubePairBootstrap();
+  }
+
   static void openManualGate(gvf_manager& manager) {
     if (manager.phase_offset_matched_adapter_) {
       manager.phase_offset_matched_adapter_->zero_gate_open_ = true;
@@ -1979,6 +1984,54 @@ TEST(GvfTimerBootstrap,
   EXPECT_TRUE(executed.executed_authority);
   EXPECT_FALSE(executed.pending_activation);
   EXPECT_TRUE(executed.h2_required);
+}
+
+TEST(GvfTimerBootstrap,
+     AdvertisedRuntimeIntentCannotBootstrapOrBlockNeutralPlannerReplacement) {
+  FLAG_Race::gvf_manager manager;
+  const auto owner = makeTimerBootstrapPath(std::function<void()>());
+  const auto replacement = makeTimerBootstrapPath(std::function<void()>());
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(replacement);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                  installTimerBootstrapFixture(manager, owner));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setOdom(
+      manager, Eigen::Vector3d(0.4, 0.0, 1.0));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, 0.4, true, false);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setAdapterAdvertised(manager, true);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setTestOnlyRuntimeOwnerAllowed(
+      manager, false);
+
+  ASSERT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   requiresPathTubePairBootstrap(manager));
+  const auto attempt = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      activateTimerBootstrapAttempt(manager);
+  EXPECT_FALSE(attempt.committed);
+  EXPECT_EQ("NOT_REQUIRED", attempt.outcome);
+  EXPECT_EQ("NONE", attempt.stage_failure);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   bootstrapAuthority(manager));
+
+  const auto handoff = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      captureReplanHandoff(manager);
+  EXPECT_FALSE(handoff.pair);
+  EXPECT_FALSE(handoff.executed_authority);
+  EXPECT_FALSE(handoff.pending_activation);
+  EXPECT_FALSE(handoff.h2_required);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   recoveryMailbox(manager).pending);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   authoritySnapshot(manager).valid);
+
+  const auto neutral = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      attemptNeutralPlannerFrontend(manager, replacement);
+  EXPECT_TRUE(neutral.committed);
+  EXPECT_TRUE(neutral.installed_new_owner);
+  EXPECT_FALSE(neutral.pair_present);
+  EXPECT_GT(neutral.session_after, neutral.session_before);
+  EXPECT_DOUBLE_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                       retainedDelta(manager), 0.0);
 }
 
 TEST(GvfTimerBootstrap, ResetDuringStageRejectsWithoutPublishingAuthority) {

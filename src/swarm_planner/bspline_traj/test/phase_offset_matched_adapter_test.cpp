@@ -21,6 +21,7 @@
 #undef private
 #include "bspline_race/integration/phase_offset_executed_reference_query.h"
 #include "bspline_race/integration/phase_offset_tube_epoch_diagnostics.h"
+#include "phase_offset_navigation/certified_tube_builder.h"
 
 namespace FLAG_Race {
 namespace {
@@ -629,6 +630,7 @@ PairPublicationFixture MakePairPublicationFixture() {
   pair_epoch->source_revision = source_revision;
   pair_epoch->map_observation_sequence = epoch_map_sequence;
   pair_epoch->map_observation_is_snapshot = true;
+  pair_epoch->candidate_build_w = 0.5;
   pair_epoch->full_path_samples =
       std::make_shared<const MatchedAdapterPathSamples>(MakePath().samples);
   pair_epoch->candidate_profile = fixture.pair_profile;
@@ -684,6 +686,7 @@ PairPublicationFixture MakePairPublicationFixture() {
   timer_epoch->source_revision = source_revision;
   timer_epoch->map_observation_sequence = 99U;
   timer_epoch->map_observation_is_snapshot = true;
+  timer_epoch->candidate_build_w = 0.4;
   timer_epoch->candidate_profile = fixture.timer_candidate_profile;
   timer_epoch->epoch_status = output.tube_epoch_status;
   fixture.timer_candidate_epoch = timer_epoch;
@@ -1014,6 +1017,121 @@ TEST(PhaseOffsetMatchedAdapterTest,
   neutral.runtime_->delta_ = 0.02;
   EXPECT_TRUE(neutral.requiresAuthoritativeOffsetHandoff());
   EXPECT_FALSE(neutral.requiresPathTubePairBootstrap());
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     ProductionRuntimeCapabilityDisablesBootstrapAndPendingActivation) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  for (int cycle = 0; cycle < 100; ++cycle) {
+    EXPECT_FALSE(adapter.update(MakeInput(path, &path, cycle * kDt), output));
+    if (cycle == 0) {
+      ASSERT_TRUE(adapter.timerTick());
+    }
+  }
+  ASSERT_TRUE(output.zero_gate_open);
+  ASSERT_TRUE(adapter.execution_authority_.config().allow_test_only_runtime_owner);
+  ASSERT_TRUE(adapter.requiresPathTubePairBootstrap());
+
+  const std::shared_ptr<const ContinuousPhasePath> owner = MakeSyntheticOwner();
+  ASSERT_TRUE(owner);
+  MatchedAdapterInput activation_input = MakeInput(path, owner.get(), 100.0 * kDt);
+  activation_input.semantic_path_owner = owner;
+  activation_input.semantic_path_start_w = owner->startW();
+  activation_input.semantic_path_end_w = owner->endW();
+  PathTubePairTransaction transaction;
+  ASSERT_TRUE(adapter.stagePathTubePair(
+      std::shared_ptr<const PathTubePair>(), owner, path.samples,
+      path.current.w, 1.0, 2.4, activation_input.position,
+      activation_input.gains, activation_input.dt,
+      std::shared_ptr<const plan_env::CloudOccupancySnapshot>(), transaction));
+  std::shared_ptr<const PathTubePair> pair;
+  ASSERT_TRUE(PrepareAndFinalizePair(
+      adapter, transaction, path.current.w, activation_input.position,
+      activation_input.gains, activation_input.dt,
+      std::shared_ptr<const plan_env::CloudOccupancySnapshot>(), pair));
+  ASSERT_TRUE(pair);
+  ASSERT_TRUE(adapter.hasPendingOffsetActivationPair(pair));
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), 0.0);
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+
+  // This is the same capability fact cleared by advertise().  It is the only
+  // permitted distinction between the unadvertised fixture and production.
+  adapter.execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
+  EXPECT_FALSE(adapter.requiresPathTubePairBootstrap());
+  EXPECT_FALSE(adapter.hasPendingOffsetActivationPair(pair));
+  std::uint64_t retired_session = 0U;
+  EXPECT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+      adapter.authority_session_.load(std::memory_order_acquire),
+      retired_session));
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), 0.0);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     EsdfBelowRequiredCentrelineClearanceRemainsZeroOnlyFailClosed) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  phase_offset_navigation::CertifiedTubeBuilder builder(
+      config.tube, config.filter,
+      phase_offset_navigation::TubeSurfaceValidatorConfig());
+  ASSERT_TRUE(builder.configurationValid());
+
+  phase_offset_navigation::CertifiedTubeBuildInput input;
+  input.source = TubeSource::ESDF;
+  input.preview_path.push_back(MakeStraightState(0.4));
+  input.preview_path.push_back(MakeStraightState(0.8));
+  input.preview_path.push_back(MakeStraightState(1.2));
+  input.current_w = 0.4;
+  input.current_delta = 0.0;
+  input.path_source_revision = 11U;
+  input.tube_revision = 12U;
+  input.map_observation_sequence = 13U;
+  input.map_observation_is_snapshot = true;
+  input.cloud_snapshot_resolution = 0.10;
+  input.path_state_query = [](const double w,
+                              phase_offset_core::PathDifferentialState& state) {
+    state = MakeStraightState(w);
+    return true;
+  };
+  input.cloud_clearance_query =
+      [](const Eigen::Vector3d&, const double) {
+        phase_offset_navigation::ClearanceQueryResult result;
+        result.status = DistanceStatus::KNOWN_FREE;
+        result.clearance = 0.39;
+        result.clearance_certified = true;
+        return result;
+      };
+
+  phase_offset_navigation::CertifiedTubeBuildResult result;
+  ASSERT_TRUE(builder.build(input, result));
+  ASSERT_TRUE(result.complete);
+  ASSERT_TRUE(result.profile.raw_complete);
+  ASSERT_TRUE(result.profile.filtered_complete);
+  EXPECT_EQ(result.profile.classification,
+            phase_offset_navigation::TubeProfileClassification::
+                ZERO_ONLY_PLANNER_BASELINE);
+  EXPECT_TRUE(result.profile.zero_only);
+  ASSERT_FALSE(result.profile.samples.empty());
+  EXPECT_EQ(result.profile.samples.front().cross_section_reason,
+            phase_offset_navigation::TubeCrossSectionReason::
+                EMPTY_AFTER_OBSTACLE_BOUNDS);
+  EXPECT_DOUBLE_EQ(result.profile.samples.front().filtered_lower, 0.0);
+  EXPECT_DOUBLE_EQ(result.profile.samples.front().filtered_upper, 0.0);
+
+  // The adapter lifecycle remains neutral for a zero-only candidate; the
+  // below-clearance evidence cannot manufacture a nonzero owner/bootstrap.
+  PhaseOffsetMatchedAdapter adapter(config);
+  std::shared_ptr<TubeEpochSnapshot> epoch(new TubeEpochSnapshot());
+  epoch->active = true;
+  epoch->active_profile = std::make_shared<const TubeProfile>(result.profile);
+  epoch->epoch_status.active_available = true;
+  epoch->epoch_status.active_classification = result.profile.classification;
+  std::atomic_store(&adapter.latest_epoch_snapshot_,
+                    std::shared_ptr<const TubeEpochSnapshot>(epoch));
+  adapter.zero_gate_open_ = true;
+  EXPECT_FALSE(adapter.requiresPathTubePairBootstrap());
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), 0.0);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -1537,6 +1655,208 @@ TEST(PhaseOffsetMatchedAdapterTest, MarkersReadCandidateAndActiveProfilesSeparat
   EXPECT_NEAR(markers.tube.markers[0].points.front().x, 20.0, 1e-12);
 }
 
+TEST(PhaseOffsetMatchedAdapterCandidateProvenance,
+     EpochCopiesBuildPhaseBitExactly) {
+  SyntheticPath path = MakePath();
+  const double build_w = std::nextafter(0.4, 1.0);
+  path.current = MakeState(build_w);
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  const MatchedAdapterInput input = MakeInput(path, &path, 0.0);
+
+  ASSERT_FALSE(adapter.update(input, output));
+  ASSERT_TRUE(adapter.timerTick());
+  const std::shared_ptr<const TubeEpochSnapshot> epoch =
+      std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+  ASSERT_TRUE(epoch);
+  EXPECT_EQ(0, std::memcmp(&epoch->candidate_build_w, &build_w,
+                           sizeof(build_w)));
+}
+
+TEST(PhaseOffsetMatchedAdapterCandidateProvenance,
+     DelayedCommandPhaseUsesSameBuildAnchorForCandidateMarkers) {
+  SyntheticPath build_path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  const MatchedAdapterInput build_input = MakeInput(build_path, &build_path,
+                                                    0.0);
+  ASSERT_FALSE(adapter.update(build_input, output));
+  ASSERT_TRUE(adapter.timerTick());
+  const std::shared_ptr<const TubeEpochSnapshot> epoch =
+      std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+  ASSERT_TRUE(epoch);
+  ASSERT_TRUE(epoch->candidate_profile);
+  ASSERT_TRUE(epoch->candidate_profile->raw_build_samples.size() >= 2U);
+  EXPECT_EQ(0, std::memcmp(&epoch->candidate_build_w, &build_input.path.w,
+                           sizeof(build_input.path.w)));
+
+  SyntheticPath later_path = build_path;
+  later_path.current = MakeState(1.35);
+  const MatchedAdapterInput later_input = MakeInput(later_path, &build_path,
+                                                    0.02);
+  ASSERT_FALSE(adapter.update(later_input, output));
+  const std::shared_ptr<const ControlPublishSnapshot> control =
+      std::atomic_load(&adapter.latest_control_snapshot_);
+  ASSERT_TRUE(control);
+  ASSERT_EQ(control->epoch_snapshot.get(), epoch.get());
+  EXPECT_DOUBLE_EQ(control->current_w, later_input.path.w);
+
+  const MatchedAdapterOutput output_before_marker = control->output;
+  const std::shared_ptr<const TubeProfile> candidate_profile_before =
+      control->output.candidate_profile;
+  const std::shared_ptr<const TubeProfile> active_profile_before =
+      control->output.active_profile;
+  const std::shared_ptr<const TubeEpochSnapshot> epoch_before_marker =
+      control->epoch_snapshot;
+  const std::shared_ptr<const MatchedAdapterPathSamples> samples_before_marker =
+      control->full_path_samples;
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_before =
+      adapter.execution_authority_.snapshot();
+  const std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
+      authority_pointer_before = adapter.execution_authority_.snapshotPtr();
+  const phase_offset_core::PortCommand previous_port_before =
+      adapter.runtime_->previousFinalPort();
+  const double retained_delta_before = adapter.runtime_->retainedDelta();
+  const phase_offset_navigation::PhaseOffsetRuntime* runtime_pointer_before =
+      adapter.runtime_.get();
+
+  // Production publishManual() selects one immutable epoch and calls this
+  // const marker-construction overload.  It receives no mutable planner or
+  // governor handle; the adapter-boundary assertions below document the
+  // visualization-only noninterference contract without adding a hook/state.
+
+  MatchedAdapterMarkerBundle same_build;
+  ASSERT_TRUE(adapter.buildMarkers(*control, epoch, same_build));
+  ExpectActions(same_build.tube_candidate, visualization_msgs::Marker::ADD);
+  for (const visualization_msgs::Marker& marker : same_build.tube_candidate.markers) {
+    EXPECT_FALSE(marker.points.empty());
+  }
+
+  const auto& raw_samples = epoch->candidate_profile->raw_build_samples;
+  std::size_t anchor_index = raw_samples.size();
+  for (std::size_t index = 0U; index < raw_samples.size(); ++index) {
+    if (std::memcmp(&raw_samples[index].w, &epoch->candidate_build_w,
+                    sizeof(epoch->candidate_build_w)) == 0) {
+      anchor_index = index;
+      break;
+    }
+  }
+  ASSERT_LT(anchor_index, raw_samples.size());
+  const TubeRawSample& anchor_sample = raw_samples[anchor_index];
+  const Eigen::Vector3d expected_lower =
+      anchor_sample.p + anchor_sample.N * anchor_sample.filtered_lower;
+  const Eigen::Vector3d expected_upper =
+      anchor_sample.p + anchor_sample.N * anchor_sample.filtered_upper;
+  const auto point_matches_bits = [](const geometry_msgs::Point& actual,
+                                     const Eigen::Vector3d& expected) {
+    return std::memcmp(&actual.x, &expected[0], sizeof(double)) == 0 &&
+        std::memcmp(&actual.y, &expected[1], sizeof(double)) == 0 &&
+        std::memcmp(&actual.z, &expected[2], sizeof(double)) == 0;
+  };
+  bool found_anchor_lower = false;
+  bool found_anchor_upper = false;
+  for (const geometry_msgs::Point& point :
+       same_build.tube_candidate.markers[0].points) {
+    found_anchor_lower = found_anchor_lower ||
+        point_matches_bits(point, expected_lower);
+  }
+  for (const geometry_msgs::Point& point :
+       same_build.tube_candidate.markers[1].points) {
+    found_anchor_upper = found_anchor_upper ||
+        point_matches_bits(point, expected_upper);
+  }
+  EXPECT_TRUE(found_anchor_lower);
+  EXPECT_TRUE(found_anchor_upper);
+
+  // The compatibility path intentionally models the old command-phase
+  // helper; with the later phase it must fail exact-anchor selection.
+  MatchedAdapterMarkerBundle later_phase;
+  ASSERT_TRUE(adapter.buildMarkers(*control, later_phase));
+  ExpectActions(later_phase.tube_candidate,
+                visualization_msgs::Marker::DELETE);
+
+  EXPECT_EQ(control->epoch_snapshot.get(), epoch_before_marker.get());
+  EXPECT_EQ(control->full_path_samples.get(), samples_before_marker.get());
+  EXPECT_EQ(control->output.candidate_profile.get(),
+            candidate_profile_before.get());
+  EXPECT_EQ(control->output.active_profile.get(), active_profile_before.get());
+  EXPECT_EQ(control->output.selected, output_before_marker.selected);
+  EXPECT_EQ(control->output.valid, output_before_marker.valid);
+  EXPECT_DOUBLE_EQ(control->output.delta, output_before_marker.delta);
+  EXPECT_DOUBLE_EQ(control->output.delta_ref, output_before_marker.delta_ref);
+  EXPECT_EQ(control->output.tube_epoch_status.candidate_sequence,
+            output_before_marker.tube_epoch_status.candidate_sequence);
+  EXPECT_EQ(control->output.tube_epoch_status.active_tube_epoch,
+            output_before_marker.tube_epoch_status.active_tube_epoch);
+  EXPECT_TRUE((control->output.guidance.v_cmd -
+               output_before_marker.guidance.v_cmd).isZero());
+  EXPECT_DOUBLE_EQ(control->output.guidance.w_dot,
+                   output_before_marker.guidance.w_dot);
+  EXPECT_TRUE((control->output.base_guidance.v_cmd -
+               output_before_marker.base_guidance.v_cmd).isZero());
+  EXPECT_DOUBLE_EQ(control->output.base_guidance.w_dot,
+                   output_before_marker.base_guidance.w_dot);
+  EXPECT_TRUE((control->output.matched.v_cmd -
+               output_before_marker.matched.v_cmd).isZero());
+  EXPECT_DOUBLE_EQ(control->output.projection.final_port.u_w,
+                   output_before_marker.projection.final_port.u_w);
+  EXPECT_DOUBLE_EQ(control->output.projection.final_port.u_delta,
+                   output_before_marker.projection.final_port.u_delta);
+  EXPECT_EQ(adapter.runtime_.get(), runtime_pointer_before);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), retained_delta_before);
+  const phase_offset_core::PortCommand previous_port_after =
+      adapter.runtime_->previousFinalPort();
+  EXPECT_EQ(0, std::memcmp(&previous_port_after.u_w,
+                           &previous_port_before.u_w,
+                           sizeof(previous_port_before.u_w)));
+  EXPECT_EQ(0, std::memcmp(&previous_port_after.u_delta,
+                           &previous_port_before.u_delta,
+                           sizeof(previous_port_before.u_delta)));
+  EXPECT_EQ(adapter.execution_authority_.snapshotPtr().get(),
+            authority_pointer_before.get());
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_after =
+      adapter.execution_authority_.snapshot();
+  EXPECT_EQ(authority_after.snapshotId(), authority_before.snapshotId());
+  EXPECT_EQ(authority_after.sequence, authority_before.sequence);
+  EXPECT_EQ(authority_after.owner_mode, authority_before.owner_mode);
+  EXPECT_DOUBLE_EQ(authority_after.delta, authority_before.delta);
+}
+
+TEST(PhaseOffsetMatchedAdapterCandidateProvenance,
+     ExactMismatchFailsClosedWithoutTolerance) {
+  PairPublicationFixture fixture = MakePairPublicationFixture();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  std::shared_ptr<TubeEpochSnapshot> mismatched(
+      new TubeEpochSnapshot(*fixture.timer_candidate_epoch));
+  mismatched->candidate_build_w = std::nextafter(0.4, 1.0);
+  MatchedAdapterMarkerBundle markers;
+  ASSERT_TRUE(adapter.buildMarkers(
+      fixture.control, std::shared_ptr<const TubeEpochSnapshot>(mismatched),
+      markers));
+  ExpectActions(markers.tube_candidate, visualization_msgs::Marker::DELETE);
+}
+
+TEST(PhaseOffsetMatchedAdapterCandidateProvenance,
+     AuthoritativeCandidateSubstitutionCouplesProfileAndAnchor) {
+  PairPublicationFixture fixture = MakePairPublicationFixture();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  fixture.control.current_w = 1.3;
+
+  MatchedAdapterMarkerBundle authoritative;
+  ASSERT_TRUE(adapter.buildMarkers(
+      fixture.control, fixture.timer_candidate_epoch, authoritative));
+  ExpectActions(authoritative.tube_candidate,
+                visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(6.0, TubeMarkerWidth(authoritative.tube_candidate));
+
+  MatchedAdapterMarkerBundle pair_markers;
+  ASSERT_TRUE(adapter.buildMarkers(
+      fixture.control, fixture.control.epoch_snapshot, pair_markers));
+  ExpectActions(pair_markers.tube_candidate,
+                visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(5.0, TubeMarkerWidth(pair_markers.tube_candidate));
+}
+
 TEST(PhaseOffsetMatchedAdapterPairPublication,
      ExactLivePairUsesNewerTimerRawCandidateAndPairCertifiedGeometry) {
   PairPublicationFixture fixture = MakePairPublicationFixture();
@@ -1571,11 +1891,59 @@ TEST(PhaseOffsetMatchedAdapterPairPublication,
       fixture.task_generation, fixture.authority_session));
 
   MatchedAdapterMarkerBundle markers;
-  ASSERT_TRUE(adapter.buildMarkers(fixture.control, markers));
+  const std::shared_ptr<const TubeEpochSnapshot> candidate_epoch =
+      adapter.selectCandidateEpochForPublication(
+          true, std::shared_ptr<const TubeEpochSnapshot>(),
+          fixture.control.epoch_snapshot);
+  ASSERT_EQ(candidate_epoch.get(), fixture.control.epoch_snapshot.get());
+  ASSERT_TRUE(adapter.buildMarkers(fixture.control, candidate_epoch, markers));
   ExpectActions(markers.tube_candidate, visualization_msgs::Marker::ADD);
   ExpectActions(markers.tube, visualization_msgs::Marker::ADD);
   EXPECT_DOUBLE_EQ(5.0, TubeMarkerWidth(markers.tube_candidate));
   EXPECT_DOUBLE_EQ(0.20, TubeMarkerWidth(markers.tube));
+}
+
+TEST(PhaseOffsetMatchedAdapterPairPublication,
+     ProductionCandidateEpochSelectionUsesAuthoritativeThenLivePairAndFailsClosedWithoutEpoch) {
+  PairPublicationFixture fixture = MakePairPublicationFixture();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  fixture.control.current_w = 1.3;
+  ASSERT_TRUE(PhaseOffsetMatchedAdapter::exactLivePairPublicationControl(
+      fixture.control, fixture.request, fixture.pair,
+      fixture.task_generation, fixture.authority_session));
+
+  const std::shared_ptr<const TubeEpochSnapshot> authoritative =
+      adapter.selectCandidateEpochForPublication(
+          true, fixture.timer_candidate_epoch, fixture.control.epoch_snapshot);
+  ASSERT_EQ(authoritative.get(), fixture.timer_candidate_epoch.get());
+  MatchedAdapterMarkerBundle authoritative_markers;
+  ASSERT_TRUE(adapter.buildMarkers(fixture.control, authoritative,
+                                   authoritative_markers));
+  ExpectActions(authoritative_markers.tube_candidate,
+                visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(6.0,
+                   TubeMarkerWidth(authoritative_markers.tube_candidate));
+
+  const std::shared_ptr<const TubeEpochSnapshot> live_pair_epoch =
+      adapter.selectCandidateEpochForPublication(
+          true, std::shared_ptr<const TubeEpochSnapshot>(),
+          fixture.control.epoch_snapshot);
+  ASSERT_EQ(live_pair_epoch.get(), fixture.control.epoch_snapshot.get());
+  MatchedAdapterMarkerBundle live_pair_markers;
+  ASSERT_TRUE(adapter.buildMarkers(fixture.control, live_pair_epoch,
+                                   live_pair_markers));
+  ExpectActions(live_pair_markers.tube_candidate,
+                visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(5.0, TubeMarkerWidth(live_pair_markers.tube_candidate));
+
+  const std::shared_ptr<const TubeEpochSnapshot> no_epoch =
+      adapter.selectCandidateEpochForPublication(
+          true, std::shared_ptr<const TubeEpochSnapshot>(),
+          std::shared_ptr<const TubeEpochSnapshot>());
+  EXPECT_FALSE(no_epoch);
+  MatchedAdapterMarkerBundle deleted;
+  ASSERT_TRUE(adapter.buildMarkers(fixture.control, no_epoch, deleted));
+  ExpectActions(deleted.tube_candidate, visualization_msgs::Marker::DELETE);
 }
 
 TEST(PhaseOffsetMatchedAdapterPairPublication,

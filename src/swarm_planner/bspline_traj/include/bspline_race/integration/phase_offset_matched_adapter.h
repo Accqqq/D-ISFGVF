@@ -503,6 +503,10 @@ struct TubeEpochSnapshot {
   bool map_observation_is_snapshot = false;
   ros::Time request_stamp;
   ros::Time completion_stamp;
+  // Exact finite phase copied from TubeBuildRequest::current_path.w.  This is
+  // Candidate marker provenance for this immutable build and is independent
+  // of any later command-cycle ControlPublishSnapshot::current_w value.
+  double candidate_build_w = 0.0;
   std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
   std::shared_ptr<const phase_offset_navigation::TubeProfile> candidate_profile;
   std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
@@ -587,8 +591,8 @@ struct ControlPublishSnapshot {
   bool candidate_only = false;
   std::uint64_t epoch_build_sequence = 0U;
   ros::Time stamp;
-  // Exact command-cycle phase used to select the same epoch's raw candidate
-  // display range.  It is immutable publication provenance, not a gate.
+  // Exact command-cycle phase retained for command/diagnostic evidence.  It
+  // must not substitute for the selected Candidate epoch's build provenance.
   double current_w = 0.0;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   std::shared_ptr<const TubeEpochSnapshot> epoch_snapshot;
@@ -654,11 +658,16 @@ class PhaseOffsetMatchedAdapter {
   // observation/intent only and the planner remains the command owner.
   // A true result means the zero-port gate is open, Runtime is still neutral,
   // no pair is installed, and the pending profile must be proven atomically
-  // before it can issue its first nonzero port.
+  // before it can issue its first nonzero port.  Runtime bootstrap is
+  // permitted only for an unadvertised test fixture while the existing
+  // execution-authority test-only owner capability is enabled; advertise()
+  // clears that capability for passive production NORMAL.
   bool requiresPathTubePairBootstrap() const;
   // A committed pair may be passed to Runtime for the one activation command
   // even though Runtime has not yet committed its first nonzero port.  The
   // command guidance remains on the planner owner until that commit occurs.
+  // An advertised production adapter never reports a Runtime pair as pending
+  // activation because Runtime is not the production NORMAL owner.
   bool hasPendingOffsetActivationPair(
       const std::shared_ptr<const PathTubePair>& pair) const;
   // Begin bounded in-owner recentering after a successor denial.  This does
@@ -748,6 +757,9 @@ class PhaseOffsetMatchedAdapter {
                    PathSamples& preview) const;
   std::uint64_t sourceRevision(const MatchedAdapterInput& input);
   bool requiresAuthoritativeOffsetHandoffLocked() const;
+  // These two predicates intentionally share the authority configuration's
+  // existing test-only Runtime-owner capability.  They must not arm or retain
+  // passive production Runtime intent after advertise() clears that fact.
   bool requiresPathTubePairBootstrapLocked() const;
   bool hasPendingOffsetActivationPairLocked(
       const std::shared_ptr<const PathTubePair>& pair) const;
@@ -907,12 +919,27 @@ class PhaseOffsetMatchedAdapter {
       const std::shared_ptr<const PathTubePair>& live_pair,
       std::uint64_t current_task_generation,
       std::uint64_t current_authority_session);
+  static std::shared_ptr<const TubeEpochSnapshot>
+  selectCandidateEpochForPublication(
+      bool exact_live_pair_control,
+      const std::shared_ptr<const TubeEpochSnapshot>& authoritative_candidate,
+      const std::shared_ptr<const TubeEpochSnapshot>& control_epoch);
   bool buildMarkers(const ControlPublishSnapshot& control,
                     MatchedAdapterMarkerBundle& markers) const;
   bool buildMarkers(
       const ControlPublishSnapshot& control,
       const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
           candidate_marker_profile,
+      MatchedAdapterMarkerBundle& markers) const;
+  bool buildMarkers(
+      const ControlPublishSnapshot& control,
+      const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
+          candidate_marker_profile,
+      double candidate_anchor_w,
+      MatchedAdapterMarkerBundle& markers) const;
+  bool buildMarkers(
+      const ControlPublishSnapshot& control,
+      const std::shared_ptr<const TubeEpochSnapshot>& candidate_epoch,
       MatchedAdapterMarkerBundle& markers) const;
   bool markEpochBuildPublished(std::uint64_t build_sequence);
   void publishBuildDiagnostics(const TubeEpochSnapshot& epoch);
