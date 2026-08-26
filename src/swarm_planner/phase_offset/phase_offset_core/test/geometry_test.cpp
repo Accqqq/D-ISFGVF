@@ -119,6 +119,32 @@ PathDifferentialState MakeSlopedLine(const double slope, const double w) {
   return path;
 }
 
+PathCellGeometryCertificate MakeConsistentCellCertificate() {
+  PathCellGeometryCertificate certificate;
+  certificate.w0 = 0.0;
+  certificate.w1 = 1.0;
+  certificate.segment_w0 = 0.0;
+  certificate.segment_w1 = 1.0;
+  certificate.segment_identity = 1U;
+  certificate.inf_p_w_norm = 2.0;
+  certificate.inf_horizontal_p_w_norm = 2.0;
+  certificate.sup_p_w_norm = 2.0;
+  certificate.sup_p_ww_norm = 1.0;
+  certificate.sup_p_www_norm = 0.0;
+  certificate.sup_horizontal_p_ww_norm = 1.0;
+  certificate.horizontal_acceleration_bound_complete = true;
+  certificate.sup_N_w_norm = 0.5;
+  certificate.sup_abs_curvature = 0.5;
+  certificate.normal_variation_bound = 0.5;
+  certificate.tangent_variation_bound = 0.5;
+  certificate.curvature_variation_bound = 0.0;
+  certificate.midpoint_position_variation_bound = 0.0;
+  certificate.chord_deviation_bound = 0.0;
+  certificate.valid = true;
+  certificate.complete = true;
+  return certificate;
+}
+
 PathDifferentialState MakeHeightVaryingParabola(const double coefficient,
                                                  const double w) {
   PathDifferentialState path;
@@ -343,6 +369,35 @@ TEST(GeometryEvaluatorTest, HelixMatchesNormalAndReferenceNumericalDerivatives) 
   ExpectVectorNear((plus.r - minus.r) / (2.0 * h), state.r_w, 2e-9);
 }
 
+TEST(GeometryEvaluatorTest, DescendingHelixPreservesAltitudeAndHorizontalOffset) {
+  const GeometryEvaluator evaluator;
+  const double radius = 2.5;
+  const double vertical_rate = -1.25;
+  const double w = 1.1;
+  const double delta = 0.35;
+  const PathDifferentialState path =
+      MakeHelix(radius, vertical_rate, w, 4.0);
+  const PhaseOffsetGeometryState state =
+      Evaluate(evaluator, path, Eigen::Vector3d::Zero(), delta);
+
+  EXPECT_TRUE(state.valid);
+  EXPECT_LT(state.T.z(), -0.40);
+  EXPECT_NEAR(state.r.z(), path.p.z(), 1e-12);
+  EXPECT_NEAR(state.r_w.z(), path.p_w.z(), 1e-12);
+  EXPECT_NEAR(state.N.z(), 0.0, 1e-12);
+  EXPECT_NEAR(state.N_w.z(), 0.0, 1e-12);
+
+  const double h = 1e-5;
+  const PhaseOffsetGeometryState plus = Evaluate(
+      evaluator, MakeHelix(radius, vertical_rate, w + h, 4.0),
+      Eigen::Vector3d::Zero(), delta);
+  const PhaseOffsetGeometryState minus = Evaluate(
+      evaluator, MakeHelix(radius, vertical_rate, w - h, 4.0),
+      Eigen::Vector3d::Zero(), delta);
+  ExpectVectorNear((plus.N - minus.N) / (2.0 * h), state.N_w, 2e-9);
+  ExpectVectorNear((plus.r - minus.r) / (2.0 * h), state.r_w, 2e-9);
+}
+
 TEST(GeometryEvaluatorTest, LargeFiniteVerticalDerivativesAreAccepted) {
   const GeometryEvaluator evaluator;
   const PathDifferentialState path = MakeHeightVaryingParabola(2.0, 1.5);
@@ -358,11 +413,14 @@ TEST(GeometryEvaluatorTest, LargeFiniteVerticalDerivativesAreAccepted) {
   EXPECT_NEAR(state.r.z(), path.p.z(), 1e-12);
 }
 
-TEST(GeometryEvaluatorTest, RegularityMarginStillRejectsHorizontalOffsetFold) {
+TEST(GeometryEvaluatorTest, Full3DRegularityDoesNotUseLegacyCurvatureMargin) {
   GeometryParams params;
   params.regularity_margin = 0.1;
   const GeometryEvaluator evaluator(params);
-  ExpectInvalid(evaluator, MakeCircle(1.0, 0.0), Eigen::Vector3d::Zero(), 0.95);
+  PhaseOffsetGeometryState state;
+  EXPECT_TRUE(evaluator.evaluate(
+      MakeCircle(1.0, 0.0), Eigen::Vector3d::Zero(), 0.95, state));
+  EXPECT_GT(state.regularity, params.minimum_reference_speed);
 }
 
 TEST(GeometryEvaluatorTest, ConfiguredMinimumReferenceSpeedUsesFull3DFrameBound) {
@@ -374,6 +432,8 @@ TEST(GeometryEvaluatorTest, ConfiguredMinimumReferenceSpeedUsesFull3DFrameBound)
   frame_bound.N = Eigen::Vector3d::UnitY();
   frame_bound.N_w = Eigen::Vector3d::UnitX();
   frame_bound.frame_valid = true;
+  frame_bound.frame_provenance =
+      "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
   const GeometryEvaluator evaluator(params);
   PhaseOffsetGeometryState safe;
   const bool safe_ok = evaluator.evaluate(
@@ -386,15 +446,318 @@ TEST(GeometryEvaluatorTest, ConfiguredMinimumReferenceSpeedUsesFull3DFrameBound)
   EXPECT_FALSE(unsafe.valid);
 }
 
-TEST(GeometryEvaluatorTest, VerticalOrNearVerticalPathsAreRejectedSafely) {
+TEST(GeometryEvaluatorTest, IncompatibleFrameProvenanceFailsClosed) {
+  PathDifferentialState incompatible = MakeLine();
+  incompatible.p_w = Eigen::Vector3d(0.20, 0.0, 0.0);
+  incompatible.T = Eigen::Vector3d::UnitX();
+  incompatible.N = Eigen::Vector3d::UnitY();
+  incompatible.N_w = Eigen::Vector3d::UnitX();
+  incompatible.frame_valid = true;
+  incompatible.frame_provenance =
+      "ContinuousPhaseNormalFrame/ProjectedHermiteTransport";
+
+  PhaseOffsetGeometryState output;
+  EXPECT_FALSE(GeometryEvaluator().evaluate(
+      incompatible, Eigen::Vector3d::Zero(), 0.1, output));
+  EXPECT_EQ(output.invalid_reason, "normal frame provenance is incompatible");
+  EXPECT_FALSE(output.valid);
+  ExpectFiniteState(output);
+
+  // An unbound synthetic value is allowed to construct the unique
+  // Horizontal-N representation from p_w/p_ww instead of consuming the
+  // incompatible diagnostic string as frame authority.
+  incompatible.frame_valid = false;
+  output = PhaseOffsetGeometryState();
+  ASSERT_TRUE(GeometryEvaluator().evaluate(
+      incompatible, Eigen::Vector3d::Zero(), 0.1, output));
+  ExpectVectorNear(output.N, Eigen::Vector3d::UnitY(), 1e-12);
+  EXPECT_EQ(output.provenance,
+            "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct");
+}
+
+TEST(GeometryEvaluatorTest, CanonicalFrameThresholdIsStrictForNonzeroOnly) {
+  const double epsilon = phase_offset_core::kHorizontalNormalSpeedEpsilon;
+  const double values[] = {
+      std::nextafter(epsilon, 0.0), epsilon,
+      std::nextafter(epsilon, std::numeric_limits<double>::infinity())};
+  for (const double q : values) {
+    PathDifferentialState path = MakeSlopedLine(1.0, 1.0);
+    path.p_w = Eigen::Vector3d(q, 0.0, 1.0);
+    path.T = path.p_w.normalized();
+    path.N = Eigen::Vector3d::UnitY();
+    path.N_w = Eigen::Vector3d::Zero();
+    path.frame_valid = true;
+    path.frame_provenance = kWorldHorizontalCrossProductProvenance;
+    PhaseOffsetGeometryState neutral;
+    ASSERT_TRUE(GeometryEvaluator().evaluate(
+        path, Eigen::Vector3d::Zero(), 0.0, neutral));
+    PhaseOffsetGeometryState nonzero;
+    const bool ok = GeometryEvaluator().evaluate(
+        path, Eigen::Vector3d::Zero(), 0.1, nonzero);
+    EXPECT_EQ(ok, q > epsilon);
+    EXPECT_EQ(nonzero.valid, q > epsilon);
+  }
+}
+
+TEST(GeometryEvaluatorTest, VerticalOrNearVerticalPathsRetainNeutralCenterline) {
   const GeometryEvaluator evaluator;
   PathDifferentialState near_vertical = MakeSlopedLine(1.0, 0.0);
   near_vertical.p_w = Eigen::Vector3d(1e-10, 0.0, 1.0);
-  ExpectInvalid(evaluator, near_vertical, Eigen::Vector3d::Zero(), 0.0);
+  PhaseOffsetGeometryState neutral;
+  ASSERT_TRUE(evaluator.evaluate(
+      near_vertical, Eigen::Vector3d::Zero(), 0.0, neutral));
+  EXPECT_NEAR(neutral.r.z(), near_vertical.p.z(), 1e-12);
+  ExpectInvalid(evaluator, near_vertical, Eigen::Vector3d::Zero(), 0.1);
 
   PathDifferentialState vertical = MakeSlopedLine(1.0, 0.0);
   vertical.p_w = Eigen::Vector3d(0.0, 0.0, 1.0);
-  ExpectInvalid(evaluator, vertical, Eigen::Vector3d::Zero(), 0.0);
+  ASSERT_TRUE(evaluator.evaluate(
+      vertical, Eigen::Vector3d::Zero(), 0.0, neutral));
+  EXPECT_NEAR(neutral.r_w.z(), vertical.p_w.z(), 1e-12);
+  ExpectInvalid(evaluator, vertical, Eigen::Vector3d::Zero(), 0.1);
+}
+
+TEST(GeometryEvaluatorTest, HorizontalNormalThresholdIsStrictForNonzeroOnly) {
+  const double epsilon = phase_offset_core::kHorizontalNormalSpeedEpsilon;
+  const double below = std::nextafter(epsilon, 0.0);
+  const double equal = epsilon;
+  const double above = std::nextafter(epsilon,
+                                      std::numeric_limits<double>::infinity());
+  for (const double q : {below, equal, above}) {
+    PathDifferentialState path = MakeSlopedLine(1.0, 1.0);
+    path.p_w = Eigen::Vector3d(q, 0.0, 1.0);
+    PhaseOffsetGeometryState neutral;
+    ASSERT_TRUE(GeometryEvaluator().evaluate(
+        path, Eigen::Vector3d::Zero(), 0.0, neutral));
+    EXPECT_NEAR(neutral.r.z(), path.p.z(), 1e-12);
+    PhaseOffsetGeometryState nonzero;
+    const bool ok = GeometryEvaluator().evaluate(
+        path, Eigen::Vector3d::Zero(), 0.1, nonzero);
+    EXPECT_EQ(ok, q > epsilon);
+    EXPECT_EQ(nonzero.valid, q > epsilon);
+  }
+}
+
+TEST(GeometryEvaluatorTest,
+     UnavailableHorizontalNormalRejectsFiniteTinyNonzeroOffsets) {
+  PathDifferentialState path = MakeSlopedLine(1.0, 0.0);
+  path.p_w = Eigen::Vector3d(0.0, 0.0, 1.0);
+  path.T = Eigen::Vector3d::UnitZ();
+  path.N = Eigen::Vector3d::UnitX();
+  path.N_w = Eigen::Vector3d::Zero();
+  path.frame_valid = true;
+  path.frame_provenance = kWorldHorizontalCrossProductProvenance;
+
+  const double tiny = std::numeric_limits<double>::denorm_min();
+  for (const double delta : {tiny, -tiny}) {
+    PhaseOffsetGeometryState output;
+    EXPECT_FALSE(GeometryEvaluator().evaluate(
+        path, Eigen::Vector3d::Zero(), delta, output));
+    EXPECT_EQ(output.invalid_reason, "horizontal path speed is too small");
+    EXPECT_FALSE(output.valid);
+    ExpectFiniteState(output);
+  }
+
+  PhaseOffsetGeometryState neutral;
+  ASSERT_TRUE(GeometryEvaluator().evaluate(
+      path, Eigen::Vector3d::Zero(), 0.0, neutral));
+  EXPECT_TRUE(neutral.valid);
+}
+
+TEST(GeometryEvaluatorTest, ClosedCellHorizontalSpeedThresholdIsStrict) {
+  const double epsilon = phase_offset_core::kHorizontalNormalSpeedEpsilon;
+  const double values[] = {
+      std::nextafter(epsilon, 0.0), epsilon,
+      std::nextafter(epsilon, std::numeric_limits<double>::infinity())};
+  for (const double q : values) {
+    PathCellGeometryCertificate certificate;
+    certificate.w0 = 0.0;
+    certificate.w1 = 1.0;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 1.0;
+    certificate.segment_identity = 1U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = q;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.sup_p_ww_norm = 0.0;
+    certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
+    certificate.sup_N_w_norm = 0.0;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
+    certificate.curvature_variation_bound = 0.0;
+    certificate.midpoint_position_variation_bound = 0.0;
+    certificate.chord_deviation_bound = 0.0;
+    certificate.valid = true;
+    certificate.complete = true;
+    EXPECT_EQ(pathCellGeometryCertificateIsComplete(certificate), q > epsilon);
+  }
+}
+
+TEST(GeometryEvaluatorTest, FrameCellCertificateProvenanceIsStrict) {
+  PathCellGeometryCertificate certificate;
+  certificate.w0 = 0.0;
+  certificate.w1 = 1.0;
+  certificate.path_revision = 7U;
+  certificate.frame_revision = 8U;
+  certificate.segment_w0 = 0.0;
+  certificate.segment_w1 = 1.0;
+  certificate.segment_identity = 1U;
+  certificate.inf_p_w_norm = 1.0;
+  certificate.inf_horizontal_p_w_norm = 1.0;
+  certificate.sup_p_w_norm = 1.0;
+  certificate.sup_p_ww_norm = 0.0;
+  certificate.sup_p_www_norm = 0.0;
+  certificate.sup_horizontal_p_ww_norm = 0.0;
+  certificate.horizontal_acceleration_bound_complete = true;
+  certificate.sup_N_w_norm = 0.0;
+  certificate.sup_abs_curvature = 0.0;
+  certificate.normal_variation_bound = 0.0;
+  certificate.tangent_variation_bound = 0.0;
+  certificate.curvature_variation_bound = 0.0;
+  certificate.midpoint_position_variation_bound = 0.0;
+  certificate.chord_deviation_bound = 0.0;
+  certificate.normal_frame_proof_complete = true;
+  certificate.valid = true;
+  certificate.complete = true;
+
+  certificate.provenance =
+      "ContinuousPhaseNormalFrame/ProjectedHermiteTransport";
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(certificate));
+  certificate.provenance = kWorldHorizontalCrossProductProvenance;
+  EXPECT_TRUE(pathCellGeometryCertificateIsComplete(certificate));
+}
+
+TEST(GeometryEvaluatorTest, CellCertificateRejectsUnderstatedDerivedBounds) {
+  const PathCellGeometryCertificate consistent =
+      MakeConsistentCellCertificate();
+  ASSERT_TRUE(pathCellGeometryCertificateIsComplete(consistent));
+
+  PathCellGeometryCertificate understated_normal = consistent;
+  understated_normal.sup_N_w_norm =
+      std::nextafter(consistent.sup_N_w_norm, 0.0);
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(understated_normal));
+
+  PathCellGeometryCertificate understated_normal_variation = consistent;
+  understated_normal_variation.normal_variation_bound =
+      std::nextafter(consistent.normal_variation_bound, 0.0);
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(
+      understated_normal_variation));
+
+  PathCellGeometryCertificate missing_horizontal_acceleration = consistent;
+  missing_horizontal_acceleration.horizontal_acceleration_bound_complete =
+      false;
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(
+      missing_horizontal_acceleration));
+
+  PathCellGeometryCertificate understated_tangent_variation = consistent;
+  understated_tangent_variation.tangent_variation_bound =
+      std::nextafter(consistent.tangent_variation_bound, 0.0);
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(
+      understated_tangent_variation));
+}
+
+TEST(GeometryEvaluatorTest, CellCertificateBindsProvenanceRevisionAndRange) {
+  PathCellGeometryCertificate bound = MakeConsistentCellCertificate();
+  bound.path_revision = 7U;
+  bound.frame_revision = 8U;
+  bound.normal_frame_proof_complete = true;
+  bound.provenance = kWorldHorizontalCrossProductProvenance;
+  ASSERT_TRUE(pathCellGeometryCertificateIsComplete(bound));
+  EXPECT_TRUE(pathCellGeometryCertificateMatches(bound, 7U, 8U));
+  EXPECT_FALSE(pathCellGeometryCertificateMatches(bound, 7U, 9U));
+
+  PathCellGeometryCertificate one_revision = bound;
+  one_revision.frame_revision = 0U;
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(one_revision));
+
+  PathCellGeometryCertificate range_mismatch = MakeConsistentCellCertificate();
+  range_mismatch.w0 = -0.1;
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(range_mismatch));
+
+  PathCellGeometryCertificate provenance_mismatch = bound;
+  provenance_mismatch.provenance =
+      "ContinuousPhaseNormalFrame/ProjectedHermiteTransport";
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(provenance_mismatch));
+}
+
+TEST(GeometryEvaluatorTest,
+     PositiveSubnormalNormalVariationCannotCollapseToZero) {
+  const double positive_subnormal = std::numeric_limits<double>::denorm_min();
+  PathCellGeometryCertificate certificate = MakeConsistentCellCertificate();
+  certificate.w1 = 0.5;
+  certificate.inf_horizontal_p_w_norm = 1.0;
+  certificate.sup_horizontal_p_ww_norm = positive_subnormal;
+  certificate.sup_N_w_norm = positive_subnormal;
+  certificate.normal_variation_bound = 0.0;
+  EXPECT_FALSE(pathCellGeometryCertificateIsComplete(certificate));
+  certificate.normal_variation_bound = positive_subnormal;
+  EXPECT_TRUE(pathCellGeometryCertificateIsComplete(certificate));
+
+  NormalFrameCellProof proof;
+  proof.w0 = 0.0;
+  proof.w1 = 0.5;
+  proof.path_revision = 7U;
+  proof.frame_revision = 8U;
+  proof.inf_path_speed = 1.0;
+  proof.sup_path_speed = 1.0;
+  proof.sup_path_acceleration = 0.0;
+  proof.sup_path_jerk = 0.0;
+  proof.inf_horizontal_path_speed = 1.0;
+  proof.sup_horizontal_p_ww_norm = positive_subnormal;
+  proof.horizontal_acceleration_bound_complete = true;
+  proof.sup_normal_derivative = positive_subnormal;
+  proof.normal_variation_bound = 0.0;
+  proof.tangent_variation_bound = 0.0;
+  proof.valid = true;
+  proof.complete = true;
+  proof.provenance = kWorldHorizontalCrossProductProvenance;
+  EXPECT_FALSE(normalFrameCellProofIsComplete(proof));
+  proof.normal_variation_bound = positive_subnormal;
+  EXPECT_TRUE(normalFrameCellProofIsComplete(proof));
+}
+
+TEST(GeometryEvaluatorTest,
+     OutwardUpperProductUsesExactDyadicComparisonNearUnderflow) {
+  const double lhs = 0x1.1a283fd4e7426p-376;
+  const double rhs = 0x1.f3c83c1c1ef05p-645;
+  const double ordinary = lhs * rhs;
+  const double expected = std::nextafter(
+      ordinary, std::numeric_limits<double>::infinity());
+  double upper = 0.0;
+  ASSERT_TRUE(outwardUpperProduct(lhs, rhs, upper));
+  EXPECT_DOUBLE_EQ(upper, expected);
+  EXPECT_GT(upper, ordinary);
+
+  double exact = 0.0;
+  ASSERT_TRUE(outwardUpperProduct(0.5, 2.0, exact));
+  EXPECT_DOUBLE_EQ(exact, 1.0);
+  ASSERT_TRUE(outwardUpperProduct(
+      std::numeric_limits<double>::denorm_min(), 0.5, exact));
+  EXPECT_DOUBLE_EQ(exact, std::numeric_limits<double>::denorm_min());
+}
+
+TEST(GeometryEvaluatorTest,
+     OutwardUpperRatioUsesExactDyadicComparisonNearUnderflow) {
+  const double numerator = 0x1.b1c0d9e3ba427p-1022;
+  const double denominator = 0x1.2934d2a911067p-1;
+  const double ordinary = numerator / denominator;
+  const double expected = std::nextafter(
+      ordinary, std::numeric_limits<double>::infinity());
+  double upper = 0.0;
+  ASSERT_TRUE(outwardUpperRatio(numerator, denominator, upper));
+  EXPECT_DOUBLE_EQ(upper, expected);
+  EXPECT_GT(upper, ordinary);
+
+  double exact = 0.0;
+  ASSERT_TRUE(outwardUpperRatio(1.0, 2.0, exact));
+  EXPECT_DOUBLE_EQ(exact, 0.5);
+  ASSERT_TRUE(outwardUpperRatio(
+      std::numeric_limits<double>::denorm_min(), 2.0, exact));
+  EXPECT_DOUBLE_EQ(exact,
+                   std::numeric_limits<double>::denorm_min());
 }
 
 TEST(GeometryEvaluatorTest, InvalidInputsAndParametersHaveFiniteDiagnostics) {
@@ -528,9 +891,9 @@ TEST(GeometryEvaluatorTest, PreparedReferenceRetainsReferenceFieldsOnTerminalFai
   PreparedPathGeometry margin_prepared;
   evaluator.preparePath(margin_path, margin_prepared);
   PreparedReferenceResult margin_reference;
-  EXPECT_FALSE(evaluator.evaluatePreparedReference(
+  EXPECT_TRUE(evaluator.evaluatePreparedReference(
       margin_prepared, zero, 0.95, margin_reference));
-  EXPECT_STREQ("offset regularity margin is violated", margin_reference.invalid_reason);
+  EXPECT_STREQ("", margin_reference.invalid_reason);
   EXPECT_TRUE(std::isfinite(margin_reference.regularity));
   ExpectPreparedReferenceMatchesFull(evaluator, margin_path, zero, 0.95);
 

@@ -52,9 +52,12 @@ PathCellBoundQuery CertifiedLineCells() {
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = 0.0;
     certificate.sup_abs_curvature = 0.0;
     certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
@@ -79,6 +82,8 @@ CertifiedTubePathSamples NearVerticalLine() {
     state.path_revision = 77U;
     state.frame_revision = 79U;
     state.frame_valid = true;
+    state.frame_provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     state.w = w;
     state.valid = true;
     path.push_back(state);
@@ -99,6 +104,8 @@ PathStateQuery ExactNearVerticalLine() {
     state.path_revision = 77U;
     state.frame_revision = 79U;
     state.frame_valid = true;
+    state.frame_provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     state.w = w;
     state.valid = std::isfinite(w);
     return state.valid;
@@ -121,15 +128,20 @@ PathCellBoundQuery CertifiedNearVerticalCells() {
     certificate.sup_p_w_norm = 1.01;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = 0.0;
     certificate.sup_abs_curvature = 0.0;
     certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
     certificate.valid = std::isfinite(w0) && std::isfinite(w1) && w1 > w0;
     certificate.complete = certificate.valid;
     certificate.normal_frame_proof_complete = true;
+    certificate.provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     certificate.combined_regularity_proof_complete = true;
     certificate.regularity_speed_min = 1.0;
     certificate.regularity_speed_max = 1.01;
@@ -1064,6 +1076,27 @@ TEST(CertifiedTubeBuilderTest, ZeroConnectedCapacityCollapsesToCompleteBaseline)
     EXPECT_DOUBLE_EQ(sample.filtered_lower, 0.0);
     EXPECT_DOUBLE_EQ(sample.filtered_upper, 0.0);
   }
+}
+
+TEST(CertifiedTubeBuilderTest, DenormalCapacityRemainsNonzeroEvidence) {
+  TubeBuilderConfig config = Config();
+  config.fixed_delta_max = std::numeric_limits<double>::denorm_min();
+  CertifiedTubeBuildInput input;
+  input.source = TubeSource::FIXED;
+  input.preview_path = Line();
+  input.current_w = 0.0;
+  input.path_source_revision = 31U;
+  input.tube_revision = 41U;
+  CertifiedTubeBuildResult result;
+  ASSERT_TRUE(CertifiedTubeBuilder(config, FilterConfig(),
+                                   TubeSurfaceValidatorConfig())
+                  .build(input, result));
+  EXPECT_EQ(result.profile.classification,
+            TubeProfileClassification::OFFSET_CERTIFIED);
+  EXPECT_FALSE(result.profile.zero_only);
+  ASSERT_FALSE(result.profile.samples.empty());
+  EXPECT_GT(result.profile.samples.front().filtered_upper, 0.0);
+  EXPECT_LT(result.profile.samples.front().filtered_lower, 0.0);
 }
 
 TEST(CertifiedTubeBuilderTest, SurfaceFailureCollapsesAndPreservesFirstFailure) {

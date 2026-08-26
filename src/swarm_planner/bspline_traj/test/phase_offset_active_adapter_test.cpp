@@ -154,7 +154,9 @@ TEST(PhaseOffsetActiveAdapterTest, InvalidPathAndGainsFailWithoutNonFiniteOutput
   const PhaseOffsetActiveAdapter adapter;
   phase_offset_core::PathDifferentialState vertical_path;
   vertical_path.p = Eigen::Vector3d(0.0, 0.0, 1.0);
-  vertical_path.p_w = Eigen::Vector3d(0.0, 0.0, 1.0);
+  // A truly degenerate tangent is required here: a merely vertical tangent
+  // is still a valid full-3-D planner direction under Horizontal-N.
+  vertical_path.p_w = Eigen::Vector3d::Zero();
   vertical_path.p_ww = Eigen::Vector3d::Zero();
   vertical_path.valid = true;
   ActiveAdapterOutput output;

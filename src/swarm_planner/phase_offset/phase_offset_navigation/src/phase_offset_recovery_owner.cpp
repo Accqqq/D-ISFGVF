@@ -469,8 +469,7 @@ bool PhaseOffsetRecoveryOwner::prepare(const RecoveryPrepareInput& input,
           candidate.provenance ==
               "PortProjector/exact-selected-ZOH-arrival";
       const bool certified_exact_arrival = exact_candidate_provenance &&
-          std::abs(computed_next_delta - input.target_delta_lower) <=
-              config_.recovery_command_comparison_epsilon;
+          computed_next_delta == input.target_delta_lower;
       const double canonical_next_delta = certified_exact_arrival
           ? input.target_delta_lower : computed_next_delta;
       const double canonical_next_measure = DistanceToClosedInterval(
@@ -518,10 +517,8 @@ bool PhaseOffsetRecoveryOwner::prepare(const RecoveryPrepareInput& input,
         candidate.provenance == "PortProjector/exact-selected-ZOH-arrival" &&
         Finite(candidate.command) &&
         Finite(input.current_delta + input.dt * candidate.command.u_delta) &&
-        std::abs(input.current_delta +
-                     input.dt * candidate.command.u_delta -
-                 input.target_delta_lower) <=
-            config_.recovery_command_comparison_epsilon;
+        input.current_delta + input.dt * candidate.command.u_delta ==
+            input.target_delta_lower;
     if (!certified_exact_arrival &&
         (!Finite(candidate.progress) ||
          candidate.progress < required_progress)) {
@@ -587,8 +584,7 @@ bool PhaseOffsetRecoveryOwner::prepare(const RecoveryPrepareInput& input,
       selected.exact_terminal_predicate &&
       selected.provenance == "PortProjector/exact-selected-ZOH-arrival" &&
       Finite(expected_next_delta) &&
-      std::abs(expected_next_delta - input.target_delta_lower) <=
-          config_.recovery_command_comparison_epsilon &&
+      expected_next_delta == input.target_delta_lower &&
       selected.next_delta == input.target_delta_lower;
   if (selected.progress < required_progress && !exact_selected_arrival) {
     output.status = RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
@@ -633,8 +629,7 @@ bool PhaseOffsetRecoveryOwner::prepare(const RecoveryPrepareInput& input,
   const bool selected_exact_candidate = selected.exact_terminal_predicate &&
       selected.provenance == "PortProjector/exact-selected-ZOH-arrival" &&
       Finite(recomputed_selected_next_delta) &&
-      std::abs(recomputed_selected_next_delta - input.target_delta_lower) <=
-          config_.recovery_command_comparison_epsilon;
+      recomputed_selected_next_delta == input.target_delta_lower;
   output.exact_terminal_predicate = input.target_interval_valid &&
       input.target_delta_lower == input.target_delta_upper &&
       selected_exact_candidate && output.next_delta == input.target_delta_lower;

@@ -124,9 +124,12 @@ PathCellBoundQuery InvalidOffsetCertificate() {
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = 2.0;
     certificate.sup_abs_curvature = 10.0;
     certificate.normal_variation_bound = 0.2 * (w1 - w0);
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.5 * (w1 - w0);
     certificate.chord_deviation_bound = 0.0;
@@ -557,15 +560,37 @@ TEST(TubeEpochManagerTest, CurrentRetainedDeltaOutsideDoesNotInstallOrLatch) {
   EXPECT_FALSE(result.status.retained_delta_current_inside);
 }
 
-TEST(TubeEpochManagerTest, InvalidCurrentRegularityCannotInstallNormally) {
+TEST(TubeEpochManagerTest,
+     ZeroOnlyCandidateDoesNotTreatTinyRetainedDeltaAsNeutral) {
+  TubeEpochManagerConfig config = MakeConfig();
+  config.builder.fixed_delta_max = 0.0;
+  config.builder.max_offset = 0.0;
+  TubeEpochManager manager(config);
+  const double tiny_values[] = {
+      1e-13, -1e-13, std::numeric_limits<double>::denorm_min(),
+      -std::numeric_limits<double>::denorm_min()};
+  for (const double delta : tiny_values) {
+    TubeEpochUpdateInput input = MakeInput();
+    input.retained_delta = delta;
+    TubeEpochUpdateResult result;
+    EXPECT_FALSE(manager.update(input, result));
+    EXPECT_TRUE(result.status.candidate_complete);
+    EXPECT_EQ(result.status.candidate_classification,
+              TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
+    EXPECT_FALSE(result.status.current_state_admissible);
+    EXPECT_EQ(result.status.reason, TubeEpochReason::CURRENT_OFFSET_OUTSIDE);
+    EXPECT_DOUBLE_EQ(result.status.retained_delta, delta);
+  }
+}
+
+TEST(TubeEpochManagerTest, Full3DCurrentRegularityUsesAnalyticHorizontalNormal) {
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateInput input = MakeInput();
   input.retained_delta = -0.10;
   input.current_path.p_ww = Eigen::Vector3d(0.0, -100.0, 0.0);
   TubeEpochUpdateResult result;
-  EXPECT_FALSE(manager.update(input, result));
-  EXPECT_FALSE(result.status.current_geometry_valid);
-  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
+  EXPECT_TRUE(manager.update(input, result));
+  EXPECT_TRUE(result.status.current_geometry_valid);
 }
 
 TEST(TubeEpochManagerTest, NeutralExplicitCloudUnsafeProducesZeroOnlyObservation) {

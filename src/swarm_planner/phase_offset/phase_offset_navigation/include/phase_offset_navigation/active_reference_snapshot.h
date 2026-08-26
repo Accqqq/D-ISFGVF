@@ -54,8 +54,9 @@ struct ActiveReferenceSnapshot {
   bool r_ww_valid = false;
   Eigen::Vector3d matched_base_v_cmd = Eigen::Vector3d::Zero();
   double matched_base_w_dot = 0.0;
-  // Stored only for successor-frame construction. Governor-facing code must
-  // consume executed_reference_query and never this seed normal.
+  // Observed copy of the executed shared-frame normal for snapshot integrity
+  // and diagnostics only. It is never a successor-frame seed, projection,
+  // sign-alignment authority, or governor-facing input.
   Eigen::Vector3d executed_N = Eigen::Vector3d::Zero();
   ImmutableExecutedReferenceQueryPtr executed_reference_query;
   std::string provenance;

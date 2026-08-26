@@ -654,6 +654,54 @@ TEST(RecoveryOwnerTest, ExactSelectedZohArrivalIsTheOnlyTerminalProof) {
   EXPECT_TRUE(owner.status().exact_terminal_predicate);
 }
 
+TEST(RecoveryOwnerTest, TinyNonzeroTargetResidualIsNotCanonicalizedToTerminal) {
+  const double denorm = std::numeric_limits<double>::denorm_min();
+  const double residuals[] = {0.0, 1e-13, -1e-13, denorm, -denorm};
+  for (const double residual : residuals) {
+    PhaseOffsetRecoveryOwnerConfig config;
+    // Permit a zero-progress diagnostic candidate so this test isolates the
+    // exact-arrival predicate and residual preservation semantics.
+    config.recovery_progress_tolerance = 1.0;
+    PhaseOffsetRecoveryOwner owner(config);
+    RecoveryPrepareInput input = Input();
+    input.current_delta = residual;
+    input.measure = std::abs(residual);
+    input.reference_jet.delta = residual;
+    input.base_w_dot = 0.1;
+    input.base_w_dot_valid = true;
+    input.target_delta_lower = 0.0;
+    input.target_delta_upper = 0.0;
+    input.target_interval_valid = true;
+
+    RecoveryCandidate candidate = Candidate(0.0, 0.0, 0.0, 0.0, 0.0);
+    candidate.exact_terminal_predicate = true;
+    candidate.provenance = "PortProjector/exact-selected-ZOH-arrival";
+    candidate.reference_jet.delta = residual;
+    candidate.measure = std::abs(residual);
+    candidate.next_measure_upper_bound = std::abs(residual);
+    candidate.next_delta = residual;
+    candidate.next_w = input.current_w + input.dt * input.base_w_dot;
+    input.candidates.push_back(candidate);
+
+    RecoveryPreparedStep prepared;
+    ASSERT_TRUE(owner.prepare(input, prepared)) << residual;
+    EXPECT_DOUBLE_EQ(prepared.next_delta, residual);
+    EXPECT_EQ(prepared.exact_terminal_predicate, residual == 0.0);
+    EXPECT_EQ(prepared.terminal_predicate, residual == 0.0);
+    if (residual == 0.0) {
+      ASSERT_TRUE(owner.commit(prepared));
+      EXPECT_TRUE(owner.status().exact_terminal_predicate);
+      EXPECT_FALSE(owner.status().nonzero_authority_retained);
+    } else {
+      EXPECT_FALSE(prepared.exact_terminal_predicate);
+      ASSERT_TRUE(owner.commit(prepared));
+      EXPECT_FALSE(owner.status().exact_terminal_predicate);
+      EXPECT_TRUE(owner.status().nonzero_authority_retained);
+      EXPECT_DOUBLE_EQ(owner.status().current_delta, residual);
+    }
+  }
+}
+
 }  // namespace
 }  // namespace phase_offset_navigation
 

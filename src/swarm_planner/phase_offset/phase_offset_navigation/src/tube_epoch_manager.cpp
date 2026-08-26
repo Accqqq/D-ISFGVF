@@ -438,11 +438,11 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
                                                     current_bounds);
     status.current_interval_nonempty = current_bounds.valid &&
         current_bounds.lower <= current_bounds.upper + config_.inside_tolerance;
-    status.current_interval_contains_zero = IsInside(
-        current_bounds, 0.0, 0.0, config_.inside_tolerance);
-    status.current_interval_contains_retained_delta = IsInside(
-        current_bounds, input.retained_delta, 0.0,
-        config_.inside_tolerance);
+    status.current_interval_contains_zero = current_bounds.valid &&
+        current_bounds.lower <= 0.0 && current_bounds.upper >= 0.0;
+    status.current_interval_contains_retained_delta = current_bounds.valid &&
+        current_bounds.lower <= input.retained_delta &&
+        current_bounds.upper >= input.retained_delta;
     status.retained_delta_current_inside = IsInside(current_bounds, input.retained_delta,
         config_.builder.interior_margin, config_.inside_tolerance);
     status.tracking_error_bound = cloud_clearance_source
@@ -473,13 +473,22 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
       ? std::max(0.0, candidate.certified_segment_end_w - input.current_path.w) : 0.0;
   status.forward_horizon_sufficient = status.certified_forward_w +
       config_.inside_tolerance >= config_.builder.min_certified_forward_w;
-  const bool current_offset_geometrically_inside = cloud_clearance_source
+  const bool candidate_classified_zero_only = candidate.classification ==
+      TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+  const bool candidate_is_zero_only = candidate_classified_zero_only &&
+      candidate.zero_only && candidate.current_delta_valid &&
+      candidate.current_delta == 0.0;
+  const bool zero_only_neutral = candidate_is_zero_only &&
+      input.retained_delta == 0.0;
+  bool current_offset_geometrically_inside = cloud_clearance_source
       ? status.current_interval_contains_retained_delta
       : status.retained_delta_current_inside;
-  const bool candidate_is_zero_only = candidate.classification ==
-      TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
-  const bool zero_only_neutral = candidate_is_zero_only &&
-      std::abs(input.retained_delta) <= config_.inside_tolerance;
+  // A zero-width planner baseline is never a current-safe witness for a
+  // nonzero retained offset, even when the generic inside tolerance would
+  // otherwise absorb that offset into [0,0].
+  if (candidate_classified_zero_only && input.retained_delta != 0.0) {
+    current_offset_geometrically_inside = false;
+  }
   // Tracking error is a robust-certificate monitor, not categorical obstacle
   // evidence.  It therefore never turns an otherwise usable current tube
   // into a certificate denial here; Runtime still evaluates its live U+ then
@@ -514,7 +523,7 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
     status.actual_clearance_sufficient = actual_safety == QuerySafety::SAFE;
     explicit_unsafe = explicit_unsafe || reference_safety == QuerySafety::UNSAFE ||
         actual_safety == QuerySafety::UNSAFE;
-    if (!candidate_is_zero_only) {
+    if (!zero_only_neutral) {
       indeterminate = indeterminate ||
           reference_safety == QuerySafety::INDETERMINATE ||
           actual_safety == QuerySafety::INDETERMINATE;
@@ -530,7 +539,7 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
       status.current_bounds_valid && current_offset_geometrically_inside &&
       (input.source == TubeSource::FIXED ||
       (cloud_clearance_source
-            ? (candidate_is_zero_only ||
+            ? (zero_only_neutral ||
                (status.reference_clearance_sufficient &&
                 status.actual_clearance_sufficient))
             : status.current_safety_status == CurrentSafetyStatus::SAFE));
@@ -584,7 +593,7 @@ bool TubeEpochManager::update(const TubeEpochUpdateInput& input,
     // fresh candidate contains the retained delta again.  In the ordinary
     // single-UAV case that retained delta is zero, so this cannot turn a
     // one-sided corridor into an implicit lateral-offset request.
-    if (!current_offset_geometrically_inside && !candidate_is_zero_only) {
+    if (!current_offset_geometrically_inside && !zero_only_neutral) {
       active_current_validation_valid_ = false;
     }
     TubeEpochReason reason = !status.current_geometry_valid

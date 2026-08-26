@@ -40,6 +40,8 @@ PathSamples FrameBoundQuadraticLine(const double tangent_x = 0.20,
     state.N = Eigen::Vector3d::UnitY();
     state.N_w = Eigen::Vector3d(normal_w_x, 0.0, 0.0);
     state.frame_valid = true;
+    state.frame_provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     state.w = w;
     state.valid = true;
     path.push_back(state);
@@ -131,9 +133,12 @@ PathCellBoundQuery CertifiedLineCells() {
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = 0.0;
     certificate.sup_abs_curvature = 0.0;
     certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
@@ -264,9 +269,12 @@ TEST(TubeBuilderTest,
         certificate.sup_p_w_norm = 1.0;
         certificate.sup_p_ww_norm = 0.0;
         certificate.sup_p_www_norm = 0.0;
+        certificate.sup_horizontal_p_ww_norm = 0.0;
+        certificate.horizontal_acceleration_bound_complete = true;
         certificate.sup_N_w_norm = 2.0;
         certificate.sup_abs_curvature = 10.0;
         certificate.normal_variation_bound = 0.2 * (w1 - w0);
+        certificate.tangent_variation_bound = 0.0;
         certificate.curvature_variation_bound = 0.0;
         certificate.midpoint_position_variation_bound = 0.5 * (w1 - w0);
         certificate.chord_deviation_bound = 0.0;

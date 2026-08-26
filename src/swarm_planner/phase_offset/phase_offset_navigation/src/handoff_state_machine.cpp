@@ -3,14 +3,6 @@
 #include <cmath>
 
 namespace phase_offset_navigation {
-namespace {
-
-bool NearlyZero(const double value, const double tolerance) {
-  return std::isfinite(value) && std::isfinite(tolerance) &&
-      tolerance >= 0.0 && std::abs(value) <= tolerance;
-}
-
-}  // namespace
 
 const char* handoffStateName(const HandoffState state) {
   switch (state) {
@@ -67,7 +59,7 @@ bool HandoffStateMachine::evaluate(const HandoffStateInput& input,
     return true;
   }
 
-  const bool nonzero = !NearlyZero(input.delta, input.neutral_tolerance);
+  const bool nonzero = input.delta != 0.0;
   const bool zero_only = input.successor_zero_only;
   const bool successor_unusable = !input.successor_available ||
       input.successor_disconnected || input.stale || input.preview_denied ||
@@ -75,7 +67,7 @@ bool HandoffStateMachine::evaluate(const HandoffStateInput& input,
 
   if (input.event == HandoffEvent::ATOMIC_NEUTRAL_HANDOFF ||
       input.neutral_handoff_committed) {
-    if (!NearlyZero(input.delta, input.neutral_tolerance)) {
+    if (input.delta != 0.0) {
       decision.next_state = HandoffState::RECENTERING_FOR_HANDOFF;
       decision.request_recenter = true;
       decision.retain_current_owner = true;
@@ -124,10 +116,9 @@ bool HandoffStateMachine::evaluate(const HandoffStateInput& input,
   }
 
   if (input.recovery_progress_certified && nonzero &&
-      NearlyZero(input.delta - input.target_delta, input.neutral_tolerance)) {
+      input.delta == input.target_delta) {
     decision.next_state = HandoffState::HANDOFF_READY;
-    decision.neutral_handoff_ready = NearlyZero(input.target_delta,
-                                                input.neutral_tolerance);
+    decision.neutral_handoff_ready = input.target_delta == 0.0;
     decision.retain_current_owner = true;
     decision.reason = "recovery reached a handoff-compatible state";
     return true;

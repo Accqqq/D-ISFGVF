@@ -38,6 +38,8 @@ RuntimePathSamples MakeFrameBoundPath(const double tangent_speed) {
     state.N = Eigen::Vector3d::UnitY();
     state.N_w = Eigen::Vector3d::Zero();
     state.frame_valid = true;
+    state.frame_provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     state.valid = true;
     samples.push_back(state);
   }

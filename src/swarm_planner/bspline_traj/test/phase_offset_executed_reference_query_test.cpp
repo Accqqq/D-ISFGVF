@@ -1,5 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <string>
+#include <limits>
+
 #include <bspline_race/integration/phase_offset_executed_reference_query.h>
 
 TEST(PhaseOffsetExecutedReferenceQueryTest, BindsPathAndFrameRevisions) {
@@ -18,6 +21,8 @@ TEST(PhaseOffsetExecutedReferenceQueryTest, BindsPathAndFrameRevisions) {
   EXPECT_EQ(result.query_revision, 23U);
   EXPECT_TRUE(result.r.allFinite());
   EXPECT_TRUE(result.r_w.allFinite());
+  EXPECT_NE(result.provenance.find("WorldHorizontalCrossProduct"),
+            std::string::npos);
   EXPECT_FALSE(result.r_ww_valid);
   double w0 = 0.0;
   double w1 = 0.0;
@@ -48,6 +53,43 @@ TEST(PhaseOffsetExecutedReferenceQueryTest, SharedFrameAndFiniteDifference) {
   EXPECT_EQ(center.path_revision, frame->pathRevision());
   EXPECT_EQ(center.frame_revision, frame->frameRevision());
   EXPECT_FALSE(center.r_ww_valid);
+  EXPECT_NE(center.provenance.find("WorldHorizontalCrossProduct"),
+            std::string::npos);
+}
+
+TEST(PhaseOffsetExecutedReferenceQueryTest,
+     UnavailableFrameRejectsFiniteTinyNonzeroOffsets) {
+  const auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  FLAG_Race::ContinuousPhasePathState start;
+  start.p = Eigen::Vector3d::Zero();
+  start.dp_dw = Eigen::Vector3d(0.0, 0.0, 1.0);
+  start.d2p_dw2 = Eigen::Vector3d::Zero();
+  start.vel = start.dp_dw;
+  start.valid = true;
+  auto end = start;
+  end.p = Eigen::Vector3d(0.0, 0.0, 2.0);
+  ASSERT_TRUE(path->appendSegment(
+      0.0, 2.0, "vertical",
+      FLAG_Race::ContinuousPhasePath::makeQuinticHermite(0.0, 2.0,
+                                                          start, end)));
+  const auto frame = std::make_shared<const FLAG_Race::ContinuousPhaseNormalFrame>(
+      path, 31U, 37U);
+  const double tiny = std::numeric_limits<double>::denorm_min();
+  for (const double delta : {tiny, -tiny}) {
+    FLAG_Race::PhaseOffsetExecutedReferenceQuery query(
+        path, delta, frame, 31U, 37U, 41U, 43U);
+    phase_offset_navigation::ExecutedReferenceQueryResult result;
+    EXPECT_FALSE(query.query(1.0, result));
+    EXPECT_FALSE(result.valid);
+    EXPECT_NE(result.invalid_reason.find("horizontal normal"),
+              std::string::npos);
+  }
+  FLAG_Race::PhaseOffsetExecutedReferenceQuery neutral_query(
+      path, 0.0, frame, 31U, 37U, 41U, 43U);
+  phase_offset_navigation::ExecutedReferenceQueryResult neutral;
+  ASSERT_TRUE(neutral_query.query(1.0, neutral));
+  EXPECT_TRUE(neutral.valid);
+  EXPECT_NE(neutral.provenance.find("Unavailable"), std::string::npos);
 }
 
 int main(int argc, char** argv) {

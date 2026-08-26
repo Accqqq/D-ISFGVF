@@ -249,6 +249,71 @@ TEST(TubeMarkersTest,
   EXPECT_EQ(certified.markers[0].ns, "phase_offset_manual_tube");
 }
 
+TEST(TubeMarkersTest, CertifiedGeometryUsesFilteredEsdfSamplesOnly) {
+  auto profile = MakeProfile(4U, true, true,
+                             phase_offset_navigation::TubeSource::ESDF);
+  profile.raw_build_samples = profile.samples;
+  for (std::size_t index = 0U; index < profile.samples.size(); ++index) {
+    profile.samples[index].w = 0.5 * static_cast<double>(index);
+    profile.samples[index].complete = true;
+    profile.samples[index].filtered_lower = -0.10;
+    profile.samples[index].filtered_upper = 0.10;
+    profile.raw_build_samples[index].raw_lower = -2.0;
+    profile.raw_build_samples[index].raw_upper = 2.0;
+    profile.raw_build_samples[index].filtered_lower = -2.0;
+    profile.raw_build_samples[index].filtered_upper = 2.0;
+  }
+  const auto markers = MakeCertifiedGeometryTubeMarkers(
+      ros::Time(1.0), "world", profile, true);
+  ExpectActions(markers, visualization_msgs::Marker::ADD);
+  ASSERT_EQ(markers.markers[0].points.size(), profile.samples.size());
+  ASSERT_EQ(markers.markers[1].points.size(), profile.samples.size());
+  EXPECT_DOUBLE_EQ(markers.markers[0].points[1].y, -0.10);
+  EXPECT_DOUBLE_EQ(markers.markers[1].points[1].y, 0.10);
+  EXPECT_EQ(markers.markers[0].ns,
+            "phase_offset_manual_tube_certified_geometry");
+  EXPECT_EQ(markers.markers[1].type, visualization_msgs::Marker::LINE_STRIP);
+  EXPECT_EQ(markers.markers[2].type,
+            visualization_msgs::Marker::TRIANGLE_LIST);
+  EXPECT_EQ(markers.markers[2].points.size(),
+            6U * (profile.samples.size() - 1U));
+  EXPECT_FLOAT_EQ(markers.markers[2].color.r, 1.0F);
+  EXPECT_FLOAT_EQ(markers.markers[2].color.g, 0.2F);
+}
+
+TEST(TubeMarkersTest, CertifiedGeometryRejectsInvalidFilteredSamplesAsAllDelete) {
+  auto profile = MakeProfile(3U, true, true,
+                             phase_offset_navigation::TubeSource::ESDF);
+  profile.samples[1].w = profile.samples[0].w;
+  const auto duplicate = MakeCertifiedGeometryTubeMarkers(
+      ros::Time(1.0), "world", profile, true);
+  ExpectActions(duplicate, visualization_msgs::Marker::DELETE);
+  profile = MakeProfile(3U, true, true,
+                        phase_offset_navigation::TubeSource::ESDF);
+  profile.samples[0].filtered_lower = 0.2;
+  profile.samples[0].filtered_upper = -0.2;
+  const auto inverted = MakeCertifiedGeometryTubeMarkers(
+      ros::Time(1.0), "world", profile, true);
+  ExpectActions(inverted, visualization_msgs::Marker::DELETE);
+  profile = MakeProfile(1U, true, true,
+                        phase_offset_navigation::TubeSource::ESDF);
+  const auto short_profile = MakeCertifiedGeometryTubeMarkers(
+      ros::Time(1.0), "world", profile, true);
+  ExpectActions(short_profile, visualization_msgs::Marker::DELETE);
+}
+
+TEST(TubeMarkersTest, CertifiedGeometryRequiresEsdfAndDisplayability) {
+  const auto fixed = MakeProfile();
+  const auto fixed_markers = MakeCertifiedGeometryTubeMarkers(
+      ros::Time(1.0), "world", fixed, true);
+  ExpectActions(fixed_markers, visualization_msgs::Marker::DELETE);
+  auto profile = MakeProfile(2U, true, true,
+                             phase_offset_navigation::TubeSource::ESDF);
+  const auto denied = MakeCertifiedGeometryTubeMarkers(
+      ros::Time(1.0), "world", profile, false);
+  ExpectActions(denied, visualization_msgs::Marker::DELETE);
+}
+
 }  // namespace
 }  // namespace FLAG_Race
 

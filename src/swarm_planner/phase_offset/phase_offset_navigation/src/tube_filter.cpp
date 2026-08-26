@@ -81,7 +81,7 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w,
   if (FindAnchor(profile, current_w) >= profile.samples.size()) return false;
   profile.current_delta = current_delta;
   profile.current_delta_valid = IsFinite(current_delta);
-  profile.selected_component = std::abs(current_delta) <= kEpsilon
+  profile.selected_component = current_delta == 0.0
       ? TubeComponentSelection::ZERO_CONNECTED
       : TubeComponentSelection::CURRENT_DELTA_CONNECTED;
 
@@ -95,8 +95,8 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w,
     TubeRawSample& sample = local[index];
     sample.filtered_lower = sample.raw_lower;
     sample.filtered_upper = sample.raw_upper;
-    sample.filtered_contains_zero = sample.filtered_lower <= kEpsilon &&
-        sample.filtered_upper >= -kEpsilon;
+    sample.filtered_contains_zero = sample.filtered_lower <= 0.0 &&
+        sample.filtered_upper >= 0.0;
     if (index + 1U < local.size()) {
       const double dw = local[index + 1U].w - local[index].w;
       if (!IsFinite(dw) || dw <= kEpsilon) return false;
@@ -145,8 +145,8 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w,
   TubeBounds selected;
   if (query(profile, current_w, selected)) {
     profile.current_component_contains_delta =
-        selected.lower <= current_delta + kEpsilon &&
-        selected.upper >= current_delta - kEpsilon;
+        selected.lower <= current_delta &&
+        selected.upper >= current_delta;
   }
   // This is evidence about the component actually represented by the
   // filtered intervals, not an unconditional claim that zero is connected.
@@ -154,19 +154,18 @@ bool TubeFilter::filter(TubeProfile& profile, const double current_w,
   bool all_knots_contain_zero = true;
   bool has_nonzero_capacity = false;
   for (const TubeRawSample& sample : profile.samples) {
-    const bool contains_zero = sample.filtered_lower <= kEpsilon &&
-        sample.filtered_upper >= -kEpsilon;
+    const bool contains_zero = sample.filtered_lower <= 0.0 &&
+        sample.filtered_upper >= 0.0;
     all_knots_contain_zero = all_knots_contain_zero && contains_zero;
     has_nonzero_capacity = has_nonzero_capacity ||
-        sample.filtered_lower < -kEpsilon || sample.filtered_upper > kEpsilon;
+        sample.filtered_lower < 0.0 || sample.filtered_upper > 0.0;
   }
   profile.zero_component_contains_zero = all_knots_contain_zero;
   // ZERO_ONLY is reserved for the authoritative neutral [0,0] interval, and
   // only when the complete retained component has no nonzero capacity.
   profile.zero_only = profile.current_component_contains_delta &&
-      std::abs(current_delta) <= kEpsilon &&
-      std::abs(selected.upper) <= kEpsilon &&
-      std::abs(selected.lower) <= kEpsilon &&
+      current_delta == 0.0 && selected.upper == 0.0 &&
+      selected.lower == 0.0 &&
       !has_nonzero_capacity && profile.zero_component_contains_zero;
   return true;
 }

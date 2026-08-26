@@ -20,8 +20,7 @@ bool HasNonzeroCapacity(const TubeProfile& profile) {
     if (!IsFinite(sample.filtered_lower) || !IsFinite(sample.filtered_upper)) {
       return false;
     }
-    if (sample.filtered_lower < -kCapacityTolerance ||
-        sample.filtered_upper > kCapacityTolerance) {
+    if (sample.filtered_lower < 0.0 || sample.filtered_upper > 0.0) {
       return true;
     }
   }
@@ -185,8 +184,7 @@ bool PrepareNarrowedCandidate(const TubeProfile& original,
     const double original_upper = sample.filtered_upper;
     if (!IsFinite(original_lower) || !IsFinite(original_upper) ||
         original_lower > original_upper + kCapacityTolerance ||
-        original_lower > kCapacityTolerance ||
-        original_upper < -kCapacityTolerance) {
+        original_lower > 0.0 || original_upper < 0.0) {
       // Inward search may remove capacity, never manufacture the planner
       // centreline when the original filtered interval did not contain it.
       return false;
@@ -234,8 +232,8 @@ bool PrepareNarrowedCandidate(const TubeProfile& original,
     sample.filtered_lower = lower;
     sample.filtered_upper = upper;
     sample.filtered_contains_zero = lower <= 0.0 && 0.0 <= upper;
-    has_positive = has_positive || upper > kCapacityTolerance;
-    has_negative = has_negative || lower < -kCapacityTolerance;
+    has_positive = has_positive || upper > 0.0;
+    has_negative = has_negative || lower < 0.0;
   }
 
   if ((family == InwardFamily::POSITIVE_ONLY && !has_positive) ||
@@ -352,8 +350,7 @@ void CollapseToPlannerZeroBaseline(
   bool had_nonzero_capacity = false;
   for (const TubeRawSample& sample : profile.samples) {
     had_nonzero_capacity = had_nonzero_capacity ||
-        sample.filtered_lower < -kCapacityTolerance ||
-        sample.filtered_upper > kCapacityTolerance;
+        sample.filtered_lower < 0.0 || sample.filtered_upper > 0.0;
   }
   for (TubeRawSample& sample : profile.samples) {
     if (!preserve_raw_environment_evidence) {
@@ -384,7 +381,7 @@ void CollapseToPlannerZeroBaseline(
   profile.complete = profile.raw_complete;
   profile.obstacle_certified = false;
   profile.current_component_contains_delta =
-      profile.current_delta_valid && std::abs(profile.current_delta) <= 1e-10;
+      profile.current_delta_valid && profile.current_delta == 0.0;
   profile.zero_component_contains_zero = profile.current_component_contains_delta;
   profile.zero_only = profile.current_component_contains_delta &&
       !had_nonzero_capacity;
@@ -494,7 +491,7 @@ bool CertifiedTubeBuilder::build(const CertifiedTubeBuildInput& input,
             if (valid) {
               double width = 0.0;
               if (CurrentIntervalWidth(inward, input.current_w, width) &&
-                  width > kCapacityTolerance && HasNonzeroCapacity(inward) &&
+                  width > 0.0 && HasNonzeroCapacity(inward) &&
                   inward.zero_centerline_continuously_certified) {
                 InwardCandidateSelection selection;
                 selection.profile = inward;

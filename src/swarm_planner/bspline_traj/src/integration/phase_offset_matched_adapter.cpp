@@ -90,6 +90,45 @@ bool FrameMatchesRevision(
       frame->frameRevision() != 0U;
 }
 
+bool CertifiedGeometrySampleFiniteAndOrdered(
+    const phase_offset_navigation::TubeRawSample& sample,
+    const phase_offset_navigation::TubeProfile& profile,
+    const bool have_previous,
+    const double previous_w) {
+  if (!sample.complete || !std::isfinite(sample.w) ||
+      !sample.p.allFinite() || !sample.N.allFinite() ||
+      !std::isfinite(sample.filtered_lower) ||
+      !std::isfinite(sample.filtered_upper) ||
+      sample.filtered_lower > sample.filtered_upper ||
+      sample.path_revision != profile.path_revision ||
+      sample.frame_revision != profile.frame_revision) {
+    return false;
+  }
+  if (have_previous && !(sample.w > previous_w)) return false;
+  const Eigen::Vector3d lower =
+      sample.p + sample.N * sample.filtered_lower;
+  const Eigen::Vector3d upper =
+      sample.p + sample.N * sample.filtered_upper;
+  return lower.allFinite() && upper.allFinite();
+}
+
+bool CertifiedGeometryProfileSamplesValid(
+    const phase_offset_navigation::TubeProfile& profile) {
+  if (profile.samples.size() < 2U) return false;
+  bool have_previous = false;
+  double previous_w = 0.0;
+  for (const phase_offset_navigation::TubeRawSample& sample :
+       profile.samples) {
+    if (!CertifiedGeometrySampleFiniteAndOrdered(
+            sample, profile, have_previous, previous_w)) {
+      return false;
+    }
+    previous_w = sample.w;
+    have_previous = true;
+  }
+  return true;
+}
+
 constexpr double kPreparedCoverageTolerance = 1e-10;
 // Must remain aligned with TubeBuilder's frozen current-anchor contract.  It
 // is used only to prove that this adapter-side partition contains exactly one
@@ -700,19 +739,22 @@ phase_offset_navigation::PathCellBoundQuery MakeTimerPathCellBoundQuery(
       }
       certificate.path_revision = immutable_frame->pathRevision();
       certificate.frame_revision = immutable_frame->frameRevision();
+      certificate.inf_horizontal_p_w_norm =
+          frame_proof.inf_horizontal_path_speed;
+      certificate.sup_horizontal_p_ww_norm =
+          frame_proof.sup_horizontal_p_ww_norm;
+      certificate.horizontal_acceleration_bound_complete =
+          frame_proof.horizontal_acceleration_bound_complete;
       certificate.sup_N_w_norm = frame_proof.sup_normal_derivative;
       certificate.normal_variation_bound = frame_proof.normal_variation_bound;
-      certificate.curvature_variation_bound =
-          std::max(certificate.curvature_variation_bound,
-                   frame_proof.tangent_variation_bound);
+      certificate.tangent_variation_bound = frame_proof.tangent_variation_bound;
       certificate.normal_frame_proof_complete = true;
       // The frame certifies path-speed/normal variation only.  The combined
       // ||p_w + N_w*delta|| bound is deliberately left unset until Builder
       // has the actual admissible delta interval for this cell.
       certificate.combined_regularity_proof_complete = false;
       certificate.provenance =
-          "ContinuousPhaseNormalFrame/ProjectedHermiteTransport/"
-          "CertifiedProjectedRawNormLowerBound";
+          "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     }
     return phase_offset_core::pathCellGeometryCertificateIsComplete(certificate);
   };
@@ -1631,6 +1673,10 @@ void PhaseOffsetMatchedAdapter::advertise(ros::NodeHandle& nh) {
         "phase_offset_manual/tube", kManualEvidenceQueueSize);
     manual_tube_candidate_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
         "phase_offset_manual/tube_candidate", kManualEvidenceQueueSize);
+    manual_tube_certified_geometry_pub_ =
+        nh.advertise<visualization_msgs::MarkerArray>(
+            "phase_offset_manual/tube_certified_geometry",
+            kManualEvidenceQueueSize);
     manual_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>(
         "phase_offset_manual/diagnostics", kManualEvidenceQueueSize);
     manual_tube_epoch_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>(
@@ -2778,13 +2824,10 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   std::uint64_t staged_revision = 0U;
   phase_offset_navigation::PhaseOffsetRuntime runtime_snapshot(
       MakeRuntimeConfig(config_));
-  // A replacement successor must inherit the exact predecessor authority's
-  // executed_N.  The seed is projected in the successor composite's start
-  // plane (the captured predecessor state), sign-aligned to that immutable
-  // predecessor vector, and only then used to construct one immutable
-  // successor frame.  The future seam is not the predecessor chaining point.
-  Eigen::Vector3d executed_seed = Eigen::Vector3d::Zero();
-  bool have_executed_seed = false;
+  // Horizontal-N successor frames are determined exclusively by the
+  // successor path derivatives.  The predecessor snapshot is retained only
+  // for exact transaction/revision provenance; executed_N is never projected,
+  // sign-aligned, or used as a frame seed.
   std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
       successor_seed_authority;
   {
@@ -2850,11 +2893,9 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
               phase_offset_navigation::ActiveReferenceOwnerMode::NONE &&
           successor_seed_authority->owner_mode !=
               phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
-      // Bootstrap and planner-only replacement have no authenticated
-      // predecessor normal.  They intentionally use the deterministic
-      // least-parallel-axis seed in ContinuousPhaseNormalFrame.  Only an
-      // active immutable authority is subject to the strict predecessor
-      // identity checks below.
+      // Bootstrap and planner-only replacement have no active predecessor.
+      // Active snapshots are checked only for transaction identity and exact
+      // predecessor state; their observed executed_N is not frame authority.
       if (authority_is_active) {
         if (successor_seed_authority->authority_session !=
                 captured_authority_session ||
@@ -2894,37 +2935,11 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
             (predecessor_state.dp_dw + predecessor_frame.N_w *
                  successor_seed_authority->delta -
              successor_seed_authority->r_w).norm() > 1e-8 ||
-            !successor_seed_authority->executed_N.allFinite() ||
-            successor_seed_authority->executed_N.norm() <= 1e-10 ||
-            (predecessor_frame.N - successor_seed_authority->executed_N).norm() >
-                1e-7) {
+            !successor_seed_authority->r.allFinite() ||
+            !successor_seed_authority->r_w.allFinite()) {
           if (temporary_failure) *temporary_failure =
               PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
           return stage_first_false("successor_frame_predecessor_state", nullptr);
-        }
-        ContinuousPhasePathState successor_start_state;
-        if (!new_path_owner->evaluate(captured_w0,
-                                      successor_start_state, false) ||
-            !successor_start_state.valid ||
-            successor_start_state.dp_dw.norm() <= 1e-10) {
-          if (temporary_failure) *temporary_failure =
-              PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-          return stage_first_false("successor_frame_seed_start_query", nullptr);
-        }
-        const Eigen::Vector3d tangent =
-            successor_start_state.dp_dw.normalized();
-        executed_seed = successor_seed_authority->executed_N -
-            tangent * successor_seed_authority->executed_N.dot(tangent);
-        // A valid authority can still carry a normal nearly parallel to the
-        // successor composite-start tangent.  In that genuinely unusable
-        // start-plane case leave the explicit seed absent so the immutable
-        // frame constructor uses its deterministic least-parallel fallback.
-        if (executed_seed.allFinite() && executed_seed.norm() > 1e-10) {
-          executed_seed.normalize();
-          if (executed_seed.dot(successor_seed_authority->executed_N) < 0.0) {
-            executed_seed = -executed_seed;
-          }
-          have_executed_seed = true;
         }
       }
     }
@@ -2934,26 +2949,9 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
         expected_pair ? expected_pair->source_revision : 0U) + 1U;
   }
 
-  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame_owner =
-      have_executed_seed
-      ? std::shared_ptr<const ContinuousPhaseNormalFrame>(
-            new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
-                                            staged_revision, executed_seed))
-      : std::shared_ptr<const ContinuousPhaseNormalFrame>(
-            new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
-                                            staged_revision));
-  if (have_executed_seed && successor_seed_authority) {
-    phase_offset_core::NormalFrameQuery successor_start_frame;
-    if (!new_frame_owner->query(captured_w0, successor_start_frame) ||
-        !successor_start_frame.valid ||
-        (successor_start_frame.N - successor_seed_authority->executed_N).norm() >
-            1e-7) {
-      if (temporary_failure) {
-        *temporary_failure = PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-      }
-      return stage_first_false("successor_frame_start_binding", nullptr);
-    }
-  }
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame_owner(
+      new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
+                                     staged_revision));
   phase_offset_core::PathDifferentialState captured_path;
   if (!EvaluateOwnerState(new_path_owner, captured_w0, captured_path,
                           new_frame_owner)) {
@@ -4179,6 +4177,19 @@ bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
       prepared.delta == 0.0) {
     return fail("recovery precondition is invalid");
   }
+  const auto horizontal_frame_matches_pair =
+      [](const std::shared_ptr<const PathTubePair>& candidate) {
+        return candidate && candidate->frame_owner &&
+            candidate->frame_owner->pathRevision() == candidate->path_revision &&
+            candidate->frame_owner->frameRevision() == candidate->frame_revision;
+      };
+  if (!horizontal_frame_matches_pair(pair) ||
+      !horizontal_frame_matches_pair(target_pair)) {
+    output.recovery_replan_required = true;
+    output.recovery_status =
+        phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+    return fail("recovery Horizontal-N frame provenance is invalid");
+  }
 
   // A production RECOVERY step is a continuation of an already committed
   // authority.  It may not use the pair/session itself as a hidden bootstrap
@@ -4211,6 +4222,11 @@ bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
         [&current_authority, &pair](
             const std::shared_ptr<const PathTubePair>& candidate_pair) {
       return candidate_pair && candidate_pair->active_profile &&
+          candidate_pair->frame_owner &&
+          candidate_pair->frame_owner->pathRevision() ==
+              candidate_pair->path_revision &&
+          candidate_pair->frame_owner->frameRevision() ==
+              candidate_pair->frame_revision &&
           current_authority.planner_path_revision == pair->source_revision &&
           current_authority.executed_path_revision == candidate_pair->path_revision &&
           current_authority.frame_revision == candidate_pair->frame_revision &&
@@ -4286,6 +4302,28 @@ bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
   const bool target_domain_contains_current = target_pair->path_owner &&
       prepared.geometry.w >= target_pair->path_owner->startW() - 1e-10 &&
       prepared.geometry.w <= target_pair->path_owner->endW() + 1e-10;
+  // An in-domain staged successor is admissible only when its own immutable
+  // frame can provide Horizontal-N capability at the current recovery phase.
+  // Merely matching frame/path revisions is insufficient: a successor whose
+  // horizontal speed is at or below the sole production threshold must not
+  // become the execution owner, nor may it be silently replaced by a
+  // centerline/neutral command.  A disconnected successor is still lifecycle
+  // evidence for the existing old-owner recenter path and is queried at its
+  // validated seam instead.  Route an in-domain capability failure through
+  // the existing recovery-replan mailbox while retaining the current owner.
+  if (has_staged_successor && target_domain_contains_current) {
+    phase_offset_core::NormalFrameQuery successor_frame;
+    if (!target_pair->frame_owner->query(prepared.geometry.w,
+                                         successor_frame) ||
+        !successor_frame.valid ||
+        !phase_offset_core::isWorldHorizontalCrossProductProvenance(
+            successor_frame.provenance)) {
+      output.recovery_replan_required = true;
+      output.recovery_status =
+          phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+      return fail("successor Horizontal-N capability is unavailable; renewed evidence required");
+    }
+  }
   // A staged ZERO_ONLY/disconnected successor is evidence for the handoff
   // decision, not the geometry owner of the current recovery tick.  Recenter
   // must stay inside the currently executed owner's connected component until
@@ -4562,7 +4600,7 @@ bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
     candidate.phase_domain_start = recovery_input.phase_domain_start;
     candidate.phase_domain_end = recovery_input.phase_domain_end;
     candidate.reference_jet = reference_jet;
-    const bool strict_exact_arrival = std::abs(checked.next_delta) <= 1e-14;
+    const bool strict_exact_arrival = checked.next_delta == 0.0;
     candidate.provenance = strict_exact_arrival
         ? "PortProjector/exact-selected-ZOH-arrival"
         : "PortProjector/closed-bounded-membership";
@@ -4599,13 +4637,13 @@ bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
       phase_offset_core::PortProjectionResult checked;
       if (!phase_offset_core::PortProjector::verify(
               projection_input, limits, exact_command, checked) ||
-          !checked.valid || std::abs(checked.next_delta) > 1e-14) {
+          !checked.valid || checked.next_delta != 0.0) {
         continue;
       }
       phase_offset_navigation::RecoveryCandidate candidate;
       candidate.command = exact_command;
       candidate.next_w = prepared.geometry.w + prepared.dt * checked.final_w_dot;
-      candidate.next_delta = 0.0;
+      candidate.next_delta = checked.next_delta;
       candidate.measure = recovery_input.measure;
       candidate.next_measure_upper_bound = 0.0;
       candidate.progress = candidate.measure;
@@ -5595,6 +5633,13 @@ bool PhaseOffsetMatchedAdapter::buildMarkers(
       config_.mode == PhaseOffsetMatchedMode::MANUAL, candidate_anchor_w);
   markers.tube = MakeCertifiedTubeMarkers(control.stamp, config_.frame_id, active,
       tubeDisplayCertified(output));
+  // This compatibility helper has no immutable Candidate epoch/request
+  // authority, so the R3 topic must fail closed here.  Production
+  // publishManual() overwrites this field with the full atomic
+  // request/Candidate decision below; existing /tube and /tube_candidate
+  // construction remains unchanged.
+  markers.tube_certified_geometry = MakeCertifiedGeometryTubeMarkers(
+      control.stamp, config_.frame_id, empty, false);
   return output.geometry.valid;
 }
 
@@ -5635,9 +5680,12 @@ void PhaseOffsetMatchedAdapter::publishManualDelete(
                                            empty, false);
   markers.tube_candidate = MakeCandidateTubeMarkers(control.stamp,
       config_.frame_id, empty, false);
+  markers.tube_certified_geometry = MakeCertifiedGeometryTubeMarkers(
+      control.stamp, config_.frame_id, empty, false);
   manual_base_path_pub_.publish(markers.base_path); manual_active_path_pub_.publish(markers.active_path);
   manual_frame_pub_.publish(markers.frame); manual_tube_pub_.publish(markers.tube);
   manual_tube_candidate_pub_.publish(markers.tube_candidate);
+  manual_tube_certified_geometry_pub_.publish(markers.tube_certified_geometry);
 }
 
 bool PhaseOffsetMatchedAdapter::markEpochBuildPublished(
@@ -5759,11 +5807,136 @@ PhaseOffsetMatchedAdapter::selectCandidateEpochForPublication(
       : control_epoch;
 }
 
+bool PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+    const TubeBuildRequest& request,
+    const TubeEpochSnapshot& candidate,
+    const std::uint64_t current_task_generation) {
+  // R3 is a display-only predicate.  It deliberately does not call
+  // epochMatchesRequest(), inspect Pair/Active ownership, or consult Runtime
+  // and ExecutionAuthority state.
+  if (!request.active ||
+      request.task_generation != current_task_generation ||
+      request.source_revision == 0U || !request.semantic_path_owner ||
+      request.semantic_path_owner->empty() ||
+      !FrameMatchesRevision(request.frame_owner, request.source_revision)) {
+    return false;
+  }
+  if (!candidate.active || candidate.task_generation != request.task_generation ||
+      candidate.task_generation != current_task_generation ||
+      candidate.source_revision == 0U ||
+      candidate.source_revision != request.source_revision ||
+      candidate.request_control_sequence > request.control_sequence ||
+      candidate.map_observation_sequence == 0U ||
+      !candidate.map_observation_is_snapshot) {
+    return false;
+  }
+
+  const phase_offset_navigation::TubeEpochStatus& status =
+      candidate.epoch_status;
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile =
+      candidate.candidate_profile;
+  if (!profile || profile->source != phase_offset_navigation::TubeSource::ESDF ||
+      profile->source_revision == 0U ||
+      profile->source_revision != candidate.source_revision ||
+      status.candidate_path_source_revision != candidate.source_revision ||
+      status.candidate_map_observation_sequence !=
+          candidate.map_observation_sequence ||
+      !status.map_observation_is_snapshot ||
+      status.map_observation_is_snapshot != candidate.map_observation_is_snapshot) {
+    return false;
+  }
+
+  const bool profile_complete = profile->raw_complete &&
+      profile->filtered_complete && profile->complete;
+  const bool status_complete = status.candidate_raw_complete &&
+      status.candidate_filtered_complete && status.candidate_complete;
+  if (!profile_complete || !status_complete ||
+      profile->raw_complete != status.candidate_raw_complete ||
+      profile->filtered_complete != status.candidate_filtered_complete ||
+      profile->complete != status.candidate_complete ||
+      profile->classification !=
+          phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED ||
+      status.candidate_classification != profile->classification ||
+      profile->zero_only || status.candidate_zero_only ||
+      !profile->obstacle_certified) {
+    return false;
+  }
+
+  if (profile->path_revision == 0U || profile->frame_revision == 0U ||
+      profile->path_revision != request.frame_owner->pathRevision() ||
+      profile->path_revision != request.source_revision ||
+      profile->frame_revision != request.frame_owner->frameRevision() ||
+      profile->tube_revision == 0U ||
+      profile->tube_revision != profile->profile_revision ||
+      profile->tube_revision != status.candidate_sequence ||
+      profile->map_revision == 0U ||
+      profile->map_revision != profile->snapshot_sequence ||
+      profile->map_revision != candidate.map_observation_sequence ||
+      profile->map_revision != status.candidate_map_observation_sequence ||
+      !profile->snapshot_provenance_is_immutable) {
+    return false;
+  }
+
+  return CertifiedGeometryProfileSamplesValid(*profile);
+}
+
+visualization_msgs::MarkerArray
+PhaseOffsetMatchedAdapter::certifiedGeometryMarkers(const ros::Time& stamp) const {
+
+  // Frozen Candidate/request linearization protocol:
+  //   request A -> Candidate -> request B -> require A == B
+  //   -> full stateless predicate -> final request identity reread -> ADD.
+  // Any failed check is one all-DELETE bundle.  The Candidate slot itself is
+  // never an authority and is never retried or replaced by Pair/Active data.
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL ||
+      config_.tube_source != phase_offset_navigation::TubeSource::ESDF) {
+    const phase_offset_navigation::TubeProfile empty;
+    return MakeCertifiedGeometryTubeMarkers(stamp, config_.frame_id, empty,
+                                            false);
+  }
+  const std::shared_ptr<const TubeBuildRequest> request_a =
+      std::atomic_load(&latest_build_request_);
+  const std::shared_ptr<const TubeEpochSnapshot> candidate =
+      std::atomic_load(&latest_candidate_epoch_snapshot_);
+  const std::shared_ptr<const TubeBuildRequest> request_b =
+      std::atomic_load(&latest_build_request_);
+
+  bool eligible = request_a && request_b && request_a == request_b &&
+      candidate && certifiedGeometryCandidateEligible(
+          *request_b, *candidate,
+          task_generation_.load(std::memory_order_acquire));
+  if (eligible) {
+    if (certified_geometry_linearization_test_hook_) {
+      certified_geometry_linearization_test_hook_();
+    }
+    const std::shared_ptr<const TubeBuildRequest> request_final =
+        std::atomic_load(&latest_build_request_);
+    eligible = request_final == request_b;
+  }
+
+  const phase_offset_navigation::TubeProfile empty;
+  const phase_offset_navigation::TubeProfile& profile =
+      eligible && candidate && candidate->candidate_profile
+      ? *candidate->candidate_profile : empty;
+  const visualization_msgs::MarkerArray markers =
+      MakeCertifiedGeometryTubeMarkers(stamp, config_.frame_id, profile,
+                                       eligible);
+  return markers;
+}
+
 void PhaseOffsetMatchedAdapter::publishManual(
     const ControlPublishSnapshot& control) {
   if (!advertised_ || config_.mode != PhaseOffsetMatchedMode::MANUAL) return;
   const std::shared_ptr<const TubeBuildRequest> request =
       std::atomic_load(&latest_build_request_);
+  const std::shared_ptr<const TubeEpochSnapshot> candidate_before_publish =
+      std::atomic_load(&latest_candidate_epoch_snapshot_);
+  // R3 geometric publication is bound to the independent atomic
+  // Candidate/request protocol and remains meaningful even when this
+  // command snapshot is stale or execution-side identity is not current.
+  // An empty lifecycle has its one DELETE emitted by publishManualDelete().
+  const bool needs_certified_geometry_decision =
+      control.active && (control.epoch_snapshot || candidate_before_publish);
   // Marker ownership follows the complete command identity.  A timer
   // completion from an older task/source/control/map must not clear or
   // overwrite a newer namespace, even when its source revision happens to
@@ -5778,7 +5951,19 @@ void PhaseOffsetMatchedAdapter::publishManual(
           request->map_observation_is_snapshot &&
       task_generation_.load(std::memory_order_acquire) ==
           request->task_generation;
-  if (!current_control_identity) return;
+  if (!current_control_identity) {
+    // A stale timer completion must not republish its old ordinary markers,
+    // but it still owns one independent R3 decision.  Loading the current
+    // request/Candidate here yields DELETE after source replacement (or ADD
+    // for an already-completed replacement Candidate) without touching the
+    // existing topic semantics.
+    if (control.active &&
+        (control.epoch_snapshot || candidate_before_publish)) {
+      manual_tube_certified_geometry_pub_.publish(
+          certifiedGeometryMarkers(control.stamp));
+    }
+    return;
+  }
 
   const std::shared_ptr<const TubeEpochSnapshot> latest_candidate =
       std::atomic_load(&latest_candidate_epoch_snapshot_);
@@ -5885,6 +6070,11 @@ void PhaseOffsetMatchedAdapter::publishManual(
     manual_frame_pub_.publish(markers.frame);
     manual_tube_pub_.publish(markers.tube);
     manual_tube_candidate_pub_.publish(markers.tube_candidate);
+    if (needs_certified_geometry_decision) {
+      markers.tube_certified_geometry = certifiedGeometryMarkers(control.stamp);
+      manual_tube_certified_geometry_pub_.publish(
+          markers.tube_certified_geometry);
+    }
     return;
   }
 
@@ -5907,11 +6097,18 @@ void PhaseOffsetMatchedAdapter::publishManual(
   // command may overwrite its control snapshot before this tick, so command
   // output cannot be the authoritative pending bit.
   MatchedAdapterOutput output = control.output;
+  if (needs_certified_geometry_decision) {
+    markers.tube_certified_geometry = certifiedGeometryMarkers(control.stamp);
+  }
   output.tube_update_due_this_cycle =
       markEpochBuildPublished(control.epoch_build_sequence);
   manual_base_path_pub_.publish(markers.base_path); manual_active_path_pub_.publish(markers.active_path);
   manual_frame_pub_.publish(markers.frame); manual_tube_pub_.publish(markers.tube);
   manual_tube_candidate_pub_.publish(markers.tube_candidate);
+  if (needs_certified_geometry_decision) {
+    manual_tube_certified_geometry_pub_.publish(
+        markers.tube_certified_geometry);
+  }
   std_msgs::Float64MultiArray diagnostics;
   diagnostics.data.assign(output.diagnostics.begin(), output.diagnostics.end());
   manual_diagnostics_pub_.publish(diagnostics);

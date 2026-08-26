@@ -27,6 +27,8 @@ const char kActiveReferenceSpeedNotFinite[] =
 const char kActiveReferenceSpeedTooSmall[] =
     "active reference speed is too small";
 const char kComputedGeometryNotFinite[] = "computed geometry is not finite";
+const char kFrameProvenanceIncompatible[] =
+    "normal frame provenance is incompatible";
 
 struct TerminalGeometry {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -154,6 +156,7 @@ void BuildPreparedPathFromValidatedPath(const PathDifferentialState& path,
   output.path_revision = path.path_revision;
   output.frame_revision = path.frame_revision;
   output.frame_bound = path.frame_valid;
+  output.horizontal_normal_capability = false;
   output.frame_provenance = path.frame_provenance;
   output.pre_point_valid = true;
   output.pre_point_reason = kNoReason;
@@ -177,19 +180,42 @@ void BuildPreparedPathFromValidatedPath(const PathDifferentialState& path,
     return;
   }
   output.T = path.p_w / output.path_speed;
-  if (path.frame_valid && IsFinite(path.T) && IsFinite(path.N) &&
-      IsFinite(path.N_w) && path.T.norm() > params.tangent_epsilon &&
-      path.N.norm() > params.tangent_epsilon) {
+  if (path.frame_valid) {
+    if (!isWorldHorizontalCrossProductProvenance(path.frame_provenance)) {
+      output.delayed_path_reason = kFrameProvenanceIncompatible;
+      return;
+    }
+    if (!IsFinite(path.T) || !IsFinite(path.N) || !IsFinite(path.N_w) ||
+        path.T.norm() <= params.tangent_epsilon ||
+        path.N.norm() <= params.tangent_epsilon ||
+        std::abs(path.N.z()) > 1e-12 ||
+        std::abs(path.N_w.z()) > 1e-12) {
+      output.delayed_path_reason = kComputedGeometryNotFinite;
+      return;
+    }
+    if (output.horizontal_path_speed <= kHorizontalNormalSpeedEpsilon) {
+      output.N.setZero();
+      output.N_w.setZero();
+      output.frame_bound = false;
+      output.frame_provenance =
+          std::string(kWorldHorizontalCrossProductProvenance) +
+          "/Unavailable";
+      output.delayed_path_reason = kHorizontalPathSpeedTooSmall;
+      output.delayed_path_valid = true;
+      return;
+    }
     output.T = path.T.normalized();
     output.N = path.N.normalized();
     output.N_w = path.N_w;
     output.frame_bound = true;
+    output.horizontal_normal_capability = true;
   } else {
     // Compatibility fallback for synthetic callers. Production adapters pass
     // frame_valid=true, so no production consumer reconstructs N/N_w.
     if (!IsFinite(output.horizontal_path_speed) ||
-        output.horizontal_path_speed <= params.horizontal_tangent_epsilon) {
+        output.horizontal_path_speed <= kHorizontalNormalSpeedEpsilon) {
       output.delayed_path_reason = kHorizontalPathSpeedTooSmall;
+      output.delayed_path_valid = true;
       return;
     }
     output.N = horizontal_tangent / output.horizontal_path_speed;
@@ -200,6 +226,8 @@ void BuildPreparedPathFromValidatedPath(const PathDifferentialState& path,
         output.N * output.N.dot(horizontal_tangent_derivative);
     output.N_w = projected_horizontal_tangent_derivative /
         output.horizontal_path_speed;
+    output.horizontal_normal_capability = true;
+    output.frame_provenance = kWorldHorizontalCrossProductProvenance;
   }
   if (!IsFinite(output.T) || !IsFinite(output.N) || !IsFinite(output.N_w) ||
       std::abs(output.T.norm() - 1.0) > 1e-6 ||
@@ -214,7 +242,7 @@ void BuildPreparedPathFromValidatedPath(const PathDifferentialState& path,
       output.horizontal_path_speed * output.horizontal_path_speed *
       output.horizontal_path_speed;
   output.curvature = output.horizontal_path_speed >
-          params.horizontal_tangent_epsilon
+          kHorizontalNormalSpeedEpsilon
       ? curvature_numerator / speed_cubed : 0.0;
   output.delayed_path_valid = true;
 }
@@ -263,17 +291,19 @@ const char* EvaluateTerminal(const PreparedPathGeometry& prepared,
   // avoiding a second fixed-size zero fill for every evaluated delta.
   output.r = prepared.p + prepared.N * delta;
   output.r_w = prepared.p_w + prepared.N_w * delta;
-  const double legacy_regularity = 1.0 - prepared.curvature * delta;
-  output.regularity = prepared.frame_bound ? output.r_w.norm()
-                                           : legacy_regularity;
+  // Horizontal-N capability is a strict geometric precondition for every
+  // nonzero offset.  Do not introduce a numerical deadband here: a finite
+  // subnormal or otherwise tiny nonzero delta must fail closed when the
+  // normal is unavailable, while an exact zero offset remains valid for the
+  // planner-only centerline.
+  if (!prepared.horizontal_normal_capability && delta != 0.0) {
+    return kHorizontalPathSpeedTooSmall;
+  }
+  output.regularity = output.r_w.norm();
   if (!IsFinite(prepared.curvature) || !IsFinite(output.regularity)) {
     return kCurvatureOrRegularityNotFinite;
   }
-  if ((!prepared.frame_bound &&
-       output.regularity < params.regularity_margin) ||
-      (prepared.frame_bound &&
-       output.regularity < params.minimum_reference_speed)) {
-    if (!prepared.frame_bound) return kOffsetRegularityMarginViolated;
+  if (output.regularity < params.minimum_reference_speed) {
     return kActiveReferenceSpeedTooSmall;
   }
   const double active_path_speed = output.r_w.norm();

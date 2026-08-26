@@ -63,6 +63,26 @@ TEST(TubeCrossSectionTest, DirectClearanceOpenSpaceHasZeroConnectedInterval) {
   ExpectFinite(result);
 }
 
+TEST(TubeCrossSectionTest, HorizontalNormalRaysPreserveCenterlineAltitude) {
+  std::size_t samples = 0U;
+  TubeCrossSectionInput input = MakeInput(
+      [&samples](const Eigen::Vector3d& point, const double required) {
+        ++samples;
+        EXPECT_DOUBLE_EQ(point.z(), 2.5);
+        ClearanceQueryResult result;
+        result.status = DistanceStatus::KNOWN_FREE;
+        result.clearance = std::max(10.0, required);
+        result.clearance_certified = true;
+        return result;
+      });
+  input.p = Eigen::Vector3d(0.0, 0.0, 2.5);
+  input.N = Eigen::Vector3d(0.0, 1.0, 0.0);
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(MakeConfig()).solve(input);
+  ASSERT_TRUE(result.valid);
+  EXPECT_GT(samples, 0U);
+}
+
 TEST(TubeCrossSectionTest, OneSideBlockedImmediatelyRetainsOtherSide) {
   const ClearanceQuery query = [](const Eigen::Vector3d& point,
                                   const double) {

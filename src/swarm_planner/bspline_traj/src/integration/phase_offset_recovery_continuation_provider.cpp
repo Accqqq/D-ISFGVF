@@ -20,7 +20,7 @@ bool AttachPathSecondDerivative(
   // The frozen frame contract does not expose N_ww.  Exact r_ww is therefore
   // optional and this helper only supplies the zero-offset capability; the
   // Batch-B first-order continuation path never requires it.
-  if (!path || !Finite(w) || !Finite(delta) || std::abs(delta) > 1e-12) {
+  if (!path || !Finite(w) || !Finite(delta) || delta != 0.0) {
     return false;
   }
   ContinuousPhasePathState state;
@@ -65,10 +65,7 @@ bool PhaseOffsetRecoveryContinuationProvider::propose(
   phase_offset_core::NormalFrameQuery target_frame_query;
   if (!input.source_path->evaluate(input.source_w, source_state, false) ||
       !input.target_path->evaluate(input.target_w, target_state, false) ||
-      !input.source_frame->query(input.source_w, source_frame_query) ||
-      !input.target_frame->query(input.target_w, target_frame_query) ||
-      !source_state.valid || !target_state.valid ||
-      !source_frame_query.valid || !target_frame_query.valid) {
+      !source_state.valid || !target_state.valid) {
     output.invalid_reason = "base-path or frame seam query failed";
     return false;
   }
@@ -77,8 +74,15 @@ bool PhaseOffsetRecoveryContinuationProvider::propose(
   // continuation, and this ordering keeps the diagnostic specific even when
   // a degenerate target also cannot match the source tangent at the seam.
   const double geometric_speed = target_state.dp_dw.norm();
-  if (!Finite(geometric_speed) || geometric_speed <= 1e-8) {
+  if (!Finite(geometric_speed) ||
+      geometric_speed <= phase_offset_core::kHorizontalNormalSpeedEpsilon) {
     output.invalid_reason = "target continuation has no finite phase speed";
+    return false;
+  }
+  if (!input.source_frame->query(input.source_w, source_frame_query) ||
+      !input.target_frame->query(input.target_w, target_frame_query) ||
+      !source_frame_query.valid || !target_frame_query.valid) {
+    output.invalid_reason = "base-path or frame seam query failed";
     return false;
   }
   // C2_CONTINUATION names the inherited base path.  Validate its exact

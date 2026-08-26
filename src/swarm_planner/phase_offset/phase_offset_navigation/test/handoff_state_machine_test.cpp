@@ -2,6 +2,9 @@
 
 #include "phase_offset_navigation/handoff_state_machine.h"
 
+#include <cmath>
+#include <limits>
+
 namespace phase_offset_navigation {
 namespace {
 
@@ -122,6 +125,41 @@ TEST(HandoffStateMachineTest, AtomicNeutralHandoffIsTerminalOnlyAtNeutral) {
 
   input.delta = 0.0;
   ASSERT_TRUE(machine.transition(input, decision));
+  EXPECT_EQ(machine.state(), HandoffState::PLANNER_ONLY);
+  EXPECT_TRUE(decision.neutral_handoff_ready);
+  EXPECT_TRUE(decision.planner_only_allowed);
+  EXPECT_FALSE(decision.retain_current_owner);
+}
+
+TEST(HandoffStateMachineTest,
+     AtomicNeutralHandoffUsesExactZeroForTinyOffsets) {
+  const double tiny_offsets[] = {
+      1e-13, -1e-13, std::numeric_limits<double>::denorm_min(),
+      -std::numeric_limits<double>::denorm_min(),
+      std::nextafter(0.0, std::numeric_limits<double>::infinity()),
+      std::nextafter(0.0, -std::numeric_limits<double>::infinity())};
+  for (const double delta : tiny_offsets) {
+    HandoffStateMachine machine;
+    HandoffStateInput input;
+    input.delta = delta;
+    input.event = HandoffEvent::ATOMIC_NEUTRAL_HANDOFF;
+    input.neutral_handoff_committed = true;
+    HandoffDecision decision;
+    ASSERT_TRUE(machine.transition(input, decision));
+    EXPECT_EQ(machine.state(), HandoffState::RECENTERING_FOR_HANDOFF);
+    EXPECT_TRUE(decision.request_recenter);
+    EXPECT_TRUE(decision.retain_current_owner);
+    EXPECT_FALSE(decision.planner_only_allowed);
+    EXPECT_FALSE(decision.neutral_handoff_ready);
+  }
+
+  HandoffStateMachine machine;
+  HandoffStateInput neutral;
+  neutral.delta = 0.0;
+  neutral.event = HandoffEvent::ATOMIC_NEUTRAL_HANDOFF;
+  neutral.neutral_handoff_committed = true;
+  HandoffDecision decision;
+  ASSERT_TRUE(machine.transition(neutral, decision));
   EXPECT_EQ(machine.state(), HandoffState::PLANNER_ONLY);
   EXPECT_TRUE(decision.neutral_handoff_ready);
   EXPECT_TRUE(decision.planner_only_allowed);

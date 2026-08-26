@@ -1,10 +1,15 @@
 #include <bspline_race/continuous_phase_path.h>
+#include <phase_offset_core/normal_frame.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
+
+#include <boost/multiprecision/cpp_int.hpp>
 
 namespace FLAG_Race
 {
@@ -36,6 +41,11 @@ struct VectorBounds
 {
     double inf_norm = 0.0;
     double sup_norm = 0.0;
+    // True only when every Bernstein control of the represented vector field
+    // is bitwise identical.  In that case the polynomial is exactly
+    // constant, so its norm has an exact lower bound and need not be eroded
+    // by the non-constant roundoff margin.
+    bool inf_norm_exact = false;
     bool valid = false;
 };
 
@@ -56,6 +66,7 @@ double UpperBound(const double value)
     if (!std::isfinite(value) || value < 0.0) {
         return std::numeric_limits<double>::quiet_NaN();
     }
+    if (value == 0.0) return 0.0;
     return std::nextafter(value * (1.0 + kCertificateRoundoff) +
                               kCertificateRoundoff,
                           std::numeric_limits<double>::infinity());
@@ -71,6 +82,157 @@ double LowerBound(const double value)
         kCertificateRoundoff;
     return std::max(0.0, std::nextafter(
         lowered, -std::numeric_limits<double>::infinity()));
+}
+
+struct Binary64Parts
+{
+    std::uint64_t significand = 0U;
+    int exponent = 0;
+};
+
+Binary64Parts DecomposeBinary64(const double value)
+{
+    Binary64Parts parts;
+    const double magnitude = std::abs(value);
+    std::uint64_t bits = 0U;
+    std::memcpy(&bits, &magnitude, sizeof(bits));
+    const std::uint64_t fraction = bits & ((std::uint64_t(1) << 52U) - 1U);
+    const std::uint64_t exponent_bits = (bits >> 52U) & 0x7ffU;
+    if (exponent_bits == 0U) {
+        parts.significand = fraction;
+        parts.exponent = -1074;
+    } else {
+        parts.significand = (std::uint64_t(1) << 52U) | fraction;
+        parts.exponent = static_cast<int>(exponent_bits) - 1023 - 52;
+    }
+    return parts;
+}
+
+struct ExactSquaredMagnitude
+{
+    boost::multiprecision::cpp_int significand = 0;
+    int exponent = 0;
+    bool zero = true;
+};
+
+ExactSquaredMagnitude ExactSquaredMagnitudeFor(
+    const Eigen::Vector3d& value, const bool horizontal)
+{
+    const double components[] = {value.x(), value.y(),
+                                 horizontal ? 0.0 : value.z()};
+    ExactSquaredMagnitude result;
+    int minimum_exponent = std::numeric_limits<int>::max();
+    Binary64Parts parts[3];
+    for (int index = 0; index < 3; ++index) {
+        parts[index] = DecomposeBinary64(components[index]);
+        if (parts[index].significand != 0U) {
+            result.zero = false;
+            minimum_exponent = std::min(minimum_exponent,
+                                        2 * parts[index].exponent);
+        }
+    }
+    if (result.zero) return result;
+    result.exponent = minimum_exponent;
+    for (int index = 0; index < 3; ++index) {
+        if (parts[index].significand == 0U) continue;
+        const int shift = 2 * parts[index].exponent - minimum_exponent;
+        boost::multiprecision::cpp_int term = parts[index].significand;
+        term *= parts[index].significand;
+        result.significand += term << shift;
+    }
+    return result;
+}
+
+bool Binary64SquaredLeq(const double candidate,
+                        const ExactSquaredMagnitude& exact)
+{
+    if (candidate <= 0.0) return true;
+    if (exact.zero) return false;
+    const Binary64Parts parts = DecomposeBinary64(candidate);
+    boost::multiprecision::cpp_int candidate_significand = parts.significand;
+    candidate_significand *= parts.significand;
+    const int candidate_exponent = 2 * parts.exponent;
+    if (candidate_exponent >= exact.exponent) {
+        candidate_significand <<= candidate_exponent - exact.exponent;
+        return candidate_significand <= exact.significand;
+    }
+    boost::multiprecision::cpp_int exact_significand = exact.significand;
+    exact_significand <<= exact.exponent - candidate_exponent;
+    return candidate_significand <= exact_significand;
+}
+
+double DirectedLowerNorm(const Eigen::Vector3d& value, const bool horizontal)
+{
+    if (!value.allFinite()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const ExactSquaredMagnitude exact =
+        ExactSquaredMagnitudeFor(value, horizontal);
+    if (exact.zero) return 0.0;
+
+    // Positive binary64 bit patterns are monotonically ordered by their
+    // integer representation.  Binary-search the greatest finite value whose
+    // exact square is no larger than the exact binary64 sum of squares.  This
+    // avoids relying on long-double precision or on the final scale*root
+    // multiplication being rounded in the desired direction.
+    std::uint64_t lower = 0U;
+    std::uint64_t upper = 0x7fefffffffffffffULL;  // DBL_MAX, finite
+    while (lower < upper) {
+        const std::uint64_t middle = lower +
+            (upper - lower + 1U) / 2U;
+        double candidate = 0.0;
+        std::memcpy(&candidate, &middle, sizeof(candidate));
+        if (Binary64SquaredLeq(candidate, exact)) {
+            lower = middle;
+        } else {
+            upper = middle - 1U;
+        }
+    }
+    double result = 0.0;
+    std::memcpy(&result, &lower, sizeof(result));
+    return result;
+}
+
+double ScaledLowerBound(const double value, const bool exact,
+                        const double scale)
+{
+    if (!std::isfinite(value) || value < 0.0 ||
+        !std::isfinite(scale) || scale <= 0.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double scaled = value / scale;
+    if (!std::isfinite(scaled) || scaled < 0.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (!exact) return LowerBound(scaled);
+    // Preserve an exact constant quotient for every finite span, not only
+    // binary powers.  The fused residual distinguishes a rounded-down
+    // quotient (already a valid lower bound) from a rounded-up one; only the
+    // latter is stepped toward zero.
+    const double residual = std::fma(scaled, scale, -value);
+    if (std::isfinite(residual) && residual <= 0.0) return scaled;
+    return std::max(0.0, std::nextafter(
+        scaled, -std::numeric_limits<double>::infinity()));
+}
+
+double ProductLowerBound(const double value, const bool exact,
+                         const double scale)
+{
+    if (!std::isfinite(value) || value < 0.0 ||
+        !std::isfinite(scale) || scale < 0.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double product = value * scale;
+    if (!std::isfinite(product) || product < 0.0) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if (!exact) return LowerBound(product);
+    // As above, retain exact constant products for arbitrary spans while
+    // moving a rounded-up product one representable value downward.
+    const double residual = std::fma(value, scale, -product);
+    if (std::isfinite(residual) && residual <= 0.0) return product;
+    return std::max(0.0, std::nextafter(
+        product, -std::numeric_limits<double>::infinity()));
 }
 
 double Binomial(const int n, const int k)
@@ -181,14 +343,23 @@ VectorBounds BoundsFromBernsteinControls(
 {
     VectorBounds bounds;
     if (controls.empty()) return bounds;
-    Eigen::Vector3d center = Eigen::Vector3d::Zero();
-    for (const Eigen::Vector3d& control : controls) {
-        if (!control.allFinite()) return bounds;
+    const Eigen::Vector3d first = horizontal
+        ? Eigen::Vector3d(controls.front().x(), controls.front().y(), 0.0)
+        : controls.front();
+    if (!first.allFinite()) return bounds;
+    bool constant = true;
+    Eigen::Vector3d center = first;
+    for (std::size_t index = 1U; index < controls.size(); ++index) {
         const Eigen::Vector3d projected = horizontal
-            ? Eigen::Vector3d(control.x(), control.y(), 0.0) : control;
+            ? Eigen::Vector3d(controls[index].x(), controls[index].y(), 0.0)
+            : controls[index];
+        if (!projected.allFinite()) return bounds;
+        if ((projected.array() != first.array()).any()) constant = false;
         center += projected;
     }
-    center /= static_cast<double>(controls.size());
+    if (!constant) {
+        center /= static_cast<double>(controls.size());
+    }
     double radius = 0.0;
     double upper = 0.0;
     for (const Eigen::Vector3d& control : controls) {
@@ -197,8 +368,11 @@ VectorBounds BoundsFromBernsteinControls(
         radius = std::max(radius, (projected - center).norm());
         upper = std::max(upper, projected.norm());
     }
-    const double lower = std::max(0.0, center.norm() - radius);
-    bounds.inf_norm = LowerBound(lower);
+    const double lower = constant
+        ? DirectedLowerNorm(first, horizontal)
+        : std::max(0.0, center.norm() - radius);
+    bounds.inf_norm = constant ? lower : LowerBound(lower);
+    bounds.inf_norm_exact = constant;
     bounds.sup_norm = UpperBound(upper);
     bounds.valid = std::isfinite(bounds.inf_norm) &&
         std::isfinite(bounds.sup_norm) && bounds.sup_norm >= bounds.inf_norm;
@@ -223,18 +397,21 @@ bool MakeCertificate(const double w0, const double w1,
     if (!differential.valid || !std::isfinite(w0) || !std::isfinite(w1) ||
         h <= kDomainEps ||
         differential.inf_speed <= kCertificateSpeedEps ||
+        differential.inf_horizontal_speed <=
+            phase_offset_core::kHorizontalNormalSpeedEpsilon ||
         !std::isfinite(differential.sup_speed) ||
         !std::isfinite(differential.sup_acceleration) ||
+        !std::isfinite(differential.sup_horizontal_acceleration) ||
         !std::isfinite(differential.sup_jerk)) {
         return false;
     }
-    // Full 3D bounds are authoritative for frame-bound production paths.
-    // Horizontal projections remain diagnostics only and may be exactly zero
-    // on a near-vertical path.  For T=p_w/||p_w||,
-    // ||T_w|| <= ||p_ww||/inf||p_w||; Bishop transport gives the same bound
-    // for ||N_w||.  These are closed-cell conservative bounds, not endpoint
-    // samples.
+    // Horizontal-N uses the direct normalized-cross-product bound
+    // ||N_w|| <= sup||p_ww,xy|| / inf||p_w,xy||.  Tangent variation remains a
+    // separate full-3-D proof using sup||p_ww|| / inf||p_w||.
     const double normal_w = UpperBound(
+        differential.sup_horizontal_acceleration /
+            differential.inf_horizontal_speed);
+    const double tangent_w = UpperBound(
         differential.sup_acceleration / differential.inf_speed);
     const double curvature = UpperBound(
         differential.sup_acceleration /
@@ -252,16 +429,20 @@ bool MakeCertificate(const double w0, const double w1,
     certificate.sup_p_w_norm = differential.sup_speed;
     certificate.sup_p_ww_norm = differential.sup_acceleration;
     certificate.sup_p_www_norm = differential.sup_jerk;
+    certificate.sup_horizontal_p_ww_norm =
+        differential.sup_horizontal_acceleration;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = normal_w;
     certificate.sup_abs_curvature = curvature;
     certificate.normal_variation_bound = UpperBound(normal_w * h);
+    certificate.tangent_variation_bound = UpperBound(tangent_w * h);
     certificate.curvature_variation_bound = UpperBound(curvature_w * h);
     certificate.midpoint_position_variation_bound = UpperBound(
         0.5 * differential.sup_speed * h);
     certificate.chord_deviation_bound = UpperBound(
         differential.sup_acceleration * h * h / 8.0);
-    certificate.valid = std::isfinite(normal_w) && std::isfinite(curvature) &&
-        std::isfinite(curvature_w);
+    certificate.valid = std::isfinite(normal_w) && std::isfinite(tangent_w) &&
+        std::isfinite(curvature) && std::isfinite(curvature_w);
     certificate.complete = certificate.valid;
     return certificate.valid;
 }
@@ -327,7 +508,9 @@ bool BoundsFromSpline(const UniformBspline& spline, const double t0,
 bool MakeQuinticDifferentialBounds(
     const std::array<Eigen::Vector3d, 6>& a,
     const double segment_w0, const double segment_w1,
-    const double w0, const double w1, DifferentialBounds& differential)
+    const double w0, const double w1,
+    const Eigen::Vector3d* constant_horizontal_dp_dw,
+    DifferentialBounds& differential)
 {
     differential = DifferentialBounds();
     if (!std::isfinite(segment_w0) || !std::isfinite(segment_w1) ||
@@ -361,9 +544,28 @@ bool MakeQuinticDifferentialBounds(
         !horizontal_jerk.valid) {
         return false;
     }
-    differential.inf_speed = LowerBound(speed.inf_norm / h_segment);
-    differential.inf_horizontal_speed = LowerBound(
-        horizontal_speed.inf_norm / h_segment);
+    differential.inf_speed = ScaledLowerBound(
+        speed.inf_norm, speed.inf_norm_exact, h_segment);
+    if (constant_horizontal_dp_dw != nullptr) {
+        const Eigen::Vector3d horizontal_derivative(
+            constant_horizontal_dp_dw->x(),
+            constant_horizontal_dp_dw->y(), 0.0);
+        const double direct_horizontal_speed =
+            DirectedLowerNorm(horizontal_derivative, true);
+        if (!std::isfinite(direct_horizontal_speed) ||
+            direct_horizontal_speed < 0.0) {
+            return false;
+        }
+        // The endpoint derivative is already expressed in phase-w units.
+        // Preserve it directly instead of recovering q through a1/h, whose
+        // arbitrary-span division can round an immediately-above-threshold
+        // value down to the threshold.
+        differential.inf_horizontal_speed = direct_horizontal_speed;
+    } else {
+        differential.inf_horizontal_speed = ScaledLowerBound(
+            horizontal_speed.inf_norm, horizontal_speed.inf_norm_exact,
+            h_segment);
+    }
     differential.sup_speed = UpperBound(speed.sup_norm / h_segment);
     differential.sup_acceleration = UpperBound(
         acceleration.sup_norm / (h_segment * h_segment));
@@ -383,6 +585,7 @@ bool MakeQuinticDifferentialBounds(
 bool MakeQuinticCertificate(
     const std::array<Eigen::Vector3d, 6>& a, const double segment_w0,
     const double segment_w1, const double w0, const double w1,
+    const Eigen::Vector3d* constant_horizontal_dp_dw,
     phase_offset_core::PathCellGeometryCertificate& certificate)
 {
     if (!std::isfinite(segment_w0) || !std::isfinite(segment_w1) ||
@@ -393,7 +596,8 @@ bool MakeQuinticCertificate(
     }
     DifferentialBounds differential;
     if (MakeQuinticDifferentialBounds(a, segment_w0, segment_w1,
-                                      w0, w1, differential) &&
+                                      w0, w1, constant_horizontal_dp_dw,
+                                      differential) &&
         MakeCertificate(w0, w1, differential, certificate)) {
         return true;
     }
@@ -420,7 +624,9 @@ bool MakeQuinticCertificate(
             static_cast<double>(kSubdivisions);
         DifferentialBounds local;
         if (!MakeQuinticDifferentialBounds(a, segment_w0, segment_w1,
-                                           local_w0, local_w1, local)) {
+                                           local_w0, local_w1,
+                                           constant_horizontal_dp_dw,
+                                           local)) {
             aggregate.valid = false;
             break;
         }
@@ -580,8 +786,10 @@ bool MakeMappedBsplineCertificate(
         return false;
     }
     DifferentialBounds differential;
-    differential.inf_speed = LowerBound(p_t.inf_norm * dt_dw_min);
-    differential.inf_horizontal_speed = LowerBound(p_t_h.inf_norm * dt_dw_min);
+    differential.inf_speed = ProductLowerBound(
+        p_t.inf_norm, p_t.inf_norm_exact, dt_dw_min);
+    differential.inf_horizontal_speed = ProductLowerBound(
+        p_t_h.inf_norm, p_t_h.inf_norm_exact, dt_dw_min);
     differential.sup_speed = UpperBound(p_t.sup_norm * dt_dw_max);
     differential.sup_acceleration = UpperBound(
         p_tt.sup_norm * dt_dw_max * dt_dw_max +
@@ -654,8 +862,10 @@ bool MakeLinearMappedBsplineCertificate(
         return false;
     }
     DifferentialBounds differential;
-    differential.inf_speed = LowerBound(p_t.inf_norm * dt_dw);
-    differential.inf_horizontal_speed = LowerBound(p_t_h.inf_norm * dt_dw);
+    differential.inf_speed = ProductLowerBound(
+        p_t.inf_norm, p_t.inf_norm_exact, dt_dw);
+    differential.inf_horizontal_speed = ProductLowerBound(
+        p_t_h.inf_norm, p_t_h.inf_norm_exact, dt_dw);
     differential.sup_speed = UpperBound(p_t.sup_norm * dt_dw);
     differential.sup_acceleration = UpperBound(
         p_tt.sup_norm * dt_dw * dt_dw);
@@ -1168,6 +1378,16 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeQuinticHermite(
     const Eigen::Vector3d a5 = 6.0 * r0 - 3.0 * r1 + 0.5 * r2;
     const double speed0 = std::max(0.0, start.vel.norm());
     const double speed1 = std::max(0.0, end.vel.norm());
+    const std::array<Eigen::Vector3d, 6> coefficients = {{
+        a0, a1, a2, a3, a4, a5}};
+    bool constant_horizontal_derivative =
+        start.dp_dw.x() == end.dp_dw.x() &&
+        start.dp_dw.y() == end.dp_dw.y();
+    for (std::size_t index = 2U; index < 6U; ++index) {
+        constant_horizontal_derivative = constant_horizontal_derivative &&
+            coefficients[index].x() == 0.0 && coefficients[index].y() == 0.0;
+    }
+    const Eigen::Vector3d constant_horizontal_dp_dw = start.dp_dw;
 
     const auto point_evaluator = [=](double w, ContinuousPhasePathState& state) {
         const double s = std::max(0.0, std::min(1.0, (w - w0) / h));
@@ -1180,6 +1400,15 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeQuinticHermite(
                        4.0 * a4 * s3 + 5.0 * a5 * s4) / h;
         state.d2p_dw2 = (2.0 * a2 + 6.0 * a3 * s + 12.0 * a4 * s2 +
                          20.0 * a5 * s3) / (h * h);
+        if (constant_horizontal_derivative) {
+            const double dw = std::max(0.0, std::min(h, w - w0));
+            state.p.x() = a0.x() + constant_horizontal_dp_dw.x() * dw;
+            state.p.y() = a0.y() + constant_horizontal_dp_dw.y() * dw;
+            state.dp_dw.x() = constant_horizontal_dp_dw.x();
+            state.dp_dw.y() = constant_horizontal_dp_dw.y();
+            state.d2p_dw2.x() = 0.0;
+            state.d2p_dw2.y() = 0.0;
+        }
         const double blend = s * s * (3.0 - 2.0 * s);
         const double speed = (1.0 - blend) * speed0 + blend * speed1;
         if (state.dp_dw.norm() > 1e-9) {
@@ -1190,13 +1419,16 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeQuinticHermite(
         state.valid = finiteState(state);
         return state.valid;
     };
-    const std::array<Eigen::Vector3d, 6> coefficients = {{
-        a0, a1, a2, a3, a4, a5}};
     const CellBoundEvaluator cell_bound_evaluator =
-        [coefficients, w0, w1](const double cell_w0, const double cell_w1,
+        [coefficients, w0, w1, constant_horizontal_derivative,
+         constant_horizontal_dp_dw](const double cell_w0, const double cell_w1,
                                 phase_offset_core::PathCellGeometryCertificate& certificate) {
+          const Eigen::Vector3d* direct_horizontal_dp_dw =
+              constant_horizontal_derivative
+                  ? &constant_horizontal_dp_dw : nullptr;
           return MakeQuinticCertificate(coefficients, w0, w1, cell_w0,
-                                        cell_w1, certificate);
+                                        cell_w1, direct_horizontal_dp_dw,
+                                        certificate);
         };
     return Evaluator(point_evaluator, cell_bound_evaluator);
 }

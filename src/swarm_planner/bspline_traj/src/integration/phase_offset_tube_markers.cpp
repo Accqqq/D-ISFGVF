@@ -120,6 +120,29 @@ bool AppendBoundaryPoints(const phase_offset_navigation::TubeProfile& profile,
   return AppendBoundaryPoints(profile.samples, lower, upper, ribbon);
 }
 
+bool CertifiedGeometryProfileDisplayable(
+    const phase_offset_navigation::TubeProfile& profile) {
+  if (profile.source != phase_offset_navigation::TubeSource::ESDF ||
+      !profile.complete || profile.samples.size() < 2U) {
+    return false;
+  }
+  bool have_previous = false;
+  double previous_w = 0.0;
+  for (const auto& sample : profile.samples) {
+    if (!sample.complete || !std::isfinite(sample.w) ||
+        !std::isfinite(sample.filtered_lower) ||
+        !std::isfinite(sample.filtered_upper) ||
+        sample.filtered_lower > sample.filtered_upper ||
+        (have_previous && !(sample.w > previous_w)) ||
+        !BoundaryPointFinite(sample)) {
+      return false;
+    }
+    previous_w = sample.w;
+    have_previous = true;
+  }
+  return true;
+}
+
 bool ExactPhase(const double first, const double second) {
   std::uint64_t first_bits = 0U;
   std::uint64_t second_bits = 0U;
@@ -222,6 +245,33 @@ visualization_msgs::MarkerArray MakeCertifiedTubeMarkers(
                                0.0F, 0.7F, 1.0F, 0.20F);
   if (!AppendBoundaryPoints(profile, lower, upper, ribbon)) {
     return MakeDeleteAll(stamp, frame_id, "phase_offset_manual_tube");
+  }
+  visualization_msgs::MarkerArray markers;
+  markers.markers.push_back(lower);
+  markers.markers.push_back(upper);
+  markers.markers.push_back(ribbon);
+  return markers;
+}
+
+visualization_msgs::MarkerArray MakeCertifiedGeometryTubeMarkers(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const phase_offset_navigation::TubeProfile& profile,
+    const bool displayable) {
+  constexpr const char* kNamespace =
+      "phase_offset_manual_tube_certified_geometry";
+  if (!displayable || !CertifiedGeometryProfileDisplayable(profile)) {
+    return MakeDeleteAll(stamp, frame_id, kNamespace);
+  }
+
+  auto lower = MakeTubeLine(stamp, frame_id, kNamespace,
+                            0, 0.05F, 1.0F, 0.2F, 0.0F);
+  auto upper = MakeTubeLine(stamp, frame_id, kNamespace,
+                            1, 0.05F, 1.0F, 0.2F, 0.0F);
+  auto ribbon = MakeTubeRibbon(stamp, frame_id, kNamespace,
+                               1.0F, 0.2F, 0.0F, 0.24F);
+  if (!AppendBoundaryPoints(profile, lower, upper, ribbon)) {
+    return MakeDeleteAll(stamp, frame_id, kNamespace);
   }
   visualization_msgs::MarkerArray markers;
   markers.markers.push_back(lower);

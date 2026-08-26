@@ -12,10 +12,10 @@
 
 namespace FLAG_Race {
 
-// Deterministic Bishop-style frame transport for one immutable path owner.
-// The frame is value/query-only; no production consumer needs to rebuild N or
-// N_w from p_w. Query results are independent of call order and are bound to
-// the path/frame revisions supplied at construction.
+// Deterministic world-horizontal cross-product frame for one immutable path
+// owner.  The frame is value/query-only; N and N_w are derived from the same
+// full-3-D path query and are bound to the path/frame revisions supplied at
+// construction.
 class ContinuousPhaseNormalFrame final
     : public phase_offset_core::ImmutableNormalFrame {
  public:
@@ -41,24 +41,17 @@ class ContinuousPhaseNormalFrame final
 
  private:
   bool tangentAt(double w, Eigen::Vector3d& tangent,
-                Eigen::Vector3d& tangent_w) const;
-  bool seedNormal(const Eigen::Vector3d& tangent,
-                  Eigen::Vector3d& normal) const;
-  // Builds the immutable represented N(w) and its derivative from the same
-  // smooth, projected interpolation.  Keeping this calculation together is
-  // essential: an analytically transported N_w cannot be paired with a
-  // discretely projected N without violating the frame contract.
+                 Eigen::Vector3d& tangent_w) const;
+  // Builds the unique Horizontal-N representation and its exact analytic
+  // derivative from p_w and p_ww at the same phase location.
   bool representedNormalAt(double w, Eigen::Vector3d& tangent,
                            Eigen::Vector3d& tangent_w,
                            Eigen::Vector3d& normal,
                            Eigen::Vector3d& normal_w) const;
-  bool transportTo(double w, Eigen::Vector3d& tangent,
-                   Eigen::Vector3d& normal) const;
 
   std::shared_ptr<const ContinuousPhasePath> path_;
   std::uint64_t path_revision_ = 0U;
   std::uint64_t frame_revision_ = 0U;
-  Eigen::Vector3d seed_normal_ = Eigen::Vector3d::Zero();
 };
 
 }  // namespace FLAG_Race

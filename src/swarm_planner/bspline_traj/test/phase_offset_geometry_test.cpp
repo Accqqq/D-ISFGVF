@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 
 #include <bspline_race/phase_offset_geometry.h>
 
@@ -8,9 +9,11 @@ namespace
 {
 
 using FLAG_Race::ContinuousPhasePathState;
+using FLAG_Race::C2ConnectorCheckResult;
 using FLAG_Race::PhaseOffsetGeometry;
 using FLAG_Race::PhaseOffsetGeometryEvaluator;
 using FLAG_Race::PhaseOffsetGeometryParams;
+using FLAG_Race::checkC2ConnectorSamples;
 
 ContinuousPhasePathState makeLineState(double w)
 {
@@ -18,6 +21,16 @@ ContinuousPhasePathState makeLineState(double w)
   s.p = Eigen::Vector3d(w, 0.0, 1.0);
   s.dp_dw = Eigen::Vector3d(1.0, 0.0, 0.0);
   s.d2p_dw2 = Eigen::Vector3d::Zero();
+  return s;
+}
+
+ContinuousPhasePathState makeVerticalState(double w)
+{
+  ContinuousPhasePathState s;
+  s.p = Eigen::Vector3d(0.0, 0.0, w);
+  s.dp_dw = Eigen::Vector3d::UnitZ();
+  s.d2p_dw2 = Eigen::Vector3d::Zero();
+  s.valid = true;
   return s;
 }
 
@@ -36,11 +49,13 @@ ContinuousPhasePathState makeFrameBoundQuadraticState(double w)
   ContinuousPhasePathState s;
   s.p = Eigen::Vector3d(w, 0.0, 1.0);
   s.dp_dw = Eigen::Vector3d(0.20, 0.0, 0.0);
-  s.d2p_dw2 = Eigen::Vector3d::Zero();
+  s.d2p_dw2 = Eigen::Vector3d(0.0, -0.20, 0.0);
   s.T = Eigen::Vector3d::UnitX();
   s.N = Eigen::Vector3d::UnitY();
   s.N_w = Eigen::Vector3d::UnitX();
   s.frame_valid = true;
+  s.frame_provenance =
+      "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
   s.valid = true;
   return s;
 }
@@ -94,7 +109,37 @@ TEST(PhaseOffsetGeometry, StraightLinePositiveNegativeDelta)
   EXPECT_NEAR(0.0, (out_p.r_w - out_p.dp_dw).norm(), 1e-12);
 }
 
-TEST(PhaseOffsetGeometry, CircleCurvatureMatchesAnalytic)
+TEST(PhaseOffsetGeometry, VerticalPathAllowsOnlyExactZeroOffset)
+{
+  PhaseOffsetGeometryEvaluator ev;
+  const ContinuousPhasePathState state = makeVerticalState(2.0);
+  const double denorm = std::numeric_limits<double>::denorm_min();
+  const double deltas[] = {0.0, 1e-13, -1e-13, denorm, -denorm};
+  for (const double delta : deltas) {
+    PhaseOffsetGeometry out;
+    const bool valid = ev.evaluate(state, state.p, delta, makeParams(), out);
+    if (delta == 0.0) {
+      ASSERT_TRUE(valid);
+      EXPECT_TRUE(out.valid);
+      EXPECT_DOUBLE_EQ(out.r.z(), state.p.z());
+      EXPECT_DOUBLE_EQ(out.r_w.z(), state.dp_dw.z());
+    } else {
+      EXPECT_FALSE(valid);
+      EXPECT_EQ(out.invalid_reason, "horizontal_normal_speed_too_small");
+    }
+
+    C2ConnectorCheckResult connector;
+    EXPECT_EQ(checkC2ConnectorSamples(
+                  std::vector<ContinuousPhasePathState>{state}, delta,
+                  makeParams().mu_regular, {}, 0.0, connector),
+              delta == 0.0);
+    if (delta != 0.0) {
+      EXPECT_EQ(connector.reason, "horizontal_normal_speed_too_small");
+    }
+  }
+}
+
+TEST(PhaseOffsetGeometry, CircleHorizontalNormalDerivativeMatchesAnalytic)
 {
   PhaseOffsetGeometryEvaluator ev;
   const double R = 5.0;
@@ -102,11 +147,12 @@ TEST(PhaseOffsetGeometry, CircleCurvatureMatchesAnalytic)
   ASSERT_TRUE(ev.evaluate(makeCircleState(2.0, R),
                           Eigen::Vector3d(R, 0.1, 1.0), 0.3, makeParams(),
                           out));
-  EXPECT_NEAR(1.0 / R, out.curvature, 1e-9);
-  EXPECT_NEAR(1.0 - (1.0 / R) * 0.3, 1.0 - out.curvature * out.delta, 1e-9);
-  // r_w = (1 - kappa*delta) * p_w
+  EXPECT_NEAR(1.0 / R, out.curvature, 1e-12);
+  EXPECT_NEAR(1.0 - 0.3 / R, out.r_w.norm(), 1e-9);
+  // The horizontal-cross-product N_w gives the same circle derivative while
+  // retaining the full 3-D regularity calculation.
   EXPECT_NEAR(0.0,
-              (out.r_w - (1.0 - out.curvature * out.delta) * out.dp_dw).norm(),
+              (out.r_w - (1.0 - 0.3 / R) * out.dp_dw).norm(),
               1e-9);
 }
 
@@ -122,19 +168,19 @@ TEST(PhaseOffsetGeometry, RwOrthogonalToN)
   EXPECT_NEAR(1.0, out.N.norm(), 1e-12);
 }
 
-TEST(PhaseOffsetGeometry, DegenerateRegularityDetected)
+TEST(PhaseOffsetGeometry, Full3DRegularityDetectsOnlyActualSpeedDegeneracy)
 {
   PhaseOffsetGeometryEvaluator ev;
   PhaseOffsetGeometry out;
   const double R = 3.0;
-  // delta = R -> 1 - kappa*delta = 0 < mu
+  // delta = R makes the full active-reference derivative exactly zero.
   EXPECT_FALSE(ev.evaluate(makeCircleState(1.0, R),
                            Eigen::Vector3d(0.0, 0.0, 1.0), R, makeParams(),
                            out));
-  EXPECT_FALSE(ev.evaluate(makeCircleState(1.0, R),
+  EXPECT_TRUE(ev.evaluate(makeCircleState(1.0, R),
                            Eigen::Vector3d(0.0, 0.0, 1.0), R + 1.0,
                            makeParams(), out));
-  EXPECT_FALSE(out.valid);
+  EXPECT_TRUE(out.valid);
 }
 
 TEST(PhaseOffsetGeometry, ConfiguredMinimumReferenceSpeedMatchesFrameQuadratic)
@@ -151,6 +197,60 @@ TEST(PhaseOffsetGeometry, ConfiguredMinimumReferenceSpeedMatchesFrameQuadratic)
   EXPECT_FALSE(ev.evaluate(makeFrameBoundQuadraticState(0.0),
                            Eigen::Vector3d::Zero(), 0.0,
                            params, out));
+}
+
+TEST(PhaseOffsetGeometry, FrameEvidenceMustMatchCanonicalHorizontalNormal)
+{
+  PhaseOffsetGeometryEvaluator ev;
+  PhaseOffsetGeometryParams params = makeParams();
+  PhaseOffsetGeometry out;
+
+  ContinuousPhasePathState forged = makeFrameBoundQuadraticState(0.0);
+  forged.N = Eigen::Vector3d::UnitX();
+  EXPECT_FALSE(ev.evaluate(forged, forged.p, 0.0, params, out));
+  EXPECT_EQ(out.invalid_reason, "normal_frame_geometry_incompatible");
+
+  forged = makeFrameBoundQuadraticState(0.0);
+  forged.N_w.z() = 1e-3;
+  EXPECT_FALSE(ev.evaluate(forged, forged.p, 0.0, params, out));
+  EXPECT_EQ(out.invalid_reason, "normal_frame_geometry_incompatible");
+
+  forged = makeFrameBoundQuadraticState(0.0);
+  forged.frame_provenance = "legacy/Bishop";
+  EXPECT_FALSE(ev.evaluate(forged, forged.p, 0.0, params, out));
+  EXPECT_EQ(out.invalid_reason, "normal_frame_provenance_incompatible");
+}
+
+TEST(PhaseOffsetGeometry, HorizontalCapabilityUsesStrictSingleThreshold)
+{
+  PhaseOffsetGeometryEvaluator ev;
+  const double threshold = phase_offset_core::kHorizontalNormalSpeedEpsilon;
+  const double below = std::nextafter(threshold, 0.0);
+  const double above = std::nextafter(
+      threshold, std::numeric_limits<double>::infinity());
+  const double deltas[] = {
+      0.0, 1e-13, -1e-13,
+      std::numeric_limits<double>::denorm_min(),
+      -std::numeric_limits<double>::denorm_min()};
+  for (const double horizontal_speed : {below, threshold, above}) {
+    ContinuousPhasePathState state;
+    state.p = Eigen::Vector3d::Zero();
+    state.dp_dw = Eigen::Vector3d(horizontal_speed, 0.0, 1.0);
+    state.d2p_dw2 = Eigen::Vector3d::Zero();
+    state.valid = true;
+    for (const double delta : deltas) {
+      PhaseOffsetGeometry out;
+      const bool valid = ev.evaluate(state, state.p, delta, makeParams(), out);
+      if (horizontal_speed > threshold || delta == 0.0) {
+        EXPECT_TRUE(valid) << "speed=" << horizontal_speed
+                           << " delta=" << delta;
+      } else {
+        EXPECT_FALSE(valid) << "speed=" << horizontal_speed
+                            << " delta=" << delta;
+        EXPECT_EQ(out.invalid_reason, "horizontal_normal_speed_too_small");
+      }
+    }
+  }
 }
 
 TEST(PhaseOffsetGeometry, ErrorDecompositionOnActiveReference)

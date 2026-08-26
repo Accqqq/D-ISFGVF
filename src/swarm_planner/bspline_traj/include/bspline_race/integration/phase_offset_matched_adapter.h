@@ -112,8 +112,8 @@ struct PathTubePair {
   std::uint64_t map_observation_sequence = 0U;
   bool map_observation_is_snapshot = false;
   std::shared_ptr<const ContinuousPhasePath> path_owner;
-  // One immutable Bishop frame is shared by all path-state, cell-proof, and
-  // executed-reference queries for this authority handoff.
+  // One immutable WorldHorizontalCrossProduct frame is shared by all
+  // path-state, cell-proof, and executed-reference queries for this handoff.
   std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       frozen_cloud_occupancy_snapshot;
@@ -636,6 +636,7 @@ struct MatchedAdapterMarkerBundle {
   visualization_msgs::MarkerArray frame;
   visualization_msgs::MarkerArray tube;
   visualization_msgs::MarkerArray tube_candidate;
+  visualization_msgs::MarkerArray tube_certified_geometry;
 };
 
 class PhaseOffsetMatchedAdapter {
@@ -924,6 +925,13 @@ class PhaseOffsetMatchedAdapter {
       bool exact_live_pair_control,
       const std::shared_ptr<const TubeEpochSnapshot>& authoritative_candidate,
       const std::shared_ptr<const TubeEpochSnapshot>& control_epoch);
+  // Stateless R3 predicate.  It validates only immutable ESDF Candidate
+  // geometry/provenance and never consults Runtime, Pair, Active ownership,
+  // selected-u or execution state.
+  static bool certifiedGeometryCandidateEligible(
+      const TubeBuildRequest& request,
+      const TubeEpochSnapshot& candidate,
+      std::uint64_t current_task_generation);
   bool buildMarkers(const ControlPublishSnapshot& control,
                     MatchedAdapterMarkerBundle& markers) const;
   bool buildMarkers(
@@ -943,6 +951,11 @@ class PhaseOffsetMatchedAdapter {
       MatchedAdapterMarkerBundle& markers) const;
   bool markEpochBuildPublished(std::uint64_t build_sequence);
   void publishBuildDiagnostics(const TubeEpochSnapshot& epoch);
+  // Timer-owned R3 marker decision.  The request/Candidate/request loads and
+  // final request identity reread form the publication linearization point;
+  // the caller publishes this already-linearized three-marker bundle.
+  visualization_msgs::MarkerArray certifiedGeometryMarkers(
+      const ros::Time& stamp) const;
   void publishManual(const ControlPublishSnapshot& control);
   void publishManualDelete(const ControlPublishSnapshot& control);
   void latchFailure(phase_offset_navigation::ControlFailureReason reason);
@@ -1043,6 +1056,9 @@ class PhaseOffsetMatchedAdapter {
   std::function<void()> finalize_publication_test_hook_;
   std::function<void()> inactive_publication_test_hook_;
   std::function<void()> deactivate_test_hook_;
+  // Bounded passive test-only interleaving hook.  It is absent in production
+  // and exists solely to force the R3 final request-identity race boundary.
+  std::function<void()> certified_geometry_linearization_test_hook_;
   // Published by the command-owned new-task reset.  A timer tick consumes it
   // before observing a request, so no TubeEpochManager/profile/cache state is
   // carried across navigation tasks.
@@ -1073,6 +1089,7 @@ class PhaseOffsetMatchedAdapter {
   ros::Publisher manual_frame_pub_;
   ros::Publisher manual_tube_pub_;
   ros::Publisher manual_tube_candidate_pub_;
+  ros::Publisher manual_tube_certified_geometry_pub_;
   ros::Publisher manual_diagnostics_pub_;
   ros::Publisher manual_tube_epoch_diagnostics_pub_;
   ros::Publisher manual_raw_candidate_diagnostics_pub_;

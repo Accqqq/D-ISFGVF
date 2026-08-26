@@ -106,6 +106,8 @@ PathStateQuery SlowFrameBoundPath() {
     state.N = Eigen::Vector3d::UnitY();
     state.N_w = Eigen::Vector3d::UnitX();
     state.frame_valid = true;
+    state.frame_provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     state.w = w;
     state.valid = std::isfinite(w);
     return state.valid;
@@ -155,9 +157,15 @@ PathCellBoundQuery CertifiedLineCells(const double inf_speed = 1.0,
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    // Keep the Horizontal-N derivative evidence mutually consistent with the
+    // advertised sup_N_w_norm even when the horizontal speed lower bound is
+    // below one: a_xy/q_min must not understate sup_N_w_norm.
+    certificate.sup_horizontal_p_ww_norm = sup_normal_w * inf_speed;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = sup_normal_w;
     certificate.sup_abs_curvature = sup_curvature;
     certificate.normal_variation_bound = sup_normal_w * (w1 - w0);
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = midpoint_scale * (w1 - w0);
     certificate.chord_deviation_bound = 0.0;
@@ -193,9 +201,12 @@ PathCellBoundQuery CertifiedConstantLineCells() {
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = 0.0;
     certificate.sup_abs_curvature = 0.0;
     certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
@@ -452,6 +463,8 @@ TEST(TubeSurfaceValidatorTest,
     certificate.valid = true;
     certificate.complete = true;
     certificate.normal_frame_proof_complete = true;
+    certificate.provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     return true;
   };
   TubeSurfaceValidationResult mismatched_result;
@@ -480,6 +493,8 @@ TEST(TubeSurfaceValidatorTest,
     certificate.valid = true;
     certificate.complete = true;
     certificate.normal_frame_proof_complete = true;
+    certificate.provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     return true;
   };
   TubeSurfaceValidationResult unbound_result;
@@ -659,6 +674,7 @@ TEST(TubeSurfaceValidatorTest,
   for (std::size_t index = 0U; index < 3U; ++index) {
     TubeProfile profile = MakeProfile({0.0, 0.10}, lower[index], upper[index]);
     TubeSurfaceValidatorConfig config;
+    config.minimum_reference_speed = 0.30;
     // Isolate the failing cell: without subdivision, any observed clearance
     // call would have to belong to that same 3x3 row-major collection.
     config.max_subdivision_depth = 0;

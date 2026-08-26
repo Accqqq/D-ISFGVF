@@ -176,9 +176,12 @@ ContinuousPhasePath::Evaluator MakeCertifiedLinePiece(
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = 0.0;
     certificate.sup_abs_curvature = 0.0;
     certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
@@ -260,6 +263,33 @@ std::shared_ptr<const ContinuousPhasePath> MakeH2ProductionNewOwner(
                 state.d2p_dw2.allFinite() && state.vel.allFinite();
             return state.valid;
           })) {
+    return std::shared_ptr<const ContinuousPhasePath>();
+  }
+  return std::shared_ptr<const ContinuousPhasePath>(owner);
+}
+
+std::shared_ptr<const ContinuousPhasePath> MakeHorizontalDegenerateOwner(
+    const double start_w, const double end_w, const double horizontal_speed) {
+  if (!std::isfinite(start_w) || !std::isfinite(end_w) ||
+      end_w <= start_w || !std::isfinite(horizontal_speed) ||
+      horizontal_speed < 0.0) {
+    return std::shared_ptr<const ContinuousPhasePath>();
+  }
+  FLAG_Race::ContinuousPhasePathState start;
+  start.p = Eigen::Vector3d(0.0, 0.0, 1.0);
+  start.dp_dw = Eigen::Vector3d(horizontal_speed, 0.0, 1.0);
+  start.d2p_dw2 = Eigen::Vector3d::Zero();
+  start.vel = start.dp_dw;
+  start.valid = true;
+  FLAG_Race::ContinuousPhasePathState end = start;
+  const double span = end_w - start_w;
+  end.p = start.p + span * start.dp_dw;
+  const auto evaluator = FLAG_Race::ContinuousPhasePath::makeQuinticHermite(
+      start_w, end_w, start, end);
+  if (!evaluator) return std::shared_ptr<const ContinuousPhasePath>();
+  auto owner = std::make_shared<ContinuousPhasePath>();
+  if (!owner->appendSegment(start_w, end_w, "horizontal-degenerate",
+                            evaluator)) {
     return std::shared_ptr<const ContinuousPhasePath>();
   }
   return std::shared_ptr<const ContinuousPhasePath>(owner);
@@ -690,6 +720,96 @@ PairPublicationFixture MakePairPublicationFixture() {
   timer_epoch->candidate_profile = fixture.timer_candidate_profile;
   timer_epoch->epoch_status = output.tube_epoch_status;
   fixture.timer_candidate_epoch = timer_epoch;
+  return fixture;
+}
+
+struct R3CertifiedGeometryFixture {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  std::shared_ptr<const ContinuousPhasePath> owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame;
+  std::shared_ptr<const TubeBuildRequest> request;
+  std::shared_ptr<const TubeEpochSnapshot> candidate;
+};
+
+R3CertifiedGeometryFixture MakeR3CertifiedGeometryFixture() {
+  R3CertifiedGeometryFixture fixture;
+  auto mutable_owner = std::make_shared<ContinuousPhasePath>();
+  EXPECT_TRUE(mutable_owner->appendSegment(
+      0.0, 3.0, "r3-certified-straight",
+      [](const double w, ContinuousPhasePathState& state) {
+        state.p = Eigen::Vector3d(w, 0.0, 1.0);
+        state.dp_dw = Eigen::Vector3d::UnitX();
+        state.d2p_dw2.setZero();
+        state.valid = true;
+        return true;
+      }));
+  fixture.owner = std::shared_ptr<const ContinuousPhasePath>(mutable_owner);
+  fixture.frame = std::make_shared<const ContinuousPhaseNormalFrame>(
+      fixture.owner, 7U, 8U);
+  std::shared_ptr<TubeProfile> profile(new TubeProfile());
+  profile->source = TubeSource::ESDF;
+  profile->source_revision = 7U;
+  profile->path_revision = 7U;
+  profile->frame_revision = 8U;
+  profile->tube_revision = 11U;
+  profile->profile_revision = 11U;
+  profile->map_revision = 41U;
+  profile->snapshot_sequence = 41U;
+  profile->snapshot_provenance_is_immutable = true;
+  profile->raw_complete = true;
+  profile->filtered_complete = true;
+  profile->complete = true;
+  profile->obstacle_certified = true;
+  profile->classification =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  for (const double w : {0.0, 0.5, 1.0}) {
+    TubeRawSample sample;
+    sample.w = w;
+    sample.path_revision = 7U;
+    sample.frame_revision = 8U;
+    sample.p = Eigen::Vector3d(w, 0.0, 1.0);
+    sample.N = Eigen::Vector3d::UnitY();
+    sample.filtered_lower = -0.12;
+    sample.filtered_upper = 0.12;
+    sample.complete = true;
+    profile->samples.push_back(sample);
+  }
+
+  TubeEpochStatus status;
+  status.candidate_sequence = 11U;
+  status.candidate_path_source_revision = 7U;
+  status.candidate_map_observation_sequence = 41U;
+  status.map_observation_is_snapshot = true;
+  status.candidate_raw_complete = true;
+  status.candidate_filtered_complete = true;
+  status.candidate_complete = true;
+  status.candidate_classification =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  status.candidate_zero_only = false;
+
+  std::shared_ptr<TubeEpochSnapshot> candidate(new TubeEpochSnapshot());
+  candidate->active = true;
+  candidate->task_generation = 3U;
+  candidate->request_control_sequence = 5U;
+  candidate->build_sequence = 19U;
+  candidate->source_revision = 7U;
+  candidate->map_observation_sequence = 41U;
+  candidate->map_observation_is_snapshot = true;
+  candidate->candidate_profile = std::shared_ptr<const TubeProfile>(profile);
+  candidate->epoch_status = status;
+  fixture.candidate = std::shared_ptr<const TubeEpochSnapshot>(candidate);
+
+  std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
+  request->active = true;
+  request->task_generation = 3U;
+  request->control_sequence = 8U;
+  request->source_revision = 7U;
+  request->map_observation_sequence = 99U;
+  request->map_observation_is_snapshot = true;
+  request->semantic_path_owner = fixture.owner;
+  request->frame_owner = fixture.frame;
+  request->current_path = MakeStraightState(0.5);
+  fixture.request = std::shared_ptr<const TubeBuildRequest>(request);
   return fixture;
 }
 
@@ -1651,6 +1771,8 @@ TEST(PhaseOffsetMatchedAdapterTest, MarkersReadCandidateAndActiveProfilesSeparat
   ASSERT_TRUE(adapter.buildMarkers(MakeInput(path, &path), output, markers));
   ExpectActions(markers.tube_candidate, visualization_msgs::Marker::ADD);
   ExpectActions(markers.tube, visualization_msgs::Marker::ADD);
+  ExpectActions(markers.tube_certified_geometry,
+                visualization_msgs::Marker::DELETE);
   EXPECT_NEAR(markers.tube_candidate.markers[0].points.front().x, 10.0, 1e-12);
   EXPECT_NEAR(markers.tube.markers[0].points.front().x, 20.0, 1e-12);
 }
@@ -1834,6 +1956,372 @@ TEST(PhaseOffsetMatchedAdapterCandidateProvenance,
       fixture.control, std::shared_ptr<const TubeEpochSnapshot>(mismatched),
       markers));
   ExpectActions(markers.tube_candidate, visualization_msgs::Marker::DELETE);
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     CurrentEsdfOffsetCertifiedCandidateProducesExactlyThreeAdds) {
+  const R3CertifiedGeometryFixture fixture =
+      MakeR3CertifiedGeometryFixture();
+  EXPECT_EQ(fixture.owner->pathRevision(), 0U);
+  EXPECT_EQ(fixture.frame->pathRevision(), fixture.request->source_revision);
+  EXPECT_EQ(fixture.candidate->candidate_profile->path_revision,
+            fixture.request->source_revision);
+  PhaseOffsetMatchedAdapter adapter(fixture.config);
+  adapter.task_generation_.store(3U, std::memory_order_release);
+  std::atomic_store(&adapter.latest_build_request_, fixture.request);
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    fixture.candidate);
+
+  EXPECT_TRUE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+      *fixture.request, *fixture.candidate, 3U));
+  const auto markers = adapter.certifiedGeometryMarkers(ros::Time(1.0));
+  ExpectActions(markers, visualization_msgs::Marker::ADD);
+  for (const auto& marker : markers.markers) {
+    EXPECT_EQ(marker.ns, "phase_offset_manual_tube_certified_geometry");
+  }
+  EXPECT_EQ(markers.markers[0].type, visualization_msgs::Marker::LINE_STRIP);
+  EXPECT_EQ(markers.markers[1].type, visualization_msgs::Marker::LINE_STRIP);
+  EXPECT_EQ(markers.markers[2].type,
+            visualization_msgs::Marker::TRIANGLE_LIST);
+  EXPECT_EQ(markers.markers[2].points.size(), 12U);
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     SemanticOwnerDefaultRevisionDoesNotMaskFrameProvenance) {
+  const R3CertifiedGeometryFixture fixture =
+      MakeR3CertifiedGeometryFixture();
+  ASSERT_EQ(fixture.owner->pathRevision(), 0U);
+  ASSERT_EQ(fixture.frame->pathRevision(), fixture.request->source_revision);
+  ASSERT_EQ(fixture.frame->frameRevision(),
+            fixture.candidate->candidate_profile->frame_revision);
+  EXPECT_TRUE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+      *fixture.request, *fixture.candidate, fixture.request->task_generation));
+
+  std::shared_ptr<TubeBuildRequest> mismatch(
+      new TubeBuildRequest(*fixture.request));
+  mismatch->frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      fixture.owner, fixture.request->source_revision + 1U,
+      fixture.frame->frameRevision());
+  const std::shared_ptr<const TubeBuildRequest> mismatch_const(mismatch);
+  EXPECT_FALSE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+      *mismatch_const, *fixture.candidate,
+      fixture.request->task_generation));
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     CandidateMapProvenanceMismatchRejectsWithUnversionedSemanticOwner) {
+  const R3CertifiedGeometryFixture fixture =
+      MakeR3CertifiedGeometryFixture();
+  ASSERT_EQ(fixture.owner->pathRevision(), 0U);
+  std::shared_ptr<TubeProfile> mismatched_profile(
+      new TubeProfile(*fixture.candidate->candidate_profile));
+  ++mismatched_profile->map_revision;
+  std::shared_ptr<TubeEpochSnapshot> mismatched_candidate(
+      new TubeEpochSnapshot(*fixture.candidate));
+  mismatched_candidate->candidate_profile =
+      std::shared_ptr<const TubeProfile>(mismatched_profile);
+  EXPECT_FALSE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+      *fixture.request, *mismatched_candidate,
+      fixture.request->task_generation));
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     PredicateProvenanceAndCertificationMismatchesDelete) {
+  const R3CertifiedGeometryFixture fixture =
+      MakeR3CertifiedGeometryFixture();
+  using Mismatch = std::function<void(TubeBuildRequest&, TubeEpochSnapshot&,
+                                      TubeProfile&)>;
+  const std::vector<std::pair<const char*, Mismatch>> cases = {
+      {"task", [](TubeBuildRequest& request, TubeEpochSnapshot&, TubeProfile&) {
+         request.task_generation = 4U;
+       }},
+      {"source", [](TubeBuildRequest&, TubeEpochSnapshot& candidate,
+                     TubeProfile&) { candidate.source_revision = 8U; }},
+      {"path", [](TubeBuildRequest&, TubeEpochSnapshot& candidate,
+                   TubeProfile&) {
+         candidate.epoch_status.candidate_path_source_revision = 8U;
+       }},
+      {"frame", [&fixture](TubeBuildRequest& request, TubeEpochSnapshot&,
+                            TubeProfile&) {
+         request.frame_owner =
+             std::make_shared<const ContinuousPhaseNormalFrame>(
+                 fixture.owner, fixture.request->source_revision,
+                 fixture.frame->frameRevision() + 1U);
+       }},
+      {"map", [](TubeBuildRequest&, TubeEpochSnapshot& candidate,
+                  TubeProfile&) { ++candidate.map_observation_sequence; }},
+      {"profile_source", [](TubeBuildRequest&, TubeEpochSnapshot&,
+                             TubeProfile& profile) {
+         profile.source = TubeSource::FIXED;
+       }},
+      {"profile_path", [](TubeBuildRequest&, TubeEpochSnapshot&,
+                           TubeProfile& profile) {
+         profile.path_revision = 8U;
+       }},
+      {"tube", [](TubeBuildRequest&, TubeEpochSnapshot&, TubeProfile& profile) {
+         ++profile.tube_revision;
+       }},
+      {"profile_classification", [](TubeBuildRequest&, TubeEpochSnapshot&,
+                                     TubeProfile& profile) {
+         profile.classification =
+             phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+       }},
+      {"status_classification", [](TubeBuildRequest&,
+                                    TubeEpochSnapshot& candidate, TubeProfile&) {
+         candidate.epoch_status.candidate_classification =
+             phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+       }},
+      {"profile_completion", [](TubeBuildRequest&, TubeEpochSnapshot&,
+                                 TubeProfile& profile) {
+         profile.complete = false;
+       }},
+      {"status_completion", [](TubeBuildRequest&,
+                                TubeEpochSnapshot& candidate, TubeProfile&) {
+         candidate.epoch_status.candidate_complete = false;
+       }},
+  };
+
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(test_case.first);
+    std::shared_ptr<TubeBuildRequest> request(
+        new TubeBuildRequest(*fixture.request));
+    std::shared_ptr<TubeEpochSnapshot> candidate(
+        new TubeEpochSnapshot(*fixture.candidate));
+    std::shared_ptr<TubeProfile> profile(
+        new TubeProfile(*fixture.candidate->candidate_profile));
+    candidate->candidate_profile = std::shared_ptr<const TubeProfile>(profile);
+    test_case.second(*request, *candidate, *profile);
+    const std::shared_ptr<const TubeBuildRequest> request_const(request);
+    const std::shared_ptr<const TubeEpochSnapshot> candidate_const(candidate);
+    EXPECT_FALSE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+        *request_const, *candidate_const, 3U));
+
+    PhaseOffsetMatchedAdapter adapter(fixture.config);
+    adapter.task_generation_.store(3U, std::memory_order_release);
+    std::atomic_store(&adapter.latest_build_request_, request_const);
+    std::atomic_store(&adapter.latest_candidate_epoch_snapshot_, candidate_const);
+    ExpectActions(adapter.certifiedGeometryMarkers(ros::Time(1.0)),
+                  visualization_msgs::Marker::DELETE);
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     CertifiedGeometryUsesFilteredSamplesAndIgnoresRawBuildWidth) {
+  R3CertifiedGeometryFixture fixture = MakeR3CertifiedGeometryFixture();
+  std::shared_ptr<TubeProfile> profile(
+      new TubeProfile(*fixture.candidate->candidate_profile));
+  for (const auto& filtered : profile->samples) {
+    TubeRawSample raw = filtered;
+    raw.raw_lower = -3.0;
+    raw.raw_upper = 3.0;
+    raw.filtered_lower = -3.0;
+    raw.filtered_upper = 3.0;
+    profile->raw_build_samples.push_back(raw);
+  }
+  std::shared_ptr<TubeEpochSnapshot> candidate(
+      new TubeEpochSnapshot(*fixture.candidate));
+  candidate->candidate_profile = std::shared_ptr<const TubeProfile>(profile);
+  fixture.candidate = std::shared_ptr<const TubeEpochSnapshot>(candidate);
+  PhaseOffsetMatchedAdapter adapter(fixture.config);
+  adapter.task_generation_.store(3U, std::memory_order_release);
+  std::atomic_store(&adapter.latest_build_request_, fixture.request);
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    fixture.candidate);
+  const auto markers = adapter.certifiedGeometryMarkers(ros::Time(1.0));
+  ExpectActions(markers, visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(markers.markers[0].points.front().y, -0.12);
+  EXPECT_DOUBLE_EQ(markers.markers[1].points.front().y, 0.12);
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     ZeroOnlyNoneIncompleteNonfiniteUnorderedDuplicateAndShortDelete) {
+  const R3CertifiedGeometryFixture fixture =
+      MakeR3CertifiedGeometryFixture();
+  const auto expect_delete = [&](const std::function<void(TubeProfile&)>& edit) {
+    std::shared_ptr<TubeProfile> profile(
+        new TubeProfile(*fixture.candidate->candidate_profile));
+    edit(*profile);
+    std::shared_ptr<TubeEpochSnapshot> candidate(
+        new TubeEpochSnapshot(*fixture.candidate));
+    candidate->candidate_profile = std::shared_ptr<const TubeProfile>(profile);
+    EXPECT_FALSE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+        *fixture.request, *candidate, 3U));
+    PhaseOffsetMatchedAdapter adapter(fixture.config);
+    adapter.task_generation_.store(3U, std::memory_order_release);
+    std::atomic_store(&adapter.latest_build_request_, fixture.request);
+    std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                      std::shared_ptr<const TubeEpochSnapshot>(candidate));
+    ExpectActions(adapter.certifiedGeometryMarkers(ros::Time(1.0)),
+                  visualization_msgs::Marker::DELETE);
+  };
+  expect_delete([](TubeProfile& profile) {
+    profile.classification =
+        phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+    profile.zero_only = true;
+  });
+  expect_delete([](TubeProfile& profile) { profile.source = TubeSource::NONE; });
+  expect_delete([](TubeProfile& profile) { profile.complete = false; });
+  expect_delete([](TubeProfile& profile) {
+    profile.samples[0].filtered_lower =
+        std::numeric_limits<double>::quiet_NaN();
+  });
+  expect_delete([](TubeProfile& profile) {
+    profile.samples[1].w = profile.samples[0].w - 0.1;
+  });
+  expect_delete([](TubeProfile& profile) {
+    profile.samples[1].w = profile.samples[0].w;
+  });
+  expect_delete([](TubeProfile& profile) { profile.samples.resize(1U); });
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     CandidateOnlyRuntimeDenialAndAuthorityAbsenceDoNotHideGeometry) {
+  R3CertifiedGeometryFixture fixture = MakeR3CertifiedGeometryFixture();
+  PhaseOffsetMatchedAdapter adapter(fixture.config);
+  adapter.task_generation_.store(3U, std::memory_order_release);
+  std::atomic_store(&adapter.latest_build_request_, fixture.request);
+  std::shared_ptr<TubeEpochSnapshot> candidate(
+      new TubeEpochSnapshot(*fixture.candidate));
+  candidate->epoch_status.active_available = false;
+  candidate->epoch_status.active_current_validation_valid = false;
+  candidate->active_profile.reset();
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    std::shared_ptr<const TubeEpochSnapshot>(candidate));
+  EXPECT_TRUE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+      *fixture.request, *candidate, 3U));
+  EXPECT_EQ(adapter.runtime_.get() != nullptr, true);
+  const auto markers = adapter.certifiedGeometryMarkers(ros::Time(1.0));
+  ExpectActions(markers, visualization_msgs::Marker::ADD);
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     NewerRequestMapAlonePreservesCompletedSameSourceCandidate) {
+  R3CertifiedGeometryFixture fixture = MakeR3CertifiedGeometryFixture();
+  std::shared_ptr<TubeBuildRequest> newer(new TubeBuildRequest(*fixture.request));
+  newer->map_observation_sequence = 1234U;
+  const std::shared_ptr<const TubeBuildRequest> newer_const(newer);
+  EXPECT_TRUE(PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
+      *newer_const, *fixture.candidate, 3U));
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     NewerValidCompletionReplacesAndInvalidCompletionNeverFallsBack) {
+  R3CertifiedGeometryFixture fixture = MakeR3CertifiedGeometryFixture();
+  PhaseOffsetMatchedAdapter adapter(fixture.config);
+  adapter.task_generation_.store(3U, std::memory_order_release);
+  std::atomic_store(&adapter.latest_build_request_, fixture.request);
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    fixture.candidate);
+  const auto old_markers = adapter.certifiedGeometryMarkers(ros::Time(1.0));
+  ExpectActions(old_markers, visualization_msgs::Marker::ADD);
+
+  std::shared_ptr<TubeProfile> replacement_profile(
+      new TubeProfile(*fixture.candidate->candidate_profile));
+  replacement_profile->samples[0].p.x() = 9.0;
+  replacement_profile->map_revision = 42U;
+  replacement_profile->snapshot_sequence = 42U;
+  std::shared_ptr<TubeEpochSnapshot> replacement(
+      new TubeEpochSnapshot(*fixture.candidate));
+  replacement->map_observation_sequence = 42U;
+  replacement->candidate_profile =
+      std::shared_ptr<const TubeProfile>(replacement_profile);
+  replacement->epoch_status.candidate_map_observation_sequence = 42U;
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    std::shared_ptr<const TubeEpochSnapshot>(replacement));
+  const auto new_markers = adapter.certifiedGeometryMarkers(ros::Time(1.0));
+  ExpectActions(new_markers, visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(new_markers.markers[0].points.front().x, 9.0);
+
+  std::shared_ptr<TubeEpochSnapshot> invalid(
+      new TubeEpochSnapshot(*replacement));
+  std::shared_ptr<TubeProfile> invalid_profile(
+      new TubeProfile(*replacement_profile));
+  invalid_profile->classification =
+      phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+  invalid_profile->zero_only = true;
+  invalid->candidate_profile = std::shared_ptr<const TubeProfile>(invalid_profile);
+  invalid->epoch_status.candidate_classification =
+      phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
+  invalid->epoch_status.candidate_zero_only = true;
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    std::shared_ptr<const TubeEpochSnapshot>(invalid));
+  ExpectActions(adapter.certifiedGeometryMarkers(ros::Time(1.0)),
+                visualization_msgs::Marker::DELETE);
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     PublicationDecisionTraceDeletesOldSlotThenAddsMatchingReplacement) {
+  R3CertifiedGeometryFixture fixture = MakeR3CertifiedGeometryFixture();
+  PhaseOffsetMatchedAdapter adapter(fixture.config);
+  adapter.task_generation_.store(3U, std::memory_order_release);
+  std::atomic_store(&adapter.latest_build_request_, fixture.request);
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    fixture.candidate);
+  ExpectActions(adapter.certifiedGeometryMarkers(ros::Time(1.0)),
+                visualization_msgs::Marker::ADD);
+
+  std::shared_ptr<TubeBuildRequest> replacement_request(
+      new TubeBuildRequest(*fixture.request));
+  replacement_request->source_revision = 8U;
+  replacement_request->control_sequence = 9U;
+  replacement_request->frame_owner =
+      std::make_shared<const ContinuousPhaseNormalFrame>(
+          fixture.owner, 8U, 9U);
+  const std::shared_ptr<const TubeBuildRequest> replacement_request_const(
+      replacement_request);
+  std::atomic_store(&adapter.latest_build_request_, replacement_request_const);
+  // The request is already linearized, but the Candidate slot still exposes
+  // the old source revision.  R3 must not display that stale geometry.
+  ExpectActions(adapter.certifiedGeometryMarkers(ros::Time(1.0)),
+                visualization_msgs::Marker::DELETE);
+
+  std::shared_ptr<TubeProfile> replacement_profile(
+      new TubeProfile(*fixture.candidate->candidate_profile));
+  replacement_profile->source_revision = 8U;
+  replacement_profile->path_revision = 8U;
+  replacement_profile->frame_revision = 9U;
+  replacement_profile->samples[0].p.x() = 9.0;
+  for (TubeRawSample& sample : replacement_profile->samples) {
+    sample.path_revision = 8U;
+    sample.frame_revision = 9U;
+  }
+  std::shared_ptr<TubeEpochSnapshot> replacement_candidate(
+      new TubeEpochSnapshot(*fixture.candidate));
+  replacement_candidate->source_revision = 8U;
+  replacement_candidate->candidate_profile =
+      std::shared_ptr<const TubeProfile>(replacement_profile);
+  replacement_candidate->epoch_status.candidate_path_source_revision = 8U;
+  const std::shared_ptr<const TubeEpochSnapshot> replacement_candidate_const(
+      replacement_candidate);
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    replacement_candidate_const);
+  const auto replacement_markers =
+      adapter.certifiedGeometryMarkers(ros::Time(1.0));
+  ExpectActions(replacement_markers, visualization_msgs::Marker::ADD);
+  EXPECT_DOUBLE_EQ(replacement_markers.markers[0].points.front().x, 9.0);
+}
+
+TEST(PhaseOffsetMatchedAdapterR3,
+     SourceReplacementFinalRequestIdentityRaceDeletesOldGeometry) {
+  R3CertifiedGeometryFixture fixture = MakeR3CertifiedGeometryFixture();
+  PhaseOffsetMatchedAdapter adapter(fixture.config);
+  adapter.task_generation_.store(3U, std::memory_order_release);
+  std::atomic_store(&adapter.latest_build_request_, fixture.request);
+  std::atomic_store(&adapter.latest_candidate_epoch_snapshot_,
+                    fixture.candidate);
+  std::shared_ptr<TubeBuildRequest> replacement(
+      new TubeBuildRequest(*fixture.request));
+  replacement->source_revision = 8U;
+  replacement->control_sequence = 9U;
+  replacement->frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      fixture.owner, 8U, 9U);
+  const std::shared_ptr<const TubeBuildRequest> replacement_const(replacement);
+  adapter.certified_geometry_linearization_test_hook_ = [&]() {
+    std::atomic_store(&adapter.latest_build_request_, replacement_const);
+  };
+  ExpectActions(adapter.certifiedGeometryMarkers(ros::Time(1.0)),
+                visualization_msgs::Marker::DELETE);
+  adapter.certified_geometry_linearization_test_hook_ = std::function<void()>();
 }
 
 TEST(PhaseOffsetMatchedAdapterCandidateProvenance,
@@ -2411,7 +2899,7 @@ void ExpectCertifiedOwnerPartitionWithoutSeamCrossing(
 }
 
 phase_offset_navigation::PathCellBoundQuery
-ProjectedHermiteCertificateForTest(const double sup_normal_derivative) {
+HorizontalNormalCertificateForTest(const double sup_normal_derivative) {
   return [sup_normal_derivative](
       const double w0, const double w1,
       phase_offset_core::PathCellGeometryCertificate& certificate) {
@@ -2426,17 +2914,19 @@ ProjectedHermiteCertificateForTest(const double sup_normal_derivative) {
     certificate.sup_p_w_norm = 1.0;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = sup_normal_derivative;
+    certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = sup_normal_derivative;
     certificate.sup_abs_curvature = 0.0;
     certificate.normal_variation_bound =
         sup_normal_derivative * (w1 - w0);
+    certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
     certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
     certificate.normal_frame_proof_complete = true;
     certificate.provenance =
-        "ContinuousPhaseNormalFrame/ProjectedHermiteTransport/"
-        "CertifiedProjectedRawNormLowerBound";
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     certificate.valid = std::isfinite(w0) && std::isfinite(w1) &&
         std::isfinite(sup_normal_derivative) && sup_normal_derivative >= 0.0 &&
         w1 > w0;
@@ -2446,7 +2936,7 @@ ProjectedHermiteCertificateForTest(const double sup_normal_derivative) {
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
-     TubeBuilderConsumesProjectedHermiteNormalDerivativeBound) {
+     TubeBuilderConsumesHorizontalNormalDerivativeBound) {
   MatchedAdapterPathSamples line;
   for (int index = 0; index <= 4; ++index) {
     phase_offset_core::PathDifferentialState state;
@@ -2482,21 +2972,21 @@ TEST(PhaseOffsetMatchedAdapterTest,
   ASSERT_TRUE(phase_offset_navigation::TubeBuilder(builder_config)
       .buildCloudClearance(
           TubeSource::ESDF, line, open, exact_line,
-          ProjectedHermiteCertificateForTest(0.0), 0.05, 0.0, 13U, 14U,
+          HorizontalNormalCertificateForTest(0.0), 0.05, 0.0, 13U, 14U,
           exact_bound));
   ASSERT_TRUE(exact_bound.raw_complete);
   EXPECT_TRUE(exact_bound.cell_geometry_certified);
   EXPECT_TRUE(exact_bound.combined_regularity_proof_complete);
   EXPECT_NEAR(exact_bound.combined_regularity_speed_min, 1.0, 1e-12);
 
-  // Every certificate fact except the represented frame derivative is kept
-  // identical.  A stale Bishop/default bound would incorrectly retain the
-  // zero-local-inset certificate for this unsafe projected-Hermite derivative.
+  // Every certificate fact except the Horizontal-N derivative bound is kept
+  // identical.  An underestimated bound must not retain a zero-inset
+  // certificate for an unsafe normal variation.
   TubeProfile unsafe_bound;
   ASSERT_TRUE(phase_offset_navigation::TubeBuilder(builder_config)
       .buildCloudClearance(
           TubeSource::ESDF, line, open, exact_line,
-          ProjectedHermiteCertificateForTest(2.0), 0.05, 0.0, 13U, 15U,
+          HorizontalNormalCertificateForTest(2.0), 0.05, 0.0, 13U, 15U,
           unsafe_bound));
   ASSERT_TRUE(unsafe_bound.raw_complete);
   EXPECT_FALSE(unsafe_bound.cell_geometry_certified);
@@ -4348,11 +4838,71 @@ TEST(PhaseOffsetMatchedAdapterTest,
       1.0, 2.4, replacement_position, gains, kDt, no_snapshot, replacement,
       pin->capture().authority_session, &pin->capture(), pin->leaseId()));
   ASSERT_TRUE(replacement.candidate_pair);
+
+  // A successor with horizontal speed exactly at the single production
+  // threshold is not a usable Horizontal-N frame.  This evidence must retain
+  // the active nonzero predecessor and request renewed recovery evidence;
+  // there is no neutral/centerline takeover and no pending PositionCommand.
+  const auto degenerate_successor_owner = MakeHorizontalDegenerateOwner(
+      replacement_captured_w0, successor_end_w,
+      phase_offset_core::kHorizontalNormalSpeedEpsilon);
+  ASSERT_TRUE(degenerate_successor_owner);
+  auto degenerate_successor = std::make_shared<PathTubePair>(
+      *replacement.candidate_pair);
+  degenerate_successor->path_owner = degenerate_successor_owner;
+  degenerate_successor->frame_owner =
+      std::shared_ptr<const ContinuousPhaseNormalFrame>(
+          new ContinuousPhaseNormalFrame(
+              degenerate_successor_owner,
+              degenerate_successor->path_revision,
+              degenerate_successor->frame_revision));
+  input.successor_path_tube_pair =
+      std::shared_ptr<const PathTubePair>(degenerate_successor);
+  rebase_straight_input();
+  const double retained_before_degenerate =
+      adapter.runtime_->retainedDelta();
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_before_degenerate =
+      adapter.execution_authority_.snapshot();
+  MatchedAdapterOutput degenerate_output;
+  EXPECT_FALSE(adapter.update(input, degenerate_output));
+  EXPECT_TRUE(degenerate_output.recovery_replan_required)
+      << degenerate_output.invalid_reason;
+  EXPECT_EQ(degenerate_output.recovery_status,
+            phase_offset_navigation::RecoveryStepStatus::
+                RECOVERY_REPLAN_REQUIRED);
+  EXPECT_FALSE(degenerate_output.selected);
+  EXPECT_FALSE(degenerate_output.valid);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(),
+                   retained_before_degenerate);
+  const phase_offset_navigation::ActiveReferenceSnapshot authority_after_degenerate =
+      adapter.execution_authority_.snapshot();
+  EXPECT_EQ(authority_after_degenerate.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_EQ(authority_after_degenerate.sequence,
+            authority_before_degenerate.sequence);
+  EXPECT_FALSE(authority_after_degenerate.planner_invalid);
+  EXPECT_FALSE(authority_after_degenerate.current_state_unsafe);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  input.successor_path_tube_pair.reset();
+
   phase_offset_core::NormalFrameQuery successor_start_frame;
   ASSERT_TRUE(replacement.candidate_pair->frame_owner->query(
       replacement_captured_w0, successor_start_frame));
-  EXPECT_NEAR((successor_start_frame.N - predecessor_authority.executed_N).norm(),
-              0.0, 1e-7);
+  EXPECT_NEAR(successor_start_frame.N.z(), 0.0, 1e-12);
+  phase_offset_core::NormalFrameQuery seed_a;
+  phase_offset_core::NormalFrameQuery seed_b;
+  const ContinuousPhaseNormalFrame frame_a(
+      replacement.candidate_pair->path_owner,
+      replacement.candidate_pair->path_revision,
+      replacement.candidate_pair->frame_revision, Eigen::Vector3d::UnitX());
+  const ContinuousPhaseNormalFrame frame_b(
+      replacement.candidate_pair->path_owner,
+      replacement.candidate_pair->path_revision,
+      replacement.candidate_pair->frame_revision, Eigen::Vector3d::UnitY());
+  ASSERT_TRUE(frame_a.query(replacement_captured_w0, seed_a));
+  ASSERT_TRUE(frame_b.query(replacement_captured_w0, seed_b));
+  EXPECT_NEAR((seed_a.N - seed_b.N).norm(), 0.0, 1e-12);
+  EXPECT_NEAR((seed_a.N_w - seed_b.N_w).norm(), 0.0, 1e-12);
   ContinuousPhasePathState successor_start_state;
   ContinuousPhasePathState successor_future_state;
   ASSERT_TRUE(successor_owner->evaluate(
@@ -4368,7 +4918,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
   bad_successor->frame_owner = std::shared_ptr<const ContinuousPhaseNormalFrame>(
       new ContinuousPhaseNormalFrame(
           bad_successor->path_owner, bad_successor->path_revision,
-          bad_successor->frame_revision, Eigen::Vector3d::UnitZ()));
+          bad_successor->frame_revision + 1U));
   input.successor_path_tube_pair = std::shared_ptr<const PathTubePair>(bad_successor);
   rebase_straight_input();
   MatchedAdapterOutput rejected_successor_output;

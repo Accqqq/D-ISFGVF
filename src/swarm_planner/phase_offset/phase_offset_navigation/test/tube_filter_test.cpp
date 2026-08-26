@@ -250,6 +250,36 @@ TEST(TubeFilterTest, NonzeroSingletonIsNotZeroOnly) {
             TubeComponentSelection::CURRENT_DELTA_CONNECTED);
 }
 
+TEST(TubeFilterTest, TinyRetainedDeltaIsNotNeutralForZeroWidthProfile) {
+  TubeFilter filter;
+  TubeProfile profile = MakeRawProfile({{0.0, 0.0}, {0.0, 0.0}});
+  const double tiny_values[] = {
+      1e-13, -1e-13, std::numeric_limits<double>::denorm_min(),
+      -std::numeric_limits<double>::denorm_min()};
+  for (const double delta : tiny_values) {
+    TubeProfile candidate = profile;
+    ASSERT_TRUE(filter.filter(candidate, 0.0, delta));
+    EXPECT_EQ(candidate.selected_component,
+              TubeComponentSelection::CURRENT_DELTA_CONNECTED);
+    EXPECT_FALSE(candidate.current_component_contains_delta);
+    EXPECT_TRUE(candidate.zero_component_contains_zero);
+    EXPECT_FALSE(candidate.zero_only);
+  }
+}
+
+TEST(TubeFilterTest, TinyPositiveCapacityIsNotZeroOnly) {
+  TubeFilter filter;
+  TubeProfile profile = MakeRawProfile({
+      {0.0, std::numeric_limits<double>::denorm_min()},
+      {0.0, std::numeric_limits<double>::denorm_min()}});
+  ASSERT_TRUE(filter.filter(profile, 0.0, 0.0));
+  EXPECT_EQ(profile.selected_component, TubeComponentSelection::ZERO_CONNECTED);
+  EXPECT_TRUE(profile.current_component_contains_delta);
+  EXPECT_TRUE(profile.zero_component_contains_zero);
+  EXPECT_FALSE(profile.zero_only);
+  EXPECT_GT(profile.samples.front().filtered_upper, 0.0);
+}
+
 TEST(TubeFilterTest, SelectedCurrentComponentExcludingZeroIsNotZeroOnly) {
   TubeFilter filter;
   TubeProfile profile = MakeRawProfile({{0.20, 0.60}, {0.20, 0.60}});

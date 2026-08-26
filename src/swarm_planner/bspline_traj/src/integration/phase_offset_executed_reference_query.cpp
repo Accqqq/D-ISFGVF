@@ -38,7 +38,9 @@ bool PhaseOffsetExecutedReferenceQuery::query(
   result.frame_revision = frame_revision_;
   result.owner_revision = owner_revision_;
   result.query_revision = query_revision_;
-  result.provenance = "PhaseOffsetExecutedReferenceQuery/immutable-path-frame";
+  result.provenance =
+      "PhaseOffsetExecutedReferenceQuery/ContinuousPhaseNormalFrame/"
+      "WorldHorizontalCrossProduct";
   if (!path_ || !frame_ || !std::isfinite(w) ||
       w < path_->startW() || w > path_->endW() || !std::isfinite(delta_)) {
     result.invalid_reason = "executed reference input is invalid";
@@ -46,8 +48,31 @@ bool PhaseOffsetExecutedReferenceQuery::query(
   }
   ContinuousPhasePathState state;
   phase_offset_core::NormalFrameQuery frame;
-  if (!path_->evaluate(w, state, false) || !frame_->query(w, frame)) {
+  if (!path_->evaluate(w, state, false)) {
     result.invalid_reason = "executed reference owner query failed";
+    return false;
+  }
+  const bool frame_available = frame_->query(w, frame);
+  // No numerical deadband is allowed for the unavailable-frame case.  Any
+  // finite nonzero offset, including a tiny/subnormal value, requires the
+  // Horizontal-N capability; exact zero remains a valid centerline query.
+  if (!frame_available && delta_ != 0.0) {
+    result.invalid_reason = "horizontal normal capability is unavailable";
+    return false;
+  }
+  if (!frame_available) {
+    result.provenance += "/Unavailable";
+    result.r = state.p;
+    result.r_w = state.dp_dw;
+    result.r_ww.setZero();
+    result.r_ww_valid = false;
+    result.valid = result.r.allFinite() && result.r_w.allFinite();
+    if (!result.valid) result.invalid_reason = "executed reference is not finite";
+    return result.valid;
+  }
+  if (frame.provenance !=
+      "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct") {
+    result.invalid_reason = "executed reference frame provenance is invalid";
     return false;
   }
   result.r = state.p + frame.N * delta_;

@@ -1,4 +1,5 @@
 #include "bspline_race/phase_offset_geometry.h"
+#include <phase_offset_core/normal_frame.h>
 
 #include <algorithm>
 #include <cmath>
@@ -32,41 +33,69 @@ checkC2ConnectorSamples(
       return false;
     }
     const double v_p = st.dp_dw.norm();
-    if (v_p < 1e-9)
+    if (!std::isfinite(v_p) || v_p < 1e-9)
     {
       out.ok = false;
       out.reason = "degenerate_tangent";
       return false;
     }
-    const Eigen::Vector3d T = st.frame_valid && st.T.allFinite()
-        ? st.T.normalized() : st.dp_dw / v_p;
-    Eigen::Vector3d N = st.frame_valid && st.N.allFinite()
-        ? st.N.normalized() : Eigen::Vector3d(-T.y(), T.x(), 0.0);
-    if (N.norm() <= 1e-9) {
-      const Eigen::Vector3d axes[] = {Eigen::Vector3d::UnitX(),
-                                      Eigen::Vector3d::UnitY(),
-                                      Eigen::Vector3d::UnitZ()};
-      int best = 0;
-      double alignment = std::abs(T.dot(axes[0]));
-      for (int i = 1; i < 3; ++i) {
-        const double next = std::abs(T.dot(axes[i]));
-        if (next < alignment) { alignment = next; best = i; }
-      }
-      N = (axes[best] - T * T.dot(axes[best])).normalized();
+    const Eigen::Vector3d T = st.dp_dw / v_p;
+    const Eigen::Vector3d horizontal_cross =
+        Eigen::Vector3d::UnitZ().cross(st.dp_dw);
+    const double horizontal_speed = horizontal_cross.norm();
+    if (!std::isfinite(horizontal_speed)) {
+      out.ok = false;
+      out.reason = "horizontal_normal_speed_not_finite";
+      return false;
     }
-    const double legacy_curvature =
-      (st.dp_dw.x() * st.d2p_dw2.y() - st.dp_dw.y() * st.d2p_dw2.x()) /
-      (v_p * v_p * v_p);
-    // The immutable frame is authoritative whenever it is available.  This
-    // planar derivative is only the explicitly synthetic/legacy fallback;
-    // N_w = -kappa * p_w makes r_w = (1 - kappa*delta) p_w consistent with
-    // the fallback normal and the legacy curvature contract.
-    const Eigen::Vector3d N_w = st.frame_valid
-        ? (st.N_w.allFinite() ? st.N_w : Eigen::Vector3d::Zero())
-        : -legacy_curvature * st.dp_dw;
-    const double regularity = st.frame_valid
-        ? (st.dp_dw + N_w * delta).norm()
-        : 1.0 - legacy_curvature * delta;
+    if (st.frame_valid &&
+        !phase_offset_core::isWorldHorizontalCrossProductProvenance(
+            st.frame_provenance)) {
+      out.ok = false;
+      out.reason = "normal_frame_provenance_incompatible";
+      return false;
+    }
+    if (st.frame_valid &&
+        (!st.T.allFinite() || !st.N.allFinite() || !st.N_w.allFinite() ||
+         std::abs(st.T.norm() - 1.0) > 1e-6 ||
+         std::abs(st.T.dot(T) - 1.0) > 1e-6 ||
+         std::abs(st.N.norm() - 1.0) > 1e-6 ||
+         std::abs(st.N.z()) > 1e-12 ||
+         std::abs(st.N_w.z()) > 1e-12)) {
+      out.ok = false;
+      out.reason = "normal_frame_geometry_incompatible";
+      return false;
+    }
+    const bool horizontal_capability =
+        horizontal_speed > phase_offset_core::kHorizontalNormalSpeedEpsilon;
+    Eigen::Vector3d N = Eigen::Vector3d::Zero();
+    Eigen::Vector3d N_w = Eigen::Vector3d::Zero();
+    if (horizontal_capability) {
+      N = horizontal_cross / horizontal_speed;
+      const Eigen::Vector3d h_w = Eigen::Vector3d::UnitZ().cross(st.d2p_dw2);
+      N_w = (h_w - N * N.dot(h_w)) / horizontal_speed;
+      if (st.frame_valid) {
+        if (std::abs(st.N.dot(N) - 1.0) > 1e-8 ||
+            (st.N - N).norm() > 1e-8 ||
+            (st.N_w - N_w).norm() > 1e-8 ||
+            std::abs(st.N_w.z()) > 1e-12) {
+          out.ok = false;
+          out.reason = "normal_frame_geometry_incompatible";
+          return false;
+        }
+      }
+    }
+    if (st.frame_valid && !horizontal_capability && delta != 0.0) {
+      out.ok = false;
+      out.reason = "horizontal_normal_speed_too_small";
+      return false;
+    }
+    if (!horizontal_capability && delta != 0.0) {
+      out.ok = false;
+      out.reason = "horizontal_normal_speed_too_small";
+      return false;
+    }
+    const double regularity = (st.dp_dw + N_w * delta).norm();
     out.min_regularity = std::min(out.min_regularity, regularity);
     if (regularity < mu_regular)
     {
@@ -113,45 +142,65 @@ PhaseOffsetGeometryEvaluator::evaluate(
   const Eigen::Vector3d p_w = path_state.dp_dw;
   const Eigen::Vector3d p_ww = path_state.d2p_dw2;
   const double v_p = p_w.norm();
-  if (v_p < 1e-9 || !p_w.allFinite() || !p_ww.allFinite() ||
+  if (!std::isfinite(v_p) || v_p < 1e-9 || !p_w.allFinite() ||
+      !p_ww.allFinite() ||
       !std::isfinite(delta))
   {
     out.invalid_reason = "nonfinite_or_degenerate";
     return false;
   }
 
-  const Eigen::Vector3d T = path_state.frame_valid && path_state.T.allFinite()
-      ? path_state.T.normalized() : p_w / v_p;
-  Eigen::Vector3d N = path_state.frame_valid && path_state.N.allFinite()
-      ? path_state.N.normalized()
-      : Eigen::Vector3d(-T.y(), T.x(), 0.0);
-  if (N.norm() <= 1e-9) {
-    const Eigen::Vector3d axes[] = {Eigen::Vector3d::UnitX(),
-                                    Eigen::Vector3d::UnitY(),
-                                    Eigen::Vector3d::UnitZ()};
-    int best = 0;
-    double alignment = std::abs(T.dot(axes[0]));
-    for (int i = 1; i < 3; ++i) {
-      const double next = std::abs(T.dot(axes[i]));
-      if (next < alignment) { alignment = next; best = i; }
-    }
-    N = (axes[best] - T * T.dot(axes[best])).normalized();
+  const Eigen::Vector3d T = p_w / v_p;
+  const Eigen::Vector3d horizontal_cross =
+      Eigen::Vector3d::UnitZ().cross(p_w);
+  const double horizontal_speed = horizontal_cross.norm();
+  if (!std::isfinite(horizontal_speed)) {
+    out.invalid_reason = "horizontal_normal_speed_not_finite";
+    return false;
   }
-  const double legacy_curvature =
-    (p_w.x() * p_ww.y() - p_w.y() * p_ww.x()) /
-    (v_p * v_p * v_p);
-  // Keep production frame-bound paths on their shared immutable N_w.  Only
-  // synthetic/legacy planar states reconstruct the derivative, so their
-  // active-reference derivative agrees with the fallback normal/curvature.
-  const Eigen::Vector3d N_w = path_state.frame_valid
-      ? (path_state.N_w.allFinite() ? path_state.N_w : Eigen::Vector3d::Zero())
-      : -legacy_curvature * p_w;
-  const double regularity = path_state.frame_valid
-      ? (p_w + N_w * delta).norm()
-      : 1.0 - legacy_curvature * delta;
-  if (regularity < (path_state.frame_valid
-                        ? params.minimum_reference_speed
-                        : params.mu_regular))
+  if (path_state.frame_valid &&
+      !phase_offset_core::isWorldHorizontalCrossProductProvenance(
+          path_state.frame_provenance)) {
+    out.invalid_reason = "normal_frame_provenance_incompatible";
+    return false;
+  }
+  if (path_state.frame_valid &&
+      (!path_state.T.allFinite() || !path_state.N.allFinite() ||
+       !path_state.N_w.allFinite() || std::abs(path_state.T.norm() - 1.0) > 1e-6 ||
+       std::abs(path_state.T.dot(T) - 1.0) > 1e-6 ||
+       std::abs(path_state.N.norm() - 1.0) > 1e-6 ||
+       std::abs(path_state.N.z()) > 1e-12 ||
+       std::abs(path_state.N_w.z()) > 1e-12)) {
+    out.invalid_reason = "normal_frame_geometry_incompatible";
+    return false;
+  }
+  const bool horizontal_capability =
+      horizontal_speed > phase_offset_core::kHorizontalNormalSpeedEpsilon;
+  Eigen::Vector3d N = Eigen::Vector3d::Zero();
+  Eigen::Vector3d N_w = Eigen::Vector3d::Zero();
+  if (horizontal_capability) {
+    N = horizontal_cross / horizontal_speed;
+    const Eigen::Vector3d h_w = Eigen::Vector3d::UnitZ().cross(p_ww);
+    N_w = (h_w - N * N.dot(h_w)) / horizontal_speed;
+    if (path_state.frame_valid) {
+      if (std::abs(path_state.N.dot(N) - 1.0) > 1e-8 ||
+          (path_state.N - N).norm() > 1e-8 ||
+          (path_state.N_w - N_w).norm() > 1e-8 ||
+          std::abs(path_state.N_w.z()) > 1e-12) {
+        out.invalid_reason = "normal_frame_geometry_incompatible";
+        return false;
+      }
+    }
+  } else if (path_state.frame_valid && delta != 0.0) {
+    out.invalid_reason = "horizontal_normal_speed_too_small";
+    return false;
+  }
+  if (!horizontal_capability && delta != 0.0) {
+    out.invalid_reason = "horizontal_normal_speed_too_small";
+    return false;
+  }
+  const double regularity = (p_w + N_w * delta).norm();
+  if (regularity < params.minimum_reference_speed)
   {
     out.invalid_reason = "r_w_degenerate";
     return false;
@@ -192,7 +241,11 @@ PhaseOffsetGeometryEvaluator::evaluate(
   out.r_w = r_w;
   out.e_perp = e_perp;
   out.base_v = base_v;
-  out.curvature = path_state.frame_valid ? 0.0 : legacy_curvature;
+  out.curvature = horizontal_speed >
+      phase_offset_core::kHorizontalNormalSpeedEpsilon
+      ? (p_w.x() * p_ww.y() - p_w.y() * p_ww.x()) /
+          (horizontal_speed * horizontal_speed * horizontal_speed)
+      : 0.0;
   out.e_parallel = e_parallel;
   out.rho = rho;
   out.alpha = alpha;

@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <bspline_race/continuous_phase_path.h>
+#include <bspline_race/continuous_phase_normal_frame.h>
+
+#include <cmath>
+#include <limits>
 
 namespace
 {
@@ -338,6 +342,9 @@ TEST(ContinuousPhasePath, QuinticCellCertificateContainsAdversarialQueries)
     EXPECT_EQ(certificate.segment_identity, 1U);
     EXPECT_GT(certificate.inf_p_w_norm, 0.0);
     EXPECT_GT(certificate.inf_horizontal_p_w_norm, 0.0);
+    EXPECT_TRUE(certificate.horizontal_acceleration_bound_complete);
+    EXPECT_GE(certificate.sup_horizontal_p_ww_norm, 0.0);
+    EXPECT_GE(certificate.tangent_variation_bound, 0.0);
     for (int index = 0; index <= 1000; ++index) {
         const double w = 2.1 + 0.6 * static_cast<double>(index) / 1000.0;
         FLAG_Race::ContinuousPhasePathState state;
@@ -391,6 +398,9 @@ TEST(ContinuousPhasePath, MappedBsplineCellCertificateUsesMonotoneMapCells)
         certificate));
     EXPECT_GT(certificate.inf_p_w_norm, 0.0);
     EXPECT_GT(certificate.sup_p_www_norm, 0.0);
+    EXPECT_TRUE(certificate.horizontal_acceleration_bound_complete);
+    EXPECT_GE(certificate.sup_horizontal_p_ww_norm, 0.0);
+    EXPECT_GE(certificate.tangent_variation_bound, 0.0);
     for (int index = 0; index <= 400; ++index) {
         const double w = 2.2 + 0.6 * static_cast<double>(index) / 400.0;
         FLAG_Race::ContinuousPhasePathState state;
@@ -458,6 +468,145 @@ TEST(ContinuousPhasePath,
     phase_offset_core::PathCellGeometryCertificate certificate;
     EXPECT_FALSE(path.cellBounds(0.5, 1.5, certificate));
     ASSERT_TRUE(path.evaluate(1.0, state, false));
+}
+
+TEST(ContinuousPhasePath,
+     QuinticHorizontalSpeedThresholdIsStrictThroughProducerAndFrameProof)
+{
+    const double epsilon =
+        phase_offset_core::kHorizontalNormalSpeedEpsilon;
+    const double values[] = {
+        std::nextafter(epsilon, 0.0), epsilon,
+        std::nextafter(epsilon, std::numeric_limits<double>::infinity())};
+    // The span 3.0 is deliberately non-power-of-two: a constant derivative
+    // must retain the direct endpoint q evidence rather than a1/h erosion.
+    for (const double span : {2.0, 3.0}) {
+        for (const double q : values) {
+            FLAG_Race::ContinuousPhasePathState start;
+            start.p = Eigen::Vector3d::Zero();
+            start.dp_dw = Eigen::Vector3d(q, 0.0, 1.0);
+            start.d2p_dw2 = Eigen::Vector3d::Zero();
+            start.vel = start.dp_dw;
+            start.valid = true;
+            FLAG_Race::ContinuousPhasePathState end = start;
+            end.p = Eigen::Vector3d(span * q, 0.0, span);
+
+            const auto evaluator =
+                FLAG_Race::ContinuousPhasePath::makeQuinticHermite(
+                    0.0, span, start, end);
+            ASSERT_TRUE(static_cast<bool>(evaluator));
+            FLAG_Race::ContinuousPhasePath path;
+            ASSERT_TRUE(path.appendSegment(0.0, span, "threshold", evaluator));
+
+            FLAG_Race::ContinuousPhasePathState point;
+            ASSERT_TRUE(path.evaluate(0.37 * span, point, false));
+            EXPECT_DOUBLE_EQ(point.dp_dw.x(), q);
+            EXPECT_DOUBLE_EQ(point.dp_dw.y(), 0.0);
+
+            phase_offset_core::PathCellGeometryCertificate certificate;
+            const bool certificate_ok = path.cellBounds(0.25 * span,
+                                                         0.75 * span,
+                                                         certificate);
+            EXPECT_EQ(certificate_ok, q > epsilon);
+            if (certificate_ok) {
+                EXPECT_GT(certificate.inf_horizontal_p_w_norm, epsilon);
+                EXPECT_TRUE(certificate.horizontal_acceleration_bound_complete);
+                EXPECT_TRUE(phase_offset_core::
+                            pathCellGeometryCertificateIsComplete(certificate));
+            }
+
+            const auto path_owner =
+                std::make_shared<FLAG_Race::ContinuousPhasePath>(path);
+            FLAG_Race::ContinuousPhaseNormalFrame frame(path_owner, 7U, 11U);
+            phase_offset_core::NormalFrameCellProof proof;
+            const bool proof_ok = frame.certifyCell(0.25 * span,
+                                                    0.75 * span, proof);
+            EXPECT_EQ(proof_ok, q > epsilon);
+            if (proof_ok) {
+                EXPECT_GT(proof.inf_horizontal_path_speed, epsilon);
+                EXPECT_TRUE(phase_offset_core::normalFrameCellProofIsComplete(
+                    proof));
+            }
+        }
+    }
+}
+
+TEST(ContinuousPhasePath,
+     ConstantHorizontalCertificateUsesDirectedLowerNormForGeneralVector)
+{
+    // This pair exposes an upward-rounded long-double norm on platforms where
+    // the intermediate approximation is not exact.
+    const double x = 0x1.9c4e88376785ap-28;
+    const double y = 0x1.33b6cef0443a5p-26;
+    const double span = 3.0;
+    FLAG_Race::ContinuousPhasePathState start;
+    start.p = Eigen::Vector3d::Zero();
+    start.dp_dw = Eigen::Vector3d(x, y, 0.0);
+    start.d2p_dw2 = Eigen::Vector3d::Zero();
+    start.vel = start.dp_dw;
+    start.valid = true;
+    FLAG_Race::ContinuousPhasePathState end = start;
+    end.p = span * start.dp_dw;
+
+    const auto evaluator = FLAG_Race::ContinuousPhasePath::makeQuinticHermite(
+        0.0, span, start, end);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+    FLAG_Race::ContinuousPhasePath path;
+    ASSERT_TRUE(path.appendSegment(0.0, span, "directed_norm", evaluator));
+
+    FLAG_Race::ContinuousPhasePathState point;
+    ASSERT_TRUE(path.evaluate(0.37 * span, point, false));
+    EXPECT_DOUBLE_EQ(point.dp_dw.x(), x);
+    EXPECT_DOUBLE_EQ(point.dp_dw.y(), y);
+
+    phase_offset_core::PathCellGeometryCertificate certificate;
+    ASSERT_TRUE(path.cellBounds(0.25 * span, 0.75 * span, certificate));
+    const double lower = certificate.inf_horizontal_p_w_norm;
+    const double full_lower = certificate.inf_p_w_norm;
+    const double reference = std::hypot(x, y);
+    EXPECT_GT(lower, 0.0);
+    EXPECT_LE(lower, reference);
+    EXPECT_GT(full_lower, 0.0);
+    EXPECT_LE(full_lower, reference);
+    // The directed lower bound must not exceed the exact squared norm as
+    // represented by a fused multiply-add evaluation.
+    const double reference_squared = std::fma(x, x, y * y);
+    EXPECT_LE(std::fma(lower, lower, -reference_squared), 0.0);
+    EXPECT_LE(std::fma(full_lower, full_lower, -reference_squared), 0.0);
+}
+
+TEST(ContinuousPhasePath,
+     SubnormalHorizontalComponentsRemainFiniteAndFailClosed)
+{
+    const double x = 0x0.000000007d19ep-1022;
+    const double y = 0x0.00000000aa90bp-1022;
+    const double span = 3.0;
+    FLAG_Race::ContinuousPhasePathState start;
+    start.p = Eigen::Vector3d::Zero();
+    start.dp_dw = Eigen::Vector3d(x, y, 1.0);
+    start.d2p_dw2 = Eigen::Vector3d::Zero();
+    start.vel = start.dp_dw;
+    start.valid = true;
+    FLAG_Race::ContinuousPhasePathState end = start;
+    end.p = span * start.dp_dw;
+
+    const auto evaluator = FLAG_Race::ContinuousPhasePath::makeQuinticHermite(
+        0.0, span, start, end);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+    FLAG_Race::ContinuousPhasePath path;
+    ASSERT_TRUE(path.appendSegment(0.0, span, "subnormal_norm", evaluator));
+
+    FLAG_Race::ContinuousPhasePathState point;
+    ASSERT_TRUE(path.evaluate(0.37 * span, point, false));
+    EXPECT_DOUBLE_EQ(point.dp_dw.x(), x);
+    EXPECT_DOUBLE_EQ(point.dp_dw.y(), y);
+
+    // The horizontal norm is far below the single production threshold; the
+    // producer must remain finite and fail closed rather than manufacture a
+    // positive capability from a rounded-up scale*root result.
+    phase_offset_core::PathCellGeometryCertificate certificate;
+    EXPECT_FALSE(path.cellBounds(0.25 * span, 0.75 * span, certificate));
+    EXPECT_FALSE(certificate.complete);
 }
 
 }  // namespace

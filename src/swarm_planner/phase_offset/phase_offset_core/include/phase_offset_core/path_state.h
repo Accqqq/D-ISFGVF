@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <string>
 
+#include "phase_offset_core/normal_frame.h"
+
 namespace phase_offset_core {
 
 struct PathDifferentialState {
@@ -56,14 +58,17 @@ struct PathCellGeometryCertificate {
   double sup_p_w_norm = 0.0;
   double sup_p_ww_norm = 0.0;
   double sup_p_www_norm = 0.0;
+  double sup_horizontal_p_ww_norm = 0.0;
+  bool horizontal_acceleration_bound_complete = false;
 
-  // These are bounds for the same normal/curvature convention used by
-  // GeometryEvaluator: N = normalize(e_z x p_w), and signed planar
-  // curvature.  The variation values bound the difference anywhere in the
-  // cell, not only at sampled endpoints.
+  // These are bounds for the same Horizontal-N convention used by
+  // GeometryEvaluator: N = normalize(e_z x p_w), with signed planar
+  // curvature retained only as compatibility metadata.  The variation values
+  // bound the complete closed cell, not only sampled endpoints.
   double sup_N_w_norm = 0.0;
   double sup_abs_curvature = 0.0;
   double normal_variation_bound = 0.0;
+  double tangent_variation_bound = 0.0;
   double curvature_variation_bound = 0.0;
 
   // Conservative position facts: max distance from p(w_mid) and from the
@@ -86,39 +91,87 @@ struct PathCellGeometryCertificate {
 
 inline bool pathCellGeometryCertificateIsComplete(
     const PathCellGeometryCertificate& certificate) {
-  return certificate.valid && certificate.complete &&
-      certificate.segment_identity != 0U &&
-      std::isfinite(certificate.w0) && std::isfinite(certificate.w1) &&
-      certificate.w1 > certificate.w0 &&
-      std::isfinite(certificate.segment_w0) &&
-      std::isfinite(certificate.segment_w1) &&
-      certificate.segment_w1 >= certificate.segment_w0 &&
-      certificate.w0 >= certificate.segment_w0 &&
-      certificate.w1 <= certificate.segment_w1 &&
-      std::isfinite(certificate.inf_p_w_norm) &&
-      certificate.inf_p_w_norm > 0.0 &&
-      std::isfinite(certificate.inf_horizontal_p_w_norm) &&
-      certificate.inf_horizontal_p_w_norm >= 0.0 &&
-      std::isfinite(certificate.sup_p_w_norm) &&
-      certificate.sup_p_w_norm >= certificate.inf_p_w_norm &&
-      std::isfinite(certificate.sup_p_ww_norm) &&
-      certificate.sup_p_ww_norm >= 0.0 &&
-      std::isfinite(certificate.sup_p_www_norm) &&
-      certificate.sup_p_www_norm >= 0.0 &&
-      std::isfinite(certificate.sup_N_w_norm) &&
-      certificate.sup_N_w_norm >= 0.0 &&
-      std::isfinite(certificate.sup_abs_curvature) &&
-      certificate.sup_abs_curvature >= 0.0 &&
-      std::isfinite(certificate.normal_variation_bound) &&
-      certificate.normal_variation_bound >= 0.0 &&
-      std::isfinite(certificate.curvature_variation_bound) &&
-      certificate.curvature_variation_bound >= 0.0 &&
-      std::isfinite(certificate.midpoint_position_variation_bound) &&
-      certificate.midpoint_position_variation_bound >= 0.0 &&
-      std::isfinite(certificate.chord_deviation_bound) &&
-      certificate.chord_deviation_bound >= 0.0 &&
-      (certificate.path_revision == 0U ||
-       certificate.normal_frame_proof_complete);
+  if (!certificate.valid || !certificate.complete ||
+      certificate.segment_identity == 0U ||
+      !std::isfinite(certificate.w0) || !std::isfinite(certificate.w1) ||
+      !(certificate.w1 > certificate.w0) ||
+      !std::isfinite(certificate.segment_w0) ||
+      !std::isfinite(certificate.segment_w1) ||
+      !(certificate.segment_w1 > certificate.segment_w0) ||
+      certificate.w0 < certificate.segment_w0 ||
+      certificate.w1 > certificate.segment_w1 ||
+      !std::isfinite(certificate.inf_p_w_norm) ||
+      certificate.inf_p_w_norm <= 0.0 ||
+      !std::isfinite(certificate.inf_horizontal_p_w_norm) ||
+      certificate.inf_horizontal_p_w_norm <=
+          kHorizontalNormalSpeedEpsilon ||
+      !std::isfinite(certificate.sup_p_w_norm) ||
+      certificate.sup_p_w_norm < certificate.inf_p_w_norm ||
+      !std::isfinite(certificate.sup_p_ww_norm) ||
+      certificate.sup_p_ww_norm < 0.0 ||
+      !std::isfinite(certificate.sup_p_www_norm) ||
+      certificate.sup_p_www_norm < 0.0 ||
+      !std::isfinite(certificate.sup_horizontal_p_ww_norm) ||
+      certificate.sup_horizontal_p_ww_norm < 0.0 ||
+      !certificate.horizontal_acceleration_bound_complete ||
+      !std::isfinite(certificate.sup_N_w_norm) ||
+      certificate.sup_N_w_norm < 0.0 ||
+      !std::isfinite(certificate.sup_abs_curvature) ||
+      certificate.sup_abs_curvature < 0.0 ||
+      !std::isfinite(certificate.normal_variation_bound) ||
+      certificate.normal_variation_bound < 0.0 ||
+      !std::isfinite(certificate.tangent_variation_bound) ||
+      certificate.tangent_variation_bound < 0.0 ||
+      !std::isfinite(certificate.curvature_variation_bound) ||
+      certificate.curvature_variation_bound < 0.0 ||
+      !std::isfinite(certificate.midpoint_position_variation_bound) ||
+      certificate.midpoint_position_variation_bound < 0.0 ||
+      !std::isfinite(certificate.chord_deviation_bound) ||
+      certificate.chord_deviation_bound < 0.0) {
+    return false;
+  }
+
+  // Value-only path bounds may be path-revision bound, but they must not carry
+  // a frame revision or a non-canonical frame provenance.  A composed frame
+  // certificate may be unbound only in legacy/synthetic fixtures (both
+  // revisions zero); otherwise the two identities must be present together.
+  if (certificate.normal_frame_proof_complete) {
+    if (!isWorldHorizontalCrossProductProvenance(certificate.provenance) ||
+        ((certificate.path_revision == 0U) !=
+         (certificate.frame_revision == 0U))) {
+      return false;
+    }
+  } else if (certificate.frame_revision != 0U ||
+             !certificate.provenance.empty()) {
+    return false;
+  }
+
+  double required_normal_derivative = 0.0;
+  if (!outwardUpperRatio(certificate.sup_horizontal_p_ww_norm,
+                         certificate.inf_horizontal_p_w_norm,
+                         required_normal_derivative) ||
+      certificate.sup_N_w_norm < required_normal_derivative) {
+    return false;
+  }
+  const double span = certificate.w1 - certificate.w0;
+  double required_normal_variation = 0.0;
+  if (!outwardUpperProduct(certificate.sup_N_w_norm, span,
+                           required_normal_variation) ||
+      certificate.normal_variation_bound < required_normal_variation) {
+    return false;
+  }
+  double tangent_rate = 0.0;
+  if (!outwardUpperRatio(certificate.sup_p_ww_norm,
+                         certificate.inf_p_w_norm, tangent_rate)) {
+    return false;
+  }
+  double required_tangent_variation = 0.0;
+  if (!outwardUpperProduct(tangent_rate, span,
+                           required_tangent_variation) ||
+      certificate.tangent_variation_bound < required_tangent_variation) {
+    return false;
+  }
+  return true;
 }
 
 inline bool pathCellGeometryCertificateMatches(

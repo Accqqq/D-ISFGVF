@@ -23,13 +23,15 @@ struct PhaseOffsetGeometryParams
   double delta_band = 1.0;
   double convergence_bandwidth = 0.10;
 
-  // Regularity / level-flight guards.
-  double mu_regular = 0.20;   // 1 - kappa*delta >= mu
+  // Full-3-D active-reference regularity.
+  double mu_regular = 0.20;
   // Minimum norm of the active reference derivative for frame-bound paths.
   double minimum_reference_speed = 1e-8;
-  double v_xy_min = 0.05;     // minimum horizontal |p_w|
-  double z_tolerance = 0.10;  // maximum |T_z| allowed
-  double max_delta = 1.20;    // |delta| clamp for degenerate queries
+  // Compatibility metadata retained for callers; Horizontal-N capability is
+  // owned by phase_offset_core::kHorizontalNormalSpeedEpsilon.
+  double v_xy_min = 0.05;
+  double z_tolerance = 0.10;
+  double max_delta = 1.20;
 };
 
 // Pure geometry / ISF evaluation on the ACTIVE reference r = p + N*delta.
@@ -56,7 +58,7 @@ struct C2ConnectorCheckResult
 
 // Evaluate a set of path samples inside the C2 connector region with the
 // CURRENT delta kept:
-//   1. regularity 1 - kappa*delta >= mu_regular;
+//   1. full-3-D regularity ||p_w + N_w*delta|| >= mu_regular;
 //   2. active reference r = p + N*delta keeps obstacle distance
 //      >= required_clearance (when obstacle_distance callback is provided).
 // Fills the minimum regularity / obstacle distance / tube margin seen.
