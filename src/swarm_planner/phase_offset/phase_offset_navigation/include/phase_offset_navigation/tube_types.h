@@ -88,6 +88,12 @@ struct TubeBuilderConfig {
   // This is the raw-occupancy contract.  The older max_offset/ray_step/erosion
   // fields remain solely for the temporary legacy DistanceQuery path.
   TubeCrossSectionConfig cross_section;
+  // ROS/configuration provenance.  These presence bits are set by the adapter
+  // loader when a legacy width/search parameter was explicitly supplied; they
+  // are otherwise false so an absent default does not create a conflict.
+  bool fixed_delta_max_explicit = false;
+  bool max_offset_explicit = false;
+  bool search_extent_explicit = false;
 };
 
 struct TubeFilterConfig {
@@ -194,6 +200,25 @@ struct TubeBuildDiagnostics {
   int first_invalid_side = 0;
   int first_stop_reason = static_cast<int>(TubeStopReason::NONE);
   std::string invalid_reason;
+  // P1 bounded construction/proof accounting.  Each underlying callback is
+  // routed to one leaf family exactly once; the aggregate fields are filled
+  // by TubeBuilder/CertifiedTubeBuilder after their one-pass work.
+  std::size_t cross_section_directional_query_count = 0U;
+  std::size_t adaptive_refinement_centerline_query_count = 0U;
+  std::size_t adaptive_sample_base_clearance_query_count = 0U;
+  std::size_t builder_certified_cell_bound_query_count = 0U;
+  std::size_t validator_certified_cell_bound_query_count = 0U;
+  std::size_t certified_cell_bound_query_count = 0U;
+  std::size_t validator_surface_query_count = 0U;
+  std::size_t total_tube_construction_clearance_query_count = 0U;
+  std::size_t total_tube_construction_query_count = 0U;
+  std::size_t surface_validator_invocation_count = 0U;
+  std::size_t inward_search_attempt_count = 0U;
+  double max_bounded_construction_abs_delta = 0.0;
+  TubeNominalWidthSource nominal_width_source =
+      TubeNominalWidthSource::DEFAULT_ABSENT;
+  bool nominal_width_legacy_conflict = false;
+  double effective_nominal_half_width_m = 0.0;
 };
 
 struct TubeProfile {

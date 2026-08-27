@@ -136,6 +136,21 @@ constexpr double kPreparedCoverageTolerance = 1e-10;
 // change any Tube acceptance tolerance.
 constexpr double kTubeCurrentPhaseAnchorTolerance = 1e-9;
 
+// Measurement-only serialization.  Keep the ROS-facing CSV vocabulary
+// stable and textual even though TubeDueTimingSample stores the enum as its
+// underlying integer for the sidecar record.
+const char* MeasurementNominalWidthSourceName(const int source) {
+  switch (source) {
+    case static_cast<int>(
+        phase_offset_navigation::TubeNominalWidthSource::DEFAULT_ABSENT):
+      return "DEFAULT_ABSENT";
+    case static_cast<int>(
+        phase_offset_navigation::TubeNominalWidthSource::EXPLICIT_PARAMETER):
+      return "EXPLICIT_PARAMETER";
+  }
+  return "DEFAULT_ABSENT";
+}
+
 // This spelling is intentionally adapter-local.  The manager owns the
 // ROS-facing bootstrap result log; stagePathTubePair only carries its exact
 // temporary enum to that caller and never publishes a second diagnostic.
@@ -1072,7 +1087,20 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
   nh.param("phase_offset/manual/tangent_speed_min", config.tangent_speed_min, 0.02); nh.param("phase_offset/manual/preflight_sample_step_w", config.preflight_sample_step_w, 0.10);
   std::string source = "none"; nh.param<std::string>("phase_offset/manual/tube_source", source, source);
   bool source_valid = false; config.tube_source = ParseTubeSource(source, source_valid);
+  // Sole P1 ESDF nominal-width owner.  Use hasParam so diagnostics can
+  // distinguish the exact absent/default path from an explicit value.
+  const std::string nominal_key = "phase_offset/tube/nominal_half_width";
+  if (nh.hasParam(nominal_key)) {
+    nh.param(nominal_key, config.tube.cross_section.nominal_half_width, 1.0);
+    config.tube.cross_section.nominal_width_source =
+        phase_offset_navigation::TubeNominalWidthSource::EXPLICIT_PARAMETER;
+  } else {
+    config.tube.cross_section.nominal_half_width = 1.0;
+    config.tube.cross_section.nominal_width_source =
+        phase_offset_navigation::TubeNominalWidthSource::DEFAULT_ABSENT;
+  }
   nh.param("phase_offset/tube/fixed_delta_max", config.tube.fixed_delta_max, 0.06); nh.param("phase_offset/tube/sample_step_w", config.tube.sample_step_w, 0.10);
+  nh.param("phase_offset/tube/max_offset", config.tube.max_offset, 0.20);
   nh.param("phase_offset/tube/lookahead_w", config.tube.lookahead_w, 2.0); nh.param("phase_offset/tube/back_w", config.tube.back_w, 0.20);
   nh.param("phase_offset/tube/min_certified_forward_w", config.tube.min_certified_forward_w, 0.40);
   nh.param("phase_offset/tube/boundary_slope_max", config.filter.boundary_slope_max, 0.80);
@@ -1095,6 +1123,23 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
            config.cloud_obstacle_set_complete, false);
   nh.param("phase_offset/tube/preincluded_map_uncertainty",
            config.tube.cross_section.margins.preincluded_map_uncertainty, 0.0);
+  config.tube.fixed_delta_max_explicit =
+      nh.hasParam("phase_offset/tube/fixed_delta_max");
+  config.tube.max_offset_explicit =
+      nh.hasParam("phase_offset/tube/max_offset");
+  config.tube.search_extent_explicit =
+      nh.hasParam("phase_offset/tube/environment_search_extent");
+  const double rho = config.tube.cross_section.nominal_half_width;
+  const auto differs_from_nominal = [rho](const double value) {
+    return !std::isfinite(value) || !std::isfinite(rho) || value != rho;
+  };
+  config.tube.cross_section.nominal_width_legacy_conflict =
+      (config.tube.fixed_delta_max_explicit &&
+       differs_from_nominal(config.tube.fixed_delta_max)) ||
+      (config.tube.max_offset_explicit &&
+       differs_from_nominal(config.tube.max_offset)) ||
+      (config.tube.search_extent_explicit &&
+       differs_from_nominal(config.tube.cross_section.search_extent));
   nh.param<std::string>("phase_offset/frame_id", config.frame_id, "world");
   if (!source_valid) config.tube.fixed_delta_max = -1.0;
   return config;
@@ -1216,7 +1261,8 @@ void PhaseOffsetMatchedAdapter::recordTubeDueTiming(
     const std::uint64_t steady_duration_ns,
     const std::uint64_t ros_stamp_ns,
     const bool source_current_finalized,
-    const bool raw_cloud_publish_attempted) {
+    const bool raw_cloud_publish_attempted,
+    const phase_offset_navigation::TubeBuildDiagnostics* const diagnostics) {
   if (!measurement_tube_due_enabled_) return;
   std::lock_guard<std::mutex> lock(measurement_tube_due_mutex_);
   TubeDueTimingSample sample;
@@ -1225,6 +1271,38 @@ void PhaseOffsetMatchedAdapter::recordTubeDueTiming(
   sample.ros_stamp_ns = ros_stamp_ns;
   sample.source_current_finalized = source_current_finalized;
   sample.raw_cloud_publish_attempted = raw_cloud_publish_attempted;
+  if (diagnostics != nullptr) {
+    sample.cross_section_directional_query_count =
+        diagnostics->cross_section_directional_query_count;
+    sample.adaptive_refinement_centerline_query_count =
+        diagnostics->adaptive_refinement_centerline_query_count;
+    sample.adaptive_sample_base_clearance_query_count =
+        diagnostics->adaptive_sample_base_clearance_query_count;
+    sample.builder_certified_cell_bound_query_count =
+        diagnostics->builder_certified_cell_bound_query_count;
+    sample.validator_certified_cell_bound_query_count =
+        diagnostics->validator_certified_cell_bound_query_count;
+    sample.certified_cell_bound_query_count =
+        diagnostics->certified_cell_bound_query_count;
+    sample.validator_surface_query_count =
+        diagnostics->validator_surface_query_count;
+    sample.total_tube_construction_clearance_query_count =
+        diagnostics->total_tube_construction_clearance_query_count;
+    sample.total_tube_construction_query_count =
+        diagnostics->total_tube_construction_query_count;
+    sample.surface_validator_invocation_count =
+        diagnostics->surface_validator_invocation_count;
+    sample.inward_search_attempt_count =
+        diagnostics->inward_search_attempt_count;
+    sample.max_bounded_construction_abs_delta =
+        diagnostics->max_bounded_construction_abs_delta;
+    sample.effective_nominal_half_width_m =
+        diagnostics->effective_nominal_half_width_m;
+    sample.nominal_width_source =
+        static_cast<int>(diagnostics->nominal_width_source);
+    sample.nominal_width_legacy_conflict =
+        diagnostics->nominal_width_legacy_conflict;
+  }
   measurement_tube_due_samples_.push_back(sample);
 }
 void PhaseOffsetMatchedAdapter::flushTubeDueTiming() {
@@ -1239,12 +1317,39 @@ void PhaseOffsetMatchedAdapter::flushTubeDueTiming() {
                        std::ios::out | std::ios::trunc);
   if (!stream.is_open()) return;
   stream << "kind,sequence,steady_duration_ns,ros_stamp_ns,"
-         << "source_current_finalized,raw_cloud_publish_attempted\n";
+         << "source_current_finalized,raw_cloud_publish_attempted,"
+         << "cross_section_directional_query_count,"
+         << "adaptive_refinement_centerline_query_count,"
+         << "adaptive_sample_base_clearance_query_count,"
+         << "builder_certified_cell_bound_query_count,"
+         << "validator_certified_cell_bound_query_count,"
+         << "certified_cell_bound_query_count,validator_surface_query_count,"
+         << "total_tube_construction_clearance_query_count,"
+         << "total_tube_construction_query_count,"
+         << "surface_validator_invocation_count,inward_search_attempt_count,"
+         << "max_bounded_construction_abs_delta,effective_nominal_half_width_m,"
+         << "nominal_width_source,nominal_width_legacy_conflict\n";
   for (const TubeDueTimingSample& sample : samples) {
     stream << "tube_due," << sample.sequence << ','
            << sample.steady_duration_ns << ',' << sample.ros_stamp_ns << ','
            << (sample.source_current_finalized ? 1 : 0) << ','
-           << (sample.raw_cloud_publish_attempted ? 1 : 0) << '\n';
+           << (sample.raw_cloud_publish_attempted ? 1 : 0) << ','
+           << sample.cross_section_directional_query_count << ','
+           << sample.adaptive_refinement_centerline_query_count << ','
+           << sample.adaptive_sample_base_clearance_query_count << ','
+           << sample.builder_certified_cell_bound_query_count << ','
+           << sample.validator_certified_cell_bound_query_count << ','
+           << sample.certified_cell_bound_query_count << ','
+           << sample.validator_surface_query_count << ','
+           << sample.total_tube_construction_clearance_query_count << ','
+           << sample.total_tube_construction_query_count << ','
+           << sample.surface_validator_invocation_count << ','
+           << sample.inward_search_attempt_count << ','
+           << sample.max_bounded_construction_abs_delta << ','
+           << sample.effective_nominal_half_width_m << ','
+           << MeasurementNominalWidthSourceName(sample.nominal_width_source)
+           << ','
+           << (sample.nominal_width_legacy_conflict ? 1 : 0) << '\n';
   }
 }
 bool PhaseOffsetMatchedAdapter::configurationValid() const { return configuration_valid_; }
@@ -3805,8 +3910,12 @@ bool PhaseOffsetMatchedAdapter::runTubeBuildJob(const SchedulePermit& permit) {
         config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
         built.raw_candidate_diagnostics_generated &&
         built.cloud_snapshot_diagnostics_generated;
+    const phase_offset_navigation::TubeBuildDiagnostics* diagnostics = nullptr;
+    if (built.candidate_profile) {
+      diagnostics = &built.candidate_profile->diagnostics;
+    }
     recordTubeDueTiming(tube_due_duration_ns, request->stamp.toNSec(),
-                        finalized, raw_cloud_publish_attempted);
+                        finalized, raw_cloud_publish_attempted, diagnostics);
   }
   return finalized && built_ok;
 }

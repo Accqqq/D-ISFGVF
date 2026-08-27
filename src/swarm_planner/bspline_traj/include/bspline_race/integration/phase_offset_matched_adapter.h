@@ -764,6 +764,25 @@ class PhaseOffsetMatchedAdapter {
     std::uint64_t ros_stamp_ns = 0U;
     bool source_current_finalized = false;
     bool raw_cloud_publish_attempted = false;
+    // P1 bounded construction/proof accounting captured from the immutable
+    // Candidate profile produced by this due build.  These fields are
+    // measurement-only and do not participate in Stage-1A scheduling or
+    // lifecycle semantics.
+    std::size_t cross_section_directional_query_count = 0U;
+    std::size_t adaptive_refinement_centerline_query_count = 0U;
+    std::size_t adaptive_sample_base_clearance_query_count = 0U;
+    std::size_t builder_certified_cell_bound_query_count = 0U;
+    std::size_t validator_certified_cell_bound_query_count = 0U;
+    std::size_t certified_cell_bound_query_count = 0U;
+    std::size_t validator_surface_query_count = 0U;
+    std::size_t total_tube_construction_clearance_query_count = 0U;
+    std::size_t total_tube_construction_query_count = 0U;
+    std::size_t surface_validator_invocation_count = 0U;
+    std::size_t inward_search_attempt_count = 0U;
+    double max_bounded_construction_abs_delta = 0.0;
+    double effective_nominal_half_width_m = 0.0;
+    int nominal_width_source = 0;
+    bool nominal_width_legacy_conflict = false;
   };
 
   bool collectSamples(const TubeBuildRequest& request,
@@ -977,7 +996,9 @@ class PhaseOffsetMatchedAdapter {
   void recordTubeDueTiming(std::uint64_t steady_duration_ns,
                            std::uint64_t ros_stamp_ns,
                            bool source_current_finalized,
-                           bool raw_cloud_publish_attempted);
+                           bool raw_cloud_publish_attempted,
+                           const phase_offset_navigation::TubeBuildDiagnostics*
+                               diagnostics = nullptr);
   void flushTubeDueTiming();
 
   // Immutable request identity used by the one-slot scheduler.  Pointer

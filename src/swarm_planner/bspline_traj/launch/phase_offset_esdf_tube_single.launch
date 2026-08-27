@@ -5,6 +5,11 @@
   <!-- Runtime accepts manual amplitudes only from 0.05 m upward. -->
   <arg name="phase_offset_manual_amplitude" default="0.10" />
   <arg name="phase_offset_manual_observe_only" default="true" />
+  <!-- P1 bounded nominal half-width; 1.5 m is an explicit experiment only. -->
+  <arg name="phase_offset_tube_nominal_half_width" default="1.0" />
+  <arg name="phase_offset_measurement_enable" default="false" />
+  <arg name="phase_offset_measurement_callback_csv_path" default="" />
+  <arg name="phase_offset_measurement_tube_due_csv_path" default="" />
   <!-- The false setting is used only for the required ESDF-unready gate
        precheck.  The active acceptance run always uses the original pillar. -->
   <arg name="publish_map" default="true" />
@@ -63,6 +68,14 @@
     <arg name="phase_offset_manual_tangent_speed_min" value="0.02" />
     <arg name="phase_offset_manual_preflight_sample_step_w" value="0.10" />
     <arg name="phase_offset_manual_tube_source" value="esdf" />
+    <arg name="phase_offset_tube_nominal_half_width"
+         value="$(arg phase_offset_tube_nominal_half_width)" />
+    <arg name="phase_offset_measurement_enable"
+         value="$(arg phase_offset_measurement_enable)" />
+    <arg name="phase_offset_measurement_callback_csv_path"
+         value="$(arg phase_offset_measurement_callback_csv_path)" />
+    <arg name="phase_offset_measurement_tube_due_csv_path"
+         value="$(arg phase_offset_measurement_tube_due_csv_path)" />
     <arg name="phase_offset_tube_fixed_delta_max" value="0.04" />
     <arg name="phase_offset_tube_sample_step_w" value="0.10" />
     <arg name="phase_offset_tube_lookahead_w" value="2.0" />

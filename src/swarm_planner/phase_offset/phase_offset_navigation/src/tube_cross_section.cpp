@@ -70,6 +70,27 @@ bool ClearanceSafe(const ClearanceQueryResult& result,
       result.clearance >= required_radius;
 }
 
+ClearanceQueryResult ConstructionQuery(
+    const TubeCrossSectionInput& input,
+    const Eigen::Vector3d& point,
+    const double delta,
+    const double required_radius) {
+  if (input.directional_query_count != nullptr) {
+    ++(*input.directional_query_count);
+  }
+  if (input.max_bounded_construction_abs_delta != nullptr &&
+      IsFinite(delta)) {
+    *input.max_bounded_construction_abs_delta = std::max(
+        *input.max_bounded_construction_abs_delta, std::abs(delta));
+  }
+  if (!input.clearance_query) {
+    ClearanceQueryResult result;
+    result.status = DistanceStatus::UNAVAILABLE;
+    return result;
+  }
+  return input.clearance_query(point, required_radius);
+}
+
 bool IntersectFull3DRegularity(const TubeCrossSectionInput& input,
                                const TubeCrossSectionConfig& config,
                                const double selected_delta,
@@ -120,7 +141,7 @@ bool IntersectFull3DRegularity(const TubeCrossSectionInput& input,
 // ball contract means an UNKNOWN result is never crossed as if it were free.
 double RefineSafeBoundary(const Eigen::Vector3d& origin,
                           const Eigen::Vector3d& normal,
-                          const ClearanceQuery& query,
+                          const TubeCrossSectionInput& input,
                           const double required_radius,
                           double unsafe_delta,
                           double safe_delta,
@@ -131,8 +152,8 @@ double RefineSafeBoundary(const Eigen::Vector3d& origin,
     if (!IsFinite(middle) || middle == unsafe_delta || middle == safe_delta) {
       break;
     }
-    const ClearanceQueryResult result = query(origin + normal * middle,
-                                              required_radius);
+    const ClearanceQueryResult result = ConstructionQuery(
+        input, origin + normal * middle, middle, required_radius);
     if (ClearanceSafe(result, required_radius)) {
       safe_delta = middle;
     } else {
@@ -173,29 +194,33 @@ struct RayExpansion {
 // first non-safe query is a hard boundary: we never resume searching on the
 // other side of it, so a disconnected non-zero free region cannot enter the
 // production interval.
-RayExpansion ExpandFromZero(const Eigen::Vector3d& origin,
+RayExpansion ExpandFromAnchor(const Eigen::Vector3d& origin,
                             const Eigen::Vector3d& normal,
-                            const ClearanceQuery& query,
+                            const TubeCrossSectionInput& input,
                             const double required_radius,
                             const double seed_delta,
                             const double direction,
-                            const double extent,
+                            const double nominal_lower,
+                            const double nominal_upper,
                             const double step,
                             const double tolerance) {
   RayExpansion expansion;
-  if (extent <= 0.0) return expansion;
+  const double endpoint = direction > 0.0 ? nominal_upper : nominal_lower;
+  const double extent = direction > 0.0
+      ? endpoint - seed_delta : seed_delta - endpoint;
+  if (!IsFinite(extent) || extent < 0.0) return expansion;
 
   double safe_distance = 0.0;
   while (safe_distance < extent) {
     const double next_distance = std::min(extent, safe_distance + step);
     if (next_distance <= safe_distance) break;
     const double next_delta = seed_delta + direction * next_distance;
-    const ClearanceQueryResult sample = query(
-        origin + normal * next_delta, required_radius);
+    const ClearanceQueryResult sample = ConstructionQuery(
+        input, origin + normal * next_delta, next_delta, required_radius);
     if (!ClearanceSafe(sample, required_radius)) {
       const double safe_delta = seed_delta + direction * safe_distance;
       expansion.boundary = RefineSafeBoundary(
-          origin, normal, query, required_radius, next_delta, safe_delta,
+          origin, normal, input, required_radius, next_delta, safe_delta,
           tolerance);
       expansion.termination = ToTermination(sample.status);
       return expansion;
@@ -203,7 +228,7 @@ RayExpansion ExpandFromZero(const Eigen::Vector3d& origin,
     safe_distance = next_distance;
   }
 
-  expansion.boundary = seed_delta + direction * safe_distance;
+  expansion.boundary = endpoint;
   return expansion;
 }
 
@@ -223,14 +248,30 @@ double RobustTubeMargins::effectiveRadius() const {
   return residualEffectiveRadius();
 }
 
+const char* tubeNominalWidthSourceName(
+    const TubeNominalWidthSource source) {
+  switch (source) {
+    case TubeNominalWidthSource::DEFAULT_ABSENT:
+      return "DEFAULT_ABSENT";
+    case TubeNominalWidthSource::EXPLICIT_PARAMETER:
+      return "EXPLICIT_PARAMETER";
+  }
+  return "DEFAULT_ABSENT";
+}
+
+const char* nominalWidthSourceName(
+    const TubeNominalWidthSource source) {
+  return tubeNominalWidthSourceName(source);
+}
+
 TubeCrossSectionSolver::TubeCrossSectionSolver(
     const TubeCrossSectionConfig& config)
     : config_(config) {}
 
 bool TubeCrossSectionSolver::configurationValid() const {
-  if (!IsFinite(config_.search_extent) || config_.search_extent <= 0.0 ||
+  if (!IsFinite(config_.nominal_half_width) ||
+      config_.nominal_half_width <= 0.0 ||
       !IsFinite(config_.ray_step) || config_.ray_step <= 0.0 ||
-      config_.ray_step > config_.search_extent ||
       !IsFinite(config_.boundary_tolerance) ||
       config_.boundary_tolerance <= 0.0 ||
       config_.boundary_tolerance > config_.ray_step ||
@@ -243,7 +284,8 @@ bool TubeCrossSectionSolver::configurationValid() const {
       config_.minimum_reference_speed <= 0.0) {
     return false;
   }
-  const double count = std::ceil(2.0 * config_.search_extent / config_.ray_step);
+  const double count = std::ceil(2.0 * config_.nominal_half_width /
+                                 config_.ray_step);
   return IsFinite(count) && count >= 1.0 &&
       count <= static_cast<double>(kMaxCrossSectionSamples);
 }
@@ -251,6 +293,10 @@ bool TubeCrossSectionSolver::configurationValid() const {
 TubeCrossSectionResult TubeCrossSectionSolver::solve(
     const TubeCrossSectionInput& input) const {
   TubeCrossSectionResult result;
+  result.nominal_half_width = config_.nominal_half_width;
+  result.nominal_width_source = config_.nominal_width_source;
+  result.nominal_width_legacy_conflict =
+      config_.nominal_width_legacy_conflict;
   // Deprecated accounting remains observable, but invalid legacy values must
   // not suppress a planner-authoritative production Tube.
   if (ValidMargins(config_.margins)) {
@@ -276,10 +322,18 @@ TubeCrossSectionResult TubeCrossSectionSolver::solve(
   }
 
   const Eigen::Vector3d normal = input.N / normal_norm;
-  const double selected_delta = input.current_delta_valid
+  const double requested_delta = input.current_delta_valid
       ? input.current_delta : 0.0;
-  result.lower_curvature = -config_.search_extent;
-  result.upper_curvature = config_.search_extent;
+  // A retained current offset outside the bounded nominal interval is never
+  // queried as a transverse construction point.  Use the exact planner
+  // centreline anchor instead; the owner above the solver restores the
+  // retained metadata and lets EpochManager report CURRENT_OFFSET_OUTSIDE.
+  const double selected_delta = requested_delta >= -config_.nominal_half_width &&
+      requested_delta <= config_.nominal_half_width ? requested_delta : 0.0;
+  const double nominal_lower = -config_.nominal_half_width;
+  const double nominal_upper = config_.nominal_half_width;
+  result.lower_curvature = nominal_lower;
+  result.upper_curvature = nominal_upper;
   if (IsFinite(input.minimum_reference_speed) &&
       input.minimum_reference_speed > 0.0 && IsFinite(input.p_w) &&
       IsFinite(input.N_w) && input.p_w.norm() > kNormalEpsilon) {
@@ -307,8 +361,9 @@ TubeCrossSectionResult TubeCrossSectionSolver::solve(
     return result;
   }
 
-  const ClearanceQueryResult centre = input.clearance_query(
-      input.p + normal * selected_delta, result.residual_effective_radius);
+  const ClearanceQueryResult centre = ConstructionQuery(
+      input, input.p + normal * selected_delta, selected_delta,
+      result.residual_effective_radius);
   if (!ClearanceSafe(centre, result.residual_effective_radius)) {
     // The planner remains authoritative for delta = 0.  A stale, unavailable,
     // or stricter Tube snapshot therefore removes only offset capacity.
@@ -323,18 +378,18 @@ TubeCrossSectionResult TubeCrossSectionSolver::solve(
     return result;
   }
 
-  const double positive_extent = std::min(
-      config_.search_extent, std::max(0.0, result.upper_curvature - selected_delta));
-  const double negative_extent = std::min(
-      config_.search_extent, std::max(0.0, selected_delta - result.lower_curvature));
-  const RayExpansion positive = ExpandFromZero(
-      input.p, normal, input.clearance_query, result.residual_effective_radius,
-      selected_delta, 1.0, positive_extent, config_.ray_step,
-      config_.boundary_tolerance);
-  const RayExpansion negative = ExpandFromZero(
-      input.p, normal, input.clearance_query, result.residual_effective_radius,
-      selected_delta, -1.0, negative_extent, config_.ray_step,
-      config_.boundary_tolerance);
+  // Obstacles clip the absolute nominal endpoints independently.  Expansion
+  // starts at the selected connected-component anchor (zero for the bounded
+  // out-of-range transition) but always terminates at [-rho_nom,+rho_nom],
+  // never at a seed-relative travel distance.
+  const RayExpansion positive = ExpandFromAnchor(
+      input.p, normal, input, result.residual_effective_radius,
+      selected_delta, 1.0, nominal_lower, nominal_upper,
+      config_.ray_step, config_.boundary_tolerance);
+  const RayExpansion negative = ExpandFromAnchor(
+      input.p, normal, input, result.residual_effective_radius,
+      selected_delta, -1.0, nominal_lower, nominal_upper,
+      config_.ray_step, config_.boundary_tolerance);
 
   result.lower_obstacle = negative.boundary;
   result.upper_obstacle = positive.boundary;

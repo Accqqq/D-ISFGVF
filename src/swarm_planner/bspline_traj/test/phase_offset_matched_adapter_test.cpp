@@ -6,11 +6,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <set>
+#include <sstream>
+#include <string>
 #include <thread>
+#include <vector>
 
 #define private public
 #include <plan_env/sdf_map.h>
@@ -2979,9 +2984,10 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_TRUE(exact_bound.combined_regularity_proof_complete);
   EXPECT_NEAR(exact_bound.combined_regularity_speed_min, 1.0, 1e-12);
 
-  // Every certificate fact except the Horizontal-N derivative bound is kept
-  // identical.  An underestimated bound must not retain a zero-inset
-  // certificate for an unsafe normal variation.
+  // The complete certificate is retained, but the delayed combined regularity
+  // proof rejects this nominal-width ribbon because its conservative speed
+  // lower bound is below the configured minimum.  Contract A still keeps the
+  // Builder inset at exact zero and leaves the Validator to fail closed.
   TubeProfile unsafe_bound;
   ASSERT_TRUE(phase_offset_navigation::TubeBuilder(builder_config)
       .buildCloudClearance(
@@ -2989,14 +2995,18 @@ TEST(PhaseOffsetMatchedAdapterTest,
           HorizontalNormalCertificateForTest(2.0), 0.05, 0.0, 13U, 15U,
           unsafe_bound));
   ASSERT_TRUE(unsafe_bound.raw_complete);
-  EXPECT_FALSE(unsafe_bound.cell_geometry_certified);
+  EXPECT_TRUE(unsafe_bound.cell_geometry_certified);
   EXPECT_FALSE(unsafe_bound.combined_regularity_proof_complete);
-  EXPECT_EQ(unsafe_bound.certified_cell_count, 0U);
+  EXPECT_EQ(unsafe_bound.certified_cell_count,
+            unsafe_bound.raw_build_samples.size() - 1U);
   ASSERT_FALSE(unsafe_bound.raw_build_samples.empty());
+  // Contract A keeps Builder's continuous inset at exact zero even when the
+  // certificate is rejected; no sampled fixed-half-voxel fallback is applied
+  // by the Builder.
   EXPECT_DOUBLE_EQ(unsafe_bound.raw_build_samples.front().continuous_inset,
-                   0.05);
-  EXPECT_FALSE(unsafe_bound.raw_build_samples.front()
-                   .cell_geometry_certificate_used);
+                   0.0);
+  EXPECT_TRUE(unsafe_bound.raw_build_samples.front()
+                  .cell_geometry_certificate_used);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
@@ -3577,7 +3587,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
-     ValidatorTerminalFallbackKeepsBroadRawDiagnosticsAndCandidateMarker) {
+     ValidatorFailureKeepsBroadRawDiagnosticsAndIncompleteCandidate) {
   SyntheticPath path = MakePath();
   MakeStraightRawPath(path);
   SDFMap map;
@@ -3602,9 +3612,9 @@ TEST(PhaseOffsetMatchedAdapterTest,
 
   ASSERT_TRUE(output.candidate_profile);
   EXPECT_EQ(output.candidate_profile->classification,
-            phase_offset_navigation::TubeProfileClassification::
-                ZERO_ONLY_PLANNER_BASELINE);
+            phase_offset_navigation::TubeProfileClassification::NONE);
   EXPECT_FALSE(output.candidate_profile->obstacle_certified);
+  EXPECT_FALSE(output.candidate_profile->complete);
   const TubeRawSample* current =
       FindSampleAtCurrentW(*output.candidate_profile, path.current.w);
   ASSERT_NE(current, nullptr);
@@ -3613,8 +3623,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_LT(current->environment_lower, -0.20);
   EXPECT_GT(current->environment_upper, 0.20);
   EXPECT_GT(current->environment_width, 0.40);
-  EXPECT_DOUBLE_EQ(current->filtered_lower, 0.0);
-  EXPECT_DOUBLE_EQ(current->filtered_upper, 0.0);
+  EXPECT_DOUBLE_EQ(current->filtered_lower, current->raw_lower);
+  EXPECT_DOUBLE_EQ(current->filtered_upper, current->raw_upper);
   ASSERT_TRUE(output.raw_candidate_diagnostics_generated);
   EXPECT_LT(output.raw_candidate_diagnostics[
                 kRawCandidateCurrentEnvironmentLower],
@@ -7822,6 +7832,136 @@ TEST(PhaseOffsetMatchedAdapterStage1A,
   EXPECT_NE(request->frame_owner.get(), newer->frame_owner.get());
   EXPECT_FALSE(adapter.requestSourceStillCurrent(*request));
   EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     NominalWidthConfigurationIsRetainedAsSoleEsdfOwner) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.tube.cross_section.nominal_half_width = 1.5;
+  config.tube.cross_section.nominal_width_source =
+      phase_offset_navigation::TubeNominalWidthSource::EXPLICIT_PARAMETER;
+  config.tube.cross_section.nominal_width_legacy_conflict = true;
+  // Deliberately contradictory legacy values must remain diagnostics only.
+  config.tube.fixed_delta_max = 0.04;
+  config.tube.max_offset = 0.20;
+  config.tube.cross_section.search_extent = 3.0;
+  PhaseOffsetMatchedAdapter adapter(config);
+  EXPECT_TRUE(adapter.configurationValid());
+  EXPECT_DOUBLE_EQ(adapter.config_.tube.cross_section.nominal_half_width, 1.5);
+  EXPECT_EQ(adapter.config_.tube.cross_section.nominal_width_source,
+            phase_offset_navigation::TubeNominalWidthSource::EXPLICIT_PARAMETER);
+  EXPECT_TRUE(adapter.config_.tube.cross_section.nominal_width_legacy_conflict);
+
+  const SyntheticPath path = MakeStraightSyntheticPath();
+  MatchedAdapterInput input = MakeInput(path, &path);
+  const std::shared_ptr<const TubeBuildRequest> request =
+      adapter.makeBuildRequest(input, 41U, 1.2);
+  ASSERT_TRUE(request);
+  EXPECT_DOUBLE_EQ(request->retained_delta, 1.2);
+  EXPECT_DOUBLE_EQ(request->authority_request.lower,
+                   -std::abs(config.amplitude));
+  EXPECT_DOUBLE_EQ(request->authority_request.upper, 1.2);
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     AbsentNominalWidthConfigurationUsesOneMetreDefault) {
+  const PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  EXPECT_DOUBLE_EQ(adapter.config_.tube.cross_section.nominal_half_width, 1.0);
+  EXPECT_EQ(adapter.config_.tube.cross_section.nominal_width_source,
+            phase_offset_navigation::TubeNominalWidthSource::DEFAULT_ABSENT);
+  EXPECT_FALSE(adapter.config_.tube.cross_section.nominal_width_legacy_conflict);
+}
+
+TEST(PhaseOffsetMatchedAdapterMeasurement,
+     TubeDueCsvCopiesInvocationCountsAndUsesStableNominalWidthTokens) {
+  const std::string csv_path =
+      "/tmp/phase_offset_matched_adapter_tube_due_measurement_test.csv";
+  std::remove(csv_path.c_str());
+
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.measurement_enabled = true;
+  config.measurement_tube_due_csv_path = csv_path;
+  {
+    PhaseOffsetMatchedAdapter adapter(config);
+    phase_offset_navigation::TubeBuildDiagnostics absent;
+    absent.surface_validator_invocation_count = 7U;
+    absent.inward_search_attempt_count = 11U;
+    absent.nominal_width_source =
+        phase_offset_navigation::TubeNominalWidthSource::DEFAULT_ABSENT;
+    absent.effective_nominal_half_width_m = 1.0;
+    adapter.recordTubeDueTiming(123U, 456U, true, false, &absent);
+
+    phase_offset_navigation::TubeBuildDiagnostics explicit_parameter;
+    explicit_parameter.surface_validator_invocation_count = 13U;
+    explicit_parameter.inward_search_attempt_count = 17U;
+    explicit_parameter.nominal_width_source =
+        phase_offset_navigation::TubeNominalWidthSource::EXPLICIT_PARAMETER;
+    explicit_parameter.nominal_width_legacy_conflict = true;
+    explicit_parameter.effective_nominal_half_width_m = 1.5;
+    adapter.recordTubeDueTiming(789U, 1011U, false, true,
+                                &explicit_parameter);
+
+    ASSERT_EQ(adapter.measurement_tube_due_samples_.size(), 2U);
+    EXPECT_EQ(adapter.measurement_tube_due_samples_[0]
+                  .surface_validator_invocation_count,
+              7U);
+    EXPECT_EQ(adapter.measurement_tube_due_samples_[0]
+                  .inward_search_attempt_count,
+              11U);
+    EXPECT_EQ(adapter.measurement_tube_due_samples_[1]
+                  .surface_validator_invocation_count,
+              13U);
+    EXPECT_EQ(adapter.measurement_tube_due_samples_[1]
+                  .inward_search_attempt_count,
+              17U);
+    adapter.flushTubeDueTiming();
+  }
+
+  std::ifstream stream(csv_path.c_str());
+  ASSERT_TRUE(stream.is_open());
+  std::string header;
+  std::string absent_row;
+  std::string explicit_row;
+  ASSERT_TRUE(static_cast<bool>(std::getline(stream, header)));
+  ASSERT_TRUE(static_cast<bool>(std::getline(stream, absent_row)));
+  ASSERT_TRUE(static_cast<bool>(std::getline(stream, explicit_row)));
+
+  const auto split_csv = [](const std::string& line) {
+    std::vector<std::string> fields;
+    std::stringstream parser(line);
+    std::string field;
+    while (std::getline(parser, field, ',')) fields.push_back(field);
+    return fields;
+  };
+  const std::vector<std::string> headers = split_csv(header);
+  const std::vector<std::string> absent_fields = split_csv(absent_row);
+  const std::vector<std::string> explicit_fields = split_csv(explicit_row);
+  ASSERT_EQ(headers.size(), absent_fields.size());
+  ASSERT_EQ(headers.size(), explicit_fields.size());
+
+  const auto field_index = [&headers](const char* name) {
+    const auto found = std::find(headers.begin(), headers.end(), name);
+    return static_cast<std::size_t>(found - headers.begin());
+  };
+  const std::size_t invocation_index =
+      field_index("surface_validator_invocation_count");
+  const std::size_t inward_index = field_index("inward_search_attempt_count");
+  const std::size_t source_index = field_index("nominal_width_source");
+  const std::size_t conflict_index =
+      field_index("nominal_width_legacy_conflict");
+  ASSERT_LT(invocation_index, headers.size());
+  ASSERT_LT(inward_index, headers.size());
+  ASSERT_LT(source_index, headers.size());
+  ASSERT_LT(conflict_index, headers.size());
+  EXPECT_EQ(absent_fields[invocation_index], "7");
+  EXPECT_EQ(absent_fields[inward_index], "11");
+  EXPECT_EQ(absent_fields[source_index], "DEFAULT_ABSENT");
+  EXPECT_EQ(explicit_fields[invocation_index], "13");
+  EXPECT_EQ(explicit_fields[inward_index], "17");
+  EXPECT_EQ(explicit_fields[source_index], "EXPLICIT_PARAMETER");
+  EXPECT_EQ(explicit_fields[conflict_index], "1");
+  stream.close();
+  std::remove(csv_path.c_str());
 }
 
 TEST(PhaseOffsetMatchedAdapterStage1A,

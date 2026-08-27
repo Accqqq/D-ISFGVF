@@ -244,10 +244,10 @@ TEST(TubeEpochManagerTest,
     const TubeRawSample& raw = result.active_profile.raw_build_samples[index];
     EXPECT_DOUBLE_EQ(certified.filtered_lower, raw.filtered_lower);
     EXPECT_DOUBLE_EQ(certified.filtered_upper, raw.filtered_upper);
-    broad_raw = broad_raw || raw.filtered_lower < -2.90 ||
-        raw.filtered_upper > 2.90;
+    broad_raw = broad_raw || raw.filtered_lower < -1.0 - 1e-12 ||
+        raw.filtered_upper > 1.0 + 1e-12;
   }
-  EXPECT_TRUE(broad_raw);
+  EXPECT_FALSE(broad_raw);
 }
 
 TEST(TubeEpochManagerTest, EsdfMissingAuthorityRequestDoesNotVetoGeometry) {
@@ -301,7 +301,7 @@ TEST(TubeEpochManagerTest,
 }
 
 TEST(TubeEpochManagerTest,
-     InvalidCertifiedOffsetFallsBackToFixedInsetAndKeepsCandidatePath) {
+     InvalidCertifiedOffsetKeepsZeroBuilderInsetAndCandidatePath) {
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateInput input = MakeCloudInput();
   input.path_cell_bound_query = InvalidOffsetCertificate();
@@ -312,27 +312,20 @@ TEST(TubeEpochManagerTest,
   ASSERT_FALSE(result.active_profile.samples.empty());
   EXPECT_FALSE(result.active_profile.cell_geometry_certified);
   EXPECT_DOUBLE_EQ(result.active_profile.samples.front().continuous_inset,
-                   input.cloud_snapshot_resolution);
+                   0.0);
 }
 
-TEST(TubeEpochManagerTest, NonzeroSurfaceProofLimitCollapsesToZeroOnly) {
+TEST(TubeEpochManagerTest, NonzeroSurfaceProofLimitFailsClosedWithoutRetry) {
   TubeEpochManagerConfig config = MakeConfig();
   config.surface_validator.max_query_samples = 9U;
   TubeEpochManager manager(config);
   TubeEpochUpdateResult result;
-  ASSERT_TRUE(manager.update(MakeCloudInput(), result));
-  EXPECT_TRUE(result.status.candidate_complete);
+  EXPECT_FALSE(manager.update(MakeCloudInput(), result));
+  EXPECT_FALSE(result.status.candidate_complete);
   EXPECT_EQ(result.status.candidate_classification,
-            TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
-  EXPECT_EQ(result.status.active_classification,
-            TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE);
-  ASSERT_FALSE(result.active_profile.samples.empty());
-  for (const TubeRawSample& sample : result.active_profile.samples) {
-    EXPECT_DOUBLE_EQ(sample.filtered_lower, 0.0);
-    EXPECT_DOUBLE_EQ(sample.filtered_upper, 0.0);
-    EXPECT_DOUBLE_EQ(sample.lower_w, 0.0);
-    EXPECT_DOUBLE_EQ(sample.upper_w, 0.0);
-  }
+            TubeProfileClassification::NONE);
+  EXPECT_FALSE(result.status.active_available);
+  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
 }
 
 TEST(TubeEpochManagerTest, CandidateAndActiveProfilesAreIndependentObjects) {
@@ -417,16 +410,21 @@ TEST(TubeEpochManagerTest, MapObservationOnlyRefreshDoesNotAdvanceActiveEpoch) {
   EXPECT_EQ(second.status.active_map_observation_sequence, 99U);
 }
 
-TEST(TubeEpochManagerTest, MaterialBoundChangeAdvancesActiveEpochExactlyOnce) {
+TEST(TubeEpochManagerTest, MaterialBoundChangeIsRejectedWithoutInwardRetry) {
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateResult first;
   TubeEpochUpdateInput input = MakeCloudInput();
   ASSERT_TRUE(manager.update(input, first));
-  input.cloud_clearance_query = CloudCorridorQuery(0.60, 2.50);
+  // Leave enough residual clearance for the Validator's Contract-A cover;
+  // the resulting asymmetric raw interval is still materially different from
+  // the open-space nominal ribbon.
+  input.cloud_clearance_query = CloudCorridorQuery(1.00, 2.50);
   TubeEpochUpdateResult second;
-  ASSERT_TRUE(manager.update(input, second));
-  EXPECT_EQ(second.status.active_tube_epoch, first.status.active_tube_epoch + 1U);
-  EXPECT_EQ(second.status.disposition, TubeInstallDisposition::REPLACED_ACTIVE);
+  EXPECT_FALSE(manager.update(input, second));
+  EXPECT_EQ(second.status.active_tube_epoch, first.status.active_tube_epoch);
+  EXPECT_EQ(second.status.disposition,
+            TubeInstallDisposition::REJECTED_CANDIDATE);
+  EXPECT_TRUE(second.status.active_available);
 }
 
 TEST(TubeEpochManagerTest, ChangedPathProvenanceAdvancesEpochEvenWithSameBounds) {
@@ -558,6 +556,26 @@ TEST(TubeEpochManagerTest, CurrentRetainedDeltaOutsideDoesNotInstallOrLatch) {
   EXPECT_FALSE(result.status.certificate_denied);
   EXPECT_DOUBLE_EQ(result.status.retained_delta, 0.20);
   EXPECT_FALSE(result.status.retained_delta_current_inside);
+}
+
+TEST(TubeEpochManagerTest,
+     EsdfRetainedDeltaOutsideNominalUsesBoundedConstructionAndKeepsMetadata) {
+  TubeEpochManager manager(MakeConfig());
+  TubeEpochUpdateInput input = MakeCloudInput();
+  input.retained_delta = 1.2;
+  TubeEpochUpdateResult result;
+  EXPECT_FALSE(manager.update(input, result));
+  EXPECT_TRUE(result.status.candidate_complete);
+  EXPECT_EQ(result.status.reason, TubeEpochReason::CURRENT_OFFSET_OUTSIDE);
+  EXPECT_DOUBLE_EQ(result.status.retained_delta, 1.2);
+  EXPECT_FALSE(result.status.retained_delta_current_inside);
+  ASSERT_FALSE(result.candidate_profile.samples.empty());
+  EXPECT_DOUBLE_EQ(result.candidate_profile.current_delta, 1.2);
+  EXPECT_LE(result.candidate_profile.diagnostics.max_bounded_construction_abs_delta,
+            MakeConfig().builder.cross_section.nominal_half_width + 1e-12);
+  EXPECT_EQ(result.candidate_profile.selected_component,
+            TubeComponentSelection::ZERO_CONNECTED);
+  EXPECT_FALSE(result.candidate_profile.current_component_contains_delta);
 }
 
 TEST(TubeEpochManagerTest,
@@ -793,19 +811,19 @@ TEST(TubeEpochManagerTest, FailedCurrentCheckDoesNotHalfUpdateProvenance) {
   EXPECT_EQ(failed.status.active_map_observation_sequence, 1U);
 }
 
-TEST(TubeEpochManagerTest, MaterialInstallCommitsOnlyOnce) {
+TEST(TubeEpochManagerTest, MaterialInstallDoesNotCommitAfterValidatorFailure) {
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateInput input = MakeCloudInput();
   TubeEpochUpdateResult first;
   ASSERT_TRUE(manager.update(input, first));
-  input.cloud_clearance_query = CloudCorridorQuery(0.60, 2.50);
+  input.cloud_clearance_query = CloudCorridorQuery(1.00, 2.50);
   TubeEpochUpdateResult material;
-  ASSERT_TRUE(manager.update(input, material));
+  EXPECT_FALSE(manager.update(input, material));
   TubeEpochUpdateResult refresh;
-  ASSERT_TRUE(manager.update(input, refresh));
-  EXPECT_EQ(material.status.active_tube_epoch, first.status.active_tube_epoch + 1U);
-  EXPECT_EQ(refresh.status.active_tube_epoch, material.status.active_tube_epoch);
-  EXPECT_EQ(refresh.status.install_count, 2U);
+  EXPECT_FALSE(manager.update(input, refresh));
+  EXPECT_EQ(material.status.active_tube_epoch, first.status.active_tube_epoch);
+  EXPECT_EQ(refresh.status.active_tube_epoch, first.status.active_tube_epoch);
+  EXPECT_EQ(refresh.status.install_count, first.status.install_count);
 }
 
 TEST(TubeEpochManagerTest, RepeatedSequenceIsDeterministic) {
@@ -855,8 +873,8 @@ TEST(TubeEpochManagerTest, CloudClearancePathHasNoLegacyQueryInput) {
   EXPECT_NEAR(result.active_profile.snapshot_resolution, 0.05, 1e-12);
   EXPECT_NEAR(result.status.residual_effective_radius, 0.40, 1e-12);
   ASSERT_FALSE(result.active_profile.samples.empty());
-  EXPECT_NEAR(result.active_profile.samples.front().raw_lower, -2.95, 1e-12);
-  EXPECT_NEAR(result.active_profile.samples.front().raw_upper, 2.95, 1e-12);
+  EXPECT_NEAR(result.active_profile.samples.front().raw_lower, -1.0, 1e-12);
+  EXPECT_NEAR(result.active_profile.samples.front().raw_upper, 1.0, 1e-12);
 }
 
 TEST(TubeEpochManagerTest,
@@ -889,18 +907,14 @@ TEST(TubeEpochManagerTest,
 TEST(TubeEpochManagerTest, CloudGeometricContainmentStaysSeparateFromInteriorMargin) {
   TubeEpochManagerConfig config = MakeConfig();
   config.builder.interior_margin = 0.05;
-  TubeEpochUpdateInput input = MakeCloudInput(CloudCorridorQuery(0.50, 0.50));
+  TubeEpochUpdateInput input = MakeCloudInput(CloudCorridorQuery(1.00, 1.00));
   input.retained_delta = 0.04;
   input.actual_position += Eigen::Vector3d(0.0, 0.04, 0.0);
   TubeEpochManager manager(config);
   TubeEpochUpdateResult result;
-  ASSERT_TRUE(manager.update(input, result));
-  EXPECT_TRUE(result.status.current_interval_contains_retained_delta);
-  EXPECT_FALSE(result.status.retained_delta_current_inside);
-  EXPECT_TRUE(result.status.reference_clearance_sufficient);
-  EXPECT_TRUE(result.status.actual_clearance_sufficient);
-  EXPECT_TRUE(result.status.current_state_admissible);
-  EXPECT_EQ(result.status.state, TubeEpochState::ROLLING);
+  EXPECT_FALSE(manager.update(input, result));
+  EXPECT_FALSE(result.status.current_state_admissible);
+  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
 }
 
 TEST(TubeEpochManagerTest, CloudExcludingZeroCandidateInstallsNeutralZeroOnly) {
@@ -997,7 +1011,7 @@ TEST(TubeEpochManagerTest, CloudTrackingViolationInstallsUncertifiedCandidateWit
   EXPECT_EQ(result.status.reason, TubeEpochReason::NONE);
 }
 
-TEST(TubeEpochManagerTest, CloudMaterialEnvironmentChangeInstallsButEquivalentRefreshDoesNot) {
+TEST(TubeEpochManagerTest, CloudMaterialEnvironmentFailurePreservesEquivalentActiveEpoch) {
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateInput input = MakeCloudInput();
   TubeEpochUpdateResult first;
@@ -1008,14 +1022,15 @@ TEST(TubeEpochManagerTest, CloudMaterialEnvironmentChangeInstallsButEquivalentRe
   EXPECT_EQ(equivalent.status.active_tube_epoch, first.status.active_tube_epoch);
   EXPECT_EQ(equivalent.status.disposition, TubeInstallDisposition::EQUIVALENT_REFRESH);
 
-  input.cloud_clearance_query = CloudCorridorQuery(0.60, 2.50);
+  input.cloud_clearance_query = CloudCorridorQuery(1.00, 2.50);
   input.map_observation_sequence = 3U;
   TubeEpochUpdateResult material;
-  ASSERT_TRUE(manager.update(input, material));
-  EXPECT_EQ(material.status.active_tube_epoch, first.status.active_tube_epoch + 1U);
-  EXPECT_EQ(material.status.disposition, TubeInstallDisposition::REPLACED_ACTIVE);
-  EXPECT_NE(material.active_profile.samples.front().raw_lower,
-            first.active_profile.samples.front().raw_lower);
+  EXPECT_FALSE(manager.update(input, material));
+  EXPECT_EQ(material.status.disposition,
+            TubeInstallDisposition::REJECTED_CANDIDATE);
+  EXPECT_EQ(material.status.active_tube_epoch, first.status.active_tube_epoch);
+  EXPECT_DOUBLE_EQ(material.active_profile.samples.front().raw_lower,
+                   first.active_profile.samples.front().raw_lower);
 }
 
 TEST(TubeEpochManagerTest,

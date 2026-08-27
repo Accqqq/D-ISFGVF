@@ -19,6 +19,11 @@ class TubeBuilder {
   explicit TubeBuilder(const TubeBuilderConfig& config = TubeBuilderConfig());
 
   bool configurationValid() const;
+  // Source-aware validation is the production gate.  ESDF validates only the
+  // nominal bounded-cloud contract; FIXED additionally validates its legacy
+  // fixed width.  Deprecated DistanceQuery max_offset is checked only by the
+  // legacy entry point that actually consumes it.
+  bool configurationValidForSource(TubeSource source) const;
   bool build(
       TubeSource source,
       const std::vector<phase_offset_core::PathDifferentialState,

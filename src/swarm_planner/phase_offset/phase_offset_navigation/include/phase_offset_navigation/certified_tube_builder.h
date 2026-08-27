@@ -59,6 +59,7 @@ class CertifiedTubeBuilder {
                            TubeSurfaceValidatorConfig());
 
   bool configurationValid() const;
+  bool configurationValidForSource(TubeSource source) const;
   bool build(const CertifiedTubeBuildInput& input,
              CertifiedTubeBuildResult& result) const;
 

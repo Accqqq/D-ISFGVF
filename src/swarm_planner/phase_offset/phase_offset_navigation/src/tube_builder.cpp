@@ -21,6 +21,29 @@ bool IsFinite(const Eigen::Vector3d& value) {
   return value.allFinite();
 }
 
+double BoundedConstructionDelta(const TubeBuilderConfig& config,
+                                const double retained_delta) {
+  if (!IsFinite(retained_delta)) return 0.0;
+  const double rho = config.cross_section.nominal_half_width;
+  if (!IsFinite(rho) || rho <= 0.0) return 0.0;
+  return retained_delta >= -rho && retained_delta <= rho
+      ? retained_delta : 0.0;
+}
+
+void FinalizeConstructionDiagnostics(TubeBuildDiagnostics& diagnostics) {
+  diagnostics.certified_cell_bound_query_count =
+      diagnostics.builder_certified_cell_bound_query_count +
+      diagnostics.validator_certified_cell_bound_query_count;
+  diagnostics.total_tube_construction_clearance_query_count =
+      diagnostics.cross_section_directional_query_count +
+      diagnostics.adaptive_refinement_centerline_query_count +
+      diagnostics.adaptive_sample_base_clearance_query_count +
+      diagnostics.validator_surface_query_count;
+  diagnostics.total_tube_construction_query_count =
+      diagnostics.total_tube_construction_clearance_query_count +
+      diagnostics.certified_cell_bound_query_count;
+}
+
 void CountStop(const TubeStopReason reason, TubeBuildDiagnostics& diagnostics) {
   switch (reason) {
     case TubeStopReason::UNAVAILABLE:
@@ -296,6 +319,7 @@ struct AdaptiveSamplingContext {
   std::vector<phase_offset_core::PathDifferentialState,
               Eigen::aligned_allocator<phase_offset_core::PathDifferentialState>>*
       samples = nullptr;
+  TubeBuildDiagnostics* diagnostics = nullptr;
   bool limit_exceeded = false;
 };
 
@@ -328,9 +352,9 @@ bool AdaptiveNeedsSubdivision(AdaptiveSamplingContext& context,
       std::abs(second.admissible_delta_lower),
       std::abs(second.admissible_delta_upper), 0.0});
   const double boundary_scale = std::min(
-      context.config->cross_section.search_extent,
+      context.config->cross_section.nominal_half_width,
       admissible_range > 0.0 ? admissible_range
-                             : context.config->cross_section.search_extent);
+                             : context.config->cross_section.nominal_half_width);
   const double boundary_span = std::max({
       (first.p + boundary_scale * first_normal -
        (second.p + boundary_scale * second_normal)).norm(),
@@ -341,6 +365,11 @@ bool AdaptiveNeedsSubdivision(AdaptiveSamplingContext& context,
       !IsFinite(boundary_span)) {
     geometry_requires_subdivision = true;
     return true;
+  }
+  if (context.diagnostics != nullptr) {
+    // Reaching this clearance-comparison block always contributes exactly
+    // three centreline callbacks (delta == 0) to the P1 taxonomy.
+    context.diagnostics->adaptive_refinement_centerline_query_count += 3U;
   }
   const ClearanceQueryResult first_clearance = (*context.clearance_query)(
       first.p, context.required_clearance);
@@ -429,7 +458,8 @@ bool BuildAdaptivePathSamples(
     std::vector<phase_offset_core::PathDifferentialState,
                 Eigen::aligned_allocator<phase_offset_core::PathDifferentialState>>&
         output,
-    bool& limit_exceeded) {
+    bool& limit_exceeded,
+    TubeBuildDiagnostics* diagnostics) {
   output.clear();
   limit_exceeded = false;
   if (preview.size() < 2U || !path_state_query || !clearance_query ||
@@ -448,6 +478,7 @@ bool BuildAdaptivePathSamples(
   context.required_clearance = config.cross_section.planner_safe_distance;
   context.geometry_evaluator = phase_offset_core::GeometryEvaluator(geometry_params);
   context.samples = &output;
+  context.diagnostics = diagnostics;
   phase_offset_core::PathDifferentialState first;
   if (!ExactPathState(path_state_query, preview.front().w, first) ||
       !AppendAdaptiveSample(context, first)) {
@@ -471,15 +502,16 @@ bool BuildCertifiedCellInsets(
                       Eigen::aligned_allocator<phase_offset_core::PathDifferentialState>>&
         samples,
     const PathCellBoundQuery& path_cell_bound_query,
-    const double search_extent,
+    const double nominal_half_width,
     std::vector<double>& sample_insets,
     std::size_t& certified_cell_count,
-    std::vector<phase_offset_core::PathCellGeometryCertificate>* certificates) {
+    std::vector<phase_offset_core::PathCellGeometryCertificate>* certificates,
+    TubeBuildDiagnostics* diagnostics) {
   sample_insets.assign(samples.size(), 0.0);
   certified_cell_count = 0U;
   if (certificates != nullptr) certificates->clear();
   if (!path_cell_bound_query || samples.size() < 2U ||
-      !IsFinite(search_extent) || search_extent < 0.0) {
+      !IsFinite(nominal_half_width) || nominal_half_width <= 0.0) {
     return false;
   }
   std::vector<double> cell_insets(samples.size() - 1U, 0.0);
@@ -489,6 +521,9 @@ bool BuildCertifiedCellInsets(
     const double w0 = samples[index].w;
     const double w1 = samples[index + 1U].w;
     phase_offset_core::PathCellGeometryCertificate certificate;
+    if (diagnostics != nullptr) {
+      ++diagnostics->builder_certified_cell_bound_query_count;
+    }
     const bool query_ok = IsFinite(w0) && IsFinite(w1) &&
         w1 > w0 + kEpsilon && path_cell_bound_query(w0, w1, certificate);
     const bool cert_complete =
@@ -536,31 +571,6 @@ bool BuildCertifiedCellInsets(
     sample_insets[index] = inset;
   }
   return certified_cell_count == cell_insets.size();
-}
-
-void ApplyContinuousInset(TubeRawSample& sample, const double inset,
-                          const bool certificate_used) {
-  sample.continuous_inset = inset;
-  sample.cell_geometry_certificate_used = certificate_used;
-  sample.cell_geometry_inset = certificate_used ? inset : 0.0;
-  // The Tube may give up all nonzero capacity, but it must never erode past
-  // the planner-authoritative centreline.
-  sample.raw_lower = std::min(0.0, sample.pre_inset_lower + inset);
-  sample.raw_upper = std::max(0.0, sample.pre_inset_upper - inset);
-  sample.filtered_lower = sample.raw_lower;
-  sample.filtered_upper = sample.raw_upper;
-  sample.environment_lower = sample.raw_lower;
-  sample.environment_upper = sample.raw_upper;
-  sample.environment_width = std::max(
-      0.0, sample.environment_upper - sample.environment_lower);
-  sample.environment_interval_nonempty = sample.environment_lower <=
-      sample.environment_upper + kEpsilon;
-  sample.environment_contains_zero = sample.environment_interval_nonempty &&
-      sample.environment_lower <= 0.0 && 0.0 <= sample.environment_upper;
-  sample.post_inset_contains_zero = sample.environment_contains_zero;
-  sample.filter_input_contains_zero = sample.post_inset_contains_zero;
-  sample.filtered_contains_zero = sample.filter_input_contains_zero;
-  sample.complete = sample.complete && sample.environment_interval_nonempty;
 }
 
 }  // namespace
@@ -623,8 +633,23 @@ const char* tubeComponentSelectionName(
 TubeBuilder::TubeBuilder(const TubeBuilderConfig& config) : config_(config) {}
 
 bool TubeBuilder::configurationValid() const {
-  return IsFinite(config_.fixed_delta_max) && config_.fixed_delta_max >= 0.0 &&
-      IsFinite(config_.max_offset) && config_.max_offset >= 0.0 &&
+  return IsFinite(config_.sample_step_w) && config_.sample_step_w > 0.0 &&
+      config_.sample_step_w <= 0.10 + kEpsilon &&
+      IsFinite(config_.lookahead_w) && config_.lookahead_w >= 0.0 &&
+      IsFinite(config_.back_w) && config_.back_w >= 0.0 &&
+      IsFinite(config_.min_certified_forward_w) &&
+      config_.min_certified_forward_w >= 0.0 &&
+      IsFinite(config_.ray_step) && config_.ray_step > 0.0 &&
+      config_.ray_step <= 0.05 + kEpsilon &&
+      IsFinite(config_.regularity_margin) && config_.regularity_margin > 0.0 &&
+      config_.regularity_margin < 1.0 && IsFinite(config_.invariant_gain) &&
+      config_.invariant_gain >= 0.0 && IsFinite(config_.interior_margin) &&
+      config_.interior_margin >= 0.0 &&
+      TubeCrossSectionSolver(config_.cross_section).configurationValid();
+}
+
+bool TubeBuilder::configurationValidForSource(const TubeSource source) const {
+  const bool common =
       IsFinite(config_.sample_step_w) && config_.sample_step_w > 0.0 &&
       config_.sample_step_w <= 0.10 + kEpsilon &&
       IsFinite(config_.lookahead_w) && config_.lookahead_w >= 0.0 &&
@@ -638,6 +663,13 @@ bool TubeBuilder::configurationValid() const {
       config_.invariant_gain >= 0.0 && IsFinite(config_.interior_margin) &&
       config_.interior_margin >= 0.0 &&
       TubeCrossSectionSolver(config_.cross_section).configurationValid();
+  if (!common) return false;
+  if (source == TubeSource::ESDF) return true;
+  if (source == TubeSource::FIXED) {
+    return IsFinite(config_.fixed_delta_max) &&
+        config_.fixed_delta_max >= 0.0;
+  }
+  return false;
 }
 
 bool TubeBuilder::build(
@@ -657,7 +689,14 @@ bool TubeBuilder::build(
   profile.profile_revision = tube_revision;
   profile.current_delta = current_delta;
   profile.current_delta_valid = IsFinite(current_delta);
-  if (!configurationValid() || source == TubeSource::NONE || preview.empty()) {
+  profile.diagnostics.nominal_width_source =
+      config_.cross_section.nominal_width_source;
+  profile.diagnostics.nominal_width_legacy_conflict =
+      config_.cross_section.nominal_width_legacy_conflict;
+  profile.diagnostics.effective_nominal_half_width_m =
+      config_.cross_section.nominal_half_width;
+  if (!configurationValidForSource(source) || source == TubeSource::NONE ||
+      preview.empty()) {
     profile.diagnostics.invalid_reason = "tube configuration, source, or preview is invalid";
     return false;
   }
@@ -713,12 +752,14 @@ bool TubeBuilder::build(
     }
     ++profile.diagnostics.sample_count;
     const double nominal_limit = source == TubeSource::FIXED
-        ? config_.fixed_delta_max : config_.max_offset;
+        ? config_.fixed_delta_max : config_.cross_section.nominal_half_width;
     // A finite retained delta is authoritative for connected-component
     // selection even when it lies outside this Builder's nominal interval.
     // The resulting evidence is clipped by [fixed_lower,fixed_upper], while
     // Filter/Epoch retain the unchanged delta and report containment outside.
-    const double selected_delta = IsFinite(current_delta) ? current_delta : 0.0;
+    const double selected_delta = source == TubeSource::ESDF
+        ? BoundedConstructionDelta(config_, current_delta)
+        : (IsFinite(current_delta) ? current_delta : 0.0);
     phase_offset_core::PhaseOffsetGeometryState geometry;
     if (!geometry_evaluator.evaluate(path, path.p, selected_delta, geometry) ||
         !geometry.valid || !IsFinite(geometry.p) || !IsFinite(geometry.N) ||
@@ -765,7 +806,7 @@ bool TubeBuilder::build(
       sample.base_signed_distance = IsFinite(base.signed_distance)
           ? base.signed_distance : 0.0;
       const TubeStopReason base_reason = StopReason(
-          base, config_.erosion.requiredReferenceClearance());
+          base, config_.cross_section.planner_safe_distance);
       if (base_reason != TubeStopReason::NONE) {
         sample.positive_certified = false;
         sample.negative_certified = false;
@@ -780,10 +821,10 @@ bool TubeBuilder::build(
       }
       const RayResult positive = TraceRay(
           sample.p, sample.N, distance_query, config_.ray_step,
-          nominal_limit, config_.erosion.requiredReferenceClearance());
+          nominal_limit, config_.cross_section.planner_safe_distance);
       const RayResult negative = TraceRay(
           sample.p, -sample.N, distance_query, config_.ray_step,
-          nominal_limit, config_.erosion.requiredReferenceClearance());
+          nominal_limit, config_.cross_section.planner_safe_distance);
       sample.esdf_upper = positive.bound;
       sample.esdf_lower = -negative.bound;
       sample.positive_certified = positive.certified;
@@ -820,7 +861,7 @@ bool TubeBuilder::build(
     if (source == TubeSource::ESDF) {
       profile.diagnostics.min_safety_margin = std::min(
           profile.diagnostics.min_safety_margin,
-          sample.base_signed_distance - config_.erosion.requiredReferenceClearance());
+          sample.base_signed_distance - config_.cross_section.planner_safe_distance);
     }
     profile.samples.push_back(sample);
   }
@@ -840,6 +881,7 @@ bool TubeBuilder::build(
   if (!profile.raw_complete && profile.diagnostics.invalid_reason.empty()) {
     profile.diagnostics.invalid_reason = "preview contains an uncertified sample";
   }
+  FinalizeConstructionDiagnostics(profile.diagnostics);
   return profile.raw_complete;
 }
 
@@ -867,6 +909,12 @@ bool TubeBuilder::buildRawOccupancy(
   profile.tube_revision = tube_revision;
   profile.current_delta = current_delta;
   profile.current_delta_valid = IsFinite(current_delta);
+  profile.diagnostics.nominal_width_source =
+      config_.cross_section.nominal_width_source;
+  profile.diagnostics.nominal_width_legacy_conflict =
+      config_.cross_section.nominal_width_legacy_conflict;
+  profile.diagnostics.effective_nominal_half_width_m =
+      config_.cross_section.nominal_half_width;
   const TubeCrossSectionSolver cross_section_solver(config_.cross_section);
   if (source != TubeSource::ESDF || !cross_section_solver.configurationValid() ||
       preview.empty()) {
@@ -923,7 +971,7 @@ bool TubeBuilder::buildRawOccupancy(
       }
     }
     phase_offset_core::PhaseOffsetGeometryState geometry;
-    const double selected_delta = IsFinite(current_delta) ? current_delta : 0.0;
+    const double selected_delta = BoundedConstructionDelta(config_, current_delta);
     if (!geometry_evaluator.evaluate(path, path.p, selected_delta, geometry) ||
         !geometry.valid || !IsFinite(geometry.p) || !IsFinite(geometry.N) ||
         !IsFinite(geometry.r_w)) {
@@ -956,8 +1004,8 @@ bool TubeBuilder::buildRawOccupancy(
     cross_section_input.N_w = geometry.N_w;
     cross_section_input.minimum_reference_speed =
         config_.cross_section.minimum_reference_speed;
-    cross_section_input.current_delta = current_delta;
-    cross_section_input.current_delta_valid = IsFinite(current_delta);
+    cross_section_input.current_delta = selected_delta;
+    cross_section_input.current_delta_valid = IsFinite(selected_delta);
     cross_section_input.path_revision = path.path_revision;
     cross_section_input.frame_revision = path.frame_revision;
     cross_section_input.clearance_query =
@@ -969,6 +1017,10 @@ bool TubeBuilder::buildRawOccupancy(
           result.clearance_certified = result.status == DistanceStatus::KNOWN_FREE;
           return result;
         };
+    cross_section_input.directional_query_count =
+        &profile.diagnostics.cross_section_directional_query_count;
+    cross_section_input.max_bounded_construction_abs_delta =
+        &profile.diagnostics.max_bounded_construction_abs_delta;
     const TubeCrossSectionResult cross_section =
         cross_section_solver.solve(cross_section_input);
     CopyCrossSectionFacts(cross_section, sample);
@@ -1057,6 +1109,7 @@ bool TubeBuilder::buildRawOccupancy(
               profile.certified_segment_truncated_after)) {
     profile.diagnostics.invalid_reason = "requested preview was truncated to the current certified segment";
   }
+  FinalizeConstructionDiagnostics(profile.diagnostics);
   return profile.raw_complete;
 }
 
@@ -1102,8 +1155,14 @@ bool TubeBuilder::buildCloudClearance(
   profile.current_delta = current_delta;
   profile.current_delta_valid = IsFinite(current_delta);
   profile.obstacle_contract_id = "direct-clearance/planner-safe-distance";
+  profile.diagnostics.nominal_width_source =
+      config_.cross_section.nominal_width_source;
+  profile.diagnostics.nominal_width_legacy_conflict =
+      config_.cross_section.nominal_width_legacy_conflict;
+  profile.diagnostics.effective_nominal_half_width_m =
+      config_.cross_section.nominal_half_width;
   const TubeCrossSectionSolver cross_section_solver(config_.cross_section);
-  if (source != TubeSource::ESDF || !configurationValid() ||
+  if (source != TubeSource::ESDF || !configurationValidForSource(source) ||
       !cross_section_solver.configurationValid() || !clearance_query ||
       !path_state_query || preview.size() < 2U || !IsFinite(current_w) ||
       !IsFinite(snapshot_resolution) || snapshot_resolution <= 0.0) {
@@ -1118,7 +1177,8 @@ bool TubeBuilder::buildCloudClearance(
   bool adaptive_limit_exceeded = false;
   if (!BuildAdaptivePathSamples(config_, preview, path_state_query,
                                 clearance_query, snapshot_resolution,
-                                adaptive_preview, adaptive_limit_exceeded)) {
+                                adaptive_preview, adaptive_limit_exceeded,
+                                &profile.diagnostics)) {
     profile.diagnostics.invalid_reason = adaptive_limit_exceeded
         ? "adaptive lifted-state sampling limit exceeded"
         : "adaptive lifted-state sampling failed";
@@ -1142,8 +1202,8 @@ bool TubeBuilder::buildCloudClearance(
   std::vector<phase_offset_core::PathCellGeometryCertificate> certified_cells;
   const bool all_active_cells_certified = BuildCertifiedCellInsets(
       adaptive_preview, path_cell_bound_query,
-      config_.cross_section.search_extent, certified_sample_insets,
-      certified_cell_count, &certified_cells);
+      config_.cross_section.nominal_half_width, certified_sample_insets,
+      certified_cell_count, &certified_cells, &profile.diagnostics);
   profile.cell_geometry_certified = all_active_cells_certified;
   profile.combined_regularity_proof_complete = false;
   profile.combined_regularity_speed_min = 0.0;
@@ -1199,8 +1259,11 @@ bool TubeBuilder::buildCloudClearance(
       current_match_error = match_error;
     }
     phase_offset_core::PhaseOffsetGeometryState geometry;
-    const double selected_delta = IsFinite(current_delta) ? current_delta : 0.0;
-    if (!geometry_evaluator.evaluate(path, path.p, selected_delta, geometry) ||
+    const double selected_delta = BoundedConstructionDelta(config_, current_delta);
+    // ESDF construction is anchored on the planner centreline.  The retained
+    // in-range delta is passed to CrossSectionSolver only for component
+    // selection; adaptive/base clearance callbacks stay at delta == 0.
+    if (!geometry_evaluator.evaluate(path, path.p, 0.0, geometry) ||
         !geometry.valid || !IsFinite(geometry.p) || !IsFinite(geometry.N) ||
         !IsFinite(geometry.r_w)) {
       sample.cross_section_reason = TubeCrossSectionReason::INVALID_GEOMETRY;
@@ -1219,6 +1282,7 @@ bool TubeBuilder::buildCloudClearance(
     sample.fixed_upper = config_.fixed_delta_max;
     sample.esdf_lower = 0.0;
     sample.esdf_upper = 0.0;
+    ++profile.diagnostics.adaptive_sample_base_clearance_query_count;
     const ClearanceQueryResult base = clearance_query(
         sample.p, config_.cross_section.planner_safe_distance);
     sample.base_signed_distance = IsFinite(base.clearance) ? base.clearance : 0.0;
@@ -1231,11 +1295,15 @@ bool TubeBuilder::buildCloudClearance(
     cross_section_input.N_w = geometry.N_w;
     cross_section_input.minimum_reference_speed =
         config_.cross_section.minimum_reference_speed;
-    cross_section_input.current_delta = current_delta;
-    cross_section_input.current_delta_valid = IsFinite(current_delta);
+    cross_section_input.current_delta = selected_delta;
+    cross_section_input.current_delta_valid = IsFinite(selected_delta);
     cross_section_input.path_revision = path.path_revision;
     cross_section_input.frame_revision = path.frame_revision;
     cross_section_input.clearance_query = clearance_query;
+    cross_section_input.directional_query_count =
+        &profile.diagnostics.cross_section_directional_query_count;
+    cross_section_input.max_bounded_construction_abs_delta =
+        &profile.diagnostics.max_bounded_construction_abs_delta;
     const TubeCrossSectionResult cross_section =
         cross_section_solver.solve(cross_section_input);
     CopyCrossSectionFacts(cross_section, sample);
@@ -1245,12 +1313,12 @@ bool TubeBuilder::buildCloudClearance(
             TubeCrossSectionReason::CURVATURE_NUMERICAL_FAILURE &&
         cross_section.reason !=
             TubeCrossSectionReason::EMPTY_AFTER_CURVATURE_INTERSECTION;
-    // This resolution-derived inset reserves the cover radius consumed by the
-    // continuous surface proof below.  It is not a second radius erosion: all
-    // queried centres use exactly planning/safe_distance.
-    const double continuous_inset = all_active_cells_certified
-        ? certified_sample_insets[index] : snapshot_resolution;
-    sample.continuous_inset = continuous_inset;
+    // Contract A charges the geometric cover exactly once in the Validator.
+    // Builder never erodes the ESDF interval by voxel resolution (nor by a
+    // certificate residual); all centre queries request planner_safe_distance
+    // only.  Keep the inset fields as zero diagnostic metadata.
+    const double continuous_inset = 0.0;
+    sample.continuous_inset = 0.0;
     sample.cell_geometry_certificate_used = all_active_cells_certified;
     sample.cell_geometry_inset = all_active_cells_certified
         ? continuous_inset : 0.0;
@@ -1297,12 +1365,12 @@ bool TubeBuilder::buildCloudClearance(
     sample_complete.push_back(sample.complete);
   }
 
-  // Certificate geometry is only eligible to replace the historical inset
-  // when the same interval facts also prove every sampled offset surface can
-  // remain regular and non-stationary.  If this preflight cannot establish
-  // that fact, restore the old inset before Filter/Validator see the profile;
-  // this is a safe fallback, not a navigation-path denial caused by the new
-  // certificate layer.
+  // A complete matching cell certificate opts the Validator into its
+  // fail-closed proof path.  Builder records the certificate facts but never
+  // applies a geometric inset; if the delayed combined-regularity proof fails
+  // the Validator must observe the attempted certificate and reject without a
+  // sampled fallback.  Missing/malformed callbacks (all_active=false) remain
+  // eligible for the Validator's sampled fallback cover.
   if (all_active_cells_certified) {
     bool certificate_offset_eligible = true;
     double combined_speed_min = std::numeric_limits<double>::infinity();
@@ -1331,19 +1399,6 @@ bool TubeBuilder::buildCloudClearance(
       profile.combined_regularity_proof_complete = true;
       profile.combined_regularity_speed_min = IsFinite(combined_speed_min)
           ? combined_speed_min : 0.0;
-    } else {
-      profile.cell_geometry_certified = false;
-      profile.certified_cell_count = 0U;
-      for (std::size_t index = 0U; index < evaluated.size(); ++index) {
-        ApplyContinuousInset(evaluated[index], snapshot_resolution, false);
-        sample_complete[index] = evaluated[index].complete;
-      }
-      profile.diagnostics.min_width = std::numeric_limits<double>::infinity();
-      for (const TubeRawSample& sample : evaluated) {
-        profile.diagnostics.min_width = std::min(
-            profile.diagnostics.min_width,
-            std::max(0.0, sample.environment_width));
-      }
     }
   }
 
@@ -1434,6 +1489,7 @@ bool TubeBuilder::buildCloudClearance(
     profile.diagnostics.invalid_reason =
         "requested preview was truncated to the current cloud-clearance segment";
   }
+  FinalizeConstructionDiagnostics(profile.diagnostics);
   return profile.raw_complete;
 }
 

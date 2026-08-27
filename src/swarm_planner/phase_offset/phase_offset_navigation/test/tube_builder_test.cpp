@@ -218,11 +218,14 @@ TEST(TubeBuilderTest, CloudClearanceUsesPlannerSafeDistanceWithoutDoubleErosion)
   const TubeRawSample& sample = profile.samples.front();
   EXPECT_NEAR(sample.full_effective_radius, 0.55, 1e-12);
   EXPECT_NEAR(sample.residual_effective_radius, 0.40, 1e-12);
-  EXPECT_NEAR(sample.raw_lower, -0.95, 1e-12);
-  EXPECT_NEAR(sample.raw_upper, 0.95, 1e-12);
+  // Contract A assigns the complete geometric cover to the Validator.  The
+  // ESDF Builder records zero continuous inset and leaves the requested
+  // nominal interval untouched.
+  EXPECT_NEAR(sample.raw_lower, -1.0, 1e-12);
+  EXPECT_NEAR(sample.raw_upper, 1.0, 1e-12);
   EXPECT_NEAR(sample.pre_inset_lower, -1.0, 1e-12);
   EXPECT_NEAR(sample.pre_inset_upper, 1.0, 1e-12);
-  EXPECT_NEAR(sample.continuous_inset, 0.05, 1e-12);
+  EXPECT_DOUBLE_EQ(sample.continuous_inset, 0.0);
   EXPECT_TRUE(sample.pre_inset_contains_zero);
   EXPECT_TRUE(sample.post_inset_contains_zero);
   EXPECT_TRUE(sample.filter_input_contains_zero);
@@ -254,7 +257,7 @@ TEST(TubeBuilderTest, CertifiedStraightCellUsesZeroLocalInsetWithoutLosingZero) 
 }
 
 TEST(TubeBuilderTest,
-     CertifiedCellWithOffsetInvariantFailureFallsBackToFixedInset) {
+     CertifiedCellWithOffsetInvariantFailureDoesNotApplySampledInset) {
   const PathCellBoundQuery invalid_offset_certificate =
       [](const double w0, const double w1,
          phase_offset_core::PathCellGeometryCertificate& certificate) {
@@ -273,7 +276,7 @@ TEST(TubeBuilderTest,
         certificate.horizontal_acceleration_bound_complete = true;
         certificate.sup_N_w_norm = 2.0;
         certificate.sup_abs_curvature = 10.0;
-        certificate.normal_variation_bound = 0.2 * (w1 - w0);
+        certificate.normal_variation_bound = 2.0 * (w1 - w0);
         certificate.tangent_variation_bound = 0.0;
         certificate.curvature_variation_bound = 0.0;
         certificate.midpoint_position_variation_bound = 0.5 * (w1 - w0);
@@ -286,16 +289,19 @@ TEST(TubeBuilderTest,
   ASSERT_TRUE(TubeBuilder(Config()).buildCloudClearance(
       TubeSource::ESDF, Line(), Open(), ExactLine(),
       invalid_offset_certificate, 0.05, 0.0, 3U, 4U, profile));
-  EXPECT_FALSE(profile.cell_geometry_certified);
+  // A complete cell callback opts into the certificate path.  If the delayed
+  // combined regularity proof fails, no fixed half-voxel fallback is applied;
+  // the Validator owns the eventual fail-closed decision.
+  EXPECT_TRUE(profile.cell_geometry_certified);
   EXPECT_FALSE(profile.combined_regularity_proof_complete);
   EXPECT_DOUBLE_EQ(profile.combined_regularity_speed_min, 0.0);
-  EXPECT_EQ(profile.certified_cell_count, 0U);
+  EXPECT_EQ(profile.certified_cell_count, profile.raw_build_samples.size() - 1U);
   ASSERT_FALSE(profile.raw_build_samples.empty());
-  EXPECT_DOUBLE_EQ(profile.raw_build_samples.front().continuous_inset, 0.05);
-  EXPECT_FALSE(profile.raw_build_samples.front().cell_geometry_certificate_used);
+  EXPECT_DOUBLE_EQ(profile.raw_build_samples.front().continuous_inset, 0.0);
+  EXPECT_TRUE(profile.raw_build_samples.front().cell_geometry_certificate_used);
 }
 
-TEST(TubeBuilderTest, PreInsetNarrowingCollapsesToZeroWithoutExcludingIt) {
+TEST(TubeBuilderTest, NarrowCrossSectionRetainsAbsoluteAsymmetricBounds) {
   const ClearanceQuery narrow_positive_side = [](const Eigen::Vector3d& point,
                                                   const double required) {
     ClearanceQueryResult result;
@@ -318,9 +324,42 @@ TEST(TubeBuilderTest, PreInsetNarrowingCollapsesToZeroWithoutExcludingIt) {
   EXPECT_TRUE(sample.pre_inset_contains_zero);
   EXPECT_TRUE(sample.post_inset_contains_zero);
   EXPECT_TRUE(sample.filter_input_contains_zero);
-  EXPECT_LT(sample.pre_inset_upper, sample.continuous_inset);
-  EXPECT_DOUBLE_EQ(sample.raw_upper, 0.0);
+  EXPECT_GT(sample.pre_inset_upper, 0.0);
+  EXPECT_GT(sample.raw_upper, 0.0);
+  EXPECT_DOUBLE_EQ(sample.continuous_inset, 0.0);
   EXPECT_TRUE(sample.filtered_contains_zero);
+}
+
+TEST(TubeBuilderTest, SourceAwareValidationIgnoresInvalidLegacyEsdfWidths) {
+  TubeBuilderConfig config = Config();
+  config.fixed_delta_max = -1.0;
+  config.max_offset = -2.0;
+  config.cross_section.search_extent = -3.0;
+  EXPECT_TRUE(TubeBuilder(config).configurationValidForSource(TubeSource::ESDF));
+  EXPECT_FALSE(TubeBuilder(config).configurationValidForSource(TubeSource::FIXED));
+}
+
+TEST(TubeBuilderTest, ConstructionQueriesRemainWithinNominalWidth) {
+  TubeBuilderConfig config = Config();
+  config.cross_section.nominal_half_width = 1.0;
+  std::vector<double> transverse;
+  const ClearanceQuery query = [&transverse](const Eigen::Vector3d& point,
+                                              const double required) {
+    transverse.push_back(point.y());
+    ClearanceQueryResult result;
+    result.status = DistanceStatus::KNOWN_FREE;
+    result.clearance = std::max(10.0, required);
+    result.clearance_certified = true;
+    return result;
+  };
+  TubeProfile profile;
+  ASSERT_TRUE(TubeBuilder(config).buildCloudClearance(
+      TubeSource::ESDF, Line(), query, ExactLine(), 0.05, 0.0, 9U, 10U,
+      profile));
+  ASSERT_FALSE(transverse.empty());
+  for (const double y : transverse) EXPECT_LE(std::abs(y), 1.0 + 1e-12);
+  EXPECT_LE(profile.diagnostics.max_bounded_construction_abs_delta,
+            config.cross_section.nominal_half_width + 1e-12);
 }
 
 TEST(TubeBuilderTest, DiagonalAndBetweenKnotObstacleCauseAdaptiveCrossSections) {

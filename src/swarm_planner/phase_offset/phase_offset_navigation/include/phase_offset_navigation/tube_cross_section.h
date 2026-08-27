@@ -5,12 +5,24 @@
 #include <Eigen/Core>
 
 #include <functional>
+#include <cstddef>
 #include <cstdint>
-#include <cstdint>
+#include <string>
 
 namespace phase_offset_navigation {
 
 using RawOccupancyQuery = std::function<DistanceStatus(const Eigen::Vector3d&)>;
+
+// Provenance for the sole ESDF nominal-width owner.  Keep the values stable:
+// they are surfaced in diagnostics/measurement and deliberately distinguish
+// an absent parameter (which selects the 1 m default) from an explicit value.
+enum class TubeNominalWidthSource {
+  DEFAULT_ABSENT,
+  EXPLICIT_PARAMETER,
+};
+
+const char* tubeNominalWidthSourceName(TubeNominalWidthSource source);
+const char* nominalWidthSourceName(TubeNominalWidthSource source);
 
 struct RobustTubeMargins {
   double uav_radius = 0.0;
@@ -30,6 +42,13 @@ struct RobustTubeMargins {
 };
 
 struct TubeCrossSectionConfig {
+  // Authoritative bounded nominal half-width for ESDF construction.  The
+  // legacy search_extent remains compatibility metadata and is never used to
+  // widen this interval.
+  double nominal_half_width = 1.0;
+  TubeNominalWidthSource nominal_width_source =
+      TubeNominalWidthSource::DEFAULT_ABSENT;
+  bool nominal_width_legacy_conflict = false;
   double search_extent = 3.0;
   double ray_step = 0.05;
   double boundary_tolerance = 1e-3;
@@ -83,9 +102,18 @@ struct TubeCrossSectionInput {
   // Compatibility-only categorical facts for old diagnostics.  It must never
   // be used to establish a cross-section safety interval.
   RawOccupancyQuery occupancy_query;
+  // Optional construction accounting hooks.  They are intentionally
+  // pointer-based so ordinary standalone solver callers remain unchanged;
+  // TubeBuilder supplies them for the whitelisted measurement path.
+  std::size_t* directional_query_count = nullptr;
+  double* max_bounded_construction_abs_delta = nullptr;
 };
 
 struct TubeCrossSectionResult {
+  double nominal_half_width = 0.0;
+  TubeNominalWidthSource nominal_width_source =
+      TubeNominalWidthSource::DEFAULT_ABSENT;
+  bool nominal_width_legacy_conflict = false;
   double c_plus_raw = 0.0;
   double c_minus_raw = 0.0;
   double full_effective_radius = 0.0;

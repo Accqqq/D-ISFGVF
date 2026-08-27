@@ -29,6 +29,7 @@
     <!--  none/esdf/fixed -->
     <arg name="phase_offset_manual_tube_source" default="none" />
     <arg name="phase_offset_tube_fixed_delta_max" default="0.06" />
+    <arg name="phase_offset_tube_nominal_half_width" default="1.0" />
     <arg name="phase_offset_tube_sample_step_w" default="0.10" />
     <arg name="phase_offset_tube_lookahead_w" default="2.0" />
     <arg name="phase_offset_tube_back_w" default="0.20" />
@@ -66,6 +67,9 @@
          until an observed-domain producer is supplied. -->
     <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false" />
     <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0" />
+    <arg name="phase_offset_measurement_enable" default="false" />
+    <arg name="phase_offset_measurement_callback_csv_path" default="" />
+    <arg name="phase_offset_measurement_tube_due_csv_path" default="" />
     <arg name="sdf_map_buffer_refresh_period" default="3.0" />
     <!-- Planning  parameters-->
     <arg name="map_size_x_" value="20.0"/>
@@ -108,6 +112,7 @@
         <param name="phase_offset/manual/preflight_sample_step_w" value="$(arg phase_offset_manual_preflight_sample_step_w)" />
         <param name="phase_offset/manual/tube_source" value="$(arg phase_offset_manual_tube_source)" />
         <param name="phase_offset/tube/fixed_delta_max" value="$(arg phase_offset_tube_fixed_delta_max)" />
+        <param name="phase_offset/tube/nominal_half_width" value="$(arg phase_offset_tube_nominal_half_width)" />
         <param name="phase_offset/tube/sample_step_w" value="$(arg phase_offset_tube_sample_step_w)" />
         <param name="phase_offset/tube/lookahead_w" value="$(arg phase_offset_tube_lookahead_w)" />
         <param name="phase_offset/tube/back_w" value="$(arg phase_offset_tube_back_w)" />
@@ -136,6 +141,9 @@
         <param name="phase_offset/tube/raw_tracking_error_bound" value="$(arg phase_offset_tube_raw_tracking_error_bound)" />
         <param name="phase_offset/tube/cloud_obstacle_set_complete" value="$(arg phase_offset_tube_cloud_obstacle_set_complete)" />
         <param name="phase_offset/tube/preincluded_map_uncertainty" value="$(arg phase_offset_tube_preincluded_map_uncertainty)" />
+        <param name="phase_offset/measurement/enable" value="$(arg phase_offset_measurement_enable)" />
+        <param name="phase_offset/measurement/callback_csv_path" value="$(arg phase_offset_measurement_callback_csv_path)" />
+        <param name="phase_offset/measurement/tube_due_csv_path" value="$(arg phase_offset_measurement_tube_due_csv_path)" />
         <param name="gvf/planInterval"     value="0.5" /> 
         <param name="gvf/num_points_to_take" value="30" />
         <param name="gvf/use_test_cmd" value="false" />

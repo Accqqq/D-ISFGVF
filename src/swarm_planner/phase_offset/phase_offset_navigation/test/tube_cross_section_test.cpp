@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace phase_offset_navigation {
 namespace {
@@ -61,6 +62,57 @@ TEST(TubeCrossSectionTest, DirectClearanceOpenSpaceHasZeroConnectedInterval) {
   EXPECT_NEAR(result.c_plus_raw, 1.0, 1e-12);
   EXPECT_NEAR(result.c_minus_raw, 1.0, 1e-12);
   ExpectFinite(result);
+}
+
+TEST(TubeCrossSectionTest, ExplicitNominalWidthOnePointFiveOwnsOpenInterval) {
+  TubeCrossSectionConfig config = MakeConfig();
+  config.nominal_half_width = 1.5;
+  config.nominal_width_source = TubeNominalWidthSource::EXPLICIT_PARAMETER;
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(config).solve(MakeInput(OpenSpace()));
+  ASSERT_TRUE(result.valid);
+  EXPECT_NEAR(result.lower_final, -1.5, 1e-12);
+  EXPECT_NEAR(result.upper_final, 1.5, 1e-12);
+  EXPECT_EQ(result.nominal_width_source,
+            TubeNominalWidthSource::EXPLICIT_PARAMETER);
+  EXPECT_DOUBLE_EQ(result.nominal_half_width, 1.5);
+}
+
+TEST(TubeCrossSectionTest, ExplicitNominalWidthConflictIsDiagnosticOnly) {
+  TubeCrossSectionConfig config = MakeConfig();
+  config.nominal_half_width = 1.0;
+  config.nominal_width_source = TubeNominalWidthSource::EXPLICIT_PARAMETER;
+  config.nominal_width_legacy_conflict = true;
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(config).solve(MakeInput(OpenSpace()));
+  ASSERT_TRUE(result.valid);
+  EXPECT_TRUE(result.nominal_width_legacy_conflict);
+  EXPECT_NEAR(result.lower_final, -1.0, 1e-12);
+  EXPECT_NEAR(result.upper_final, 1.0, 1e-12);
+}
+
+TEST(TubeCrossSectionTest, AbsentNominalWidthUsesOneMetreDefaultAndIgnoresSearchExtent) {
+  TubeCrossSectionConfig config = MakeConfig();
+  config.search_extent = std::numeric_limits<double>::quiet_NaN();
+  config.nominal_width_source = TubeNominalWidthSource::DEFAULT_ABSENT;
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(config).solve(MakeInput(OpenSpace()));
+  ASSERT_TRUE(result.valid);
+  EXPECT_DOUBLE_EQ(config.nominal_half_width, 1.0);
+  EXPECT_NEAR(result.lower_final, -1.0, 1e-12);
+  EXPECT_NEAR(result.upper_final, 1.0, 1e-12);
+  EXPECT_EQ(result.nominal_width_source,
+            TubeNominalWidthSource::DEFAULT_ABSENT);
+}
+
+TEST(TubeCrossSectionTest, NominalWidthSampleBudgetIsDerivedFromBoundedInterval) {
+  TubeCrossSectionConfig config = MakeConfig();
+  config.nominal_half_width = 1.5;
+  config.search_extent = 0.01;
+  config.ray_step = 0.05;
+  EXPECT_TRUE(TubeCrossSectionSolver(config).configurationValid());
+  config.nominal_half_width = 10000.0;
+  EXPECT_FALSE(TubeCrossSectionSolver(config).configurationValid());
 }
 
 TEST(TubeCrossSectionTest, HorizontalNormalRaysPreserveCenterlineAltitude) {
@@ -196,6 +248,36 @@ TEST(TubeCrossSectionTest, SelectedCurrentComponentIsNotConvexified) {
   EXPECT_LE(result.upper_final, 1.0);
   EXPECT_GE(input.current_delta, result.lower_final);
   EXPECT_LE(input.current_delta, result.upper_final);
+}
+
+TEST(TubeCrossSectionTest, OutOfNominalCurrentUsesExactZeroConstructionAnchor) {
+  TubeCrossSectionConfig config = MakeConfig();
+  std::vector<double> queried_y;
+  std::size_t query_count = 0U;
+  TubeCrossSectionInput input = MakeInput(
+      [&queried_y, &query_count](const Eigen::Vector3d& point,
+                                 const double required) {
+        queried_y.push_back(point.y());
+        ++query_count;
+        ClearanceQueryResult result;
+        result.status = DistanceStatus::KNOWN_FREE;
+        result.clearance = std::max(10.0, required);
+        result.clearance_certified = true;
+        return result;
+      });
+  input.current_delta = 1.2;
+  input.current_delta_valid = true;
+  input.directional_query_count = &query_count;
+  const TubeCrossSectionResult result =
+      TubeCrossSectionSolver(config).solve(input);
+  ASSERT_TRUE(result.valid);
+  EXPECT_NEAR(result.lower_final, -1.0, 1e-12);
+  EXPECT_NEAR(result.upper_final, 1.0, 1e-12);
+  ASSERT_FALSE(queried_y.empty());
+  for (const double y : queried_y) EXPECT_LE(std::abs(y), 1.0 + 1e-12);
+  // The callback itself and the solver's accounting hook observe each actual
+  // directional construction query exactly once.
+  EXPECT_EQ(query_count, queried_y.size() * 2U);
 }
 
 TEST(TubeCrossSectionTest, UnsafeCurrentComponentFailsClosed) {
