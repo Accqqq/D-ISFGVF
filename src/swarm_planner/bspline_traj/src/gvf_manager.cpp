@@ -338,10 +338,10 @@ namespace FLAG_Race
                 if (phase_offset_matched_adapter_->requiresTubeTimer())
                 {
                     // S3 owns all candidate construction and MANUAL
-                    // visualization on this 10 Hz timer; cmdCallback remains
-                    // the sole owner of Runtime/gate/control state.
+                    // visualization permits; cmdCallback remains the sole
+                    // owner of Runtime/gate/control state.
                     phase_offset_tube_timer_ = nh.createTimer(
-                        ros::Duration(0.10),
+                        ros::Duration(matched_config_.tube_update_period),
                         &gvf_manager::phaseOffsetTubeTimerCallback, this);
                 }
                 if (matched_config.mode == PhaseOffsetMatchedMode::ACTIVE)
@@ -1320,7 +1320,10 @@ void gvf_manager::phaseOffsetTubeTimerCallback(const ros::TimerEvent& event)
         !phase_offset_matched_adapter_->requiresTubeTimer()) {
         return;
     }
-    phase_offset_matched_adapter_->timerTick();
+    // The ROS callback is scheduler-only.  Heavy Tube construction runs on
+    // the adapter's single joined worker; timerTick() remains available only
+    // for unadvertised deterministic test fixtures.
+    phase_offset_matched_adapter_->scheduleTubeBuild();
 
     // The activation bridge may construct a prepared Tube epoch.  It belongs
     // to this timer-owned path, never to the 50 Hz command callback.  Capture

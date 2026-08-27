@@ -7131,6 +7131,720 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_TRUE(weak_cloud.expired());
 }
 
+// Stage 1A scheduler/lifecycle coverage.  These tests intentionally inspect
+// the adapter's private worker bookkeeping (the test file already exposes it
+// above) so that one-slot/latest-only behavior is proven without requiring a
+// ROS master or a long-running Tube build.
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     SchedulerReturnsWithoutSynchronousTubeBuild) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &path), output));
+  const std::uint64_t before = adapter.timer_build_sequence_;
+  EXPECT_TRUE(adapter.scheduleTubeBuild());
+  EXPECT_EQ(before, adapter.timer_build_sequence_);
+  EXPECT_TRUE(adapter.pending_request_);
+  EXPECT_EQ(1U, adapter.pending_request_ ? 1U : 0U);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A, LatestOnlyCoalescesAThroughDToD) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  int ids[4] = {1, 2, 3, 4};
+  std::shared_ptr<const TubeBuildRequest> requests[4];
+  for (int i = 0; i < 4; ++i) {
+    ASSERT_FALSE(adapter.update(MakeInput(path, &ids[i], i * kDt), output));
+    ASSERT_TRUE(adapter.scheduleTubeBuild());
+    requests[i] = std::atomic_load(&adapter.latest_build_request_);
+  }
+  ASSERT_TRUE(adapter.pending_request_);
+  EXPECT_EQ(requests[3].get(), adapter.pending_request_.get());
+  EXPECT_TRUE(adapter.pending_request_);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A, PendingSlotNeverExceedsOne) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  for (int i = 0; i < 32; ++i) {
+    ASSERT_FALSE(adapter.update(MakeInput(path, &i, i * kDt), output));
+    adapter.scheduleTubeBuild();
+    EXPECT_LE(adapter.pending_request_ ? 1U : 0U, 1U);
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     PendingRequestMadeStaleBeforeWorkerStartDoesNotBuild) {
+  const SyntheticPath path = MakePath();
+  int identity_a = 201;
+  int identity_b = 202;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity_a), output));
+  const auto request_a = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request_a);
+  ASSERT_TRUE(adapter.scheduleTubeBuild());
+  ASSERT_TRUE(adapter.pending_request_);
+  EXPECT_EQ(request_a.get(), adapter.pending_request_.get());
+
+  // Capture and consume exactly the permit that a worker would have taken.
+  // Calling runTubeBuildJob() directly keeps this stale-before-worker-start
+  // interleaving deterministic and proves the pre-build gate drops A before
+  // any worker-local state or timer-build sequence is consumed.
+  PhaseOffsetMatchedAdapter::SchedulePermit permit_a;
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    permit_a.permit_id = adapter.pending_permit_id_;
+    permit_a.request = adapter.pending_request_;
+    permit_a.request_identity = adapter.pending_request_identity_;
+    permit_a.work_identity = adapter.pending_work_identity_;
+    adapter.pending_request_.reset();
+    adapter.pending_permit_id_ = 0U;
+    adapter.pending_request_identity_ =
+        PhaseOffsetMatchedAdapter::RequestInstanceIdentity();
+    adapter.pending_work_identity_ =
+        PhaseOffsetMatchedAdapter::TubeWorkIdentity();
+  }
+  ASSERT_EQ(request_a.get(), permit_a.request.get());
+
+  // Replace the immutable command request after the permit captured A but
+  // before the unadvertised compatibility worker starts.  The worker must
+  // drop stale A before prepareTubeJobLocalState()/timer_build_sequence.
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity_b, kDt), output));
+  const auto request_b = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request_b);
+  EXPECT_NE(request_a.get(), request_b.get());
+  ASSERT_FALSE(adapter.runTubeBuildJob(permit_a));
+
+  EXPECT_EQ(0U, adapter.timer_build_sequence_);
+  EXPECT_FALSE(adapter.pending_request_);
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+  ASSERT_TRUE(adapter.tube_epoch_manager_);
+  EXPECT_EQ(0U, adapter.tube_epoch_manager_->candidate_sequence_);
+  EXPECT_EQ(0U, adapter.cached_path_source_revision_);
+  EXPECT_FALSE(adapter.have_cached_path_);
+  EXPECT_FALSE(adapter.timer_active_profile_);
+  EXPECT_EQ(0U, adapter.timer_installed_active_epoch_);
+
+  // No FIFO/catch-up: B is selected only by the next timer permit (the next
+  // compatibility tick below), never by the stale A completion itself.
+  EXPECT_EQ(0U, adapter.timer_build_sequence_);
+  ASSERT_TRUE(adapter.timerTick());
+  EXPECT_EQ(1U, adapter.timer_build_sequence_);
+  const auto committed = std::atomic_load(&adapter.latest_epoch_snapshot_);
+  ASSERT_TRUE(committed);
+  EXPECT_EQ(request_b->source_revision, committed->source_revision);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     NoDuplicateRebuildWithoutNewPermitOrTubeIdentity) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &path), output));
+  ASSERT_TRUE(adapter.timerTick());
+  const std::uint64_t completed = adapter.timer_build_sequence_;
+  EXPECT_FALSE(adapter.scheduleTubeBuild());
+  EXPECT_EQ(completed, adapter.timer_build_sequence_);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     Normal50HzCommandTrafficCannotCause50HzTubeBuildChurn) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  int identity = 55;
+  for (int i = 0; i < 50; ++i) {
+    ASSERT_FALSE(adapter.update(MakeInput(path, &identity, i * kDt), output));
+  }
+  EXPECT_EQ(0U, adapter.timer_build_sequence_);
+  ASSERT_TRUE(adapter.scheduleTubeBuild());
+  ASSERT_TRUE(adapter.timerTick());
+  EXPECT_EQ(1U, adapter.timer_build_sequence_);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     RequestArrivingAtWorkerCompletionWaitsAtMostNextPermitAndDoesNotFIFO) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  int ids[4] = {61, 62, 63, 64};
+
+  // Start the joined worker directly so this remains a no-master deterministic
+  // fixture.  The bounded finalization hook holds A at the completion seam
+  // while B/C/D permits replace one pending slot.
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    adapter.worker_started_ = true;
+    adapter.worker_stop_requested_ = false;
+  }
+  adapter.tube_worker_ = std::thread(&PhaseOffsetMatchedAdapter::tubeWorkerMain,
+                                    &adapter);
+  ASSERT_FALSE(adapter.update(MakeInput(path, &ids[0], 0.0), output));
+  const auto request_a = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request_a);
+
+  std::mutex hook_mutex;
+  std::condition_variable hook_cv;
+  int hook_count = 0;
+  bool release_first = false;
+  bool release_second = false;
+  adapter.finalize_publication_test_hook_ = [&]() {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    ++hook_count;
+    hook_cv.notify_all();
+    if (hook_count == 1) {
+      hook_cv.wait(lock, [&]() { return release_first; });
+    } else if (hook_count == 2) {
+      hook_cv.wait(lock, [&]() { return release_second; });
+    }
+  };
+  ASSERT_TRUE(adapter.scheduleTubeBuild());
+  {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    hook_cv.wait(lock, [&]() { return hook_count >= 1; });
+  }
+
+  std::shared_ptr<const TubeBuildRequest> request_d;
+  for (int i = 1; i < 4; ++i) {
+    ASSERT_FALSE(adapter.update(MakeInput(path, &ids[i], i * kDt), output));
+    ASSERT_TRUE(adapter.scheduleTubeBuild());
+    if (i == 3) request_d = std::atomic_load(&adapter.latest_build_request_);
+  }
+  ASSERT_TRUE(request_d);
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    ASSERT_TRUE(adapter.pending_request_);
+    EXPECT_EQ(request_d.get(), adapter.pending_request_.get());
+    EXPECT_EQ(1U, adapter.pending_request_ ? 1U : 0U);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(hook_mutex);
+    release_first = true;
+  }
+  hook_cv.notify_all();
+  {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    hook_cv.wait(lock, [&]() { return hook_count >= 2; });
+  }
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    EXPECT_EQ(request_d.get(), adapter.running_request_.get());
+    EXPECT_EQ(request_d.get(), adapter.last_started_request_identity_.request);
+    EXPECT_FALSE(adapter.pending_request_);
+  }
+  EXPECT_EQ(2U, adapter.timer_build_sequence_);
+  {
+    std::lock_guard<std::mutex> lock(hook_mutex);
+    release_second = true;
+  }
+  hook_cv.notify_all();
+  adapter.shutdown();
+  adapter.finalize_publication_test_hook_ = std::function<void()>();
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     StaleOrdinaryOwnerOrFrameCompletionCannotPublish) {
+  const SyntheticPath path = MakePath();
+  const auto owner = MakeSyntheticOwner();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterInput first = MakeInput(path, owner.get());
+  first.semantic_path_owner = owner;
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(first, output));
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  TubeEpochSnapshot built;
+  ASSERT_TRUE(adapter.buildTubeEpoch(request, built));
+  MatchedAdapterInput replacement = first;
+  replacement.frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, 1U, 2U);
+  ASSERT_FALSE(adapter.update(replacement, output));
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(request, built));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     SourceOrFrameReplacementCannotBeFollowedByOldCandidateResurrection) {
+  const SyntheticPath path = MakePath();
+  const auto owner = MakeSyntheticOwner();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterInput first = MakeInput(path, owner.get());
+  first.semantic_path_owner = owner;
+  first.frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, 1U, 1U);
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(first, output));
+  const auto request_a = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request_a);
+  PhaseOffsetMatchedAdapter::SchedulePermit permit_a;
+  permit_a.request = request_a;
+  permit_a.request_identity = adapter.makeRequestInstanceIdentity(request_a);
+  permit_a.work_identity = adapter.makeTubeWorkIdentity(request_a);
+  PhaseOffsetMatchedAdapter::TubeJobLocalState local_a;
+  adapter.prepareTubeJobLocalState(permit_a, local_a);
+  TubeEpochSnapshot built_a;
+  ASSERT_TRUE(adapter.buildTubeEpoch(request_a, built_a, &local_a));
+
+  std::mutex hook_mutex;
+  std::condition_variable hook_cv;
+  bool entered = false;
+  bool release = false;
+  adapter.finalize_before_epoch_store_test_hook_ = [&]() {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    entered = true;
+    hook_cv.notify_all();
+    hook_cv.wait(lock, [&]() { return release; });
+  };
+  bool finalized = false;
+  std::thread finalizer([&]() {
+    finalized = adapter.finalizeTubeEpoch(request_a, built_a, &local_a);
+  });
+  {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    hook_cv.wait(lock, [&]() { return entered; });
+  }
+
+  // Currentness has passed and runtime_command_mutex_ is held by the
+  // finalizer.  A concurrent frame-owner replacement can start, but update()
+  // must remain blocked until the immutable A stores complete.
+  MatchedAdapterInput replacement = first;
+  replacement.frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, 1U, 2U);
+  bool replacement_started = false;
+  bool replacement_done = false;
+  std::thread replacer([&]() {
+    {
+      std::lock_guard<std::mutex> lock(hook_mutex);
+      replacement_started = true;
+      hook_cv.notify_all();
+    }
+    MatchedAdapterOutput replacement_output;
+    adapter.update(replacement, replacement_output);
+    {
+      std::lock_guard<std::mutex> lock(hook_mutex);
+      replacement_done = true;
+      hook_cv.notify_all();
+    }
+  });
+  {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    hook_cv.wait(lock, [&]() { return replacement_started; });
+    EXPECT_FALSE(replacement_done);
+  }
+  {
+    std::lock_guard<std::mutex> lock(hook_mutex);
+    release = true;
+  }
+  hook_cv.notify_all();
+  finalizer.join();
+  replacer.join();
+  adapter.finalize_before_epoch_store_test_hook_ = std::function<void()>();
+
+  EXPECT_TRUE(finalized);
+  const auto request_b = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request_b);
+  EXPECT_EQ(request_a->source_revision, request_b->source_revision);
+  EXPECT_NE(request_a->frame_owner.get(), request_b->frame_owner.get());
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     StaleOrdinaryJobCannotMutateCommittedWorkerState) {
+  const SyntheticPath path = MakePath();
+  int identity = 71;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity), output));
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  PhaseOffsetMatchedAdapter::SchedulePermit permit;
+  permit.request = request;
+  permit.request_identity = adapter.makeRequestInstanceIdentity(request);
+  permit.work_identity = adapter.makeTubeWorkIdentity(request);
+  PhaseOffsetMatchedAdapter::TubeJobLocalState local;
+  adapter.prepareTubeJobLocalState(permit, local);
+  TubeEpochSnapshot built;
+  ASSERT_TRUE(adapter.buildTubeEpoch(request, built, &local));
+  ASSERT_EQ(0U, adapter.tube_epoch_manager_->candidate_sequence_);
+  adapter.deactivate(ros::Time(1.0));
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(request, built, &local));
+  EXPECT_EQ(0U, adapter.tube_epoch_manager_->candidate_sequence_);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     StalePairRefreshCannotMutatePersistentManagerOrNewPair) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  int identity = 81;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity), output));
+  ASSERT_TRUE(adapter.timerTick());
+  const auto old_manager = adapter.tube_epoch_manager_.get();
+  const std::uint64_t old_sequence = old_manager->candidate_sequence_;
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  PhaseOffsetMatchedAdapter::SchedulePermit permit;
+  permit.request = std::shared_ptr<const TubeBuildRequest>(
+      new TubeBuildRequest(*request));
+  std::shared_ptr<TubeBuildRequest> pair_request(
+      new TubeBuildRequest(*request));
+  pair_request->base_path_tube_pair = std::shared_ptr<const PathTubePair>(
+      new PathTubePair());
+  permit.request = std::shared_ptr<const TubeBuildRequest>(pair_request);
+  permit.request_identity = adapter.makeRequestInstanceIdentity(permit.request);
+  permit.work_identity = adapter.makeTubeWorkIdentity(permit.request);
+  PhaseOffsetMatchedAdapter::TubeJobLocalState local;
+  adapter.prepareTubeJobLocalState(permit, local);
+  EXPECT_TRUE(local.pair_refresh);
+  EXPECT_NE(old_manager, local.tube_epoch_manager.get());
+  EXPECT_EQ(old_sequence, adapter.tube_epoch_manager_->candidate_sequence_);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A, TaskGenerationResetInvalidatesRunningJob) {
+  const SyntheticPath path = MakePath();
+  int identity = 91;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity), output));
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  TubeEpochSnapshot built;
+  ASSERT_TRUE(adapter.buildTubeEpoch(request, built));
+  std::uint64_t retired = 0U;
+  ASSERT_TRUE(adapter.resetForNewNavigationTask(
+      adapter.authority_session_.load(std::memory_order_acquire), retired));
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(request, built));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     DeactivateDuringBuildProducesCorrectLifecycle) {
+  const SyntheticPath path = MakePath();
+  int identity = 101;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity), output));
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  TubeEpochSnapshot built;
+  ASSERT_TRUE(adapter.buildTubeEpoch(request, built));
+  adapter.deactivate(ros::Time(2.0));
+  const auto inactive = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(inactive);
+  EXPECT_FALSE(inactive->active);
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(request, built));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     StaleDeactivateCannotClearNewTaskPendingRequest) {
+  const SyntheticPath path = MakePath();
+  int a_identity = 131;
+  int b_identity = 132;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &a_identity), output));
+  const std::shared_ptr<const TubeBuildRequest> a_request =
+      std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(a_request);
+
+  std::mutex hook_mutex;
+  std::condition_variable hook_cv;
+  bool paused = false;
+  bool release = false;
+  adapter.deactivate_test_hook_ = [&]() {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    paused = true;
+    hook_cv.notify_all();
+    hook_cv.wait(lock, [&]() { return release; });
+  };
+  std::thread old_deactivate([&]() { adapter.deactivate(ros::Time(1.0)); });
+  {
+    std::unique_lock<std::mutex> lock(hook_mutex);
+    hook_cv.wait(lock, [&]() { return paused; });
+  }
+
+  // Retire A while its deactivate producer is paused before the command
+  // boundary.  Install and schedule B before resuming that stale producer.
+  std::uint64_t retired = 0U;
+  const std::uint64_t old_session =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  ASSERT_TRUE(adapter.resetForNewNavigationTask(old_session, retired));
+  ASSERT_FALSE(adapter.update(MakeInput(path, &b_identity, kDt), output));
+  const std::shared_ptr<const TubeBuildRequest> b_request =
+      std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(b_request);
+  EXPECT_NE(a_request.get(), b_request.get());
+  EXPECT_NE(a_request->source_revision, b_request->source_revision);
+  ASSERT_TRUE(adapter.scheduleTubeBuild());
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    ASSERT_TRUE(adapter.pending_request_);
+    EXPECT_EQ(b_request.get(), adapter.pending_request_.get());
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(hook_mutex);
+    release = true;
+  }
+  hook_cv.notify_all();
+  old_deactivate.join();
+  adapter.deactivate_test_hook_ = std::function<void()>();
+
+  // The stale A producer is a no-op at the lifecycle seam: B remains the one
+  // pending permit, and only the normal next timer scheduler may consume it.
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    ASSERT_TRUE(adapter.pending_request_);
+    EXPECT_EQ(b_request.get(), adapter.pending_request_.get());
+  }
+  EXPECT_EQ(b_request.get(),
+            std::atomic_load(&adapter.latest_build_request_).get());
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+
+  ASSERT_TRUE(adapter.timerTick());
+  EXPECT_EQ(1U, adapter.timer_build_sequence_);
+  EXPECT_FALSE(adapter.pending_request_);
+  const auto candidate =
+      std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+  const auto epoch = std::atomic_load(&adapter.latest_epoch_snapshot_);
+  ASSERT_TRUE(candidate);
+  ASSERT_TRUE(epoch);
+  EXPECT_EQ(b_request->source_revision, candidate->source_revision);
+  EXPECT_EQ(b_request->source_revision, epoch->source_revision);
+  EXPECT_EQ(b_request->control_sequence, candidate->request_control_sequence);
+  EXPECT_EQ(b_request->control_sequence, epoch->request_control_sequence);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     ShutdownJoinsAndPreventsPostShutdownPublication) {
+  const SyntheticPath path = MakeStraightSyntheticPath();
+  const std::shared_ptr<BlockingOwnerEvaluation> blocking(
+      new BlockingOwnerEvaluation());
+  const auto owner = MakeBlockingStraightSyntheticOwner(blocking);
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterInput input = MakeInput(path, owner.get());
+  input.semantic_path_owner = owner;
+  input.sampled_path.clear();
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(input, output));
+  // The command update may sample the semantic owner for preflight.  Arm the
+  // one-shot barrier only after that command-side work has completed so the
+  // worker's build, rather than update(), is the operation held for shutdown.
+  blocking->block_on_call = blocking->call_count.load(
+      std::memory_order_acquire) + 1U;
+  blocking->armed.store(true, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    adapter.worker_started_ = true;
+    adapter.worker_stop_requested_ = false;
+  }
+  adapter.tube_worker_ = std::thread(&PhaseOffsetMatchedAdapter::tubeWorkerMain,
+                                    &adapter);
+  ASSERT_TRUE(adapter.scheduleTubeBuild());
+  {
+    std::unique_lock<std::mutex> lock(blocking->mutex);
+    blocking->condition.wait(lock, [&]() { return blocking->paused; });
+  }
+
+  // requestShutdown() flips ownership before the build is released; the
+  // worker then joins after its current build returns and must not publish.
+  adapter.requestShutdown();
+  EXPECT_TRUE(adapter.shutdown_requested_.load(std::memory_order_acquire));
+  {
+    std::lock_guard<std::mutex> lock(blocking->mutex);
+    blocking->release = true;
+  }
+  blocking->condition.notify_all();
+  adapter.shutdown();
+  adapter.shutdown();
+  EXPECT_TRUE(adapter.shutdown_requested_.load(std::memory_order_acquire));
+  EXPECT_FALSE(adapter.worker_started_);
+  EXPECT_FALSE(adapter.tube_worker_.joinable());
+  EXPECT_EQ(1U, adapter.timer_build_sequence_);
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     TimerTickCannotSynchronouslyBuildWhenWorkerStarted) {
+  // The production worker is started by advertise().  Keep this test
+  // independent of a ROS master by exercising the same guard directly.
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  const SyntheticPath path = MakePath();
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &path), output));
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    adapter.worker_started_ = true;
+  }
+  const std::uint64_t before = adapter.timer_build_sequence_;
+  EXPECT_TRUE(adapter.timerTick());
+  EXPECT_EQ(before, adapter.timer_build_sequence_);
+  EXPECT_TRUE(adapter.pending_request_);
+  {
+    std::lock_guard<std::mutex> lock(adapter.worker_state_mutex_);
+    adapter.worker_started_ = false;
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     OrdinaryJobCopiesCommittedManagerButPairRefreshUsesFreshManager) {
+  const SyntheticPath path = MakePath();
+  int identity = 111;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &identity), output));
+  ASSERT_TRUE(adapter.timerTick());
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  PhaseOffsetMatchedAdapter::SchedulePermit ordinary;
+  ordinary.request = request;
+  ordinary.request_identity = adapter.makeRequestInstanceIdentity(request);
+  ordinary.work_identity = adapter.makeTubeWorkIdentity(request);
+  PhaseOffsetMatchedAdapter::TubeJobLocalState ordinary_state;
+  adapter.prepareTubeJobLocalState(ordinary, ordinary_state);
+  EXPECT_FALSE(ordinary_state.pair_refresh);
+  EXPECT_NE(adapter.tube_epoch_manager_.get(), ordinary_state.tube_epoch_manager.get());
+  PhaseOffsetMatchedAdapter::SchedulePermit refresh = ordinary;
+  std::shared_ptr<TubeBuildRequest> refresh_request(new TubeBuildRequest(*request));
+  refresh_request->base_path_tube_pair = std::shared_ptr<const PathTubePair>(
+      new PathTubePair());
+  refresh.request = std::shared_ptr<const TubeBuildRequest>(refresh_request);
+  refresh.request_identity = adapter.makeRequestInstanceIdentity(refresh.request);
+  refresh.work_identity = adapter.makeTubeWorkIdentity(refresh.request);
+  PhaseOffsetMatchedAdapter::TubeJobLocalState refresh_state;
+  adapter.prepareTubeJobLocalState(refresh, refresh_state);
+  EXPECT_TRUE(refresh_state.pair_refresh);
+  EXPECT_EQ(0U, refresh_state.tube_epoch_manager->candidate_sequence_);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     CandidateSequenceTracksCommittedCandidateAndBuildSequenceTracksAttempts) {
+  const SyntheticPath path = MakePath();
+  int first_identity = 121;
+  int second_identity = 122;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &first_identity), output));
+  const auto first_request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(first_request);
+  PhaseOffsetMatchedAdapter::SchedulePermit permit;
+  permit.request = first_request;
+  permit.request_identity = adapter.makeRequestInstanceIdentity(first_request);
+  permit.work_identity = adapter.makeTubeWorkIdentity(first_request);
+  PhaseOffsetMatchedAdapter::TubeJobLocalState local;
+  adapter.prepareTubeJobLocalState(permit, local);
+  TubeEpochSnapshot built;
+  ASSERT_TRUE(adapter.buildTubeEpoch(first_request, built, &local));
+  adapter.update(MakeInput(path, &second_identity), output);
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(first_request, built, &local));
+  ASSERT_FALSE(adapter.update(MakeInput(path, &second_identity), output));
+  ASSERT_TRUE(adapter.timerTick());
+  const auto epoch = std::atomic_load(&adapter.latest_epoch_snapshot_);
+  ASSERT_TRUE(epoch);
+  EXPECT_EQ(epoch->epoch_status.candidate_sequence,
+            epoch->candidate_profile->profile_revision);
+  EXPECT_GE(adapter.timer_build_sequence_, 2U);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A, R3RequestCandidateRequestProtocolUnchanged) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterOutput output;
+  ASSERT_FALSE(adapter.update(MakeInput(path, &path), output));
+  ASSERT_TRUE(adapter.timerTick());
+  adapter.update(MakeInput(path, &path, kDt), output);
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  const auto candidate = std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+  ASSERT_TRUE(request);
+  ASSERT_TRUE(candidate);
+  EXPECT_EQ(request->source_revision, candidate->source_revision);
+  EXPECT_TRUE(adapter.epochMatchesRequest(*candidate, *request));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     ConfiguredSchedulingPeriodIsStoredFor005And010) {
+  for (const double period : {0.05, 0.10}) {
+    PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::FIXED);
+    config.tube_update_period = period;
+    PhaseOffsetMatchedAdapter adapter(config);
+    // This unit fixture has no ROS timer, so it verifies only the truthful
+    // source/config wiring.  Real 50/100 ms cadence belongs to ROS acceptance.
+    EXPECT_DOUBLE_EQ(period, adapter.config_.tube_update_period);
+    EXPECT_GE(adapter.config_.tube_update_period, 0.05);
+    EXPECT_LE(adapter.config_.tube_update_period, 0.10);
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A, SourceRevisionSemanticOwnerInvariant) {
+  const SyntheticPath path = MakePath();
+  auto owner = MakeSyntheticOwner();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterInput input = MakeInput(path, owner.get());
+  input.semantic_path_owner = owner;
+  MatchedAdapterOutput output;
+  adapter.update(input, output);
+  const std::uint64_t first = adapter.source_revision_;
+  input.semantic_path_start_w = 0.1;
+  adapter.update(input, output);
+  EXPECT_GT(adapter.source_revision_, first);
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     FrameOwnerReplacementWithUnchangedSourceRevisionIsRejected) {
+  const SyntheticPath path = MakePath();
+  auto owner = MakeSyntheticOwner();
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  MatchedAdapterInput first = MakeInput(path, owner.get());
+  first.semantic_path_owner = owner;
+  first.frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, 1U, 1U);
+  MatchedAdapterOutput output;
+  adapter.update(first, output);
+  const auto request = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(request);
+  const std::uint64_t revision = request->source_revision;
+  MatchedAdapterInput replacement = first;
+  replacement.frame_owner = std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, 1U, 2U);
+  adapter.update(replacement, output);
+  const auto newer = std::atomic_load(&adapter.latest_build_request_);
+  ASSERT_TRUE(newer);
+  EXPECT_EQ(revision, newer->source_revision);
+  EXPECT_NE(request->frame_owner.get(), newer->frame_owner.get());
+  EXPECT_FALSE(adapter.requestSourceStillCurrent(*request));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterStage1A,
+     AdvertisedProductionBootstrapRemainsNotRequired) {
+  if (!ros::isInitialized()) {
+    int argc = 1;
+    static char name[] = "phase_offset_stage1a_test";
+    static char* argv[] = {name, nullptr};
+    ros::init(argc, argv, "phase_offset_stage1a_test",
+              ros::init_options::AnonymousName |
+                  ros::init_options::NoSigintHandler);
+  }
+  if (!ros::master::check()) {
+    GTEST_SKIP() << "ROS master unavailable for advertise/worker smoke test";
+  }
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ros::NodeHandle nh;
+  adapter.advertise(nh);
+  EXPECT_FALSE(adapter.requiresPathTubePairBootstrap());
+  adapter.requestShutdown();
+  adapter.shutdown();
+}
+
 }  // namespace
 }  // namespace FLAG_Race
 

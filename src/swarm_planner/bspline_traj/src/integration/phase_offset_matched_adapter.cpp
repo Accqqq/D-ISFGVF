@@ -1130,6 +1130,84 @@ PhaseOffsetMatchedAdapter::PhaseOffsetMatchedAdapter(const PhaseOffsetMatchedAda
         cloudOccupancyQueryConfigurationValid(cloud_occupancy_query_config_);
   }
 }
+
+PhaseOffsetMatchedAdapter::RequestInstanceIdentity
+PhaseOffsetMatchedAdapter::makeRequestInstanceIdentity(
+    const std::shared_ptr<const TubeBuildRequest>& request) const {
+  RequestInstanceIdentity identity;
+  identity.request_owner = request;
+  identity.request = request.get();
+  identity.task_generation = request ? request->task_generation : 0U;
+  return identity;
+}
+
+PhaseOffsetMatchedAdapter::TubeWorkIdentity
+PhaseOffsetMatchedAdapter::makeTubeWorkIdentity(
+    const std::shared_ptr<const TubeBuildRequest>& request) const {
+  TubeWorkIdentity identity;
+  if (!request) return identity;
+  identity.task_generation = request->task_generation;
+  identity.active = request->active;
+  identity.source_revision = request->source_revision;
+  identity.path_revision = request->path_revision;
+  identity.frame_revision = request->frame_revision;
+  identity.authority_session = request->authority_session;
+  identity.shutdown_invalidated = shutdown_requested_.load(
+      std::memory_order_acquire);
+  identity.semantic_path_owner = request->semantic_path_owner.get();
+  identity.frame_owner = request->frame_owner.get();
+  identity.base_path_tube_pair = request->base_path_tube_pair.get();
+  identity.base_path_tube_pair_generation =
+      request->base_path_tube_pair_generation;
+  return identity;
+}
+
+void PhaseOffsetMatchedAdapter::prepareTubeJobLocalState(
+    const SchedulePermit& permit, TubeJobLocalState& state) {
+  state = TubeJobLocalState();
+  state.pair_refresh = permit.request &&
+      static_cast<bool>(permit.request->base_path_tube_pair);
+  state.timer_task_generation = timer_task_generation_;
+  // Every actual worker attempt consumes one diagnostic/measurement sequence,
+  // including work which later becomes stale.  Candidate sequence remains
+  // owned by the copied manager and is committed only for current work.
+  state.timer_build_sequence = ++timer_build_sequence_;
+  state.cached_full_path_samples = cached_full_path_samples_;
+  state.cached_path_source_revision = cached_path_source_revision_;
+  state.have_cached_path = have_cached_path_;
+  state.timer_active_profile = timer_active_profile_;
+  state.timer_installed_active_epoch = timer_installed_active_epoch_;
+  state.latest_cloud_occupancy_query_status =
+      latest_cloud_occupancy_query_status_;
+  if (state.pair_refresh) {
+    state.tube_epoch_manager.reset(
+        new phase_offset_navigation::TubeEpochManager(MakeEpochConfig(config_)));
+  } else if (tube_epoch_manager_) {
+    // TubeEpochManager is an owning value type.  Copying it here preserves
+    // ordinary Candidate/Active history while isolating heavy construction
+    // from committed worker state.
+    state.tube_epoch_manager.reset(
+        new phase_offset_navigation::TubeEpochManager(*tube_epoch_manager_));
+  } else {
+    state.tube_epoch_manager.reset(
+        new phase_offset_navigation::TubeEpochManager(MakeEpochConfig(config_)));
+  }
+}
+
+void PhaseOffsetMatchedAdapter::commitTubeJobLocalState(
+    TubeJobLocalState& state) {
+  if (state.pair_refresh) return;
+  if (state.tube_epoch_manager) tube_epoch_manager_ =
+      std::move(state.tube_epoch_manager);
+  cached_full_path_samples_ = std::move(state.cached_full_path_samples);
+  cached_path_source_revision_ = state.cached_path_source_revision;
+  have_cached_path_ = state.have_cached_path;
+  timer_active_profile_ = std::move(state.timer_active_profile);
+  timer_installed_active_epoch_ = state.timer_installed_active_epoch;
+  latest_cloud_occupancy_query_status_ =
+      state.latest_cloud_occupancy_query_status;
+}
+
 PhaseOffsetMatchedAdapter::~PhaseOffsetMatchedAdapter() {
   shutdown();
   flushTubeDueTiming();
@@ -1349,7 +1427,23 @@ PhaseOffsetMatchedAdapter::captureAndAcquirePathTubePairPin() {
 }
 
 void PhaseOffsetMatchedAdapter::requestShutdown() {
-  shutdown_requested_.store(true, std::memory_order_release);
+  // The shutdown ownership flip is linearized with Candidate/diagnostic
+  // publication.  A finalizer already inside the publication barrier is
+  // allowed to finish before this flag becomes visible; no later finalizer
+  // can publish after requestShutdown() returns.
+  {
+    std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
+    shutdown_requested_.store(true, std::memory_order_release);
+  }
+  {
+    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    worker_stop_requested_ = true;
+    pending_request_.reset();
+    pending_permit_id_ = 0U;
+    pending_request_identity_ = RequestInstanceIdentity();
+    pending_work_identity_ = TubeWorkIdentity();
+  }
+  worker_condition_.notify_all();
 }
 
 void PhaseOffsetMatchedAdapter::shutdown() {
@@ -1357,6 +1451,9 @@ void PhaseOffsetMatchedAdapter::shutdown() {
   while (timer_inflight_.load(std::memory_order_acquire)) {
     std::this_thread::yield();
   }
+  // The worker may finish one already-running Stage 1A build, but it must be
+  // joined before any adapter-owned state or publishers are cleared.
+  joinTubeWorker();
   std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
   pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
   pending_authority_prepared_ =
@@ -1374,9 +1471,6 @@ void PhaseOffsetMatchedAdapter::shutdown() {
   recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
   recovery_deadline_session_ = 0U;
   recovery_deadline_target_revision_ = 0U;
-  const std::shared_ptr<const ControlPublishSnapshot> control =
-      std::atomic_load(&latest_control_snapshot_);
-  if (control && control->active) publishManualDelete(*control);
   if (path_tube_pin_registry_) {
     std::lock_guard<std::mutex> pin_lock(path_tube_pin_registry_->mutex);
     path_tube_pin_registry_->active_lease_id = 0U;
@@ -1395,6 +1489,18 @@ void PhaseOffsetMatchedAdapter::shutdown() {
   std::atomic_store(&authoritative_path_tube_pair_,
                     std::shared_ptr<const PathTubePair>());
   authority_session_.fetch_add(1U, std::memory_order_acq_rel);
+  advertised_ = false;
+  active_diagnostics_pub_ = ros::Publisher();
+  manual_base_path_pub_ = ros::Publisher();
+  manual_active_path_pub_ = ros::Publisher();
+  manual_frame_pub_ = ros::Publisher();
+  manual_tube_pub_ = ros::Publisher();
+  manual_tube_candidate_pub_ = ros::Publisher();
+  manual_tube_certified_geometry_pub_ = ros::Publisher();
+  manual_diagnostics_pub_ = ros::Publisher();
+  manual_tube_epoch_diagnostics_pub_ = ros::Publisher();
+  manual_raw_candidate_diagnostics_pub_ = ros::Publisher();
+  manual_cloud_snapshot_diagnostics_pub_ = ros::Publisher();
 }
 
 std::uint64_t PhaseOffsetMatchedAdapter::retirePathTubeAuthority(
@@ -1428,6 +1534,16 @@ bool PhaseOffsetMatchedAdapter::resetForNewNavigationTask(
   // The timer owns its manager/profile/cache and will consume this token on
   // its next tick.  Do not touch timer-owned state from this command thread.
   task_generation_.fetch_add(1U, std::memory_order_acq_rel);
+  {
+    std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+    // Invalidate only the waiting slot.  A running job retains its immutable
+    // local state and will fail the post-build task-generation gate.
+    pending_request_.reset();
+    pending_permit_id_ = 0U;
+    pending_request_identity_ = RequestInstanceIdentity();
+    pending_work_identity_ = TubeWorkIdentity();
+  }
+  worker_condition_.notify_all();
 
   // Reuse the established retirement operation for the old lease, pair, and
   // timer evidence, then deliberately clear only the new-task additions.
@@ -1540,8 +1656,35 @@ void PhaseOffsetMatchedAdapter::deactivate(const ros::Time& stamp) {
   const std::uint64_t task_generation =
       task_generation_.load(std::memory_order_acquire);
   if (deactivate_test_hook_) deactivate_test_hook_();
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  deactivateLocked(stamp, task_generation);
+  bool invalidate_pending = false;
+  {
+    // Keep the command/lifecycle boundary through the bounded worker-slot
+    // invalidation.  A stale deactivate may have paused before this lock,
+    // while reset+update have already installed a newer task/request; in that
+    // case it must be a complete no-op and cannot clear the newer pending B.
+    std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+    const bool current_generation =
+        !shutdown_requested_.load(std::memory_order_acquire) &&
+        task_generation == task_generation_.load(std::memory_order_acquire);
+    if (current_generation) {
+      deactivateLocked(stamp, task_generation);
+      std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+      // A pending active request has been invalidated by the accepted
+      // inactive command; drop it before waking the worker so it cannot start
+      // an obsolete build.  The runtime lock remains held until this check
+      // and clear are complete, so no newer task can interleave here.
+      pending_request_.reset();
+      pending_permit_id_ = 0U;
+      pending_request_identity_ = RequestInstanceIdentity();
+      pending_work_identity_ = TubeWorkIdentity();
+      invalidate_pending = true;
+    }
+  }
+  if (invalidate_pending) {
+    // Wake a worker which is waiting on lifecycle state; actual inactive
+    // DELETE processing still requires the next Tube timer permit.
+    worker_condition_.notify_one();
+  }
 }
 
 void PhaseOffsetMatchedAdapter::deactivateLocked(
@@ -1661,7 +1804,8 @@ void PhaseOffsetMatchedAdapter::commitDeactivationNoFailLocked(
   std::atomic_store(&latest_control_snapshot_, token.inactive_control);
 }
 void PhaseOffsetMatchedAdapter::advertise(ros::NodeHandle& nh) {
-  if (!configuration_valid_ || advertised_) return;
+  if (!configuration_valid_ || advertised_ ||
+      shutdown_requested_.load(std::memory_order_acquire)) return;
   execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
   if (config_.mode == PhaseOffsetMatchedMode::ACTIVE) {
     active_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>("phase_offset_active/diagnostics", 1);
@@ -1691,6 +1835,23 @@ void PhaseOffsetMatchedAdapter::advertise(ros::NodeHandle& nh) {
     }
   }
   advertised_ = true;
+  if (requiresTubeTimer()) {
+    {
+      std::lock_guard<std::mutex> lock(worker_state_mutex_);
+      worker_stop_requested_ = false;
+      worker_started_ = true;
+    }
+    try {
+      tube_worker_ = std::thread(&PhaseOffsetMatchedAdapter::tubeWorkerMain,
+                                 this);
+    } catch (...) {
+      std::lock_guard<std::mutex> lock(worker_state_mutex_);
+      worker_started_ = false;
+      worker_stop_requested_ = true;
+      advertised_ = false;
+      throw;
+    }
+  }
 }
 bool PhaseOffsetMatchedAdapter::collectSamples(const TubeBuildRequest& request,
                                                PathSamples& full_path) const {
@@ -1811,6 +1972,10 @@ std::shared_ptr<const TubeBuildRequest> PhaseOffsetMatchedAdapter::makeBuildRequ
   }
   request->semantic_path_start_w = input.semantic_path_start_w;
   request->semantic_path_end_w = input.semantic_path_end_w;
+  request->path_revision = request->semantic_path_owner
+      ? request->semantic_path_owner->pathRevision() : 0U;
+  request->frame_revision = request->frame_owner
+      ? request->frame_owner->frameRevision() : 0U;
   if (!input.sampled_path.empty()) {
     request->supplied_path_samples =
         std::make_shared<const PathSamples>(input.sampled_path);
@@ -1839,11 +2004,19 @@ bool PhaseOffsetMatchedAdapter::requestSourceStillCurrent(
   if (!latest || !latest->active ||
       latest->task_generation != request.task_generation ||
       latest->source_revision != request.source_revision ||
+      latest->path_revision != request.path_revision ||
+      latest->frame_revision != request.frame_revision ||
       latest->authority_session != request.authority_session ||
+      latest->semantic_path_owner != request.semantic_path_owner ||
+      latest->frame_owner != request.frame_owner ||
       task_generation_.load(std::memory_order_acquire) !=
           request.task_generation ||
       authority_session_.load(std::memory_order_acquire) !=
           request.authority_session) {
+    return false;
+  }
+  if (request.semantic_path_owner &&
+      !FrameMatchesRevision(request.frame_owner, request.source_revision)) {
     return false;
   }
   if (request.base_path_tube_pair) {
@@ -1919,6 +2092,19 @@ bool PhaseOffsetMatchedAdapter::epochMatchesRequest(
           request.task_generation ||
       epoch.source_revision != request.source_revision ||
       epoch.request_control_sequence > request.control_sequence) {
+    return false;
+  }
+  // Legacy deterministic fixtures may construct an epoch without the newer
+  // explicit owner/frame provenance fields.  Production-built epochs always
+  // populate them; compare populated fields strictly and retain the old
+  // compatibility behavior for an all-zero fixture value.
+  if ((epoch.path_revision != 0U &&
+       epoch.path_revision != request.path_revision) ||
+      (epoch.frame_revision != 0U &&
+       epoch.frame_revision != request.frame_revision) ||
+      (epoch.semantic_path_owner &&
+       epoch.semantic_path_owner != request.semantic_path_owner) ||
+      (epoch.frame_owner && epoch.frame_owner != request.frame_owner)) {
     return false;
   }
   const auto& status = epoch.epoch_status;
@@ -2002,12 +2188,15 @@ bool PhaseOffsetMatchedAdapter::prepareTimerPairRefresh(
   if (!latest_request || !latest_request->active ||
       latest_request->task_generation != request->task_generation ||
       latest_request->source_revision != request->source_revision ||
+      latest_request->path_revision != request->path_revision ||
+      latest_request->frame_revision != request->frame_revision ||
       latest_request->authority_session != request->authority_session ||
       latest_request->base_path_tube_pair != request->base_path_tube_pair ||
       latest_request->base_path_tube_pair_generation !=
           request->base_path_tube_pair_generation ||
       latest_request->semantic_path_owner !=
           request->base_path_tube_pair->path_owner ||
+      latest_request->frame_owner != request->base_path_tube_pair->frame_owner ||
       !PathStateMatchesOwner(latest_request->current_path,
                              request->base_path_tube_pair->path_owner) ||
       !IsFinite(latest_request->position) ||
@@ -2181,6 +2370,12 @@ bool PhaseOffsetMatchedAdapter::finalizePreparedTimerPairRefresh(
 bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
     const std::shared_ptr<const TubeBuildRequest>& request,
     TubeEpochSnapshot& snapshot) {
+  return buildTubeEpoch(request, snapshot, nullptr);
+}
+
+bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
+    const std::shared_ptr<const TubeBuildRequest>& request,
+    TubeEpochSnapshot& snapshot, TubeJobLocalState* const job_state) {
   snapshot = TubeEpochSnapshot();
   // A request anchored to an installed H2 pair is a same-path refresh.  It
   // must not change the persistent timer manager: a stale completion can be
@@ -2200,7 +2395,12 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
   snapshot.active = true;
   snapshot.task_generation = request->task_generation;
   snapshot.request_control_sequence = request->control_sequence;
-  snapshot.build_sequence = ++timer_build_sequence_;
+  snapshot.build_sequence = job_state
+      ? job_state->timer_build_sequence : ++timer_build_sequence_;
+  snapshot.path_revision = request->path_revision;
+  snapshot.frame_revision = request->frame_revision;
+  snapshot.semantic_path_owner = request->semantic_path_owner;
+  snapshot.frame_owner = request->frame_owner;
   snapshot.source_revision = request->source_revision;
   snapshot.map_observation_sequence = request->map_observation_sequence;
   snapshot.map_observation_is_snapshot = request->map_observation_is_snapshot;
@@ -2214,11 +2414,17 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
       snapshot.full_path_samples =
           std::make_shared<const PathSamples>(sampled);
     } else {
-      cached_full_path_samples_ = sampled;
-      cached_path_source_revision_ = request->source_revision;
-      have_cached_path_ = true;
+      PathSamples& cached_samples = job_state
+          ? job_state->cached_full_path_samples : cached_full_path_samples_;
+      std::uint64_t& cached_revision = job_state
+          ? job_state->cached_path_source_revision : cached_path_source_revision_;
+      bool& have_cached = job_state ? job_state->have_cached_path
+                                    : have_cached_path_;
+      cached_samples = sampled;
+      cached_revision = request->source_revision;
+      have_cached = true;
       snapshot.full_path_samples =
-          std::make_shared<const PathSamples>(cached_full_path_samples_);
+          std::make_shared<const PathSamples>(cached_samples);
     }
   }
   PathSamples preview;
@@ -2273,7 +2479,11 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
         request->cloud_snapshot, cloud_occupancy_query_config_);
     snapshot.cloud_status = cloud_status;
     if (!pair_refresh) {
-      latest_cloud_occupancy_query_status_ = cloud_status;
+      if (job_state) {
+        job_state->latest_cloud_occupancy_query_status = cloud_status;
+      } else {
+        latest_cloud_occupancy_query_status_ = cloud_status;
+      }
     }
     categorical_query = makeCloudOccupancyQuery(
         request->cloud_snapshot, cloud_occupancy_query_config_);
@@ -2292,8 +2502,12 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
   // Active history and make a stale base request influence a later refresh.
   phase_offset_navigation::TubeEpochManager local_manager(
       MakeEpochConfig(config_));
-  phase_offset_navigation::TubeEpochManager* const manager = pair_refresh
-      ? &local_manager : tube_epoch_manager_.get();
+  phase_offset_navigation::TubeEpochManager* manager = nullptr;
+  if (job_state && job_state->tube_epoch_manager) {
+    manager = job_state->tube_epoch_manager.get();
+  } else {
+    manager = pair_refresh ? &local_manager : tube_epoch_manager_.get();
+  }
   phase_offset_navigation::TubeEpochUpdateResult result;
   const bool update_result = manager->update(epoch_input, result);
   if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
@@ -2308,19 +2522,32 @@ bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
       snapshot.active_profile =
           std::make_shared<const phase_offset_navigation::TubeProfile>(
               result.active_profile);
-    } else if (timer_active_profile_ &&
-               timer_installed_active_epoch_ == result.status.active_tube_epoch) {
-      snapshot.active_profile = timer_active_profile_;
     } else {
-      timer_active_profile_ =
-          std::make_shared<const phase_offset_navigation::TubeProfile>(
-              result.active_profile);
-      timer_installed_active_epoch_ = result.status.active_tube_epoch;
-      snapshot.active_profile = timer_active_profile_;
+      std::shared_ptr<const phase_offset_navigation::TubeProfile>&
+          active_profile = job_state ? job_state->timer_active_profile
+                                     : timer_active_profile_;
+      std::uint64_t& installed_epoch = job_state
+          ? job_state->timer_installed_active_epoch
+          : timer_installed_active_epoch_;
+      if (active_profile && installed_epoch == result.status.active_tube_epoch) {
+        snapshot.active_profile = active_profile;
+      } else {
+        std::shared_ptr<const phase_offset_navigation::TubeProfile> next_profile =
+            std::make_shared<const phase_offset_navigation::TubeProfile>(
+                result.active_profile);
+        active_profile = next_profile;
+        installed_epoch = result.status.active_tube_epoch;
+        snapshot.active_profile = next_profile;
+      }
     }
   } else if (!pair_refresh) {
-    timer_active_profile_.reset();
-    timer_installed_active_epoch_ = 0U;
+    if (job_state) {
+      job_state->timer_active_profile.reset();
+      job_state->timer_installed_active_epoch = 0U;
+    } else {
+      timer_active_profile_.reset();
+      timer_installed_active_epoch_ = 0U;
+    }
   }
   if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
     RawCandidateDiagnosticsInput diagnostics_input;
@@ -2965,6 +3192,8 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   request.task_generation = captured_task_generation;
   request.authority_session = captured_authority_session;
   request.source_revision = staged_revision;
+  request.path_revision = new_path_owner->pathRevision();
+  request.frame_revision = new_frame_owner->frameRevision();
   request.semantic_path_owner = new_path_owner;
   request.frame_owner = new_frame_owner;
   request.semantic_path_start_w = new_path_owner->startW();
@@ -3091,6 +3320,10 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   epoch->active = true;
   epoch->task_generation = request.task_generation;
   epoch->source_revision = candidate->source_revision;
+  epoch->path_revision = candidate->path_revision;
+  epoch->frame_revision = candidate->frame_revision;
+  epoch->semantic_path_owner = candidate->path_owner;
+  epoch->frame_owner = candidate->frame_owner;
   epoch->map_observation_sequence = candidate->map_observation_sequence;
   epoch->map_observation_is_snapshot = candidate->map_observation_is_snapshot;
   epoch->candidate_build_w = request.current_path.w;
@@ -3371,6 +3604,12 @@ void PhaseOffsetMatchedAdapter::makeControlPublishSnapshot(
 bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
     const std::shared_ptr<const TubeBuildRequest>& request,
     const TubeEpochSnapshot& built) {
+  return finalizeTubeEpoch(request, built, nullptr);
+}
+
+bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
+    const std::shared_ptr<const TubeBuildRequest>& request,
+    const TubeEpochSnapshot& built, TubeJobLocalState* const job_state) {
   if (!request || !request->active) return false;
   // Publication, including the raw/cloud and marker paths, is serialized with
   // task reset.  The expensive build happened before this function, so this
@@ -3381,7 +3620,8 @@ bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
   // Ordinary same-task stale builds still publish their raw/cloud provenance
   // below.  A task boundary is different: no old-task completion may publish
   // or repopulate an evidence slot for the new owner.
-  if (built.task_generation != request->task_generation ||
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      built.task_generation != request->task_generation ||
       task_generation_.load(std::memory_order_acquire) !=
           request->task_generation) {
     return false;
@@ -3390,12 +3630,34 @@ bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
   // Raw/cloud payloads are per-timer-build provenance, including a path that
   // became stale while the build ran.  They never authorize Candidate,
   // Runtime, or Certified exposure, so emit them before the source gate.
+  if (shutdown_requested_.load(std::memory_order_acquire)) return false;
   publishBuildDiagnostics(built);
+  // Serialize the currentness check/ordinary-state commit with the command
+  // writer.  This closes the owner/frame replacement race between
+  // requestSourceStillCurrent() and the publication stores while retaining
+  // the fixed publication->Runtime lock order used by reset/publication.
+  std::unique_lock<std::mutex> runtime_lock(runtime_command_mutex_);
   if (!requestSourceStillCurrent(*request)) {
     // A timer build is only evidence.  If its source is stale, discard it;
     // never reset/clear a newer pair or timer manager that may already own a
     // later Runtime-eligible epoch.
     return false;
+  }
+  // Commit the transactional ordinary worker state only after the same
+  // currentness gate that protects Candidate/Active publication.  Pair
+  // refresh jobs intentionally retain their fresh config-only manager as
+  // staging and never overwrite ordinary rolling state.
+  if (job_state) {
+    std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+    commitTubeJobLocalState(*job_state);
+  }
+  // Test-only barrier for the final request-identity race.  This point is
+  // after currentness and ordinary-state commit but before either immutable
+  // Candidate/Epoch exposure store, and runtime_command_mutex_ is still held.
+  // A concurrent command replacement therefore cannot pass update() until the
+  // barrier is released and this complete publication boundary has finished.
+  if (finalize_before_epoch_store_test_hook_) {
+    finalize_before_epoch_store_test_hook_();
   }
   const std::shared_ptr<const TubeEpochSnapshot> epoch(
       new TubeEpochSnapshot(built));
@@ -3413,6 +3675,11 @@ bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
     std::atomic_store(&latest_epoch_snapshot_,
                       std::shared_ptr<const TubeEpochSnapshot>());
   }
+  // Keep the short command/runtime lock through the immutable Candidate and
+  // Epoch stores.  A source/frame replacement can therefore occur only
+  // before the currentness check (and be rejected) or after this complete
+  // publication boundary; it cannot be inserted between commit and stores.
+  runtime_lock.unlock();
   // Timer evidence may refresh a same-owner pair, but only by comparing the
   // captured base pair/generation and Runtime bits under the short authority
   // lock.  A stale completion is discarded above and cannot clear/replace a
@@ -3455,7 +3722,199 @@ void PhaseOffsetMatchedAdapter::consumeTimerTaskGeneration(
   timer_task_generation_ = task_generation;
 }
 
+bool PhaseOffsetMatchedAdapter::processInactiveTubeRequest(
+    const std::shared_ptr<const TubeBuildRequest>& request) {
+  if (!request || request->active ||
+      shutdown_requested_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  // An inactive request may publish DELETE markers and clear timer evidence.
+  // Treat those as task publication, not as an unguarded timer-local cleanup:
+  // an old A DELETE must never erase B after reset/reactivation.
+  if (inactive_publication_test_hook_) inactive_publication_test_hook_();
+  std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      request->task_generation != timer_task_generation_ ||
+      request->task_generation !=
+          task_generation_.load(std::memory_order_acquire) ||
+      std::atomic_load(&latest_build_request_) != request) {
+    return false;
+  }
+  if (request->control_sequence != timer_last_deactivate_sequence_) {
+    cached_full_path_samples_.clear();
+    cached_path_source_revision_ = 0U;
+    have_cached_path_ = false;
+    timer_active_profile_.reset();
+    timer_installed_active_epoch_ = 0U;
+    tube_epoch_manager_.reset(new phase_offset_navigation::TubeEpochManager(
+        MakeEpochConfig(config_)));
+    std::atomic_store(&latest_candidate_epoch_snapshot_,
+                      std::shared_ptr<const TubeEpochSnapshot>());
+    const std::shared_ptr<const ControlPublishSnapshot> control =
+        std::atomic_load(&latest_control_snapshot_);
+    if (control && !control->active) publishManualDelete(*control);
+    timer_last_deactivate_sequence_ = request->control_sequence;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::runTubeBuildJob(const SchedulePermit& permit) {
+  const std::shared_ptr<const TubeBuildRequest>& request = permit.request;
+  if (!request || shutdown_requested_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  const std::uint64_t current_task_generation =
+      task_generation_.load(std::memory_order_acquire);
+  if (timer_task_generation_ != current_task_generation) {
+    consumeTimerTaskGeneration(current_task_generation);
+  }
+  if (request->task_generation != timer_task_generation_ ||
+      request->task_generation != current_task_generation) {
+    return false;
+  }
+  if (!request->active) return processInactiveTubeRequest(request);
+
+  // A request can become obsolete after the timer permit captured it but
+  // before the worker gets scheduled.  Reject it before copying committed
+  // state or consuming timer_build_sequence_: stale pending work is not an
+  // attempted Tube build and must not perturb Candidate/cache/profile state.
+  if (!requestSourceStillCurrent(*request)) return false;
+
+  TubeJobLocalState job_state;
+  prepareTubeJobLocalState(permit, job_state);
+  const bool measure_tube_due = measurement_tube_due_enabled_;
+  const auto tube_due_start = measure_tube_due
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point();
+  TubeEpochSnapshot built;
+  const bool built_ok = buildTubeEpoch(request, built, &job_state);
+  std::uint64_t tube_due_duration_ns = 0U;
+  if (measure_tube_due) {
+    const auto tube_due_end = std::chrono::steady_clock::now();
+    tube_due_duration_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            tube_due_end - tube_due_start).count());
+  }
+
+  // An incomplete Candidate is still required evidence.  Finalize it before
+  // reporting the manager's build result so WAITING/diagnostic semantics do
+  // not disappear merely because installation was correctly rejected.
+  const bool finalized = finalizeTubeEpoch(request, built, &job_state);
+  if (measure_tube_due) {
+    const bool raw_cloud_publish_attempted =
+        config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
+        built.raw_candidate_diagnostics_generated &&
+        built.cloud_snapshot_diagnostics_generated;
+    recordTubeDueTiming(tube_due_duration_ns, request->stamp.toNSec(),
+                        finalized, raw_cloud_publish_attempted);
+  }
+  return finalized && built_ok;
+}
+
+void PhaseOffsetMatchedAdapter::tubeWorkerMain() {
+  for (;;) {
+    SchedulePermit permit;
+    {
+      std::unique_lock<std::mutex> lock(worker_state_mutex_);
+      worker_condition_.wait(lock, [this]() {
+        return worker_stop_requested_ ||
+            static_cast<bool>(pending_request_);
+      });
+      if (!pending_request_) {
+        if (worker_stop_requested_) break;
+        continue;
+      }
+      permit.permit_id = pending_permit_id_;
+      permit.request = pending_request_;
+      permit.request_identity = pending_request_identity_;
+      permit.work_identity = pending_work_identity_;
+      pending_request_.reset();
+      pending_permit_id_ = 0U;
+      pending_request_identity_ = RequestInstanceIdentity();
+      pending_work_identity_ = TubeWorkIdentity();
+      running_request_ = permit.request;
+      running_permit_id_ = permit.permit_id;
+      running_request_identity_ = permit.request_identity;
+      running_work_identity_ = permit.work_identity;
+      last_started_request_identity_ = permit.request_identity;
+      last_started_work_identity_ = permit.work_identity;
+    }
+
+    runTubeBuildJob(permit);
+
+    {
+      std::lock_guard<std::mutex> lock(worker_state_mutex_);
+      last_completed_request_identity_ = permit.request_identity;
+      last_completed_work_identity_ = permit.work_identity;
+      running_request_.reset();
+      running_permit_id_ = 0U;
+      running_request_identity_ = RequestInstanceIdentity();
+      running_work_identity_ = TubeWorkIdentity();
+      if (worker_stop_requested_) {
+        // Shutdown never starts a second job from an already-populated slot.
+        pending_request_.reset();
+        pending_permit_id_ = 0U;
+        pending_request_identity_ = RequestInstanceIdentity();
+        pending_work_identity_ = TubeWorkIdentity();
+        break;
+      }
+    }
+  }
+}
+
+void PhaseOffsetMatchedAdapter::joinTubeWorker() {
+  if (tube_worker_.joinable()) tube_worker_.join();
+  std::lock_guard<std::mutex> lock(worker_state_mutex_);
+  worker_started_ = false;
+  running_request_.reset();
+  running_permit_id_ = 0U;
+  running_request_identity_ = RequestInstanceIdentity();
+  running_work_identity_ = TubeWorkIdentity();
+  pending_request_.reset();
+  pending_permit_id_ = 0U;
+  pending_request_identity_ = RequestInstanceIdentity();
+  pending_work_identity_ = TubeWorkIdentity();
+}
+
+bool PhaseOffsetMatchedAdapter::scheduleTubeBuild() {
+  const std::shared_ptr<const TubeBuildRequest> request =
+      std::atomic_load(&latest_build_request_);
+  std::lock_guard<std::mutex> lock(worker_state_mutex_);
+  const std::uint64_t permit_id = ++schedule_permit_id_;
+  if (worker_stop_requested_ || shutdown_requested_.load(
+          std::memory_order_acquire) || !request ||
+      request->task_generation !=
+          task_generation_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  const RequestInstanceIdentity identity =
+      makeRequestInstanceIdentity(request);
+  if ((running_request_identity_.valid() &&
+       running_request_identity_ == identity) ||
+      (pending_request_identity_.valid() &&
+       pending_request_identity_ == identity) ||
+      (last_completed_request_identity_.valid() &&
+       last_completed_request_identity_ == identity)) {
+    return false;
+  }
+  pending_request_ = request;
+  pending_permit_id_ = permit_id;
+  pending_request_identity_ = identity;
+  pending_work_identity_ = makeTubeWorkIdentity(request);
+  worker_condition_.notify_one();
+  return true;
+}
+
 bool PhaseOffsetMatchedAdapter::timerTick() {
+  // Once advertise() has started the joined production worker, this legacy
+  // entry point is scheduler-only and cannot execute a second synchronous
+  // Tube implementation on the callback thread.
+  bool production_worker_started = false;
+  {
+    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    production_worker_started = worker_started_;
+  }
+  if (production_worker_started) return scheduleTubeBuild();
   if (shutdown_requested_.load(std::memory_order_acquire)) return false;
   bool expected = false;
   if (!timer_inflight_.compare_exchange_strong(expected, true,
@@ -3468,85 +3927,56 @@ bool PhaseOffsetMatchedAdapter::timerTick() {
   } exit {timer_inflight_};
   if (shutdown_requested_.load(std::memory_order_acquire)) return false;
 
-  const std::uint64_t task_generation =
-      task_generation_.load(std::memory_order_acquire);
-  if (timer_task_generation_ != task_generation) {
-    consumeTimerTaskGeneration(task_generation);
+  bool have_pending = false;
+  {
+    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    have_pending = static_cast<bool>(pending_request_);
   }
-
-  std::shared_ptr<const TubeBuildRequest> request =
-      std::atomic_load(&latest_build_request_);
-  if (request && request->task_generation != timer_task_generation_) {
-    const std::uint64_t latest_task_generation =
-        task_generation_.load(std::memory_order_acquire);
-    if (timer_task_generation_ != latest_task_generation) {
-      consumeTimerTaskGeneration(latest_task_generation);
+  if (!have_pending && !scheduleTubeBuild()) {
+    // Repeated compatibility ticks for an already-consumed inactive request
+    // are harmless no-ops.  Preserve the historical timerTick() success
+    // result without rebuilding or republishing the same DELETE transition.
+    const std::shared_ptr<const TubeBuildRequest> latest =
+        std::atomic_load(&latest_build_request_);
+    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    if (latest && !latest->active &&
+        last_completed_request_identity_ ==
+            makeRequestInstanceIdentity(latest)) {
+      return true;
     }
-    request = std::atomic_load(&latest_build_request_);
-  }
-  if (request &&
-      (request->task_generation != timer_task_generation_ ||
-       request->task_generation !=
-           task_generation_.load(std::memory_order_acquire))) {
     return false;
   }
-  if (!request) return false;
-  if (!request->active) {
-    // An inactive request may publish DELETE markers and clear timer evidence.
-    // Treat those as task publication, not as an unguarded timer-local
-    // cleanup: an old A DELETE must never erase B after reset returns.
-    if (inactive_publication_test_hook_) inactive_publication_test_hook_();
-    std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
-    if (request->task_generation != timer_task_generation_ ||
-        request->task_generation !=
-            task_generation_.load(std::memory_order_acquire)) {
-      return false;
-    }
-    if (request->control_sequence != timer_last_deactivate_sequence_) {
-      cached_full_path_samples_.clear();
-      cached_path_source_revision_ = 0U;
-      have_cached_path_ = false;
-      timer_active_profile_.reset();
-      timer_installed_active_epoch_ = 0U;
-      tube_epoch_manager_.reset(new phase_offset_navigation::TubeEpochManager(
-          MakeEpochConfig(config_)));
-      std::atomic_store(&latest_candidate_epoch_snapshot_,
-                        std::shared_ptr<const TubeEpochSnapshot>());
-      const std::shared_ptr<const ControlPublishSnapshot> control =
-          std::atomic_load(&latest_control_snapshot_);
-      if (control && !control->active) publishManualDelete(*control);
-      timer_last_deactivate_sequence_ = request->control_sequence;
-    }
-    return true;
-  }
 
-  const bool measure_tube_due = measurement_tube_due_enabled_;
-  const auto tube_due_start = measure_tube_due
-      ? std::chrono::steady_clock::now()
-      : std::chrono::steady_clock::time_point();
-  TubeEpochSnapshot built;
-  const bool built_ok = buildTubeEpoch(request, built);
-  std::uint64_t tube_due_duration_ns = 0U;
-  if (measure_tube_due) {
-    const auto tube_due_end = std::chrono::steady_clock::now();
-    tube_due_duration_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            tube_due_end - tube_due_start).count());
+  SchedulePermit permit;
+  {
+    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    if (!pending_request_) return false;
+    permit.permit_id = pending_permit_id_;
+    permit.request = pending_request_;
+    permit.request_identity = pending_request_identity_;
+    permit.work_identity = pending_work_identity_;
+    pending_request_.reset();
+    pending_permit_id_ = 0U;
+    pending_request_identity_ = RequestInstanceIdentity();
+    pending_work_identity_ = TubeWorkIdentity();
+    running_request_ = permit.request;
+    running_permit_id_ = permit.permit_id;
+    running_request_identity_ = permit.request_identity;
+    running_work_identity_ = permit.work_identity;
+    last_started_request_identity_ = permit.request_identity;
+    last_started_work_identity_ = permit.work_identity;
   }
-
-  // An incomplete Candidate is still required evidence.  Finalize it before
-  // reporting the manager's build result so WAITING/diagnostic semantics do
-  // not disappear merely because installation was correctly rejected.
-  const bool finalized = finalizeTubeEpoch(request, built);
-  if (measure_tube_due) {
-    const bool raw_cloud_publish_attempted =
-        config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
-        built.raw_candidate_diagnostics_generated &&
-        built.cloud_snapshot_diagnostics_generated;
-    recordTubeDueTiming(tube_due_duration_ns, request->stamp.toNSec(),
-                        finalized, raw_cloud_publish_attempted);
+  const bool result = runTubeBuildJob(permit);
+  {
+    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    last_completed_request_identity_ = permit.request_identity;
+    last_completed_work_identity_ = permit.work_identity;
+    running_request_.reset();
+    running_permit_id_ = 0U;
+    running_request_identity_ = RequestInstanceIdentity();
+    running_work_identity_ = TubeWorkIdentity();
   }
-  return finalized && built_ok;
+  return result;
 }
 
 void PhaseOffsetMatchedAdapter::latchFailure(
@@ -5138,7 +5568,17 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
     // Do not let an old complete request keep rebuilding while the command
     // side has no valid path/legacy facts.  This only clears async exposure;
     // updateGate deliberately left Runtime, gate count, and latch unchanged.
-    if (requiresTubeTimer()) deactivateLocked(input.stamp, task_generation);
+    if (requiresTubeTimer()) {
+      deactivateLocked(input.stamp, task_generation);
+      {
+        std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+        pending_request_.reset();
+        pending_permit_id_ = 0U;
+        pending_request_identity_ = RequestInstanceIdentity();
+        pending_work_identity_ = TubeWorkIdentity();
+      }
+      worker_condition_.notify_one();
+    }
     return false;
   }
   const bool equivalent = output.zero_comparison.valid && output.zero_comparison.equivalent;
@@ -5196,6 +5636,8 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
         task_generation_.load(std::memory_order_acquire);
     request->control_sequence = ++control_sequence_;
     request->source_revision = pair->source_revision;
+    request->path_revision = pair->path_revision;
+    request->frame_revision = pair->frame_revision;
     request->authority_session = pair->authority_session;
     request->stamp = input.stamp;
     request->semantic_path_owner = pair->path_owner;
@@ -5394,17 +5836,22 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
   }
   const std::shared_ptr<const TubeBuildRequest> previous_request =
       std::atomic_load(&latest_build_request_);
+  const std::shared_ptr<const TubeBuildRequest> request =
+      makeBuildRequest(input, revision, runtime_->retainedDelta());
   if (previous_request && previous_request->active &&
-      previous_request->source_revision != revision) {
-    // A changed path never inherits a visual Candidate from the old path.
-    // The timer will reset its manager state if an old build is in flight.
+      (previous_request->source_revision != request->source_revision ||
+       previous_request->path_revision != request->path_revision ||
+       previous_request->frame_revision != request->frame_revision ||
+       previous_request->semantic_path_owner != request->semantic_path_owner ||
+       previous_request->frame_owner != request->frame_owner)) {
+    // A changed path or frame owner never inherits a visual Candidate from
+    // the old path.  Frame identity is checked explicitly because a planner
+    // may replace the frame while retaining its numeric source revision.
     std::atomic_store(&latest_candidate_epoch_snapshot_,
                       std::shared_ptr<const TubeEpochSnapshot>());
     std::atomic_store(&latest_epoch_snapshot_,
                       std::shared_ptr<const TubeEpochSnapshot>());
   }
-  const std::shared_ptr<const TubeBuildRequest> request =
-      makeBuildRequest(input, revision, runtime_->retainedDelta());
   command_active_ = true;
   // Required ordering: publish the complete current request before reading a
   // timer result.  The timer coalesces same-source control updates.
@@ -5415,6 +5862,10 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       latest_candidate->active &&
       latest_candidate->task_generation == request->task_generation &&
       latest_candidate->source_revision == request->source_revision &&
+      latest_candidate->path_revision == request->path_revision &&
+      latest_candidate->frame_revision == request->frame_revision &&
+      latest_candidate->semantic_path_owner == request->semantic_path_owner &&
+      latest_candidate->frame_owner == request->frame_owner &&
       (config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
        latest_candidate->epoch_status.candidate_path_source_revision ==
            request->source_revision);

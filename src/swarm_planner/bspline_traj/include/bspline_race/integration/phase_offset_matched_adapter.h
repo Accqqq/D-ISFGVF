@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <ros/ros.h>
@@ -464,6 +466,11 @@ struct TubeBuildRequest {
   std::uint64_t task_generation = 0U;
   std::uint64_t control_sequence = 0U;
   std::uint64_t source_revision = 0U;
+  // Explicit frame/path provenance is carried beside the semantic source
+  // revision.  A frame-owner replacement is therefore observable even when
+  // the planner keeps the same numeric source revision.
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
   std::uint64_t authority_session = 0U;
   std::uint64_t map_observation_sequence = 0U;
   bool map_observation_is_snapshot = false;
@@ -499,10 +506,14 @@ struct TubeEpochSnapshot {
   std::uint64_t request_control_sequence = 0U;
   std::uint64_t build_sequence = 0U;
   std::uint64_t source_revision = 0U;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
   std::uint64_t map_observation_sequence = 0U;
   bool map_observation_is_snapshot = false;
   ros::Time request_stamp;
   ros::Time completion_stamp;
+  std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
   // Exact finite phase copied from TubeBuildRequest::current_path.w.  This is
   // Candidate marker provenance for this immutable build and is independent
   // of any later command-cycle ControlPublishSnapshot::current_w value.
@@ -729,6 +740,10 @@ class PhaseOffsetMatchedAdapter {
   // Called only by the manager's 10 Hz MANUAL timer (or deterministically by
   // an owning test).  It is non-reentrant and owns all TubeEpochManager work.
   bool timerTick();
+  // Scheduler-only production entry point.  One call represents one ROS Tube
+  // timer event and creates at most one pending worker permit.  It never
+  // performs heavy Tube construction on the caller thread.
+  bool scheduleTubeBuild();
   // Command-thread transition used when no goal/path is active.  It clears
   // only async request/tube exposure and queues one timer-side DELETE; Runtime
   // execution state (delta, previous port, profile lifecycle) is preserved.
@@ -965,6 +980,104 @@ class PhaseOffsetMatchedAdapter {
                            bool raw_cloud_publish_attempted);
   void flushTubeDueTiming();
 
+  // Immutable request identity used by the one-slot scheduler.  Pointer
+  // identity plus task generation prevents a repeated timer permit from
+  // rebuilding the exact same immutable request after completion.
+  struct RequestInstanceIdentity {
+    // Keep the immutable object alive while its identity is retained in the
+    // scheduler bookkeeping; otherwise a later allocation could reuse the
+    // same raw address and look like a duplicate request.
+    std::shared_ptr<const TubeBuildRequest> request_owner;
+    const TubeBuildRequest* request = nullptr;
+    std::uint64_t task_generation = 0U;
+
+    bool valid() const { return request != nullptr; }
+    bool operator==(const RequestInstanceIdentity& other) const {
+      return request == other.request &&
+          task_generation == other.task_generation;
+    }
+    bool operator!=(const RequestInstanceIdentity& other) const {
+      return !(*this == other);
+    }
+  };
+
+  // Semantic Tube work identity.  It is intentionally richer than a request
+  // sequence so stale owner/frame/pair replacements cannot publish an old
+  // result when a planner reuses a numeric source revision.
+  struct TubeWorkIdentity {
+    std::uint64_t task_generation = 0U;
+    bool active = false;
+    std::uint64_t source_revision = 0U;
+    std::uint64_t path_revision = 0U;
+    std::uint64_t frame_revision = 0U;
+    std::uint64_t authority_session = 0U;
+    bool shutdown_invalidated = false;
+    const ContinuousPhasePath* semantic_path_owner = nullptr;
+    const ContinuousPhaseNormalFrame* frame_owner = nullptr;
+    const PathTubePair* base_path_tube_pair = nullptr;
+    std::uint64_t base_path_tube_pair_generation = 0U;
+
+    bool operator==(const TubeWorkIdentity& other) const {
+      return task_generation == other.task_generation &&
+          active == other.active && source_revision == other.source_revision &&
+          path_revision == other.path_revision &&
+          frame_revision == other.frame_revision &&
+          authority_session == other.authority_session &&
+          shutdown_invalidated == other.shutdown_invalidated &&
+          semantic_path_owner == other.semantic_path_owner &&
+          frame_owner == other.frame_owner &&
+          base_path_tube_pair == other.base_path_tube_pair &&
+          base_path_tube_pair_generation ==
+              other.base_path_tube_pair_generation;
+    }
+    bool operator!=(const TubeWorkIdentity& other) const {
+      return !(*this == other);
+    }
+  };
+
+  struct SchedulePermit {
+    std::uint64_t permit_id = 0U;
+    std::shared_ptr<const TubeBuildRequest> request;
+    RequestInstanceIdentity request_identity;
+    TubeWorkIdentity work_identity;
+  };
+
+  // Worker-local transactional copy.  Heavy construction mutates only this
+  // value; its ordinary state is committed after the currentness gate passes.
+  struct TubeJobLocalState {
+    bool pair_refresh = false;
+    std::unique_ptr<phase_offset_navigation::TubeEpochManager>
+        tube_epoch_manager;
+    PathSamples cached_full_path_samples;
+    std::uint64_t cached_path_source_revision = 0U;
+    bool have_cached_path = false;
+    std::shared_ptr<const phase_offset_navigation::TubeProfile>
+        timer_active_profile;
+    std::uint64_t timer_installed_active_epoch = 0U;
+    CloudOccupancyQueryStatus latest_cloud_occupancy_query_status;
+    std::uint64_t timer_task_generation = 0U;
+    std::uint64_t timer_build_sequence = 0U;
+  };
+
+  TubeWorkIdentity makeTubeWorkIdentity(
+      const std::shared_ptr<const TubeBuildRequest>& request) const;
+  RequestInstanceIdentity makeRequestInstanceIdentity(
+      const std::shared_ptr<const TubeBuildRequest>& request) const;
+  bool runTubeBuildJob(const SchedulePermit& permit);
+  void tubeWorkerMain();
+  void joinTubeWorker();
+  void prepareTubeJobLocalState(const SchedulePermit& permit,
+                                TubeJobLocalState& state);
+  void commitTubeJobLocalState(TubeJobLocalState& state);
+  bool buildTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
+                      TubeEpochSnapshot& snapshot,
+                      TubeJobLocalState* job_state);
+  bool processInactiveTubeRequest(
+      const std::shared_ptr<const TubeBuildRequest>& request);
+  bool finalizeTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
+                         const TubeEpochSnapshot& snapshot,
+                         TubeJobLocalState* job_state);
+
   friend class gvf_manager;
   friend class GvfManagerS4AnchorTestAccess;
 
@@ -1054,6 +1167,10 @@ class PhaseOffsetMatchedAdapter {
   // remains outside both locks.
   mutable std::mutex task_publication_mutex_;
   std::function<void()> finalize_publication_test_hook_;
+  // Bounded passive test-only interleaving hook.  It is invoked after the
+  // currentness gate has passed but before immutable Candidate/Epoch stores,
+  // while runtime_command_mutex_ remains held.  Production leaves it empty.
+  std::function<void()> finalize_before_epoch_store_test_hook_;
   std::function<void()> inactive_publication_test_hook_;
   std::function<void()> deactivate_test_hook_;
   // Bounded passive test-only interleaving hook.  It is absent in production
@@ -1083,6 +1200,28 @@ class PhaseOffsetMatchedAdapter {
   std::uint64_t timer_task_generation_ = 1U;
   std::atomic<bool> timer_inflight_ {false};
   std::atomic<bool> shutdown_requested_ {false};
+
+  // One joined production worker and one latest-only pending request slot.
+  // The mutex protects only this lifecycle/bookkeeping state; it is never
+  // held while Tube construction or finalization runs.
+  mutable std::mutex worker_state_mutex_;
+  std::condition_variable worker_condition_;
+  std::thread tube_worker_;
+  std::uint64_t schedule_permit_id_ = 0U;
+  std::shared_ptr<const TubeBuildRequest> pending_request_;
+  std::uint64_t pending_permit_id_ = 0U;
+  RequestInstanceIdentity pending_request_identity_;
+  TubeWorkIdentity pending_work_identity_;
+  std::shared_ptr<const TubeBuildRequest> running_request_;
+  std::uint64_t running_permit_id_ = 0U;
+  RequestInstanceIdentity running_request_identity_;
+  TubeWorkIdentity running_work_identity_;
+  RequestInstanceIdentity last_started_request_identity_;
+  RequestInstanceIdentity last_completed_request_identity_;
+  TubeWorkIdentity last_started_work_identity_;
+  TubeWorkIdentity last_completed_work_identity_;
+  bool worker_started_ = false;
+  bool worker_stop_requested_ = false;
   ros::Publisher active_diagnostics_pub_;
   ros::Publisher manual_base_path_pub_;
   ros::Publisher manual_active_path_pub_;
