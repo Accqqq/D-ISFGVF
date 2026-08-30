@@ -3727,16 +3727,8 @@ bool gvf_manager::retireOffsetAuthorityForPlannerOwnerLocked()
     // Retire the old offset pair first, so no command can observe a new
     // planner mirror together with an old PathTubePair.  Keep the manager and
     // adapter sessions aligned for any subsequent authoritative bootstrap.
-    const std::shared_ptr<const PathTubePair> captured_pair =
-        phase_offset_matched_adapter_->capturePathTubePair();
-    if (phase_offset_matched_adapter_->hasPendingOffsetActivationPair(
-            captured_pair)) {
-        // A bootstrap CAS may precede its first command.  That Pair is
-        // already the certified owner of the activation edge and cannot be
-        // invalidated by a planner-only install.  The adapter repeats this
-        // check under its Runtime lock to close the CAS-to-retire race.
-        return false;
-    }
+    // The adapter owns the sole atomic safe-neutral proof under its Runtime
+    // lock; pending activation is not an unconditional manager veto.
     const std::uint64_t requested_session = path_tube_authority_session_ + 1U;
     std::uint64_t retired_session = 0U;
     if (!phase_offset_matched_adapter_->retirePathTubeAuthorityIfNeutral(

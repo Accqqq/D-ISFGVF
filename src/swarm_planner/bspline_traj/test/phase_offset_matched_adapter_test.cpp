@@ -541,6 +541,101 @@ NormalProductionFixture MakeNormalProductionFixture(
   return fixture;
 }
 
+bool PublishNormalZeroAuthority(PhaseOffsetMatchedAdapter& adapter,
+                                NormalProductionFixture& fixture) {
+  fixture.input.g_des_valid = false;
+  MatchedAdapterOutput output;
+  if (!adapter.update(fixture.input, output) || !output.selected) return false;
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  return capture.pending && capture.valid &&
+      adapter.publishPendingPositionCommand([]() { return true; },
+                                            capture.identity);
+}
+
+bool StageNormalPendingAuthority(PhaseOffsetMatchedAdapter& adapter,
+                                 NormalProductionFixture& fixture,
+                                 const bool g_des_valid,
+                                 const Eigen::Vector3d& g_des,
+                                 MatchedAdapterOutput& output) {
+  fixture.input.g_des_valid = g_des_valid;
+  fixture.input.g_des = g_des;
+  if (!adapter.update(fixture.input, output) || !output.selected) return false;
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  return capture.pending && capture.valid &&
+      adapter.validatePendingPositionCommand();
+}
+
+void ReplaceAuthoritySnapshot(
+    PhaseOffsetMatchedAdapter& adapter,
+    const std::function<void(phase_offset_navigation::ActiveReferenceSnapshot&)>&
+        mutate) {
+  const phase_offset_navigation::ActiveReferenceSnapshot current =
+      adapter.execution_authority_.snapshot();
+  std::shared_ptr<phase_offset_navigation::ActiveReferenceSnapshot> replacement(
+      new phase_offset_navigation::ActiveReferenceSnapshot(current));
+  mutate(*replacement);
+  adapter.execution_authority_.snapshot_ = replacement;
+}
+
+struct NeutralRetirementResult {
+  bool setup = false;
+  bool retired = false;
+  std::uint64_t session_before = 0U;
+  std::uint64_t retired_session = 0U;
+  std::uint64_t session_after = 0U;
+  bool pair_present = false;
+};
+
+NeutralRetirementResult RunPublishedNormalNeutralRetirementCase(
+    const std::function<void(PhaseOffsetMatchedAdapter&,
+                             NormalProductionFixture&)>& mutate) {
+  NeutralRetirementResult result;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  if (!fixture.pair || !PublishNormalZeroAuthority(adapter, fixture)) {
+    return result;
+  }
+  result.setup = true;
+  result.session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  mutate(adapter, fixture);
+  result.retired = adapter.retirePathTubeAuthorityIfNeutral(
+      result.session_before + 1U, result.retired_session);
+  result.session_after =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  result.pair_present = static_cast<bool>(adapter.capturePathTubePair());
+  return result;
+}
+
+NeutralRetirementResult RunPendingNormalNeutralRetirementCase(
+    const std::function<void(PhaseOffsetMatchedAdapter&,
+                             NormalProductionFixture&)>& mutate) {
+  NeutralRetirementResult result;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  if (!fixture.pair) return result;
+  fixture.input.g_des_valid = false;
+  MatchedAdapterOutput output;
+  if (!adapter.update(fixture.input, output) || !output.selected ||
+      !adapter.pending_authority_valid_ ||
+      !adapter.pending_runtime_commit_.valid ||
+      !adapter.pending_authority_prepared_.committed_snapshot) {
+    return result;
+  }
+  result.setup = true;
+  result.session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  mutate(adapter, fixture);
+  result.retired = adapter.retirePathTubeAuthorityIfNeutral(
+      result.session_before + 1U, result.retired_session);
+  result.session_after =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  result.pair_present = static_cast<bool>(adapter.capturePathTubePair());
+  return result;
+}
+
 TEST(PhaseOffsetMatchedAdapterC3,
      NormalAllocatorZeroPortPreservesNominalMatchedReference) {
   PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
@@ -1199,6 +1294,507 @@ TEST(PhaseOffsetMatchedAdapterC3,
                    output.allocator.selected_u.u_delta);
 }
 
+TEST(PhaseOffsetMatchedAdapterC3,
+     ExactZeroNormalAuthorityRetiresPairAtNeutralPlannerBoundary) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = false;
+
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, capture.identity));
+
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(authority.valid);
+  ASSERT_EQ(authority.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_DOUBLE_EQ(0.0, adapter.runtime_->retainedDelta());
+  EXPECT_DOUBLE_EQ(0.0, authority.proposed_next_delta);
+  EXPECT_TRUE(authority.selectedUConsistent(0.0));
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  ASSERT_EQ(fixture.pair->authority_session, session_before);
+
+  // This is the adapter-side linearization used after an H2 successor Tube
+  // stage denial: exact-zero NORMAL may retire the old Pair and let the
+  // manager publish its already planner-valid successor frontend.
+  std::uint64_t retired_session = 0U;
+  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_GT(retired_session, session_before);
+  EXPECT_EQ(retired_session,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_DOUBLE_EQ(0.0, adapter.runtime_->retainedDelta());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     NormalPhaseOnlySelectedUCannotRetireAsNeutral) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  ASSERT_TRUE(PublishNormalZeroAuthority(adapter, fixture));
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  ReplaceAuthoritySnapshot(
+      adapter, [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        snapshot.selected_u.u_w = 0.08;
+        snapshot.selected_u.u_delta = 0.0;
+        snapshot.selected_u_w = 0.08;
+        snapshot.selected_u_delta = 0.0;
+        snapshot.proposed_next_u_prev = snapshot.selected_u;
+        snapshot.proposed_next_delta = 0.0;
+      });
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session_before,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     NormalTransverseOnlySelectedUCannotRetireAsNeutral) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  ASSERT_TRUE(PublishNormalZeroAuthority(adapter, fixture));
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  ReplaceAuthoritySnapshot(
+      adapter, [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        snapshot.selected_u.u_w = 0.0;
+        snapshot.selected_u.u_delta = 0.08;
+        snapshot.selected_u_w = 0.0;
+        snapshot.selected_u_delta = 0.08;
+        snapshot.proposed_next_u_prev = snapshot.selected_u;
+        snapshot.proposed_next_delta = snapshot.dt * 0.08;
+      });
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session_before,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     NormalSnapshotDeltaCannotRetireWhenProposedDeltaIsZero) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  ASSERT_TRUE(PublishNormalZeroAuthority(adapter, fixture));
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  ReplaceAuthoritySnapshot(
+      adapter, [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        snapshot.delta = 0.08;
+        snapshot.selected_u = phase_offset_core::PortCommand();
+        snapshot.selected_u_w = 0.0;
+        snapshot.selected_u_delta = 0.0;
+        snapshot.proposed_next_u_prev = snapshot.selected_u;
+        snapshot.proposed_next_delta = 0.0;
+      });
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session_before,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     PlannerOnlyNeutralRetiresWithoutAllocatorSelectedU) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  ASSERT_TRUE(PublishNormalZeroAuthority(adapter, fixture));
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  ReplaceAuthoritySnapshot(
+      adapter, [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        snapshot.owner_mode =
+            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+        snapshot.selected_u_owner = "PlannerOwner";
+        snapshot.selected_u = phase_offset_core::PortCommand();
+        snapshot.selected_u_w = 0.0;
+        snapshot.selected_u_delta = 0.0;
+        snapshot.proposed_next_u_prev = snapshot.selected_u;
+        snapshot.proposed_next_delta = 0.0;
+        snapshot.provenance =
+            "PhaseOffsetMatchedAdapter/atomic-neutral-handoff";
+        snapshot.handoff_state = "PLANNER_ONLY";
+      });
+
+  std::uint64_t retired_session = 0U;
+  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_GT(retired_session, session_before);
+  EXPECT_FALSE(adapter.capturePathTubePair());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     PendingNormalPhaseOnlyTransactionCannotRetireAsNeutral) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = false;
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output));
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(adapter.pending_authority_valid_);
+  ASSERT_TRUE(adapter.pending_authority_prepared_.committed_snapshot);
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+  std::shared_ptr<phase_offset_navigation::ActiveReferenceSnapshot> pending(
+      new phase_offset_navigation::ActiveReferenceSnapshot(
+          *adapter.pending_authority_prepared_.committed_snapshot));
+  pending->selected_u.u_w = 0.08;
+  pending->selected_u.u_delta = 0.0;
+  pending->selected_u_w = 0.08;
+  pending->selected_u_delta = 0.0;
+  pending->proposed_next_w = pending->w + pending->dt *
+      (pending->matched_base_w_dot + pending->selected_u.u_w);
+  pending->proposed_next_u_prev = pending->selected_u;
+  pending->proposed_next_delta = 0.0;
+  adapter.pending_authority_prepared_.committed_snapshot = pending;
+  adapter.pending_runtime_commit_.next_previous_final_port = pending->selected_u;
+  adapter.pending_runtime_commit_.next_delta = pending->proposed_next_delta;
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+  EXPECT_TRUE(adapter.hasPendingPositionCommand());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     ValidCurrentExactNeutralPendingTransactionRetiresPair) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(StageNormalPendingAuthority(
+      adapter, fixture, false, Eigen::Vector3d::Zero(), output))
+      << output.invalid_reason;
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+
+  std::uint64_t retired_session = 0U;
+  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_GT(retired_session, session_before);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     ValidCurrentPhaseOnlyNonzeroPendingRetainsAuthority) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(StageNormalPendingAuthority(
+      adapter, fixture, true, Eigen::Vector3d(0.08, 0.0, 0.0), output))
+      << output.invalid_reason;
+  const auto pending = adapter.pending_authority_prepared_.committed_snapshot;
+  ASSERT_TRUE(pending);
+  EXPECT_GT(std::abs(pending->selected_u.u_w), 1e-6);
+  EXPECT_NEAR(pending->selected_u.u_delta, 0.0, 1e-12);
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session_before,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_TRUE(adapter.hasPendingPositionCommand());
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     ValidCurrentTransverseOnlyNonzeroPendingRetainsAuthority) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(StageNormalPendingAuthority(
+      adapter, fixture, true, Eigen::Vector3d(0.0, 0.16, 0.0), output))
+      << output.invalid_reason;
+  const auto pending = adapter.pending_authority_prepared_.committed_snapshot;
+  ASSERT_TRUE(pending);
+  EXPECT_NEAR(pending->selected_u.u_w, 0.0, 1e-12);
+  EXPECT_GT(std::abs(pending->selected_u.u_delta), 1e-6);
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session_before,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_TRUE(adapter.hasPendingPositionCommand());
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     StaleNeutralPendingIsInvalidatedBeforePlannerReplacement) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(PublishNormalZeroAuthority(adapter, fixture));
+  const phase_offset_navigation::ActiveReferenceSnapshot committed =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(committed.valid);
+  fixture.input.path = MakeStraightState(committed.proposed_next_w);
+  ActiveAdapterInput zero_input;
+  zero_input.path = fixture.input.path;
+  zero_input.position = fixture.input.position;
+  zero_input.gains = fixture.input.gains;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterOutput zero_output;
+  ASSERT_TRUE(zero.evaluate(zero_input, zero_output));
+  fixture.input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+  ASSERT_TRUE(StageNormalPendingAuthority(
+      adapter, fixture, false, Eigen::Vector3d::Zero(), output))
+      << output.invalid_reason;
+  ASSERT_TRUE(adapter.hasPendingPositionCommand());
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+
+  // Install a newer planner-only neutral authority while the old NORMAL
+  // transaction remains staged.  The changed sequence makes that pending
+  // transaction stale; retirement must clear it, then use only the committed
+  // planner-owned snapshot to cross the replacement boundary.
+  ReplaceAuthoritySnapshot(
+      adapter, [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        ++snapshot.sequence;
+        snapshot.owner_mode =
+            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+        snapshot.selected_u_owner = "PlannerOwner";
+        snapshot.selected_u = phase_offset_core::PortCommand();
+        snapshot.selected_u_w = 0.0;
+        snapshot.selected_u_delta = 0.0;
+        snapshot.proposed_next_u_prev = snapshot.selected_u;
+        snapshot.delta = 0.0;
+        snapshot.proposed_next_delta = 0.0;
+        snapshot.provenance =
+            "PhaseOffsetMatchedAdapter/atomic-neutral-handoff";
+        snapshot.handoff_state = "PLANNER_ONLY";
+      });
+
+  std::uint64_t retired_session = 0U;
+  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_GT(retired_session, session_before);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     ActiveNonzeroNormalAuthorityNeverRetiresAsNeutral) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(StageNormalPendingAuthority(
+      adapter, fixture, true, Eigen::Vector3d(0.0, 0.16, 0.0), output))
+      << output.invalid_reason;
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, capture.identity));
+  ASSERT_GT(std::abs(adapter.runtime_->retainedDelta()), 1e-6);
+  const std::uint64_t session_before =
+      adapter.authority_session_.load(std::memory_order_acquire);
+
+  std::uint64_t retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session_before + 1U, retired_session));
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session_before,
+            adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_EQ(fixture.pair, adapter.capturePathTubePair());
+  EXPECT_TRUE(adapter.execution_authority_.snapshot().valid);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     SignedZeroRuntimeRetainedDeltaIsAcceptedAsNeutral) {
+  const NeutralRetirementResult result =
+      RunPublishedNormalNeutralRetirementCase(
+          [](PhaseOffsetMatchedAdapter& adapter,
+             NormalProductionFixture&) {
+            adapter.runtime_->delta_ = -0.0;
+          });
+  ASSERT_TRUE(result.setup);
+  EXPECT_TRUE(result.retired);
+  EXPECT_GT(result.retired_session, result.session_before);
+  EXPECT_EQ(result.retired_session, result.session_after);
+  EXPECT_FALSE(result.pair_present);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     SignedZeroAuthorityDeltaAndProposedNextDeltaAreAcceptedAsNeutral) {
+  const NeutralRetirementResult signed_snapshot_delta =
+      RunPublishedNormalNeutralRetirementCase(
+          [](PhaseOffsetMatchedAdapter& adapter,
+             NormalProductionFixture&) {
+            ReplaceAuthoritySnapshot(
+                adapter,
+                [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+                  snapshot.delta = -0.0;
+                });
+          });
+  ASSERT_TRUE(signed_snapshot_delta.setup);
+  EXPECT_TRUE(signed_snapshot_delta.retired);
+  EXPECT_FALSE(signed_snapshot_delta.pair_present);
+
+  const NeutralRetirementResult signed_proposed_delta =
+      RunPublishedNormalNeutralRetirementCase(
+          [](PhaseOffsetMatchedAdapter& adapter,
+             NormalProductionFixture&) {
+            ReplaceAuthoritySnapshot(
+                adapter,
+                [](phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+                  snapshot.proposed_next_delta = -0.0;
+                });
+          });
+  ASSERT_TRUE(signed_proposed_delta.setup);
+  EXPECT_TRUE(signed_proposed_delta.retired);
+  EXPECT_FALSE(signed_proposed_delta.pair_present);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     SignedZeroSelectedUAndMixedAliasesRemainNeutralWithExactIdentity) {
+  for (int variant = 0; variant < 2; ++variant) {
+    const double selected_u_w = variant == 0 ? -0.0 : +0.0;
+    const double selected_u_delta = variant == 0 ? +0.0 : -0.0;
+    const NeutralRetirementResult result =
+        RunPublishedNormalNeutralRetirementCase(
+            [selected_u_w, selected_u_delta](
+                PhaseOffsetMatchedAdapter& adapter,
+                NormalProductionFixture&) {
+              ReplaceAuthoritySnapshot(
+                  adapter,
+                  [selected_u_w, selected_u_delta](
+                      phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+                    snapshot.selected_u.u_w = selected_u_w;
+                    snapshot.selected_u.u_delta = selected_u_delta;
+                    // Deliberately use the opposite signed-zero spelling in
+                    // the diagnostic aliases.  Their numeric consistency is
+                    // required, while proposed_next_u_prev remains a
+                    // bit-exact copy of selected_u.
+                    snapshot.selected_u_w = -selected_u_w;
+                    snapshot.selected_u_delta = -selected_u_delta;
+                    snapshot.proposed_next_u_prev = snapshot.selected_u;
+                  });
+            });
+    ASSERT_TRUE(result.setup);
+    EXPECT_TRUE(result.retired) << "variant=" << variant;
+    EXPECT_FALSE(result.pair_present) << "variant=" << variant;
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     SignedZeroPendingNormalTransactionIsNotFalselyNonneutral) {
+  const NeutralRetirementResult result =
+      RunPendingNormalNeutralRetirementCase(
+          [](PhaseOffsetMatchedAdapter& adapter,
+             NormalProductionFixture&) {
+            // Preserve a valid pending transaction while exercising signed
+            // zero.  Runtime's exact retained delta and previous-port bits
+            // are part of the pending commit identity; changing only the
+            // snapshot/token delta must otherwise (correctly) invalidate the
+            // transaction before retirement.
+            adapter.runtime_->delta_ = -0.0;
+            std::shared_ptr<phase_offset_navigation::ActiveReferenceSnapshot>
+                pending(new phase_offset_navigation::ActiveReferenceSnapshot(
+                    *adapter.pending_authority_prepared_.committed_snapshot));
+            pending->delta = -0.0;
+            pending->proposed_next_delta = -0.0;
+            pending->selected_u.u_w = -0.0;
+            pending->selected_u.u_delta = +0.0;
+            pending->selected_u_w = +0.0;
+            pending->selected_u_delta = -0.0;
+            pending->proposed_next_u_prev = pending->selected_u;
+            adapter.pending_authority_prepared_.committed_snapshot = pending;
+            adapter.pending_runtime_commit_.expected_delta = -0.0;
+            adapter.pending_runtime_commit_.next_delta = -0.0;
+            adapter.pending_runtime_commit_.expected_previous_final_port =
+                adapter.runtime_->previousFinalPort();
+            adapter.pending_runtime_commit_.next_previous_final_port.u_w =
+                -0.0;
+            adapter.pending_runtime_commit_.next_previous_final_port.u_delta =
+                +0.0;
+          });
+  ASSERT_TRUE(result.setup);
+  EXPECT_TRUE(result.retired);
+  EXPECT_GT(result.retired_session, result.session_before);
+  EXPECT_EQ(result.retired_session, result.session_after);
+  EXPECT_FALSE(result.pair_present);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     TinyNonzeroAndNonfiniteNeutralScalarsRemainDenied) {
+  const std::array<double, 5U> denied_values = {{
+      std::numeric_limits<double>::denorm_min(),
+      -std::numeric_limits<double>::denorm_min(),
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity(),
+      -std::numeric_limits<double>::infinity()}};
+  for (const double denied_value : denied_values) {
+    const NeutralRetirementResult result =
+        RunPublishedNormalNeutralRetirementCase(
+            [denied_value](PhaseOffsetMatchedAdapter& adapter,
+                           NormalProductionFixture&) {
+              ReplaceAuthoritySnapshot(
+                  adapter,
+                  [denied_value](
+                      phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+                    snapshot.delta = denied_value;
+                  });
+            });
+    ASSERT_TRUE(result.setup);
+    EXPECT_FALSE(result.retired);
+    EXPECT_EQ(0U, result.retired_session);
+    EXPECT_EQ(result.session_before, result.session_after);
+    EXPECT_TRUE(result.pair_present);
+  }
+}
+
 bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
   const std::shared_ptr<const ContinuousPhasePath> owner =
       MakeSyntheticOwner();
@@ -1243,7 +1839,8 @@ bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
   candidate.r_ww_valid = false;
   candidate.executed_reference_query = query;
   candidate.reference_query_revision = query->queryRevision();
-  candidate.provenance = "test/pending-position-command";
+  candidate.provenance = "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator";
+  candidate.handoff_state = "PATH_TUBE_PAIR";
   candidate.valid = true;
 
   phase_offset_navigation::AuthorityPrepareInput authority_input;
@@ -1297,6 +1894,34 @@ bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
   adapter.pending_authority_session_ = prepared.candidate.authority_session;
   adapter.pending_authority_valid_ = true;
   return true;
+}
+
+struct PendingPublishMutationResult {
+  bool setup = false;
+  bool published = false;
+  int callback_count = 0;
+  bool pending = false;
+  bool authority_valid = false;
+};
+
+PendingPublishMutationResult RunPendingPublishMutationCase(
+    const std::function<void(PhaseOffsetMatchedAdapter&)>& mutate) {
+  PendingPublishMutationResult result;
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  if (!StageValidPendingPositionCommand(adapter)) return result;
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  if (!capture.pending || !capture.valid) return result;
+  result.setup = true;
+  mutate(adapter);
+  result.published = adapter.publishPendingPositionCommand(
+      [&result]() {
+        ++result.callback_count;
+        return true;
+      }, capture.identity);
+  result.pending = adapter.hasPendingPositionCommand();
+  result.authority_valid = adapter.execution_authority_.snapshot().valid;
+  return result;
 }
 
 bool PrepareAndFinalizePair(
@@ -2206,7 +2831,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
-     PendingActivationPairCannotBeNeutralRetiredBeforeFirstCommand) {
+     NeutralPendingActivationPairRetiresAndLaterBootstrapReenters) {
   const SyntheticPath path = MakePath();
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
   MatchedAdapterOutput output;
@@ -2240,16 +2865,33 @@ TEST(PhaseOffsetMatchedAdapterTest,
       adapter.authority_session_.load(std::memory_order_acquire);
 
   std::uint64_t retired_session = 0U;
-  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
       session_before + 1U, retired_session));
-  EXPECT_EQ(0U, retired_session);
-  EXPECT_EQ(session_before,
+  EXPECT_GT(retired_session, session_before);
+  EXPECT_EQ(retired_session,
             adapter.authority_session_.load(std::memory_order_acquire));
-  EXPECT_EQ(pair, adapter.capturePathTubePair());
-  EXPECT_EQ(owner, pair->path_owner);
-  EXPECT_TRUE(adapter.hasPendingOffsetActivationPair(pair));
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_DOUBLE_EQ(0.0, adapter.runtime_->retainedDelta());
+  EXPECT_FALSE(adapter.runtime_->hasExecutedOffsetAuthority());
 
-  input.path_tube_pair = pair;
+  // A later valid Tube can bootstrap a fresh Pair in the advanced session;
+  // retirement must not strand the planner in a stale frontend.
+  PathTubePairTransaction fresh_transaction;
+  ASSERT_TRUE(adapter.stagePathTubePair(
+      std::shared_ptr<const PathTubePair>(), owner, path.samples,
+      path.current.w, 1.0, 2.4, input.position, input.gains, input.dt,
+      std::shared_ptr<const plan_env::CloudOccupancySnapshot>(),
+      fresh_transaction, retired_session));
+  std::shared_ptr<const PathTubePair> fresh_pair;
+  ASSERT_TRUE(PrepareAndFinalizePair(
+      adapter, fresh_transaction, path.current.w, input.position,
+      input.gains, input.dt,
+      std::shared_ptr<const plan_env::CloudOccupancySnapshot>(), fresh_pair));
+  ASSERT_TRUE(fresh_pair);
+  EXPECT_EQ(retired_session, fresh_pair->authority_session);
+  EXPECT_TRUE(adapter.hasPendingOffsetActivationPair(fresh_pair));
+
+  input.path_tube_pair = fresh_pair;
   RebaseInputToAuthority(adapter, input);
   EXPECT_TRUE(adapter.update(input, output)) << output.invalid_reason;
   EXPECT_TRUE(output.selected);
@@ -2269,9 +2911,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,
-     RequestRecenterKeepsPairAndOwnerUntilFiniteNeutralHandoff) {
+     RequestRecenterKeepsPairAndRuntimeOwnerUntilNeutralButCannotRetire) {
   const SyntheticPath path = MakePath();
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  // Keep the compatibility fixture on the same nonzero session convention as
+  // the production manager so the terminal NORMAL snapshot and Pair bind
+  // exactly for the retirement proof.
+  adapter.authority_session_.store(1U, std::memory_order_release);
   MatchedAdapterOutput output;
   // Prime the fixed-Tube sidecar once before the warm-up gate.  The helper's
   // command-boundary bootstrap then consumes this immutable candidate epoch.
@@ -2331,6 +2977,14 @@ TEST(PhaseOffsetMatchedAdapterTest,
   ASSERT_GT(std::abs(nonzero_delta), 1e-3);
   EXPECT_TRUE(adapter.requiresAuthoritativeOffsetHandoff());
 
+  // A live nonzero NORMAL/Runtime authority is never planner-only retired,
+  // even when the caller asks for the same neutral replacement edge.
+  std::uint64_t rejected_retired_session = 0U;
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
+      session + 1U, rejected_retired_session));
+  EXPECT_EQ(0U, rejected_retired_session);
+  EXPECT_EQ(pair, adapter.capturePathTubePair());
+
   ASSERT_TRUE(adapter.requestRecenter());
   EXPECT_TRUE(adapter.recenterRequested());
   EXPECT_TRUE(adapter.requiresAuthoritativeOffsetHandoff());
@@ -2363,14 +3017,16 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_FALSE(adapter.requiresAuthoritativeOffsetHandoff());
   EXPECT_EQ(adapter.capturePathTubePair(), pair);
 
-  // Only after the exact neutral command may the atomic planner-only
-  // retirement edge clear the pair and reset the execution authority.
+  // This unadvertised compatibility fixture intentionally uses the legacy
+  // Runtime owner.  Exact neutral retirement is production-only for the
+  // PhaseOffsetAllocator owner, so the pair remains until an explicit task
+  // retirement rather than crossing the planner boundary here.
   std::uint64_t retired_session = 0U;
-  ASSERT_TRUE(adapter.retirePathTubeAuthorityIfNeutral(
+  EXPECT_FALSE(adapter.retirePathTubeAuthorityIfNeutral(
       session, retired_session));
-  EXPECT_EQ(retired_session,
-            adapter.authority_session_.load(std::memory_order_acquire));
-  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_EQ(0U, retired_session);
+  EXPECT_EQ(session, adapter.authority_session_.load(std::memory_order_acquire));
+  EXPECT_EQ(pair, adapter.capturePathTubePair());
   EXPECT_FALSE(adapter.requiresAuthoritativeOffsetHandoff());
   EXPECT_FALSE(adapter.recenterRequested());
 }
@@ -7809,6 +8465,163 @@ TEST(PhaseOffsetMatchedAdapterTest,
     EXPECT_EQ(callback_count, 0);
     EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
   }
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     PendingNormalIdentityMismatchesCannotPublish) {
+  struct MutationCase {
+    const char* name;
+    std::function<void(PhaseOffsetMatchedAdapter&)> mutate;
+  };
+  const std::vector<MutationCase> cases = {
+      {"proposed-next-previous-port",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         phase_offset_navigation::ActiveReferenceSnapshot changed =
+             *adapter.pending_authority_prepared_.committed_snapshot;
+         changed.proposed_next_u_prev.u_w = 0.123;
+         adapter.pending_authority_prepared_.committed_snapshot =
+             std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+                 changed);
+       }},
+      {"expected-previous-port",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         adapter.pending_runtime_commit_.expected_previous_final_port.u_w =
+             0.123;
+       }},
+      {"pair-revision-identity",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         const std::shared_ptr<const PathTubePair> source =
+             adapter.pending_normal_source_pair_;
+         std::shared_ptr<PathTubePair> changed(new PathTubePair(*source));
+         ++changed->source_revision;
+         std::atomic_store(
+             &adapter.authoritative_path_tube_pair_,
+             std::shared_ptr<const PathTubePair>(changed));
+       }},
+      {"same-revision-pair-clone",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         const std::shared_ptr<const PathTubePair> source =
+             adapter.pending_normal_source_pair_;
+         std::shared_ptr<PathTubePair> clone(new PathTubePair(*source));
+         std::atomic_store(
+             &adapter.authoritative_path_tube_pair_,
+             std::shared_ptr<const PathTubePair>(clone));
+       }},
+      {"query-revision",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         phase_offset_navigation::ActiveReferenceSnapshot changed =
+             *adapter.pending_authority_prepared_.committed_snapshot;
+         ++changed.reference_query_revision;
+         adapter.pending_authority_prepared_.committed_snapshot =
+             std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+                 changed);
+       }},
+      {"provenance",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         phase_offset_navigation::ActiveReferenceSnapshot changed =
+             *adapter.pending_authority_prepared_.committed_snapshot;
+         changed.provenance = "PhaseOffsetMatchedAdapter/other-owner";
+         adapter.pending_authority_prepared_.committed_snapshot =
+             std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+                 changed);
+       }},
+      {"authority-session",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         adapter.authority_session_.store(8U, std::memory_order_release);
+       }},
+      {"stale-prepared-status",
+       [](PhaseOffsetMatchedAdapter& adapter) {
+         adapter.pending_authority_prepared_.status =
+             phase_offset_navigation::ExecutionAuthorityStatus::STALE;
+       }},
+  };
+
+  for (const MutationCase& mutation : cases) {
+    const PendingPublishMutationResult result =
+        RunPendingPublishMutationCase(mutation.mutate);
+    ASSERT_TRUE(result.setup) << mutation.name;
+    EXPECT_FALSE(result.published) << mutation.name;
+    EXPECT_EQ(0, result.callback_count) << mutation.name;
+    EXPECT_FALSE(result.pending) << mutation.name;
+    EXPECT_FALSE(result.authority_valid) << mutation.name;
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     PendingCandidateAuthoritySessionMustMatchPendingSession) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+  ASSERT_TRUE(adapter.pending_authority_prepared_.committed_snapshot);
+  const std::uint64_t pending_session = adapter.pending_authority_session_;
+  ASSERT_NE(pending_session, 0U);
+  phase_offset_navigation::ActiveReferenceSnapshot changed =
+      *adapter.pending_authority_prepared_.committed_snapshot;
+  changed.authority_session = pending_session + 1U;
+  adapter.pending_authority_prepared_.committed_snapshot =
+      std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+          changed);
+
+  // The live adapter session is unchanged, so this specifically exercises
+  // the candidate-versus-pending-session identity check rather than only the
+  // outer live-session check.
+  EXPECT_FALSE(adapter.validatePendingPositionCommand());
+  EXPECT_FALSE(adapter.pending_authority_prepared_.committed_snapshot ==
+               nullptr);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     PendingNormalQueryOwnerRevisionMustMatchSourcePair) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+  ASSERT_TRUE(adapter.pending_authority_prepared_.committed_snapshot);
+  ASSERT_TRUE(adapter.pending_normal_source_pair_);
+  const auto owner = MakeSyntheticOwner();
+  ASSERT_TRUE(owner);
+  auto candidate =
+      *adapter.pending_authority_prepared_.committed_snapshot;
+  const std::uint64_t wrong_owner_revision =
+      adapter.pending_normal_source_pair_->source_revision + 1U;
+  candidate.executed_reference_query =
+      phase_offset_navigation::ImmutableExecutedReferenceQueryPtr(
+          new PhaseOffsetExecutedReferenceQuery(
+              owner, 0.0, candidate.executed_path_revision,
+              candidate.frame_revision, wrong_owner_revision,
+              candidate.reference_query_revision));
+  adapter.pending_authority_prepared_.committed_snapshot =
+      std::make_shared<const phase_offset_navigation::ActiveReferenceSnapshot>(
+          candidate);
+
+  // The query still returns the same reference jet and all path/frame/query
+  // revisions remain equal; only its immutable owner provenance is wrong.
+  // The NORMAL pending seam must reject this rather than treating revisions
+  // alone as sufficient identity.
+  EXPECT_FALSE(adapter.validatePendingPositionCommand());
+  EXPECT_TRUE(adapter.pending_authority_valid_);
+  EXPECT_TRUE(adapter.pending_runtime_commit_.valid);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     MalformedPendingSlotSuppressesOrdinaryPublicationAfterInvalidation) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  ASSERT_TRUE(StageValidPendingPositionCommand(adapter));
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+
+  // Simulate a stale producer clearing only the validity bit.  The remaining
+  // token/prepared payload is still an occupied transaction and must be
+  // discarded through the canonical validator before any no-pending path can
+  // invoke the local publisher.
+  adapter.pending_authority_valid_ = false;
+  int callback_count = 0;
+  EXPECT_FALSE(adapter.publishPendingPositionCommand(
+      [&]() { ++callback_count; return true; }, capture.identity));
+  EXPECT_EQ(0, callback_count);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_FALSE(adapter.pending_runtime_commit_.valid);
+  EXPECT_FALSE(adapter.pending_authority_prepared_.valid);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,

@@ -2066,7 +2066,7 @@ TEST(GvfTimerBootstrap,
 }
 
 TEST(GvfTimerBootstrap,
-     PendingActivationPairRequiresH2AndSurvivesNeutralPlannerAttempt) {
+     NeutralPendingActivationPairRetiresForPlannerReplacement) {
   FLAG_Race::gvf_manager manager;
   const auto owner = makeTimerBootstrapPath(std::function<void()>());
   const auto replacement = makeTimerBootstrapPath(std::function<void()>());
@@ -2097,46 +2097,13 @@ TEST(GvfTimerBootstrap,
 
   const auto neutral = FLAG_Race::GvfManagerS4AnchorTestAccess::
       attemptNeutralPlannerFrontend(manager, replacement);
-  EXPECT_FALSE(neutral.committed);
-  EXPECT_FALSE(neutral.installed_new_owner);
-  EXPECT_TRUE(neutral.pair_present);
-  EXPECT_EQ(neutral.session_before, neutral.session_after);
-  const std::shared_ptr<const FLAG_Race::PathTubePair> preserved =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager);
-  ASSERT_EQ(pair, preserved);
-  EXPECT_EQ(pair->authority_session, preserved->authority_session);
-  EXPECT_EQ(owner, preserved->path_owner);
-
-  const auto first_command = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      executePendingBootstrapPairCommand(manager, 3.0);
-  ASSERT_TRUE(first_command.selected);
-  ASSERT_TRUE(first_command.executed_authority);
-  ASSERT_TRUE(first_command.projection_valid);
-  EXPECT_LE(std::abs(first_command.retained_delta_before), 1e-6);
-  EXPECT_LE(std::abs(first_command.retained_delta_after), 1e-6);
-  // The lifecycle log uses a strict, significant threshold and an atomic
-  // generation claim.  Exercise both sides without changing Runtime state.
-  EXPECT_FALSE(std::abs(1e-6) > 1e-6);
-  EXPECT_TRUE(std::abs(1.1e-6) > 1e-6);
-  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  claimPendingActivationNonzeroLogGeneration(manager, pair));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                   claimPendingActivationNonzeroLogGeneration(manager, pair));
-  const auto denied_command = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      executePendingBootstrapPairCommand(manager, 3.02, true);
-  EXPECT_FALSE(denied_command.update_success);
-  EXPECT_FALSE(denied_command.selected);
-  EXPECT_FALSE(denied_command.valid);
-  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  claimPendingActivationNotSelectedLogGeneration(manager, pair));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                   claimPendingActivationNotSelectedLogGeneration(manager, pair));
-  const auto executed = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      captureReplanHandoff(manager);
-  EXPECT_EQ(pair, executed.pair);
-  EXPECT_TRUE(executed.executed_authority);
-  EXPECT_FALSE(executed.pending_activation);
-  EXPECT_TRUE(executed.h2_required);
+  EXPECT_TRUE(neutral.committed);
+  EXPECT_TRUE(neutral.installed_new_owner);
+  EXPECT_FALSE(neutral.pair_present);
+  EXPECT_GT(neutral.session_after, neutral.session_before);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager));
+  EXPECT_EQ(neutral.session_after,
+            FLAG_Race::GvfManagerS4AnchorTestAccess::mailbox(manager).session);
 }
 
 TEST(GvfTimerBootstrap,

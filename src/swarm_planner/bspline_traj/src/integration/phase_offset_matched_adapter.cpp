@@ -1836,15 +1836,193 @@ bool PhaseOffsetMatchedAdapter::retirePathTubeAuthorityIfNeutral(
     std::uint64_t& retired_session) {
   retired_session = 0U;
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  // A just-committed bootstrap Pair has not executed Runtime authority yet,
-  // but it is nevertheless the sole certified owner of the next activation
-  // command.  Check it under this same lock as the final CAS so a neutral
-  // planner publication cannot erase the Pair in the check-to-retire gap.
-  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
-  if (!runtime_ || runtime_->hasExecutedOffsetAuthority() ||
-      hasPendingOffsetActivationPairLocked(pair)) {
+  if (!runtime_) {
     return false;
   }
+
+  // The manager calls this only while it is linearizing a planner frontend
+  // installation.  Keep the complete neutral proof in this Runtime lock so
+  // a pending activation, command publication, or timer refresh cannot pass a
+  // check and then change the facts before the Pair/session retirement.
+  const auto exact_zero = [](const double value) {
+    // Mathematical-zero classification intentionally accepts both IEEE
+    // signed zeros while rejecting every non-finite and nonzero value.  Keep
+    // bit-exact identity checks below on BitsEqual; this predicate is only for
+    // the neutral scalar proof.
+    return std::isfinite(value) && value == 0.0;
+  };
+
+  // Formal NORMAL publication and this retirement edge share one
+  // side-effect-free transaction proof.  A malformed/changed pending
+  // transaction is cancelled first; the neutral decision below then observes
+  // only the already-committed authority and Runtime state.
+  std::string pending_reason;
+  if (!validatePendingPositionCommandLocked(&pending_reason)) {
+    clearPendingPositionCommandLocked();
+  }
+  if (pending_authority_valid_ && pending_runtime_commit_.valid) {
+    const phase_offset_navigation::ActiveReferenceSnapshot& pending =
+        *pending_authority_prepared_.committed_snapshot;
+    const bool recovery_or_handoff_metadata = pending_handoff_valid_ ||
+        pending_recovery_step_valid_ || pending_recovery_source_pair_ ||
+        pending_recovery_execution_pair_ || pending_recovery_target_pair_;
+    const bool protected_pending_mode =
+        pending.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY ||
+        pending.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+    if (protected_pending_mode) {
+      return false;
+    }
+    const bool normal_pending_mode =
+        pending.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
+        pending.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION;
+    if (recovery_or_handoff_metadata || !normal_pending_mode) {
+      // A mixed-mode pending slot is not NORMAL evidence.  Drop its future
+      // publication eligibility, then continue from committed authority.
+      clearPendingPositionCommandLocked();
+    } else {
+      const bool pending_neutral = exact_zero(pending.delta) &&
+          exact_zero(pending.proposed_next_delta) &&
+          exact_zero(pending.selected_u.u_w) &&
+          exact_zero(pending.selected_u.u_delta) &&
+          exact_zero(pending.selected_u_w) &&
+          exact_zero(pending.selected_u_delta) &&
+          exact_zero(pending_runtime_commit_.expected_delta) &&
+          exact_zero(pending_runtime_commit_.next_delta) &&
+          exact_zero(pending_runtime_commit_.next_previous_final_port.u_w) &&
+          exact_zero(pending_runtime_commit_.next_previous_final_port.u_delta);
+      if (!pending_neutral) {
+        // A current, exact, non-neutral pending NORMAL command retains the
+        // existing authority and remains eligible for its normal publication.
+        return false;
+      }
+      clearPendingPositionCommandLocked();
+    }
+  }
+
+  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      execution_authority_.snapshot();
+  const std::uint64_t live_session =
+      authority_session_.load(std::memory_order_acquire);
+  const auto pair_lifecycle_matches = [&pair, live_session]() {
+    if (!pair || !pair->path_owner || !pair->frame_owner ||
+        !pair->active_profile || !pair->epoch_snapshot ||
+        pair->authority_session != live_session ||
+        pair->source_revision == 0U || pair->path_revision == 0U ||
+        pair->frame_revision == 0U) {
+      return false;
+    }
+    const phase_offset_navigation::TubeProfile& profile =
+        *pair->active_profile;
+    return profile.source_revision == pair->source_revision &&
+        profile.path_revision == pair->path_revision &&
+        profile.frame_revision == pair->frame_revision &&
+        pair->epoch_status.active_path_source_revision ==
+            pair->source_revision &&
+        pair->epoch_status.active_available &&
+        pair->epoch_status.active_current_validation_valid &&
+        pair->epoch_snapshot->source_revision == pair->source_revision &&
+        pair->epoch_snapshot->path_revision == pair->path_revision &&
+        pair->epoch_snapshot->frame_revision == pair->frame_revision &&
+        pair->epoch_snapshot->active_profile == pair->active_profile;
+  };
+  const auto pair_provenance_matches =
+      [&pair, &pair_lifecycle_matches](
+          const phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
+        if (!pair_lifecycle_matches()) return false;
+        const phase_offset_navigation::TubeProfile& profile =
+            *pair->active_profile;
+        return snapshot.authority_session == pair->authority_session &&
+            snapshot.planner_path_revision == pair->source_revision &&
+            snapshot.executed_path_revision == pair->path_revision &&
+            snapshot.frame_revision == pair->frame_revision &&
+            snapshot.tube_revision == profile.tube_revision &&
+            snapshot.profile_revision == profile.profile_revision &&
+            snapshot.map_revision == profile.map_revision &&
+            snapshot.executed_reference_query &&
+            snapshot.executed_reference_query->pathRevision() ==
+                pair->path_revision &&
+            snapshot.executed_reference_query->frameRevision() ==
+                pair->frame_revision &&
+            snapshot.executed_reference_query->ownerRevision() ==
+                pair->source_revision &&
+            snapshot.executed_reference_query->queryRevision() ==
+                snapshot.reference_query_revision &&
+            snapshot.governorViewValid();
+      };
+  const auto neutral_snapshot_matches =
+      [this, &authority, &pair_provenance_matches, exact_zero](
+          const bool require_zero_selected_u) {
+        if (!authority.valid || authority.stale ||
+            authority.current_state_unsafe || authority.planner_invalid ||
+            !pair_provenance_matches(authority) ||
+            !exact_zero(authority.delta) ||
+            !exact_zero(authority.proposed_next_delta) ||
+            !authority.selectedUConsistent(0.0) ||
+            !BitsEqual(authority.proposed_next_u_prev,
+                       authority.selected_u) ||
+            !std::isfinite(authority.delta) ||
+            !std::isfinite(authority.dt) || authority.dt <= 0.0 ||
+            std::abs(authority.delta + authority.dt *
+                         authority.selected_u.u_delta -
+                     authority.proposed_next_delta) >
+                execution_authority_.config().comparison_epsilon) {
+          return false;
+        }
+        if (require_zero_selected_u &&
+            (!exact_zero(authority.selected_u.u_w) ||
+             !exact_zero(authority.selected_u.u_delta) ||
+             !exact_zero(authority.selected_u_w) ||
+             !exact_zero(authority.selected_u_delta))) {
+          return false;
+        }
+        return true;
+      };
+
+  // Runtime's exact retained delta is the first neutral fact.  A started but
+  // incomplete profile remains an executed authority at its instantaneous
+  // zero crossing, so the existing predicate still blocks retirement there.
+  if (!exact_zero(runtime_->retainedDelta()) ||
+      runtime_->hasExecutedOffsetAuthority()) {
+    return false;
+  }
+  if (pair && !pair_lifecycle_matches()) {
+    return false;
+  }
+
+  bool safe_neutral = false;
+  if (!authority.valid) {
+    // No command/snapshot has executed yet.  This is the pending activation
+    // case: the Pair is still provisional ownership and may be retired while
+    // Runtime is exactly neutral.  The existing session retirement below
+    // invalidates any staged command/pending transaction atomically.
+    safe_neutral = true;
+  } else if (authority.owner_mode ==
+                 phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY) {
+    safe_neutral = authority.selected_u_owner == "PlannerOwner" &&
+        authority.handoff_state == "PLANNER_ONLY" &&
+        authority.provenance ==
+            "PhaseOffsetMatchedAdapter/atomic-neutral-handoff" &&
+        neutral_snapshot_matches(true);
+  } else if (authority.owner_mode ==
+                 phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
+             authority.owner_mode ==
+                 phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION) {
+    const bool allocator_owner = authority.selected_u_owner ==
+        phase_offset_navigation::PhaseOffsetAllocator::ownerName() &&
+        authority.handoff_state == "PATH_TUBE_PAIR" &&
+        authority.provenance ==
+            "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator";
+    safe_neutral = allocator_owner && neutral_snapshot_matches(true);
+  }
+  if (!safe_neutral) {
+    return false;
+  }
+
   retired_session = retirePathTubeAuthorityLocked(authority_session);
   execution_authority_.resetForNewTask(retired_session);
   return true;
@@ -5752,7 +5930,52 @@ void PhaseOffsetMatchedAdapter::clearPendingPositionCommandLocked() {
 bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
     std::string* reason) const {
   if (reason) reason->clear();
-  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) return true;
+  const auto numerically_equal = [](const double first, const double second) {
+    return std::isfinite(first) && std::isfinite(second) && first == second;
+  };
+  const bool any_pending = pending_authority_valid_ ||
+      pending_runtime_commit_.valid || pending_authority_prepared_.valid ||
+      pending_authority_prepared_.candidate.valid ||
+      pending_authority_prepared_.expected.valid ||
+      pending_authority_prepared_.committed_snapshot ||
+      pending_authority_prepared_.expected_snapshot_id != 0U ||
+      pending_authority_prepared_.status !=
+          phase_offset_navigation::ExecutionAuthorityStatus::NONE ||
+      pending_authority_session_ != 0U || pending_runtime_commit_.selected ||
+      pending_runtime_commit_.safety_priority ||
+      pending_runtime_commit_.should_start_profile ||
+      pending_runtime_commit_.profile_active ||
+      pending_runtime_commit_.complete_profile ||
+      pending_runtime_commit_.exact_terminal_predicate ||
+      pending_runtime_commit_.dt != 0.0 ||
+      pending_runtime_commit_.expected_delta != 0.0 ||
+      pending_runtime_commit_.next_delta != 0.0 ||
+      !BitsEqual(pending_runtime_commit_.expected_previous_final_port,
+                 phase_offset_core::PortCommand()) ||
+      !BitsEqual(pending_runtime_commit_.next_previous_final_port,
+                 phase_offset_core::PortCommand()) ||
+      pending_normal_source_pair_ || pending_recovery_step_valid_ ||
+      pending_handoff_valid_ || pending_recovery_source_pair_ ||
+      pending_recovery_execution_pair_ || pending_recovery_target_pair_;
+  if (!any_pending) return true;
+  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
+    if (reason) *reason = "pending PositionCommand transaction is incomplete";
+    return false;
+  }
+  if (!pending_authority_prepared_.valid ||
+      !pending_authority_prepared_.side_effect_free ||
+      pending_authority_prepared_.status !=
+          phase_offset_navigation::ExecutionAuthorityStatus::PREPARED ||
+      !pending_authority_prepared_.committed_snapshot) {
+    if (reason) *reason = "pending authority preparation is invalid";
+    return false;
+  }
+  if (!pending_runtime_commit_.selected ||
+      !std::isfinite(pending_runtime_commit_.dt) ||
+      pending_runtime_commit_.dt <= 0.0) {
+    if (reason) *reason = "pending Runtime commit token is invalid";
+    return false;
+  }
   if (!execution_authority_.finalValidate(pending_authority_prepared_, reason)) {
     return false;
   }
@@ -5764,17 +5987,27 @@ bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
   }
   const phase_offset_navigation::ActiveReferenceSnapshot& candidate =
       *pending_authority_prepared_.committed_snapshot;
-  const double epsilon = execution_authority_.config().comparison_epsilon;
   if (pending_authority_session_ == 0U ||
       pending_authority_session_ !=
-          authority_session_.load(std::memory_order_acquire)) {
+          authority_session_.load(std::memory_order_acquire) ||
+      candidate.authority_session != pending_authority_session_) {
     if (reason) *reason = "pending authority session is stale";
     return false;
   }
   const std::shared_ptr<const PathTubePair> live_pair =
       std::atomic_load(&authoritative_path_tube_pair_);
   if (candidate.owner_mode ==
-      phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL) {
+          phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
+      candidate.owner_mode ==
+          phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION) {
+    if (candidate.selected_u_owner !=
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
+        candidate.handoff_state != "PATH_TUBE_PAIR" ||
+        candidate.provenance !=
+            "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator") {
+      if (reason) *reason = "pending NORMAL owner/provenance is stale";
+      return false;
+    }
     const std::shared_ptr<const PathTubePair>& source_pair =
         pending_normal_source_pair_;
     const bool source_pair_matches = source_pair &&
@@ -5794,7 +6027,25 @@ bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
         source_pair->active_profile->tube_revision == candidate.tube_revision &&
         source_pair->active_profile->profile_revision ==
             candidate.profile_revision &&
-        source_pair->active_profile->map_revision == candidate.map_revision;
+        source_pair->active_profile->map_revision == candidate.map_revision &&
+        candidate.executed_reference_query &&
+        candidate.executed_reference_query->pathRevision() ==
+            source_pair->path_revision &&
+        candidate.executed_reference_query->frameRevision() ==
+            source_pair->frame_revision &&
+        candidate.executed_reference_query->ownerRevision() ==
+            source_pair->source_revision &&
+        candidate.executed_reference_query->queryRevision() ==
+            candidate.reference_query_revision &&
+        (!source_pair->epoch_snapshot ||
+         (source_pair->epoch_snapshot->source_revision ==
+              source_pair->source_revision &&
+          source_pair->epoch_snapshot->path_revision ==
+              source_pair->path_revision &&
+          source_pair->epoch_snapshot->frame_revision ==
+              source_pair->frame_revision &&
+          source_pair->epoch_snapshot->active_profile ==
+              source_pair->active_profile));
     if (!source_pair_matches) {
       if (reason) *reason = "pending NORMAL source Pair identity or revisions changed";
       return false;
@@ -5844,14 +6095,29 @@ bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
     if (reason) *reason = "pending authority snapshot changed";
     return false;
   }
-  if (std::abs(runtime_->retainedDelta() -
-               pending_runtime_commit_.expected_delta) > epsilon ||
-      std::abs(runtime_->previousFinalPort().u_w -
-               pending_runtime_commit_.expected_previous_final_port.u_w) >
-          epsilon ||
-      std::abs(runtime_->previousFinalPort().u_delta -
-               pending_runtime_commit_.expected_previous_final_port.u_delta) >
-          epsilon || !candidate.selectedUConsistent(epsilon)) {
+  if (!std::isfinite(pending_runtime_commit_.expected_delta) ||
+      !std::isfinite(pending_runtime_commit_.next_delta) ||
+      !std::isfinite(pending_runtime_commit_.dt) ||
+      !std::isfinite(pending_runtime_commit_.expected_previous_final_port.u_w) ||
+      !std::isfinite(pending_runtime_commit_.expected_previous_final_port.u_delta) ||
+      !std::isfinite(pending_runtime_commit_.next_previous_final_port.u_w) ||
+      !std::isfinite(pending_runtime_commit_.next_previous_final_port.u_delta) ||
+      !BitsEqual(runtime_->retainedDelta(),
+                 pending_runtime_commit_.expected_delta) ||
+      !BitsEqual(runtime_->previousFinalPort(),
+                 pending_runtime_commit_.expected_previous_final_port) ||
+      !BitsEqual(candidate.dt, pending_runtime_commit_.dt) ||
+      !BitsEqual(candidate.u_prev,
+                 pending_runtime_commit_.expected_previous_final_port) ||
+      !BitsEqual(candidate.delta, pending_runtime_commit_.expected_delta) ||
+      !BitsEqual(candidate.proposed_next_delta,
+                 pending_runtime_commit_.next_delta) ||
+      !BitsEqual(candidate.selected_u,
+                 pending_runtime_commit_.next_previous_final_port) ||
+      !numerically_equal(candidate.selected_u.u_w, candidate.selected_u_w) ||
+      !numerically_equal(candidate.selected_u.u_delta,
+                         candidate.selected_u_delta) ||
+      !BitsEqual(candidate.proposed_next_u_prev, candidate.selected_u)) {
     if (reason) *reason = "pending Runtime state or exact selected-u changed";
     return false;
   }
@@ -5916,6 +6182,13 @@ bool PhaseOffsetMatchedAdapter::publishPendingPositionCommand(
   std::unique_lock<std::mutex> task_lock(task_publication_mutex_);
   std::unique_lock<std::mutex> runtime_lock(runtime_command_mutex_);
   if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
+    // A partially cleared or malformed transaction is not the same as an
+    // empty slot.  Invalidate it through the canonical pending seam before
+    // allowing any no-pending publication path to proceed.
+    if (!validatePendingPositionCommandLocked(nullptr)) {
+      clearPendingPositionCommandLocked();
+      return false;
+    }
     // If a transaction was present before the governor ran, its disappearance
     // is a fail-closed race outcome.  Ordinary publication is allowed only
     // when the capture explicitly observed no pending transaction.
