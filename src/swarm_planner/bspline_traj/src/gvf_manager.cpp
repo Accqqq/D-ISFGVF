@@ -163,6 +163,37 @@ namespace FLAG_Race
         authoritative_phase_generation_ = token.committed.generation;
     }
 
+    bool gvf_manager::setPhaseOffsetGDes(const Eigen::Vector3d& g_des)
+    {
+        std::lock_guard<std::mutex> lock(phase_offset_g_des_mutex_);
+        if (!g_des.allFinite()) {
+            phase_offset_g_des_.setZero();
+            phase_offset_g_des_valid_ = false;
+            return false;
+        }
+        phase_offset_g_des_ = g_des;
+        phase_offset_g_des_valid_ = true;
+        return true;
+    }
+
+    void gvf_manager::clearPhaseOffsetGDes()
+    {
+        std::lock_guard<std::mutex> lock(phase_offset_g_des_mutex_);
+        phase_offset_g_des_.setZero();
+        phase_offset_g_des_valid_ = false;
+    }
+
+    bool gvf_manager::capturePhaseOffsetGDes(Eigen::Vector3d& g_des) const
+    {
+        std::lock_guard<std::mutex> lock(phase_offset_g_des_mutex_);
+        if (!phase_offset_g_des_valid_ || !phase_offset_g_des_.allFinite()) {
+            g_des.setZero();
+            return false;
+        }
+        g_des = phase_offset_g_des_;
+        return true;
+    }
+
     gvf_manager::gvf_manager(ros::NodeHandle &nh)
     {
         nh.param("gvf/planInterval", planInterval, -1.0);
@@ -1595,6 +1626,8 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     matched_input.semantic_path_start_w = command_path->startW();
                     matched_input.semantic_path_end_w = command_path->endW();
                     matched_input.path_tube_pair = command_pair;
+                    matched_input.g_des_valid =
+                        capturePhaseOffsetGDes(matched_input.g_des);
                     // Preserve the exact staged successor as evidence for a
                     // recovery/preview tick when the command-boundary CAS
                     // could not install it yet.  The candidate remains
@@ -1955,7 +1988,7 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         // The adapter serializes final validation, the actual cmd_pub.publish
         // invocation, and the no-fail authority/token commit against task
         // reset and pair retirement.
-            command_published_and_committed =
+        command_published_and_committed =
             phase_offset_matched_adapter_->publishPendingPositionCommand(
             [this, &result]() {
                 return publishGovernorPositionCommand(

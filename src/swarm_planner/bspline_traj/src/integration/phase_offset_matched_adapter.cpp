@@ -38,6 +38,26 @@ bool IsFinite(double value) { return std::isfinite(value); }
 bool IsFinite(const Eigen::Vector3d& value) { return value.allFinite(); }
 double FiniteOrZero(double value) { return IsFinite(value) ? value : 0.0; }
 
+std::uint64_t MixPolicyBits(std::uint64_t hash, const double value) {
+  std::uint64_t bits = 0U;
+  std::memcpy(&bits, &value, sizeof(bits));
+  hash ^= bits;
+  hash *= 1099511628211ULL;
+  return hash;
+}
+
+std::uint64_t NormalPreviewPolicyIdentity(
+    const phase_offset_navigation::NormalPreviewProductionPolicy& policy) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  hash = MixPolicyBits(hash, policy.preview_horizon_w);
+  hash = MixPolicyBits(hash, policy.sample_spacing_w);
+  hash = MixPolicyBits(hash, policy.lower_nu);
+  hash = MixPolicyBits(hash, policy.upper_nu);
+  hash = MixPolicyBits(hash, policy.b_tight);
+  hash = MixPolicyBits(hash, policy.b_open);
+  return hash == 0U ? 1U : hash;
+}
+
 bool HasNonzeroRawBuildCapacity(
     const phase_offset_navigation::TubeProfile& profile) {
   constexpr double kCapacityTolerance = 1e-10;
@@ -1085,6 +1105,49 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
   nh.param("phase_offset/manual/u_delta_abs_max", config.u_delta_abs_max, 0.25); nh.param("phase_offset/manual/u_w_rate_max", config.u_w_rate_max, 0.60);
   nh.param("phase_offset/manual/u_delta_rate_max", config.u_delta_rate_max, 1.20); nh.param("phase_offset/manual/phase_dot_min", config.phase_dot_min, 0.02);
   nh.param("phase_offset/manual/tangent_speed_min", config.tangent_speed_min, 0.02); nh.param("phase_offset/manual/preflight_sample_step_w", config.preflight_sample_step_w, 0.10);
+  // NORMAL Preview production policy is required configuration.  Read each
+  // value only when explicitly present; absent/invalid values remain invalid
+  // and are never replaced by an adapter or Tube default.
+  const auto read_required_double = [&nh](const std::string& key,
+                                           double& value) {
+    return nh.hasParam(key) && nh.getParam(key, value);
+  };
+  bool preview_policy_complete = true;
+  preview_policy_complete = read_required_double(
+      "phase_offset/normal_preview/preview_horizon_w",
+      config.normal_preview_policy.preview_horizon_w) &&
+      preview_policy_complete;
+  preview_policy_complete = read_required_double(
+      "phase_offset/normal_preview/sample_spacing_w",
+      config.normal_preview_policy.sample_spacing_w) &&
+      preview_policy_complete;
+  preview_policy_complete = read_required_double(
+      "phase_offset/normal_preview/lower_nu",
+      config.normal_preview_policy.lower_nu) && preview_policy_complete;
+  preview_policy_complete = read_required_double(
+      "phase_offset/normal_preview/upper_nu",
+      config.normal_preview_policy.upper_nu) && preview_policy_complete;
+  preview_policy_complete = read_required_double(
+      "phase_offset/normal_preview/b_tight",
+      config.normal_preview_policy.b_tight) && preview_policy_complete;
+  preview_policy_complete = read_required_double(
+      "phase_offset/normal_preview/b_open",
+      config.normal_preview_policy.b_open) && preview_policy_complete;
+  if (preview_policy_complete &&
+      config.normal_preview_policy.immutable &&
+      IsFinite(config.normal_preview_policy.preview_horizon_w) &&
+      IsFinite(config.normal_preview_policy.sample_spacing_w) &&
+      IsFinite(config.normal_preview_policy.lower_nu) &&
+      IsFinite(config.normal_preview_policy.upper_nu) &&
+      IsFinite(config.normal_preview_policy.b_tight) &&
+      IsFinite(config.normal_preview_policy.b_open)) {
+    config.normal_preview_policy.policy_revision = 1U;
+    config.normal_preview_policy.configuration_identity =
+        NormalPreviewPolicyIdentity(config.normal_preview_policy);
+    config.normal_preview_policy.configuration_id =
+        "normal-preview-w-v1";
+    config.normal_preview_policy_explicit = true;
+  }
   std::string source = "none"; nh.param<std::string>("phase_offset/manual/tube_source", source, source);
   bool source_valid = false; config.tube_source = ParseTubeSource(source, source_valid);
   // Sole P1 ESDF nominal-width owner.  Use hasParam so diagnostics can
@@ -1396,29 +1459,33 @@ bool PhaseOffsetMatchedAdapter::requiresPathTubePairBootstrapLocked() const {
       config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
     return false;
   }
-  // Runtime is a deterministic unadvertised fixture owner only.  The same
-  // existing authority capability is cleared by advertise() for production;
-  // do not let passive Runtime intent bootstrap a PathTubePair that cannot
-  // legally execute production NORMAL selected-u.
-  if (!execution_authority_.config().allow_test_only_runtime_owner) {
-    return false;
-  }
-  // Configuration alone must never capture the planner frontend.  This is
-  // intentionally the post-warm-up activation edge: the manager will build
-  // and dry-run a same-owner pair before Runtime is allowed to start.
-  // Bootstrap is only the transition from pending neutral intent to the first
-  // authoritative nonzero command.  If Runtime has already executed offset
-  // authority, losing the Pair must remain fail-closed: a null-expected-pair
-  // bootstrap would otherwise attach retained nonzero state to a new planner
-  // owner without an old-authority seam or recovery proof.
   const std::shared_ptr<const TubeEpochSnapshot> epoch =
       std::atomic_load(&latest_epoch_snapshot_);
   if (!epoch || !IsOffsetCertifiedProfile(epoch->active_profile)) {
     return false;
   }
-  return zero_gate_open_ && !failure_latched_ &&
-      !capturePathTubePair() && runtime_->hasPendingOrActiveOffsetIntent() &&
-      !runtime_->hasExecutedOffsetAuthority();
+  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
+  if (pair || !zero_gate_open_ || failure_latched_ ||
+      runtime_->hasExecutedOffsetAuthority() || runtime_->retainedDelta() != 0.0) {
+    return false;
+  }
+
+  // Advertised NORMAL always reconnects to the existing H2 null-expected-pair
+  // stage/prepare/final-CAS lifecycle.  The predicate is deliberately
+  // independent of manual waveform intent and the test-only Runtime owner.
+  // The old intent-gated behavior remains only for explicitly unadvertised
+  // compatibility fixtures.
+  if (advertised_) {
+    const phase_offset_navigation::ActiveReferenceSnapshot authority =
+        execution_authority_.snapshot();
+    return !authority.valid ||
+        authority.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
+  }
+  if (!execution_authority_.config().allow_test_only_runtime_owner) {
+    return false;
+  }
+  return runtime_->hasPendingOrActiveOffsetIntent();
 }
 
 bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPair(
@@ -1449,17 +1516,40 @@ bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPairLocked(
       config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
     return false;
   }
-  // A Runtime-owned pending activation is valid only for the existing
-  // unadvertised test fixture capability.  In production, an already present
-  // never-executed Runtime pair must not block neutral planner retirement.
+  if (pair != capturePathTubePair() || !IsOffsetCertifiedProfile(pair->active_profile) ||
+      !zero_gate_open_ || failure_latched_ ||
+      runtime_->hasExecutedOffsetAuthority() || runtime_->retainedDelta() != 0.0) {
+    return false;
+  }
+  if (advertised_) {
+    // A live production Pair remains the command-local activation owner even
+    // when the selected NORMAL command is exactly neutral/zero.  This keeps
+    // steady NORMAL and planner replacement on the same H2 lifecycle.
+    const phase_offset_navigation::ActiveReferenceSnapshot authority =
+        execution_authority_.snapshot();
+    if (!authority.valid || authority.owner_mode ==
+            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY) {
+      return true;
+    }
+    const bool steady_zero_normal =
+        (authority.owner_mode ==
+             phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
+         authority.owner_mode ==
+             phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION) &&
+        authority.selected_u_owner ==
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName() &&
+        authority.authority_session == pair->authority_session &&
+        authority.executed_path_revision == pair->path_revision &&
+        authority.frame_revision == pair->frame_revision &&
+        authority.tube_revision == pair->active_profile->tube_revision &&
+        authority.profile_revision == pair->active_profile->profile_revision &&
+        authority.proposed_next_delta == 0.0;
+    return steady_zero_normal;
+  }
   if (!execution_authority_.config().allow_test_only_runtime_owner) {
     return false;
   }
-  return IsOffsetCertifiedProfile(pair->active_profile) &&
-      zero_gate_open_ && !failure_latched_ &&
-      pair == capturePathTubePair() &&
-      runtime_->hasPendingOrActiveOffsetIntent() &&
-      !runtime_->hasExecutedOffsetAuthority();
+  return runtime_->hasPendingOrActiveOffsetIntent();
 }
 
 double PhaseOffsetMatchedAdapter::bootstrapPreparedHorizonEnd(
@@ -1570,6 +1660,7 @@ void PhaseOffsetMatchedAdapter::shutdown() {
   pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
   pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
   pending_handoff_valid_ = false;
+  pending_normal_source_pair_.reset();
   pending_recovery_source_pair_.reset();
   pending_recovery_execution_pair_.reset();
   pending_recovery_target_pair_.reset();
@@ -1684,6 +1775,7 @@ bool PhaseOffsetMatchedAdapter::resetForNewNavigationTask(
   pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
   pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
   pending_handoff_valid_ = false;
+  pending_normal_source_pair_.reset();
   pending_recovery_source_pair_.reset();
   pending_recovery_execution_pair_.reset();
   pending_recovery_target_pair_.reset();
@@ -1729,6 +1821,7 @@ std::uint64_t PhaseOffsetMatchedAdapter::retirePathTubeAuthorityLocked(
   pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
   pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
   pending_handoff_valid_ = false;
+  pending_normal_source_pair_.reset();
   pending_recovery_source_pair_.reset();
   pending_recovery_execution_pair_.reset();
   pending_recovery_target_pair_.reset();
@@ -1814,6 +1907,7 @@ void PhaseOffsetMatchedAdapter::deactivateLocked(
   pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
   pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
   pending_handoff_valid_ = false;
+  pending_normal_source_pair_.reset();
   pending_recovery_source_pair_.reset();
   pending_recovery_execution_pair_.reset();
   pending_recovery_target_pair_.reset();
@@ -1893,6 +1987,7 @@ void PhaseOffsetMatchedAdapter::commitDeactivationNoFailLocked(
   pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
   pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
   pending_handoff_valid_ = false;
+  pending_normal_source_pair_.reset();
   pending_recovery_source_pair_.reset();
   pending_recovery_execution_pair_.reset();
   pending_recovery_target_pair_.reset();
@@ -1911,6 +2006,9 @@ void PhaseOffsetMatchedAdapter::commitDeactivationNoFailLocked(
 void PhaseOffsetMatchedAdapter::advertise(ros::NodeHandle& nh) {
   if (!configuration_valid_ || advertised_ ||
       shutdown_requested_.load(std::memory_order_acquire)) return;
+  // Advertisement wires publishers and the timer worker only.  Session
+  // ownership remains with the manager's existing new-task reset / H2 pair
+  // lifecycle; there is no duplicate advertise-time initialization.
   execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
   if (config_.mode == PhaseOffsetMatchedMode::ACTIVE) {
     active_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>("phase_offset_active/diagnostics", 1);
@@ -4240,6 +4338,140 @@ void PhaseOffsetMatchedAdapter::fillManualDiagnostics(MatchedAdapterOutput& outp
   for (double& value : d) value = FiniteOrZero(value);
 }
 
+bool PhaseOffsetMatchedAdapter::evaluateNormalAllocator(
+    const MatchedAdapterInput& input,
+    const phase_offset_navigation::RuntimePreparedStep& prepared,
+    const double base_w_dot,
+    phase_offset_navigation::NormalPreviewResult& preview,
+    phase_offset_navigation::PhaseOffsetAllocatorResult& allocator,
+    Eigen::Vector3d& g_des,
+    std::string& failure_reason) const {
+  preview = phase_offset_navigation::NormalPreviewResult();
+  allocator = phase_offset_navigation::PhaseOffsetAllocatorResult();
+  g_des = Eigen::Vector3d::Zero();
+  failure_reason.clear();
+
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile =
+      prepared.active_profile;
+  if (!profile || !profile->complete || profile->samples.size() < 2U) {
+    failure_reason = "NORMAL Preview profile is unavailable";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        PREVIEW_INFEASIBLE;
+    allocator.reason = failure_reason;
+    return false;
+  }
+  if (!prepared.geometry.valid || !prepared.geometry.r_w.allFinite() ||
+      !prepared.geometry.N.allFinite() || !std::isfinite(base_w_dot) ||
+      !std::isfinite(prepared.dt) || prepared.dt <= 0.0) {
+    failure_reason = "NORMAL allocator geometry or tick is invalid";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        INVALID_INPUT;
+    allocator.reason = failure_reason;
+    return false;
+  }
+
+  // The parallel swarm workstream hands this boundary an exact value.  In
+  // single-UAV operation there is no producer, so use only the frozen
+  // recentering term and the immutable current normal; no neighbour state or
+  // swarm mathematics is reconstructed here.
+  if (input.g_des_valid) {
+    g_des = input.g_des;
+  } else if (prepared.delta == 0.0) {
+    g_des.setZero();
+  } else {
+    g_des = -config_.delta_tracking_gain * prepared.delta *
+        prepared.geometry.N;
+  }
+  if (!g_des.allFinite()) {
+    failure_reason = "NORMAL desired active-reference motion is invalid";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        INVALID_INPUT;
+    allocator.reason = failure_reason;
+    return false;
+  }
+
+  // The immutable policy is the sole source of the common phase-rate
+  // envelope and W-domain horizon/sampling/beta thresholds.  C3 does not
+  // derive any of these values from geometry, the current command or Tube
+  // sample density.
+  const phase_offset_navigation::NormalPreviewProductionPolicy& policy =
+      config_.normal_preview_policy;
+  if (!config_.normal_preview_policy_explicit || !policy.valid()) {
+    failure_reason = "NORMAL Preview production policy is unavailable";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        INVALID_INPUT;
+    allocator.reason = failure_reason;
+    return false;
+  }
+
+  phase_offset_navigation::NormalPreviewInput preview_input;
+  preview_input.profile = profile.get();
+  preview_input.current_w = prepared.geometry.w;
+  preview_input.current_delta = prepared.delta;
+  preview_input.policy = policy;
+  preview_input.upper_u_delta = std::max(0.0, config_.u_delta_abs_max);
+  preview_input.boundary_tolerance = 1e-10;
+  preview_input.path_revision = profile->path_revision;
+  preview_input.frame_revision = profile->frame_revision;
+  preview_input.profile_revision = profile->profile_revision;
+  preview_input.expected_path_revision = profile->path_revision;
+  preview_input.expected_frame_revision = profile->frame_revision;
+  preview_input.expected_profile_revision = profile->profile_revision;
+  if (!phase_offset_navigation::NormalPreview::evaluate(
+          preview_input, preview)) {
+    failure_reason = preview.reason.empty() ?
+        "NORMAL Preview evaluation failed" : preview.reason;
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        PREVIEW_INFEASIBLE;
+    allocator.reason = failure_reason;
+    return false;
+  }
+
+  phase_offset_navigation::PhaseOffsetAllocatorInput allocator_input;
+  allocator_input.geometry = prepared.geometry;
+  allocator_input.preview = &preview;
+  allocator_input.g_des = g_des;
+  allocator_input.f_w0 = base_w_dot;
+  allocator_input.previous_u = runtime_->previousFinalPort();
+  allocator_input.dt = prepared.dt;
+  allocator_input.bounds.lower_nu = policy.lower_nu;
+  allocator_input.bounds.upper_nu = policy.upper_nu;
+  allocator_input.bounds.u_w_abs_max = std::max(0.0, config_.u_w_abs_max);
+  allocator_input.bounds.upper_u_delta =
+      std::max(0.0, config_.u_delta_abs_max);
+  allocator_input.bounds.u_w_slew_rate =
+      std::max(0.0, config_.u_w_rate_max);
+  allocator_input.bounds.u_delta_slew_rate =
+      std::max(0.0, config_.u_delta_rate_max);
+  allocator_input.bounds.zoh_dt = prepared.dt;
+  allocator_input.expected_path_revision = profile->path_revision;
+  allocator_input.expected_frame_revision = profile->frame_revision;
+  allocator_input.expected_profile_revision = profile->profile_revision;
+  allocator_input.expected_source_revision = profile->source_revision;
+  allocator_input.expected_tube_revision = profile->tube_revision;
+  allocator_input.expected_map_revision = profile->map_revision;
+  allocator_input.expected_obstacle_contract_id =
+      profile->obstacle_contract_id;
+  if (!phase_offset_navigation::PhaseOffsetAllocator::allocate(
+          allocator_input, allocator)) {
+    failure_reason = allocator.reason.empty()
+        ? "NORMAL PhaseOffsetAllocator rejected the value"
+        : allocator.reason;
+    return false;
+  }
+  if (!allocator.valid || !allocator.feasible ||
+      allocator.selected_u_owner !=
+          phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
+      !allocator.selectedUConsistent(0.0)) {
+    failure_reason = "NORMAL PhaseOffsetAllocator returned inconsistent selected-u";
+    allocator.valid = false;
+    allocator.feasible = false;
+    allocator.reason = failure_reason;
+    return false;
+  }
+  return true;
+}
+
 bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
     const MatchedAdapterInput& input,
     const std::shared_ptr<const PathTubePair>& pair,
@@ -4249,7 +4481,9 @@ bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
     const Eigen::Vector3d& base_v_cmd,
     const double base_w_dot,
     const bool base_guidance_valid,
-    phase_offset_navigation::RuntimeStepOutput& output) {
+    phase_offset_navigation::RuntimeStepOutput& output,
+    const phase_offset_navigation::PhaseOffsetAllocatorResult*
+        allocator_result) {
   output = phase_offset_navigation::RuntimeStepOutput();
   if (!runtime_) return false;
 
@@ -4259,8 +4493,92 @@ bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
   phase_offset_navigation::PhaseOffsetRuntime staged_runtime(*runtime_);
   const phase_offset_core::PortCommand previous_final_port =
       staged_runtime.previousFinalPort();
-  if (!staged_runtime.complete(prepared, base_v_cmd, base_w_dot,
-                               base_guidance_valid, output)) {
+  if (allocator_result != nullptr) {
+    // The allocator already emitted the exact NORMAL selected-u.  Do not
+    // route it through Runtime's legacy manual waveform or PortProjector,
+    // either of which could replace the value before matched execution.
+    output = phase_offset_navigation::RuntimeStepOutput();
+    if (!allocator_result->valid || !allocator_result->feasible ||
+        allocator_result->selected_u_owner !=
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
+        !allocator_result->selectedUConsistent(0.0) ||
+        !prepared.valid || !prepared.requires_base_guidance ||
+        !base_guidance_valid || !base_v_cmd.allFinite() ||
+        !std::isfinite(base_w_dot) || !std::isfinite(prepared.dt) ||
+        prepared.dt <= 0.0) {
+      output.selected = false;
+      output.valid = false;
+      output.invalid_reason =
+          "NORMAL allocator selected-u is invalid at execution boundary";
+      return false;
+    }
+    const phase_offset_core::PortCommand selected_u =
+        allocator_result->selected_u;
+    phase_offset_core::MatchedPortInput matched_input;
+    matched_input.geometry = prepared.geometry;
+    matched_input.base_v_cmd = base_v_cmd;
+    matched_input.base_w_dot = base_w_dot;
+    matched_input.final_port = selected_u;
+    if (!phase_offset_core::MatchedPort::evaluate(
+            matched_input, output.matched) || !output.matched.valid) {
+      output.selected = false;
+      output.valid = false;
+      output.invalid_reason = output.matched.invalid_reason.empty()
+          ? "NORMAL allocator matched output is invalid"
+          : output.matched.invalid_reason;
+      return false;
+    }
+    output.geometry = prepared.geometry;
+    output.raw_port = selected_u;
+    output.projection.final_port = selected_u;
+    output.projection.final_w_dot = base_w_dot + selected_u.u_w;
+    output.projection.final_tangent_speed =
+        prepared.geometry.T.dot(output.matched.v_cmd);
+    output.projection.next_delta = prepared.delta +
+        prepared.dt * selected_u.u_delta;
+    output.projection.next_regularity = prepared.geometry.regularity;
+    output.projection.u_w_limited = allocator_result->u_w.amplitude_limited ||
+        allocator_result->u_w.envelope_limited ||
+        allocator_result->u_w.slew_limited;
+    output.projection.u_delta_limited =
+        allocator_result->u_delta.amplitude_limited ||
+        allocator_result->u_delta.envelope_limited ||
+        allocator_result->u_delta.slew_limited;
+    output.projection.valid = std::isfinite(output.projection.final_w_dot) &&
+        std::isfinite(output.projection.final_tangent_speed) &&
+        std::isfinite(output.projection.next_delta) &&
+        std::isfinite(output.projection.next_regularity);
+    output.current_bounds = prepared.current_bounds;
+    output.next_bounds = prepared.current_bounds;
+    if (prepared.active_profile && prepared.active_profile->complete) {
+      phase_offset_navigation::TubeBounds queried_next;
+      const double next_w = prepared.geometry.w + prepared.dt *
+          output.projection.final_w_dot;
+      if (phase_offset_navigation::TubeFilter::query(
+              *prepared.active_profile, next_w, queried_next)) {
+        output.next_bounds = queried_next;
+      }
+    }
+    output.active_profile = prepared.active_profile;
+    output.preflight = prepared.preflight;
+    output.epoch_status = prepared.epoch_status;
+    output.execution = prepared.execution;
+    output.execution.mode = phase_offset_navigation::RuntimeExecutionMode::
+        NORMAL;
+    output.execution.executable = output.projection.valid;
+    output.delta = prepared.delta;
+    output.delta_ref = 0.0;
+    output.profile_active = false;
+    output.selected = output.projection.valid;
+    output.valid = output.projection.valid;
+    output.exact_terminal_predicate = output.projection.valid &&
+        output.projection.next_delta == 0.0;
+    if (!output.valid) {
+      output.invalid_reason = "NORMAL allocator selected-u recurrence is invalid";
+      return false;
+    }
+  } else if (!staged_runtime.complete(prepared, base_v_cmd, base_w_dot,
+                                      base_guidance_valid, output)) {
     return false;
   }
   if (!output.selected) {
@@ -4393,9 +4711,13 @@ bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
   candidate.tube_revision = profile ? profile->tube_revision : 0U;
   candidate.profile_revision = profile ? profile->profile_revision : 0U;
   candidate.map_revision = profile ? profile->map_revision : 0U;
+  candidate.obstacle_contract_id = profile ? profile->obstacle_contract_id
+                                           : std::string();
   candidate.owner_mode =
       phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL;
-  candidate.selected_u_owner = "PhaseOffsetMatchedAdapterRuntime";
+  candidate.selected_u_owner = allocator_result != nullptr
+      ? phase_offset_navigation::PhaseOffsetAllocator::ownerName()
+      : "PhaseOffsetMatchedAdapterRuntime";
   candidate.w = prepared.geometry.w;
   candidate.delta = prepared.delta;
   candidate.dt = prepared.dt;
@@ -4414,9 +4736,10 @@ bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
   candidate.executed_N = prepared.geometry.N;
   candidate.executed_reference_query = reference_query;
   candidate.reference_query_revision = reference_query->queryRevision();
-  candidate.provenance = pair
-      ? "PhaseOffsetMatchedAdapter/path-tube-runtime"
-      : "PhaseOffsetMatchedAdapter/planner-runtime";
+  candidate.provenance = allocator_result != nullptr
+      ? "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator"
+      : (pair ? "PhaseOffsetMatchedAdapter/path-tube-runtime"
+              : "PhaseOffsetMatchedAdapter/planner-runtime");
   candidate.safety_status = output.execution.certificate_denied
       ? "CERTIFICATE_DENIED" : "SAFE";
   candidate.handoff_state = pair ? "PATH_TUBE_PAIR" : "PLANNER_ONLY";
@@ -4464,7 +4787,17 @@ bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
           "selected Runtime step cannot form a bounded commit token";
       return false;
     }
+    if (allocator_result != nullptr) {
+      // NORMAL allocator execution updates only the exact selected-u ZOH
+      // state.  Runtime's manual profile lifecycle is not a second owner.
+      pending_runtime_commit_.should_start_profile = false;
+      pending_runtime_commit_.profile_active = false;
+      pending_runtime_commit_.safety_priority = false;
+      pending_runtime_commit_.complete_profile = false;
+    }
     pending_authority_prepared_ = authority_prepared;
+    pending_normal_source_pair_ = allocator_result != nullptr ? pair
+        : std::shared_ptr<const PathTubePair>();
     pending_authority_session_ = authority_prepared.candidate.authority_session;
     pending_authority_valid_ = true;
     return true;
@@ -5406,6 +5739,7 @@ void PhaseOffsetMatchedAdapter::clearPendingPositionCommandLocked() {
   pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
   pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
   pending_handoff_valid_ = false;
+  pending_normal_source_pair_.reset();
   pending_recovery_source_pair_.reset();
   pending_recovery_execution_pair_.reset();
   pending_recovery_target_pair_.reset();
@@ -5439,6 +5773,33 @@ bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
   }
   const std::shared_ptr<const PathTubePair> live_pair =
       std::atomic_load(&authoritative_path_tube_pair_);
+  if (candidate.owner_mode ==
+      phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL) {
+    const std::shared_ptr<const PathTubePair>& source_pair =
+        pending_normal_source_pair_;
+    const bool source_pair_matches = source_pair &&
+        live_pair == source_pair &&
+        candidate.authority_session == source_pair->authority_session &&
+        source_pair->authority_session == pending_authority_session_ &&
+        source_pair->source_revision == candidate.planner_path_revision &&
+        source_pair->path_revision == candidate.executed_path_revision &&
+        source_pair->frame_revision == candidate.frame_revision &&
+        source_pair->active_profile &&
+        source_pair->active_profile->source_revision ==
+            candidate.planner_path_revision &&
+        source_pair->active_profile->path_revision ==
+            candidate.executed_path_revision &&
+        source_pair->active_profile->frame_revision ==
+            candidate.frame_revision &&
+        source_pair->active_profile->tube_revision == candidate.tube_revision &&
+        source_pair->active_profile->profile_revision ==
+            candidate.profile_revision &&
+        source_pair->active_profile->map_revision == candidate.map_revision;
+    if (!source_pair_matches) {
+      if (reason) *reason = "pending NORMAL source Pair identity or revisions changed";
+      return false;
+    }
+  }
   if (candidate.owner_mode ==
           phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY) {
     const auto pair_matches_candidate =
@@ -5849,7 +6210,65 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
           execution_authority_.snapshot();
       bool authority_step_completed = false;
-      if (current_authority.valid &&
+      phase_offset_navigation::NormalPreviewResult normal_preview;
+      phase_offset_navigation::PhaseOffsetAllocatorResult normal_allocator;
+      Eigen::Vector3d normal_g_des = Eigen::Vector3d::Zero();
+      std::string normal_allocator_failure;
+      const bool recovery_authority = current_authority.valid &&
+          current_authority.owner_mode ==
+              phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
+      const bool active_nonzero_authority = current_authority.valid &&
+          !recovery_authority && runtime_->hasExecutedOffsetAuthority() &&
+          prepared.delta != 0.0;
+      // C3 production path: consume the current valid NORMAL Preview value,
+      // invoke the sole NoQP allocator, and pass its exact selected-u through
+      // the existing authority/matched transaction.  Recovery remains owned
+      // by the existing RecoveryOwner path below.
+      if (advertised_ && !recovery_authority && !config_.observe_only &&
+          pair && prepared.requires_base_guidance &&
+          prepared.execution.mode ==
+              phase_offset_navigation::RuntimeExecutionMode::NORMAL) {
+        const bool allocator_ok = evaluateNormalAllocator(
+            input, prepared, base.w_dot, normal_preview, normal_allocator,
+            normal_g_des, normal_allocator_failure);
+        output.g_des = normal_g_des;
+        output.g_des_valid = allocator_ok &&
+            normal_g_des.allFinite();
+        output.normal_preview = normal_preview;
+        output.allocator = normal_allocator;
+        output.allocator_evaluated = true;
+        if (allocator_ok) {
+          authority_step_completed = completeThroughExecutionAuthority(
+              input, pair, request, pair->epoch_snapshot, prepared,
+              base.v_cmd, base.w_dot, base_ok && base.valid, runtime_output,
+              &normal_allocator);
+        } else {
+          // Preview/allocator failure is value-only for a neutral planner
+          // baseline.  Once an authoritative nonzero NORMAL state exists,
+          // fail this tick closed so the manager cannot publish nominal
+          // centerline guidance; all committed authority/runtime state stays
+          // untouched in either case.
+          runtime_output = phase_offset_navigation::RuntimeStepOutput();
+          runtime_output.geometry = prepared.geometry;
+          runtime_output.active_profile = prepared.active_profile;
+          runtime_output.current_bounds = prepared.current_bounds;
+          runtime_output.preflight = prepared.preflight;
+          runtime_output.epoch_status = prepared.epoch_status;
+          runtime_output.execution = prepared.execution;
+          runtime_output.execution.mode =
+              phase_offset_navigation::RuntimeExecutionMode::NORMAL;
+          runtime_output.execution.executable = true;
+          runtime_output.delta = prepared.delta;
+          runtime_output.delta_ref = 0.0;
+          runtime_output.profile_active = false;
+          runtime_output.selected = false;
+          runtime_output.valid = active_nonzero_authority
+              ? false : (base_ok && base.valid);
+          runtime_output.execution.executable = !active_nonzero_authority;
+          runtime_output.invalid_reason = normal_allocator_failure;
+          output.allocator_value_failure = true;
+        }
+      } else if (current_authority.valid &&
           current_authority.owner_mode ==
               phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY &&
           prepared.delta == 0.0 &&
@@ -5862,11 +6281,9 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
             input, pair, request, pair->epoch_snapshot, prepared, base.v_cmd,
             base.w_dot, base_ok && base.valid, runtime_output);
       }
-      // A production NORMAL/COORDINATION Runtime candidate is deliberately
-      // rejected by ExecutionAuthority while Batch C is unauthorized.  An
-      // already-authoritative nonzero pair may instead enter the real
-      // Preview -> Handoff -> RecoveryOwner chain; the recovery owner owns
-      // the exact selected-u and the same authority transaction below.
+      // Any active nonzero failure (including Preview/allocator failure) uses
+      // the existing Preview -> Handoff -> RecoveryOwner chain.  RecoveryOwner
+      // remains the sole owner for that mode; no C3-local HOLD is created.
       if (!authority_step_completed && advertised_ && pair &&
           prepared.delta != 0.0) {
       authority_step_completed = completeThroughRecoveryOwner(
@@ -5893,6 +6310,13 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       output.recovery_replan_required =
           runtime_output.recovery_replan_required;
       output.invalid_reason = runtime_output.invalid_reason;
+      if (output.allocator_value_failure &&
+          !runtime_output.execution.executable) {
+        // Keep the nominal base guidance available as evidence only; the
+        // active-authority failure path must not expose it as executable
+        // matched guidance or allow a caller to publish a centerline command.
+        output.guidance = guidance::IsfGuidance();
+      }
       if (output.selected) SetGuidance(base, output.matched, output.guidance);
     } else {
       output.valid = prepared.valid;
@@ -6020,6 +6444,35 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
     output.active_profile = runtime_epoch->active_profile;
     output.tube_epoch_status = runtime_epoch->epoch_status;
   }
+
+  // Advertised production NORMAL has exactly one entry point: an installed
+  // H2 PathTubePair.  Before the existing timer-side stage/prepare/final CAS
+  // publishes that pair, keep the planner/zero-port baseline and publish only
+  // immutable request/evidence.  In particular, do not run Runtime::complete,
+  // Preview, Allocator, PortProjector or ExecutionAuthority on a no-pair tick.
+  // Unadvertised fixtures retain the legacy Runtime compatibility path below.
+  if (advertised_) {
+    output.base_guidance = output.zero_port.guidance;
+    output.guidance = output.zero_port.guidance;
+    output.delta = runtime_->retainedDelta();
+    output.delta_ref = 0.0;
+    output.profile_active = false;
+    output.selected = false;
+    output.valid = output.zero_port.valid && output.zero_comparison.valid &&
+        !failure_latched_;
+    output.invalid_reason = output.valid ? "PathTubePair activation pending"
+                                         : output.zero_comparison.invalid_reason;
+    output.failure_latched = failure_latched_;
+    output.control_failure_reason = control_failure_reason_;
+    output.tube_profile = output.active_profile ? *output.active_profile
+        : phase_offset_navigation::TubeProfile();
+    fillLegacyTubeStatus(output);
+    fillManualDiagnostics(output);
+    makeControlPublishSnapshot(input, request, exposure_epoch, candidate_only,
+                               output);
+    return false;
+  }
+
   {
     phase_offset_navigation::RuntimePrepareInput runtime_input;
     runtime_input.current_path = input.path;
@@ -6035,14 +6488,12 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
           config_.tube_update_period, config_.tube.min_certified_forward_w);
     }
     runtime_input.dt = input.dt;
-    // A sidecar epoch is evidence only.  Until the manager has atomically
-    // installed a matching pair at the activation edge, Runtime must not
-    // consume the open warm-up gate and emit the first nonzero offset port.
-    // The legacy NONE source has no Tube authority contract and retains its
-    // isolated A4 recurrence behavior.
-    runtime_input.zero_gate_open =
-        config_.tube_source == phase_offset_navigation::TubeSource::NONE &&
-        zero_gate_open_ && !failure_latched_ && !config_.observe_only;
+    // The unadvertised compatibility path retains the historical Runtime
+    // gate semantics.  Advertised production has already returned above
+    // unless it carries an exact installed PathTubePair.
+    runtime_input.zero_gate_open = zero_gate_open_ && !failure_latched_ &&
+        !config_.observe_only &&
+        (config_.tube_source == phase_offset_navigation::TubeSource::NONE);
     runtime_input.fatal_adapter_failure_latched = failure_latched_;
     phase_offset_navigation::RuntimePreparedStep prepared;
     runtime_->prepare(runtime_input, prepared);
@@ -6066,9 +6517,9 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       const bool base_ok = guidance::IsfReferenceKernel::evaluate(
           input.position, reference, input.gains, base);
       completeThroughExecutionAuthority(
-          input, std::shared_ptr<const PathTubePair>(), request, runtime_epoch,
-          prepared, base.v_cmd, base.w_dot, base_ok && base.valid,
-          runtime_output);
+          input, std::shared_ptr<const PathTubePair>(), request,
+          runtime_epoch, prepared, base.v_cmd, base.w_dot,
+          base_ok && base.valid, runtime_output);
       completed = true;
       output.base_guidance = base;
       output.geometry = runtime_output.geometry;
@@ -6085,6 +6536,10 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
       output.selected = runtime_output.selected;
       output.valid = runtime_output.valid;
       output.invalid_reason = runtime_output.invalid_reason;
+      if (output.allocator_value_failure &&
+          !runtime_output.execution.executable) {
+        output.guidance = guidance::IsfGuidance();
+      }
       if (output.selected) SetGuidance(base, output.matched, output.guidance);
     } else {
       output.valid = prepared.valid;

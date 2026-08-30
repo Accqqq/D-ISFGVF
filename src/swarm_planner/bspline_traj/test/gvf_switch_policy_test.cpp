@@ -15,6 +15,9 @@
 #include <thread>
 #include <vector>
 
+#define private public
+#include <plan_env/sdf_map.h>
+#undef private
 #include <bspline_race/gvf_manager.h>
 #include <phase_offset_core/geometry.h>
 
@@ -411,6 +414,104 @@ class GvfManagerS4AnchorTestAccess {
     return static_cast<bool>(manager.cmd_pub);
   }
 
+  static bool installProductionManagerFixture(
+      gvf_manager& manager,
+      const std::shared_ptr<const ContinuousPhasePath>& owner,
+      const std::shared_ptr<SDFMap>& map,
+      ros::NodeHandle& nh) {
+    if (!owner || !map) return false;
+    // The zero-argument manager constructor is intentionally lightweight for
+    // deterministic unit fixtures.  Set the legacy command-mode flags that
+    // cmdCallback reads before reaching the production H2 path.
+    manager.use_test_cmd_ = false;
+    manager.enable_gvfcmd_control = false;
+    PhaseOffsetMatchedAdapterConfig config;
+    config.mode = PhaseOffsetMatchedMode::MANUAL;
+    config.tube_source = phase_offset_navigation::TubeSource::ESDF;
+    config.observe_only = false;
+    config.profile_period = 2.0;
+    config.warmup_cycles = 100;
+    config.u_w_rate_max = 100.0;
+    config.u_delta_rate_max = 100.0;
+    config.u_delta_abs_max = 0.40;
+    config.tube_update_period = 0.10;
+    config.normal_preview_policy.preview_horizon_w = 2.0;
+    config.normal_preview_policy.sample_spacing_w = 0.10;
+    config.normal_preview_policy.lower_nu = 0.02;
+    config.normal_preview_policy.upper_nu = 2.0;
+    config.normal_preview_policy.b_tight = 0.10;
+    config.normal_preview_policy.b_open = 0.90;
+    config.normal_preview_policy.policy_revision = 1U;
+    config.normal_preview_policy.configuration_identity = 1U;
+    config.normal_preview_policy.configuration_id = "test-normal-preview-w";
+    config.normal_preview_policy_explicit = true;
+    config.tube.fixed_delta_max = 0.04;
+    config.tube.back_w = 0.0;
+    config.tube.lookahead_w = 2.0;
+    config.tube.min_certified_forward_w = 0.40;
+    config.tube.cross_section.search_extent = 3.0;
+    config.tube.cross_section.ray_step = 0.05;
+    config.tube.cross_section.boundary_tolerance = 0.01;
+    config.tube.cross_section.regularity_margin = 0.10;
+    config.tube.cross_section.curvature_epsilon = 1e-9;
+    config.tube.cross_section.planner_safe_distance = 0.40;
+    config.tube.cross_section.margins.uav_radius = 0.25;
+    config.tube.cross_section.margins.map_uncertainty = 0.10;
+    config.tube.cross_section.margins.localization_uncertainty = 0.05;
+    config.tube.cross_section.margins.tracking_error_bound = 0.15;
+    config.tube.cross_section.margins.preincluded_map_uncertainty = 0.10;
+    config.cloud_obstacle_set_complete = true;
+    std::unique_ptr<PhaseOffsetMatchedAdapter> adapter(
+        new PhaseOffsetMatchedAdapter(config));
+    if (!adapter->configurationValid()) return false;
+    manager.matched_config_ = config;
+    manager.phase_offset_matched_adapter_ = std::move(adapter);
+    manager.cmd_topic_ = "/gvf_c3_bootstrap/position_command";
+    manager.cmd_pub = nh.advertise<quadrotor_msgs::PositionCommand>(
+        manager.cmd_topic_, 10);
+    const std::uint64_t session_before_advertise =
+        manager.phase_offset_matched_adapter_->authority_session_.load(
+            std::memory_order_acquire);
+    manager.phase_offset_matched_adapter_->advertise(nh);
+    const std::uint64_t session_after_advertise =
+        manager.phase_offset_matched_adapter_->authority_session_.load(
+            std::memory_order_acquire);
+    if (session_after_advertise != session_before_advertise) return false;
+    if (!manager.resetForNewNavigationTask()) return false;
+    gvf_manager::gvfManager frontend;
+    frontend.gvf_.reset(new gvf());
+    frontend.gvf_->setAuthoritativePhaseMode(true);
+    frontend.gvf_->setContinuousPhasePath(owner);
+    frontend.gvf_->gvf_.K1_ = 2.0;
+    frontend.gvf_->gvf_.K2_ = -2.2;
+    frontend.gvf_->gvf_.convergence_bandwidth_ = 0.1;
+    frontend.gvf_->progress_rho0_ = 0.5;
+    frontend.gvf_->progress_delta_ = 0.3;
+    frontend.gvf_->alpha_min_ = 0.05;
+    frontend.sdf_map_ = map;
+    frontend.receive_goal = true;
+    frontend.goal_pt = Eigen::Vector3d(20.0, 0.0, 1.0);
+    manager.swarmParticlesManager.clear();
+    manager.swarmParticlesManager.push_back(frontend);
+    manager.point_phase_v2_enabled_ = true;
+    manager.odom_ = Eigen::Vector3d(0.4, 0.10, 1.10);
+    manager.publishAuthoritativePhase(0.4, true, false);
+    return static_cast<bool>(manager.cmd_pub);
+  }
+
+  static void runCommand(gvf_manager& manager) {
+    manager.cmdCallback(ros::TimerEvent());
+  }
+
+  static MatchedAdapterOutput latestAdapterOutput(gvf_manager& manager) {
+    const std::shared_ptr<const ControlPublishSnapshot> control =
+        manager.phase_offset_matched_adapter_
+            ? std::atomic_load(&manager.phase_offset_matched_adapter_
+                                    ->latest_control_snapshot_)
+            : std::shared_ptr<const ControlPublishSnapshot>();
+    return control ? control->output : MatchedAdapterOutput();
+  }
+
   static bool updateAdapter(gvf_manager& manager,
                             const MatchedAdapterInput& input,
                             MatchedAdapterOutput& output) {
@@ -659,6 +760,16 @@ class GvfManagerS4AnchorTestAccess {
     config.u_delta_rate_max = 100.0;
     config.u_delta_abs_max = 0.40;
     config.tube_update_period = 0.10;
+    config.normal_preview_policy.preview_horizon_w = 2.0;
+    config.normal_preview_policy.sample_spacing_w = 0.10;
+    config.normal_preview_policy.lower_nu = 0.02;
+    config.normal_preview_policy.upper_nu = 2.0;
+    config.normal_preview_policy.b_tight = 0.10;
+    config.normal_preview_policy.b_open = 0.90;
+    config.normal_preview_policy.policy_revision = 1U;
+    config.normal_preview_policy.configuration_identity = 1U;
+    config.normal_preview_policy.configuration_id = "test-normal-preview-w";
+    config.normal_preview_policy_explicit = true;
     config.tube.fixed_delta_max = 0.04;
     config.tube.back_w = 0.0;
     config.tube.lookahead_w = 2.0;
@@ -1140,6 +1251,48 @@ std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeTimerBootstrapPath(
         return true;
       }));
   return path;
+}
+
+void initializeProductionFreeMap(SDFMap& map) {
+  map.mp_.resolution_ = map.mp_.resolution_inv_ = 1.0;
+  map.mp_.map_origin_ = Eigen::Vector3d(-5.0, -5.0, -5.0);
+  map.mp_.map_size_ = Eigen::Vector3d(10.0, 10.0, 10.0);
+  map.mp_.map_voxel_num_ = Eigen::Vector3i(10, 10, 10);
+  map.mp_.map_min_boundary_ = map.mp_.map_origin_;
+  map.mp_.map_max_boundary_ = map.mp_.map_origin_ + map.mp_.map_size_;
+  map.mp_.clamp_min_log_ = -2.0;
+  map.mp_.min_occupancy_log_ = 0.0;
+  map.md_.occupancy_buffer_.assign(1000U, -1.0);
+  map.md_.occupancy_buffer_inflate_.assign(1000U, 1);
+  map.md_.distance_buffer_all_.assign(
+      1000U, std::numeric_limits<double>::quiet_NaN());
+  map.md_.manual_boundary_enabled_ = false;
+}
+
+void installProductionCloudSnapshot(SDFMap& map,
+                                    const std::uint64_t sequence = 1U) {
+  std::shared_ptr<plan_env::CloudOccupancySnapshot> snapshot(
+      new plan_env::CloudOccupancySnapshot());
+  snapshot->valid = true;
+  snapshot->observation_sequence = sequence;
+  snapshot->observation_stamp = ros::Time(static_cast<double>(sequence));
+  snapshot->map_min = map.mp_.map_min_boundary_;
+  snapshot->map_max = map.mp_.map_max_boundary_;
+  snapshot->observed_min = snapshot->map_min;
+  snapshot->observed_max = snapshot->map_max;
+  snapshot->grid_origin = map.mp_.map_origin_;
+  snapshot->voxel_count = map.mp_.map_voxel_num_;
+  snapshot->resolution = map.mp_.resolution_;
+  snapshot->included_map_inflation = 0.10;
+  const std::size_t size = static_cast<std::size_t>(snapshot->voxel_count.x()) *
+      static_cast<std::size_t>(snapshot->voxel_count.y()) *
+      static_cast<std::size_t>(snapshot->voxel_count.z());
+  snapshot->occupied.assign(size, 0U);
+  ASSERT_TRUE(plan_env::cloudOccupancySnapshotConsistent(*snapshot));
+  ASSERT_TRUE(map.cloud_occupancy_snapshot_store_);
+  std::lock_guard<std::mutex> lock(map.cloud_occupancy_snapshot_store_->mutex);
+  map.cloud_occupancy_snapshot_store_->observation_sequence = sequence;
+  map.cloud_occupancy_snapshot_store_->latest = snapshot;
 }
 
 std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeShortTimerBootstrapPath(
@@ -1987,12 +2140,10 @@ TEST(GvfTimerBootstrap,
 }
 
 TEST(GvfTimerBootstrap,
-     AdvertisedRuntimeIntentCannotBootstrapOrBlockNeutralPlannerReplacement) {
+     AdvertisedNeutralActivationUsesExistingPairLifecycle) {
   FLAG_Race::gvf_manager manager;
   const auto owner = makeTimerBootstrapPath(std::function<void()>());
-  const auto replacement = makeTimerBootstrapPath(std::function<void()>());
   ASSERT_TRUE(owner);
-  ASSERT_TRUE(replacement);
   ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
                   installTimerBootstrapFixture(manager, owner));
   FLAG_Race::GvfManagerS4AnchorTestAccess::setOdom(
@@ -2002,17 +2153,10 @@ TEST(GvfTimerBootstrap,
   FLAG_Race::GvfManagerS4AnchorTestAccess::setAdapterAdvertised(manager, true);
   FLAG_Race::GvfManagerS4AnchorTestAccess::setTestOnlyRuntimeOwnerAllowed(
       manager, false);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::openManualGate(manager);
 
-  ASSERT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
                    requiresPathTubePairBootstrap(manager));
-  const auto attempt = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      activateTimerBootstrapAttempt(manager);
-  EXPECT_FALSE(attempt.committed);
-  EXPECT_EQ("NOT_REQUIRED", attempt.outcome);
-  EXPECT_EQ("NONE", attempt.stage_failure);
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                   bootstrapAuthority(manager));
-
   const auto handoff = FLAG_Race::GvfManagerS4AnchorTestAccess::
       captureReplanHandoff(manager);
   EXPECT_FALSE(handoff.pair);
@@ -2024,14 +2168,139 @@ TEST(GvfTimerBootstrap,
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
                    authoritySnapshot(manager).valid);
 
-  const auto neutral = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      attemptNeutralPlannerFrontend(manager, replacement);
-  EXPECT_TRUE(neutral.committed);
-  EXPECT_TRUE(neutral.installed_new_owner);
-  EXPECT_FALSE(neutral.pair_present);
-  EXPECT_GT(neutral.session_after, neutral.session_before);
+  const auto bootstrap = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      activateTimerBootstrapAttempt(manager);
+  ASSERT_TRUE(bootstrap.committed) << bootstrap.outcome << ": "
+                                   << bootstrap.stage_failure;
+  const auto pair = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      bootstrapAuthority(manager);
+  ASSERT_TRUE(pair);
+  const auto post_handoff = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      captureReplanHandoff(manager);
+  EXPECT_EQ(post_handoff.pair, pair);
+  EXPECT_TRUE(post_handoff.pending_activation);
   EXPECT_DOUBLE_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::
                        retainedDelta(manager), 0.0);
+}
+
+TEST(GvfManagerGDes,
+     ProductionValueSeamProvidesUpdatesAndClearWithoutPrivateDefault) {
+  FLAG_Race::gvf_manager manager;
+  Eigen::Vector3d captured = Eigen::Vector3d::Constant(9.0);
+  EXPECT_FALSE(manager.capturePhaseOffsetGDes(captured));
+  EXPECT_TRUE(captured.isZero());
+
+  const Eigen::Vector3d supplied(0.21, -0.34, 0.56);
+  ASSERT_TRUE(manager.setPhaseOffsetGDes(supplied));
+  ASSERT_TRUE(manager.capturePhaseOffsetGDes(captured));
+  EXPECT_TRUE(captured.isApprox(supplied, 0.0));
+
+  const Eigen::Vector3d updated(-0.11, 0.22, -0.33);
+  ASSERT_TRUE(manager.setPhaseOffsetGDes(updated));
+  ASSERT_TRUE(manager.capturePhaseOffsetGDes(captured));
+  EXPECT_TRUE(captured.isApprox(updated, 0.0));
+
+  EXPECT_FALSE(manager.setPhaseOffsetGDes(
+      Eigen::Vector3d(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0)));
+  EXPECT_FALSE(manager.capturePhaseOffsetGDes(captured));
+  EXPECT_TRUE(captured.isZero());
+
+  ASSERT_TRUE(manager.setPhaseOffsetGDes(supplied));
+  manager.clearPhaseOffsetGDes();
+  EXPECT_FALSE(manager.capturePhaseOffsetGDes(captured));
+  EXPECT_TRUE(captured.isZero());
+}
+
+TEST(GvfManagerC3,
+     ProductionNeutralBootstrapRunsManagerToFirstAllocatorTransaction) {
+  ensureRosInitializedForSeededRecoveryE2E();
+  ros::Time::init();
+  if (!ros::master::check()) {
+    GTEST_SKIP() << "ROS master unavailable for production manager boundary";
+  }
+  ros::NodeHandle nh;
+  std::shared_ptr<SDFMap> map(new SDFMap());
+  initializeProductionFreeMap(*map);
+  installProductionCloudSnapshot(*map, 1U);
+  const std::shared_ptr<const FLAG_Race::ContinuousPhasePath> owner =
+      makeTimerBootstrapPath(std::function<void()>());
+  ASSERT_TRUE(owner);
+  FLAG_Race::gvf_manager manager;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                  installProductionManagerFixture(manager, owner, map, nh));
+  ASSERT_TRUE(manager.setPhaseOffsetGDes(Eigen::Vector3d(0.08, 0.0, 0.0)));
+
+  // Enter through gvf_manager::cmdCallback.  The first command is planner
+  // baseline only and creates the immutable Tube request; no pair or
+  // execution authority may exist before the H2 timer CAS.
+  FLAG_Race::GvfManagerS4AnchorTestAccess::runCommand(manager);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(
+                   manager).valid);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(
+      manager));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::openManualGate(manager);
+  for (int attempt = 0; attempt < 200 &&
+           !FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager);
+       ++attempt) {
+    manager.phaseOffsetTubeTimerCallback(ros::TimerEvent());
+    ros::spinOnce();
+    if (!FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(
+      manager));
+  const std::shared_ptr<const FLAG_Race::PathTubePair> pair_before_command =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager);
+  ASSERT_TRUE(pair_before_command);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::runCommand(manager);
+  const auto authority =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+  ASSERT_TRUE(authority.valid);
+  EXPECT_EQ(authority.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_EQ(authority.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(authority.selectedUConsistent(0.0));
+  EXPECT_GT(std::abs(authority.selected_u_w) +
+                std::abs(authority.selected_u_delta), 0.0);
+  const std::shared_ptr<const FLAG_Race::PathTubePair> pair_after_command =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager);
+  ASSERT_TRUE(pair_after_command);
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::sameAuthority(
+      pair_before_command, pair_after_command));
+  EXPECT_EQ(pair_before_command->authority_session,
+            pair_after_command->authority_session);
+  EXPECT_EQ(pair_after_command->authority_session,
+            authority.authority_session);
+  const FLAG_Race::MatchedAdapterOutput output =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::latestAdapterOutput(manager);
+  EXPECT_TRUE(output.allocator_evaluated);
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(output.matched.physical_port.allFinite());
+  EXPECT_TRUE(output.matched.v_cmd.allFinite());
+
+  // A subsequent exact-zero desired normal command remains on the same
+  // immutable H2 Pair/session; it does not reopen bootstrap or retire the
+  // live NORMAL authority.
+  ASSERT_TRUE(manager.setPhaseOffsetGDes(Eigen::Vector3d::Zero()));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::runCommand(manager);
+  const auto zero_authority =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(manager);
+  ASSERT_TRUE(zero_authority.valid);
+  EXPECT_EQ(zero_authority.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_EQ(zero_authority.authority_session,
+            authority.authority_session);
+  EXPECT_DOUBLE_EQ(0.0, zero_authority.selected_u_delta);
+  const std::shared_ptr<const FLAG_Race::PathTubePair> pair_after_zero =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager);
+  ASSERT_TRUE(pair_after_zero);
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::sameAuthority(
+      pair_after_command, pair_after_zero));
+  EXPECT_EQ(pair_after_command->authority_session,
+            pair_after_zero->authority_session);
 }
 
 TEST(GvfTimerBootstrap, ResetDuringStageRejectsWithoutPublishingAuthority) {

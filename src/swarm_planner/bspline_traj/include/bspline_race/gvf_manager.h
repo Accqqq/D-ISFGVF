@@ -516,6 +516,12 @@ class gvf_manager
         // callback never calls TubeEpochManager.
         ros::Timer phase_offset_tube_timer_;
         PhaseOffsetMatchedAdapterConfig matched_config_;
+        // Value-semantic boundary from the parallel interaction workstream.
+        // No producer is connected in the single-UAV baseline, so the
+        // adapter's frozen recenter-only fallback remains authoritative.
+        mutable std::mutex phase_offset_g_des_mutex_;
+        Eigen::Vector3d phase_offset_g_des_ = Eigen::Vector3d::Zero();
+        bool phase_offset_g_des_valid_ = false;
         bool phase_offset_measurement_callback_enabled_ = false;
         std::string phase_offset_measurement_callback_csv_path_;
         std::mutex phase_offset_measurement_callback_mutex_;
@@ -868,6 +874,12 @@ class gvf_manager
         bool checkCollision();
         void cmdCallback(const ros::TimerEvent& event);
         void phaseOffsetTubeTimerCallback(const ros::TimerEvent& event);
+        // Value-semantic NORMAL workspace-intent seam. An upstream producer
+        // may publish one final Eigen::Vector3d per control tick; clearing the
+        // value returns the adapter to its frozen single-UAV recenter fallback.
+        bool setPhaseOffsetGDes(const Eigen::Vector3d& g_des);
+        void clearPhaseOffsetGDes();
+        bool capturePhaseOffsetGDes(Eigen::Vector3d& g_des) const;
         void test_cmdCallback(const ros::TimerEvent& event);  // 新增测试命令回调函数
         void KinoPathCallback(const ros::TimerEvent& event);  // 新增回调函数
         void publishCorridorMarker(double C_thresh = -1.0);

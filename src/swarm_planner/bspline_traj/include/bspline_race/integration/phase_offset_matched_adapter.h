@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -28,6 +29,7 @@
 #include <bspline_race/integration/phase_offset_raw_candidate_diagnostics.h>
 #include <plan_env/cloud_occupancy_snapshot.h>
 #include <phase_offset_navigation/phase_offset_runtime.h>
+#include <phase_offset_navigation/phase_offset_allocator.h>
 #include <phase_offset_navigation/immutable_executed_reference_query.h>
 #include <phase_offset_navigation/active_reference_snapshot.h>
 #include <phase_offset_navigation/active_reference_authority.h>
@@ -68,6 +70,12 @@ struct PhaseOffsetMatchedAdapterConfig {
   double phase_dot_min = 0.02;
   double tangent_speed_min = 0.02;
   double preflight_sample_step_w = 0.10;
+  // Required immutable NORMAL Preview production policy.  Its values are
+  // captured by the integration boundary and passed through unchanged to C1;
+  // an absent policy is invalid and never replaced with an adapter default.
+  phase_offset_navigation::NormalPreviewProductionPolicy
+      normal_preview_policy;
+  bool normal_preview_policy_explicit = false;
   phase_offset_navigation::TubeSource tube_source =
       phase_offset_navigation::TubeSource::NONE;
   phase_offset_navigation::TubeBuilderConfig tube;
@@ -305,6 +313,12 @@ struct MatchedAdapterInput {
   std::shared_ptr<const PathTubePair> successor_path_tube_pair;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       cloud_occupancy_snapshot;
+  // Value-semantic NORMAL interaction boundary.  A producer may provide an
+  // exact desired active-reference motion for this tick.  When no producer is
+  // connected (single-UAV operation), the adapter supplies the frozen
+  // recenter-only value from the current delta and immutable normal.
+  Eigen::Vector3d g_des = Eigen::Vector3d::Zero();
+  bool g_des_valid = false;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   guidance::IsfGains gains;
   LegacyGuidanceSnapshot legacy;
@@ -427,6 +441,17 @@ struct MatchedAdapterOutput {
   phase_offset_navigation::TubeRuntimeStatus tube_status;
   phase_offset_navigation::TubeEpochStatus tube_epoch_status;
   phase_offset_navigation::RuntimeExecutionStatus runtime_execution;
+  // NORMAL value-core evidence.  These are immutable copies for diagnostics
+  // and tests; they do not add a second owner or execution authority.
+  Eigen::Vector3d g_des = Eigen::Vector3d::Zero();
+  bool g_des_valid = false;
+  phase_offset_navigation::NormalPreviewResult normal_preview;
+  phase_offset_navigation::PhaseOffsetAllocatorResult allocator;
+  bool allocator_evaluated = false;
+  // Preview/allocator failure is value-only for neutral planner operation;
+  // an active authoritative nonzero tick is fail-closed by the manager while
+  // retaining its existing authority snapshot.
+  bool allocator_value_failure = false;
   double delta_ref = 0.0;
   double delta = 0.0;
   bool zero_gate_open = false;
@@ -928,7 +953,17 @@ class PhaseOffsetMatchedAdapter {
       const Eigen::Vector3d& base_v_cmd,
       double base_w_dot,
       bool base_guidance_valid,
-      phase_offset_navigation::RuntimeStepOutput& output);
+      phase_offset_navigation::RuntimeStepOutput& output,
+      const phase_offset_navigation::PhaseOffsetAllocatorResult*
+          allocator_result = nullptr);
+  bool evaluateNormalAllocator(
+      const MatchedAdapterInput& input,
+      const phase_offset_navigation::RuntimePreparedStep& prepared,
+      double base_w_dot,
+      phase_offset_navigation::NormalPreviewResult& preview,
+      phase_offset_navigation::PhaseOffsetAllocatorResult& allocator,
+      Eigen::Vector3d& g_des,
+      std::string& failure_reason) const;
   bool completeThroughRecoveryOwner(
       const MatchedAdapterInput& input,
       const std::shared_ptr<const PathTubePair>& pair,
@@ -1123,6 +1158,11 @@ class PhaseOffsetMatchedAdapter {
   phase_offset_navigation::HandoffStateInput pending_handoff_input_;
   phase_offset_navigation::HandoffDecision pending_handoff_decision_;
   bool pending_handoff_valid_ = false;
+  // A production NORMAL transaction is bound to the exact immutable Pair
+  // used for its C1/C2 preparation.  Final publication must reject any
+  // timer replacement that wins the live Pair CAS before this command is
+  // published; revisions alone are not sufficient identity.
+  std::shared_ptr<const PathTubePair> pending_normal_source_pair_;
   // A RECOVERY snapshot may intentionally execute against a staged successor
   // before the manager can install that pair.  Keep both immutable pair
   // identities bound to the pending PositionCommand: the source is the exact

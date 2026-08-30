@@ -373,6 +373,16 @@ PhaseOffsetMatchedAdapterConfig MakeManualConfig(TubeSource source = TubeSource:
   config.profile_period = 2.0; config.warmup_cycles = 100;
   config.u_w_rate_max = 100.0; config.u_delta_rate_max = 100.0;
   config.u_delta_abs_max = 0.40; config.tube_update_period = 0.10;
+  config.normal_preview_policy.preview_horizon_w = 2.0;
+  config.normal_preview_policy.sample_spacing_w = 0.10;
+  config.normal_preview_policy.lower_nu = 0.02;
+  config.normal_preview_policy.upper_nu = 2.0;
+  config.normal_preview_policy.b_tight = 0.10;
+  config.normal_preview_policy.b_open = 0.90;
+  config.normal_preview_policy.policy_revision = 1U;
+  config.normal_preview_policy.configuration_identity = 1U;
+  config.normal_preview_policy.configuration_id = "test-normal-preview-w";
+  config.normal_preview_policy_explicit = true;
   config.tube.fixed_delta_max = 0.04; config.tube.back_w = 0.0;
   config.tube.lookahead_w = 2.0; config.tube.min_certified_forward_w = 0.40;
   config.tube.cross_section.search_extent = 3.0;
@@ -387,6 +397,806 @@ PhaseOffsetMatchedAdapterConfig MakeManualConfig(TubeSource source = TubeSource:
   config.tube.cross_section.margins.preincluded_map_uncertainty = 0.10;
   config.cloud_obstacle_set_complete = true;
   return config;
+}
+
+std::shared_ptr<const plan_env::CloudOccupancySnapshot>
+MakeAllFreeCloudSnapshot() {
+  std::shared_ptr<plan_env::CloudOccupancySnapshot> snapshot(
+      new plan_env::CloudOccupancySnapshot());
+  snapshot->valid = true;
+  snapshot->observation_sequence = 1U;
+  snapshot->observation_stamp = ros::Time(1.0);
+  snapshot->map_min = Eigen::Vector3d(-5.0, -5.0, -5.0);
+  snapshot->map_max = Eigen::Vector3d(5.0, 5.0, 5.0);
+  snapshot->observed_min = snapshot->map_min;
+  snapshot->observed_max = snapshot->map_max;
+  snapshot->grid_origin = snapshot->map_min;
+  snapshot->voxel_count = Eigen::Vector3i(10, 10, 10);
+  snapshot->resolution = 1.0;
+  snapshot->included_map_inflation = 0.10;
+  snapshot->occupied.assign(1000U, 0U);
+  if (!plan_env::cloudOccupancySnapshotConsistent(*snapshot)) {
+    return std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
+  }
+  return std::shared_ptr<const plan_env::CloudOccupancySnapshot>(snapshot);
+}
+
+struct NormalProductionFixture {
+  std::shared_ptr<const ContinuousPhasePath> owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame;
+  std::shared_ptr<const PathTubePair> pair;
+  MatchedAdapterInput input;
+};
+
+NormalProductionFixture MakeNormalProductionFixture(
+    PhaseOffsetMatchedAdapter& adapter) {
+  NormalProductionFixture fixture;
+  fixture.owner = MakeStraightSyntheticOwner();
+  if (!fixture.owner) return fixture;
+  fixture.frame = std::make_shared<const ContinuousPhaseNormalFrame>(
+      fixture.owner, 7U, 8U);
+  std::shared_ptr<TubeProfile> profile(new TubeProfile());
+  profile->source = TubeSource::ESDF;
+  profile->source_revision = 7U;
+  profile->path_revision = 7U;
+  profile->frame_revision = 8U;
+  profile->tube_revision = 11U;
+  profile->profile_revision = 11U;
+  profile->map_revision = 41U;
+  profile->obstacle_contract_id =
+      "direct-clearance/planner-safe-distance";
+  profile->preview_start_w = 0.0;
+  profile->preview_end_w = 3.0;
+  profile->requested_preview_start_w = 0.0;
+  profile->requested_preview_end_w = 3.0;
+  profile->certified_segment_start_w = 0.0;
+  profile->certified_segment_end_w = 3.0;
+  profile->raw_complete = true;
+  profile->filtered_complete = true;
+  profile->complete = true;
+  profile->obstacle_certified = true;
+  profile->zero_only = false;
+  profile->current_delta = 0.0;
+  profile->current_delta_valid = true;
+  profile->classification =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  for (const double w : {0.0, 0.5, 1.0, 2.0, 3.0}) {
+    TubeRawSample sample;
+    sample.w = w;
+    sample.path_revision = 7U;
+    sample.frame_revision = 8U;
+    sample.p = Eigen::Vector3d(w, 0.0, 1.0);
+    sample.N = Eigen::Vector3d(0.0, 1.0, 0.0);
+    sample.raw_lower = sample.filtered_lower = -0.35;
+    sample.raw_upper = sample.filtered_upper = 0.35;
+    sample.complete = true;
+    profile->samples.push_back(sample);
+  }
+  profile->raw_build_samples = profile->samples;
+  profile->zero_component_contains_zero = true;
+  profile->current_component_contains_delta = true;
+  std::shared_ptr<TubeEpochSnapshot> epoch(new TubeEpochSnapshot());
+  epoch->active = true;
+  epoch->task_generation = 1U;
+  epoch->build_sequence = 1U;
+  epoch->source_revision = 7U;
+  epoch->path_revision = 7U;
+  epoch->frame_revision = 8U;
+  epoch->candidate_profile = std::shared_ptr<const TubeProfile>(profile);
+  epoch->active_profile = std::shared_ptr<const TubeProfile>(profile);
+  epoch->epoch_status.candidate_path_source_revision = 7U;
+  epoch->epoch_status.active_path_source_revision = 7U;
+  epoch->epoch_status.active_available = true;
+  epoch->epoch_status.active_current_validation_valid = true;
+  epoch->epoch_status.candidate_complete = true;
+  epoch->epoch_status.candidate_classification =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  epoch->epoch_status.map_observation_is_snapshot = true;
+  std::shared_ptr<PathTubePair> pair(new PathTubePair());
+  pair->source_revision = 7U;
+  pair->path_revision = 7U;
+  pair->frame_revision = 8U;
+  pair->generation = 1U;
+  pair->authority_session = 3U;
+  pair->map_observation_sequence = 41U;
+  pair->map_observation_is_snapshot = true;
+  pair->path_owner = fixture.owner;
+  pair->frame_owner = fixture.frame;
+  pair->full_path_samples = std::make_shared<const MatchedAdapterPathSamples>(
+      SampleOwner(fixture.owner, {0.0, 0.5, 1.0, 2.0, 3.0}));
+  pair->active_profile = std::shared_ptr<const TubeProfile>(profile);
+  pair->epoch_status = epoch->epoch_status;
+  pair->epoch_snapshot = std::shared_ptr<const TubeEpochSnapshot>(epoch);
+  fixture.pair = std::shared_ptr<const PathTubePair>(pair);
+  adapter.authority_session_.store(3U, std::memory_order_release);
+  adapter.advertised_ = true;
+  adapter.execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
+  std::atomic_store(&adapter.authoritative_path_tube_pair_, fixture.pair);
+  fixture.input = MakeInput(MakeStraightSyntheticPath(), fixture.owner.get());
+  fixture.input.path = MakeStraightState(0.5);
+  fixture.input.semantic_path_owner = fixture.owner;
+  fixture.input.frame_owner = fixture.frame;
+  fixture.input.semantic_path_start_w = fixture.owner->startW();
+  fixture.input.semantic_path_end_w = fixture.owner->endW();
+  fixture.input.path_tube_pair = fixture.pair;
+  fixture.input.path_state_query = [](const double w,
+      phase_offset_core::PathDifferentialState& state) {
+    state = MakeStraightState(w);
+    return true;
+  };
+  ActiveAdapterInput zero_input;
+  zero_input.path = fixture.input.path;
+  zero_input.position = fixture.input.position;
+  zero_input.gains = fixture.input.gains;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterOutput zero_output;
+  if (!zero.evaluate(zero_input, zero_output)) return NormalProductionFixture();
+  fixture.input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+  fixture.input.dt = 0.02;
+  fixture.input.stamp = ros::Time(1.0);
+  return fixture;
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     NormalAllocatorZeroPortPreservesNominalMatchedReference) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 0.20;
+  config.u_delta_abs_max = 0.40;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = false;
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.allocator_evaluated);
+  EXPECT_TRUE(output.g_des_valid);
+  EXPECT_DOUBLE_EQ(0.0, output.g_des.x());
+  EXPECT_DOUBLE_EQ(0.0, output.g_des.y());
+  EXPECT_DOUBLE_EQ(0.0, output.g_des.z());
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_DOUBLE_EQ(0.0, output.allocator.selected_u.u_w);
+  EXPECT_DOUBLE_EQ(0.0, output.allocator.selected_u.u_delta);
+  EXPECT_DOUBLE_EQ(0.0, output.matched.physical_port.x());
+  EXPECT_DOUBLE_EQ(0.0, output.matched.physical_port.y());
+  EXPECT_DOUBLE_EQ(0.0, output.matched.physical_port.z());
+  EXPECT_DOUBLE_EQ(output.matched.v_cmd.x(), output.base_guidance.v_cmd.x());
+  EXPECT_DOUBLE_EQ(output.matched.v_cmd.y(), output.base_guidance.v_cmd.y());
+  EXPECT_DOUBLE_EQ(output.matched.v_cmd.z(), output.base_guidance.v_cmd.z());
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  const phase_offset_navigation::ActiveReferenceSnapshot pending =
+      *adapter.pending_authority_prepared_.committed_snapshot;
+  EXPECT_EQ(pending.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(pending.selectedUConsistent(0.0));
+  EXPECT_DOUBLE_EQ(output.allocator.selected_u.u_w, pending.selected_u.u_w);
+  EXPECT_DOUBLE_EQ(output.allocator.selected_u.u_delta,
+                   pending.selected_u.u_delta);
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, capture.identity));
+  EXPECT_EQ(adapter.execution_authority_.snapshot().selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     NonzeroGDesUsesExactAllocatorSelectionAndMatchedComposition) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 0.20;
+  config.u_delta_abs_max = 0.40;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(0.08, 0.16, 0.0);
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.allocator.valid);
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(output.allocator.selectedUConsistent(0.0));
+  EXPECT_DOUBLE_EQ(output.allocator.selected_u.u_w,
+                   output.projection.final_port.u_w);
+  EXPECT_DOUBLE_EQ(output.allocator.selected_u.u_delta,
+                   output.projection.final_port.u_delta);
+  const Eigen::Vector3d expected_physical = output.geometry.r_w *
+      output.allocator.selected_u.u_w + output.geometry.N *
+      output.allocator.selected_u.u_delta;
+  EXPECT_NEAR((expected_physical - output.matched.physical_port).norm(), 0.0,
+              1e-12);
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  const phase_offset_navigation::ActiveReferenceSnapshot pending =
+      *adapter.pending_authority_prepared_.committed_snapshot;
+  EXPECT_DOUBLE_EQ(output.allocator.selected_u_w, pending.selected_u_w);
+  EXPECT_DOUBLE_EQ(output.allocator.selected_u_delta, pending.selected_u_delta);
+  EXPECT_EQ(pending.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, capture.identity));
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     PhaseOnlyPortUsesExactProductionMatchedContribution) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 1.0;
+  config.u_delta_abs_max = 1.0;
+  config.u_w_rate_max = 100.0;
+  config.u_delta_rate_max = 100.0;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(0.08, 0.0, 0.0);
+
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.allocator.valid);
+  EXPECT_NEAR(output.allocator.u_delta_nom, 0.0, 1e-12);
+  EXPECT_NEAR(output.allocator.selected_u.u_delta, 0.0, 1e-12);
+  EXPECT_NEAR(output.allocator.selected_u.u_w, 0.08, 1e-12);
+  const Eigen::Vector3d expected = output.geometry.r_w *
+      output.allocator.selected_u.u_w + output.geometry.N *
+      output.allocator.selected_u.u_delta;
+  EXPECT_LE((output.matched.physical_port - expected).norm(), 1e-12);
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     TransverseOnlyPortUsesExactProductionMatchedContribution) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 1.0;
+  config.u_delta_abs_max = 1.0;
+  config.u_w_rate_max = 100.0;
+  config.u_delta_rate_max = 100.0;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(0.0, 0.16, 0.0);
+
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.allocator.valid);
+  EXPECT_NEAR(output.allocator.u_w_nom, 0.0, 1e-12);
+  EXPECT_NEAR(output.allocator.selected_u.u_w, 0.0, 1e-12);
+  EXPECT_NEAR(output.allocator.selected_u.u_delta, 0.16, 1e-12);
+  const Eigen::Vector3d expected = output.geometry.r_w *
+      output.allocator.selected_u.u_w + output.geometry.N *
+      output.allocator.selected_u.u_delta;
+  EXPECT_LE((output.matched.physical_port - expected).norm(), 1e-12);
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     SimultaneousPortUsesExactProductionMatchedBTimesU) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 1.0;
+  config.u_delta_abs_max = 1.0;
+  config.u_w_rate_max = 100.0;
+  config.u_delta_rate_max = 100.0;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(0.08, 0.16, 0.0);
+
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.allocator.valid);
+  EXPECT_NEAR(output.allocator.selected_u.u_w, 0.08, 1e-12);
+  EXPECT_NEAR(output.allocator.selected_u.u_delta, 0.16, 1e-12);
+  const Eigen::Vector3d expected = output.geometry.r_w *
+      output.allocator.selected_u.u_w + output.geometry.N *
+      output.allocator.selected_u.u_delta;
+  EXPECT_LE((output.matched.physical_port - expected).norm(), 1e-12);
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  const auto pending = *adapter.pending_authority_prepared_.committed_snapshot;
+  EXPECT_EQ(pending.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(pending.selectedUConsistent(0.0));
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, capture.identity));
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     NormalPendingPairRefreshRejectsStaleAAndCommitsNextB) {
+  PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::FIXED));
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+
+  MatchedAdapterOutput output;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  const std::shared_ptr<const PathTubePair> pair_a =
+      adapter.capturePathTubePair();
+  ASSERT_TRUE(pair_a);
+  ASSERT_EQ(adapter.pending_normal_source_pair_.get(), pair_a.get());
+
+  const auto authority_before = adapter.execution_authority_.snapshot();
+  const double retained_before = adapter.runtime_->retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      adapter.runtime_->previousFinalPort();
+
+  // Deterministically model the timer's A->B replacement winning after the
+  // manager's update and before publication.  B is numerically compatible
+  // with A but has a distinct immutable shared_ptr identity/generation.
+  std::shared_ptr<PathTubePair> replacement(new PathTubePair(*pair_a));
+  replacement->generation = pair_a->generation + 1U;
+  const std::shared_ptr<const PathTubePair> pair_b(replacement);
+  EXPECT_NE(pair_b.get(), pair_a.get());
+  EXPECT_EQ(pair_b->source_revision, pair_a->source_revision);
+  EXPECT_EQ(pair_b->path_revision, pair_a->path_revision);
+  EXPECT_EQ(pair_b->frame_revision, pair_a->frame_revision);
+  EXPECT_EQ(pair_b->active_profile->tube_revision,
+            pair_a->active_profile->tube_revision);
+  EXPECT_EQ(pair_b->active_profile->profile_revision,
+            pair_a->active_profile->profile_revision);
+  std::atomic_store(&adapter.authoritative_path_tube_pair_, pair_b);
+  ASSERT_EQ(adapter.capturePathTubePair().get(), pair_b.get());
+
+  int callback_count = 0;
+  EXPECT_FALSE(adapter.publishPendingPositionCommand(
+      [&callback_count]() {
+        ++callback_count;
+        return true;
+      }, capture.identity));
+  EXPECT_EQ(callback_count, 0);
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_EQ(adapter.execution_authority_.snapshot().snapshotId(),
+            authority_before.snapshotId());
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), retained_before);
+  EXPECT_EQ(0, std::memcmp(&previous_before.u_w,
+                           &adapter.runtime_->previous_final_port_.u_w,
+                           sizeof(previous_before.u_w)));
+  EXPECT_EQ(0, std::memcmp(&previous_before.u_delta,
+                           &adapter.runtime_->previous_final_port_.u_delta,
+                           sizeof(previous_before.u_delta)));
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_FALSE(adapter.pending_normal_source_pair_);
+
+  // The next command captures B and can publish normally; no second
+  // lifecycle/session owner is introduced by the rejected stale A tick.
+  fixture.input.path_tube_pair = pair_b;
+  fixture.input.stamp = ros::Time(2.0);
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  const PendingPositionCommandCapture replacement_capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(replacement_capture.pending);
+  ASSERT_TRUE(replacement_capture.valid);
+  EXPECT_EQ(adapter.pending_normal_source_pair_.get(), pair_b.get());
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, replacement_capture.identity));
+  const auto authority_after = adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(authority_after.valid);
+  EXPECT_EQ(authority_after.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_EQ(authority_after.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_EQ(adapter.capturePathTubePair().get(), pair_b.get());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     AllocatorValueFailureDoesNotCreatePlannerHoldOrAuthorityMutation) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::FIXED);
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  const phase_offset_navigation::ActiveReferenceSnapshot before =
+      adapter.execution_authority_.snapshot();
+  const double delta_before = adapter.runtime_->retainedDelta();
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(
+      std::numeric_limits<double>::quiet_NaN(), 0.1, 0.0);
+  MatchedAdapterOutput output;
+  EXPECT_FALSE(adapter.update(fixture.input, output));
+  EXPECT_TRUE(output.allocator_evaluated);
+  EXPECT_TRUE(output.allocator_value_failure);
+  EXPECT_TRUE(output.valid);
+  EXPECT_FALSE(output.selected);
+  EXPECT_TRUE(output.base_guidance.valid);
+  EXPECT_GT(output.base_guidance.v_cmd.norm(), 0.0);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_DOUBLE_EQ(delta_before, adapter.runtime_->retainedDelta());
+  const phase_offset_navigation::ActiveReferenceSnapshot after =
+      adapter.execution_authority_.snapshot();
+  EXPECT_EQ(after.snapshotId(), before.snapshotId());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     MissingOrInvalidNormalPolicyFailsOnlyTheProductionNormalEvaluation) {
+  for (const bool missing_policy : {true, false}) {
+    PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+    if (missing_policy) {
+      config.normal_preview_policy =
+          phase_offset_navigation::NormalPreviewProductionPolicy();
+      config.normal_preview_policy_explicit = false;
+    } else {
+      // Keep the immutable value present but invalid; there is no production
+      // clamping or defaulting path for an inconsistent phase-rate envelope.
+      config.normal_preview_policy.lower_nu = 0.0;
+    }
+    PhaseOffsetMatchedAdapter adapter(config);
+    EXPECT_TRUE(adapter.configurationValid());
+    NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+    ASSERT_TRUE(fixture.pair);
+
+    const phase_offset_navigation::ActiveReferenceSnapshot before =
+        adapter.execution_authority_.snapshot();
+    const double delta_before = adapter.runtime_->retainedDelta();
+    const phase_offset_core::PortCommand previous_before =
+        adapter.runtime_->previousFinalPort();
+    const auto policy_before = adapter.config_.normal_preview_policy;
+    const auto expect_same_double = [](const double expected,
+                                       const double actual) {
+      if (std::isnan(expected)) {
+        EXPECT_TRUE(std::isnan(actual));
+      } else {
+        EXPECT_DOUBLE_EQ(expected, actual);
+      }
+    };
+
+    MatchedAdapterOutput output;
+    EXPECT_FALSE(adapter.update(fixture.input, output));
+    EXPECT_TRUE(output.allocator_evaluated);
+    EXPECT_TRUE(output.allocator_value_failure);
+    EXPECT_FALSE(output.selected);
+    // With no already-authoritative nonzero NORMAL state, the protected base
+    // planner guidance remains available even though NORMAL Preview is not.
+    EXPECT_TRUE(output.valid);
+    EXPECT_TRUE(output.base_guidance.valid);
+    EXPECT_FALSE(adapter.hasPendingPositionCommand());
+    EXPECT_DOUBLE_EQ(delta_before, adapter.runtime_->retainedDelta());
+    EXPECT_DOUBLE_EQ(previous_before.u_w,
+                     adapter.runtime_->previousFinalPort().u_w);
+    EXPECT_DOUBLE_EQ(previous_before.u_delta,
+                     adapter.runtime_->previousFinalPort().u_delta);
+    const phase_offset_navigation::ActiveReferenceSnapshot after =
+        adapter.execution_authority_.snapshot();
+    EXPECT_EQ(after.snapshotId(), before.snapshotId());
+    EXPECT_EQ(after.selected_u_owner, before.selected_u_owner);
+    expect_same_double(policy_before.preview_horizon_w,
+                       adapter.config_.normal_preview_policy.preview_horizon_w);
+    expect_same_double(policy_before.sample_spacing_w,
+                       adapter.config_.normal_preview_policy.sample_spacing_w);
+    expect_same_double(policy_before.lower_nu,
+                       adapter.config_.normal_preview_policy.lower_nu);
+    expect_same_double(policy_before.upper_nu,
+                       adapter.config_.normal_preview_policy.upper_nu);
+    expect_same_double(policy_before.b_tight,
+                       adapter.config_.normal_preview_policy.b_tight);
+    expect_same_double(policy_before.b_open,
+                       adapter.config_.normal_preview_policy.b_open);
+    EXPECT_EQ(policy_before.policy_revision,
+              adapter.config_.normal_preview_policy.policy_revision);
+    EXPECT_EQ(policy_before.configuration_identity,
+              adapter.config_.normal_preview_policy.configuration_identity);
+    EXPECT_EQ(policy_before.configuration_id,
+              adapter.config_.normal_preview_policy.configuration_id);
+  }
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     MissingNormalPolicyDoesNotInvalidateTheNonNormalRuntimeSeam) {
+  const SyntheticPath path = MakePath();
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::FIXED);
+  config.normal_preview_policy =
+      phase_offset_navigation::NormalPreviewProductionPolicy();
+  config.normal_preview_policy_explicit = false;
+  PhaseOffsetMatchedAdapter adapter(config);
+
+  // The adapter/tube seam remains usable for the unadvertised Runtime fixture
+  // and neutral planner baseline.  No production NORMAL Preview evaluation is
+  // entered on this path, so the absent policy is intentionally irrelevant.
+  EXPECT_TRUE(adapter.configurationValid());
+  EXPECT_TRUE(adapter.requiresTubeTimer());
+  MatchedAdapterOutput output;
+  for (int cycle = 0; cycle <= 100; ++cycle) {
+    EXPECT_FALSE(adapter.update(MakeInput(path, &path, cycle * kDt), output));
+    if (cycle == 0) {
+      ASSERT_TRUE(adapter.timerTick());
+    }
+  }
+  EXPECT_TRUE(output.valid) << output.invalid_reason;
+  EXPECT_TRUE(output.zero_gate_open);
+  EXPECT_FALSE(output.selected);
+  EXPECT_TRUE(output.base_guidance.valid);
+  EXPECT_TRUE(output.matched.valid);
+  EXPECT_TRUE(output.active_profile);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     RepeatedNormalPolicyFailureIsDeterministicAndDoesNotMutatePolicy) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.normal_preview_policy =
+      phase_offset_navigation::NormalPreviewProductionPolicy();
+  config.normal_preview_policy_explicit = false;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  const auto policy_before = adapter.config_.normal_preview_policy;
+
+  MatchedAdapterOutput first;
+  MatchedAdapterOutput second;
+  EXPECT_FALSE(adapter.update(fixture.input, first));
+  EXPECT_FALSE(adapter.update(fixture.input, second));
+  EXPECT_TRUE(first.allocator_evaluated);
+  EXPECT_TRUE(second.allocator_evaluated);
+  EXPECT_TRUE(first.allocator_value_failure);
+  EXPECT_TRUE(second.allocator_value_failure);
+  EXPECT_EQ(first.invalid_reason, second.invalid_reason);
+  EXPECT_EQ(first.allocator.status, second.allocator.status);
+  EXPECT_EQ(first.allocator.reason, second.allocator.reason);
+  EXPECT_EQ(first.selected, second.selected);
+  EXPECT_EQ(first.valid, second.valid);
+  const auto expect_same_double = [](const double expected,
+                                     const double actual) {
+    if (std::isnan(expected)) {
+      EXPECT_TRUE(std::isnan(actual));
+    } else {
+      EXPECT_DOUBLE_EQ(expected, actual);
+    }
+  };
+  expect_same_double(policy_before.preview_horizon_w,
+                     adapter.config_.normal_preview_policy.preview_horizon_w);
+  expect_same_double(policy_before.sample_spacing_w,
+                     adapter.config_.normal_preview_policy.sample_spacing_w);
+  expect_same_double(policy_before.lower_nu,
+                     adapter.config_.normal_preview_policy.lower_nu);
+  expect_same_double(policy_before.upper_nu,
+                     adapter.config_.normal_preview_policy.upper_nu);
+  expect_same_double(policy_before.b_tight,
+                     adapter.config_.normal_preview_policy.b_tight);
+  expect_same_double(policy_before.b_open,
+                     adapter.config_.normal_preview_policy.b_open);
+  EXPECT_EQ(policy_before.policy_revision,
+            adapter.config_.normal_preview_policy.policy_revision);
+  EXPECT_EQ(policy_before.configuration_identity,
+            adapter.config_.normal_preview_policy.configuration_identity);
+  EXPECT_EQ(policy_before.configuration_id,
+            adapter.config_.normal_preview_policy.configuration_id);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     ActiveNonzeroAllocatorFailureRetainsAuthorityWithoutNominalLeak) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 1.0;
+  config.u_delta_abs_max = 1.0;
+  config.u_w_rate_max = 100.0;
+  config.u_delta_rate_max = 100.0;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(0.0, 0.16, 0.0);
+
+  MatchedAdapterOutput first;
+  ASSERT_TRUE(adapter.update(fixture.input, first)) << first.invalid_reason;
+  ASSERT_TRUE(first.selected);
+  const PendingPositionCommandCapture first_capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(first_capture.pending);
+  ASSERT_TRUE(first_capture.valid);
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, first_capture.identity));
+
+  const phase_offset_navigation::ActiveReferenceSnapshot before =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(before.valid);
+  EXPECT_EQ(before.owner_mode,
+            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
+  EXPECT_EQ(before.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  ASSERT_GT(std::abs(before.proposed_next_delta), 1e-6);
+  const double delta_before = adapter.runtime_->retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      adapter.runtime_->previousFinalPort();
+
+  // Rebase only the immutable current path/guidance to the exact predecessor
+  // phase; the pair and its owner remain unchanged for the failed tick.
+  fixture.input.path = MakeStraightState(before.proposed_next_w);
+  ActiveAdapterInput zero_input;
+  zero_input.path = fixture.input.path;
+  zero_input.position = fixture.input.position;
+  zero_input.gains = fixture.input.gains;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterOutput zero_output;
+  ASSERT_TRUE(zero.evaluate(zero_input, zero_output));
+  fixture.input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+  fixture.input.stamp = ros::Time(2.0);
+  fixture.input.g_des = Eigen::Vector3d(
+      std::numeric_limits<double>::quiet_NaN(), 0.16, 0.0);
+  fixture.input.g_des_valid = true;
+
+  MatchedAdapterOutput failed;
+  EXPECT_FALSE(adapter.update(fixture.input, failed));
+  EXPECT_TRUE(failed.allocator_evaluated);
+  EXPECT_TRUE(failed.allocator_value_failure);
+  EXPECT_FALSE(failed.selected);
+  EXPECT_FALSE(failed.valid);
+  EXPECT_FALSE(failed.matched.valid);
+  EXPECT_TRUE(failed.guidance.v_cmd.isZero());
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_DOUBLE_EQ(delta_before, adapter.runtime_->retainedDelta());
+  EXPECT_DOUBLE_EQ(previous_before.u_w,
+                   adapter.runtime_->previousFinalPort().u_w);
+  EXPECT_DOUBLE_EQ(previous_before.u_delta,
+                   adapter.runtime_->previousFinalPort().u_delta);
+  const phase_offset_navigation::ActiveReferenceSnapshot after =
+      adapter.execution_authority_.snapshot();
+  EXPECT_EQ(after.snapshotId(), before.snapshotId());
+  EXPECT_EQ(after.selected_u_owner, before.selected_u_owner);
+  EXPECT_DOUBLE_EQ(after.delta, before.delta);
+  EXPECT_DOUBLE_EQ(after.proposed_next_delta, before.proposed_next_delta);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     AbsentProductionGDesUsesExactSingleUavRecenterFallback) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.delta_tracking_gain = 2.5;
+  config.u_w_abs_max = 1.0;
+  config.u_delta_abs_max = 1.0;
+  config.u_w_rate_max = 100.0;
+  config.u_delta_rate_max = 100.0;
+  PhaseOffsetMatchedAdapter adapter(config);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  fixture.input.g_des_valid = true;
+  fixture.input.g_des = Eigen::Vector3d(0.0, 0.16, 0.0);
+
+  MatchedAdapterOutput first;
+  ASSERT_TRUE(adapter.update(fixture.input, first)) << first.invalid_reason;
+  ASSERT_TRUE(first.selected);
+  const PendingPositionCommandCapture first_capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(first_capture.pending);
+  ASSERT_TRUE(first_capture.valid);
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      []() { return true; }, first_capture.identity));
+  const phase_offset_navigation::ActiveReferenceSnapshot before =
+      adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(before.valid);
+  const double delta_before = adapter.runtime_->retainedDelta();
+  ASSERT_GT(std::abs(delta_before), 1e-6);
+
+  fixture.input.path = MakeStraightState(before.proposed_next_w);
+  ActiveAdapterInput zero_input;
+  zero_input.path = fixture.input.path;
+  zero_input.position = fixture.input.position;
+  zero_input.gains = fixture.input.gains;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterOutput zero_output;
+  ASSERT_TRUE(zero.evaluate(zero_input, zero_output));
+  fixture.input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+  fixture.input.g_des = Eigen::Vector3d::Zero();
+  fixture.input.g_des_valid = false;
+  fixture.input.stamp = ros::Time(2.0);
+
+  MatchedAdapterOutput fallback;
+  ASSERT_TRUE(adapter.update(fixture.input, fallback)) << fallback.invalid_reason;
+  ASSERT_TRUE(fallback.selected);
+  ASSERT_TRUE(fallback.allocator.valid);
+  ASSERT_TRUE(fallback.g_des_valid);
+  const Eigen::Vector3d expected = -config.delta_tracking_gain *
+      delta_before * fallback.geometry.N;
+  EXPECT_TRUE(fallback.g_des.isApprox(expected, 0.0));
+  EXPECT_NEAR(fallback.allocator.u_w_nom, 0.0, 1e-12);
+  EXPECT_LE((fallback.matched.physical_port -
+             (fallback.geometry.r_w * fallback.allocator.selected_u.u_w +
+              fallback.geometry.N * fallback.allocator.selected_u.u_delta)).norm(),
+            1e-12);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     AdvertisedNoPairRemainsPlannerOwnedUntilPairCas) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::FIXED);
+  config.u_w_abs_max = 0.20;
+  config.u_delta_abs_max = 0.40;
+  PhaseOffsetMatchedAdapter adapter(config);
+  ASSERT_TRUE(adapter.runtime_);
+  // This exercises the advertised production owner contract without starting
+  // a ROS timer worker; timerTick() remains the deterministic build boundary.
+  adapter.advertised_ = true;
+  adapter.execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
+  adapter.authority_session_.store(1U, std::memory_order_release);
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeStraightSyntheticOwner();
+  ASSERT_TRUE(owner);
+  MatchedAdapterInput input = MakeInput(MakeStraightSyntheticPath(),
+                                        owner.get());
+  input.semantic_path_owner = owner;
+  input.semantic_path_start_w = owner->startW();
+  input.semantic_path_end_w = owner->endW();
+  MatchedAdapterOutput output;
+  for (int cycle = 0; cycle < 101; ++cycle) {
+    input.stamp = ros::Time(0.02 * cycle);
+    EXPECT_FALSE(adapter.update(input, output));
+    adapter.timerTick();
+  }
+  EXPECT_TRUE(adapter.requiresPathTubePairBootstrap());
+  EXPECT_FALSE(adapter.capturePathTubePair());
+  EXPECT_FALSE(adapter.execution_authority_.snapshot().valid);
+  EXPECT_FALSE(adapter.hasPendingPositionCommand());
+  EXPECT_FALSE(output.allocator_evaluated);
+  EXPECT_FALSE(output.selected);
+}
+
+TEST(PhaseOffsetMatchedAdapterC3,
+     AdvertisedPairRunsAllocatorOnlyAfterH2PairIsPresent) {
+  PhaseOffsetMatchedAdapterConfig config = MakeManualConfig(TubeSource::ESDF);
+  config.u_w_abs_max = 0.20;
+  config.u_delta_abs_max = 0.40;
+  PhaseOffsetMatchedAdapter adapter(config);
+  ASSERT_TRUE(adapter.runtime_);
+  NormalProductionFixture fixture = MakeNormalProductionFixture(adapter);
+  ASSERT_TRUE(fixture.pair);
+  adapter.zero_gate_open_ = true;
+  std::atomic_store(&adapter.authoritative_path_tube_pair_, fixture.pair);
+  MatchedAdapterOutput output;
+  fixture.input.g_des = Eigen::Vector3d(0.08, 0.0, 0.0);
+  fixture.input.g_des_valid = true;
+  ASSERT_TRUE(adapter.update(fixture.input, output)) << output.invalid_reason;
+  ASSERT_TRUE(output.selected);
+  ASSERT_TRUE(output.allocator_evaluated);
+  EXPECT_EQ(output.allocator.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(output.allocator.selectedUConsistent(0.0));
+  EXPECT_TRUE(output.matched.physical_port.allFinite());
+  EXPECT_EQ(adapter.capturePathTubePair(), fixture.pair);
+  const PendingPositionCommandCapture capture =
+      adapter.capturePendingPositionCommand();
+  ASSERT_TRUE(capture.pending);
+  ASSERT_TRUE(capture.valid);
+  const auto pending = adapter.execution_authority_.snapshot();
+  EXPECT_FALSE(pending.valid);
+  bool observed_before_commit = false;
+  ASSERT_TRUE(adapter.publishPendingPositionCommand(
+      [&]() {
+        observed_before_commit = !adapter.execution_authority_.snapshot().valid;
+        return true;
+      }, capture.identity));
+  EXPECT_TRUE(observed_before_commit);
+  const auto committed = adapter.execution_authority_.snapshot();
+  ASSERT_TRUE(committed.valid);
+  EXPECT_EQ(committed.selected_u_owner,
+            phase_offset_navigation::PhaseOffsetAllocator::ownerName());
+  EXPECT_TRUE(committed.selectedUConsistent(0.0));
+  EXPECT_DOUBLE_EQ(committed.selected_u_w, output.allocator.selected_u.u_w);
+  EXPECT_DOUBLE_EQ(committed.selected_u_delta,
+                   output.allocator.selected_u.u_delta);
 }
 
 bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
@@ -446,6 +1256,33 @@ bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
       !prepared.valid || !prepared.committed_snapshot) {
     return false;
   }
+  std::shared_ptr<TubeProfile> source_profile(new TubeProfile());
+  source_profile->source = TubeSource::FIXED;
+  source_profile->source_revision = candidate.planner_path_revision;
+  source_profile->path_revision = candidate.executed_path_revision;
+  source_profile->frame_revision = candidate.frame_revision;
+  source_profile->tube_revision = candidate.tube_revision;
+  source_profile->profile_revision = candidate.profile_revision;
+  source_profile->map_revision = candidate.map_revision;
+  source_profile->complete = true;
+  source_profile->raw_complete = true;
+  source_profile->filtered_complete = true;
+  source_profile->obstacle_certified = true;
+  source_profile->classification =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  std::shared_ptr<PathTubePair> source_pair(new PathTubePair());
+  source_pair->source_revision = candidate.planner_path_revision;
+  source_pair->path_revision = candidate.executed_path_revision;
+  source_pair->frame_revision = candidate.frame_revision;
+  source_pair->generation = 1U;
+  source_pair->authority_session = candidate.authority_session;
+  source_pair->path_owner = owner;
+  source_pair->active_profile =
+      std::shared_ptr<const TubeProfile>(source_profile);
+  source_pair->executed_reference_query = query;
+  const std::shared_ptr<const PathTubePair> immutable_source_pair(source_pair);
+  std::atomic_store(&adapter.authoritative_path_tube_pair_,
+                    immutable_source_pair);
   phase_offset_navigation::RuntimeCommitToken token;
   token.expected_previous_final_port = adapter.runtime_->previousFinalPort();
   token.expected_delta = adapter.runtime_->retainedDelta();
@@ -456,6 +1293,7 @@ bool StageValidPendingPositionCommand(PhaseOffsetMatchedAdapter& adapter) {
   token.valid = true;
   adapter.pending_runtime_commit_ = token;
   adapter.pending_authority_prepared_ = prepared;
+  adapter.pending_normal_source_pair_ = immutable_source_pair;
   adapter.pending_authority_session_ = prepared.candidate.authority_session;
   adapter.pending_authority_valid_ = true;
   return true;
