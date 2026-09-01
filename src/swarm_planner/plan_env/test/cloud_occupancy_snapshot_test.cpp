@@ -141,6 +141,41 @@ void expectDenseAndIndexedClearanceEqual(
       queryCloudOccupancySnapshotClearance(indexed, point, radius));
 }
 
+void expectDenseAndIndexedPlannerClearanceEqual(
+    const CloudOccupancySnapshot& dense,
+    const CloudOccupancySnapshot& indexed, const Eigen::Vector3d& point,
+    const double radius) {
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult dense_result =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(dense, point, radius);
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult indexed_result =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(indexed, point, radius);
+  EXPECT_EQ(indexed_result.status, dense_result.status);
+  EXPECT_EQ(indexed_result.clearance_certified,
+            dense_result.clearance_certified);
+  EXPECT_EQ(
+      doubleBits(indexed_result
+                     .nearest_inflated_occupied_voxel_center_distance),
+      doubleBits(
+          dense_result.nearest_inflated_occupied_voxel_center_distance));
+}
+
+CloudOccupancySnapshot plannerFixtureSnapshot() {
+  CloudOccupancySnapshot snapshot;
+  snapshot.valid = true;
+  snapshot.observation_sequence = 904U;
+  snapshot.map_min = Eigen::Vector3d(-10.0, -15.0, -0.01);
+  snapshot.map_max = Eigen::Vector3d(6.0, 3.0, 2.99);
+  snapshot.observed_min = snapshot.map_min;
+  snapshot.observed_max = snapshot.map_max;
+  snapshot.grid_origin = snapshot.map_min;
+  snapshot.voxel_count = Eigen::Vector3i(160, 180, 30);
+  snapshot.resolution = 0.1;
+  snapshot.included_map_inflation = 0.1;
+  snapshot.occupied.assign(160U * 180U * 30U, 0U);
+  snapshot.occupied[(128U * 180U + 148U) * 30U + 10U] = 1U;
+  return snapshot;
+}
+
 CloudOccupancySnapshotBuildInput randomizedBuildInput(
     const Eigen::Vector3i& voxel_count, const std::uint64_t sequence,
     std::mt19937& random) {
@@ -311,6 +346,125 @@ TEST(CloudOccupancySnapshotTest, ClearanceFindsDiagonalVoxelAndCapsCertifiedFree
   EXPECT_NEAR(empty.nearest_occupied_voxel_volume_distance, 0.45, 1e-12);
 }
 
+TEST(CloudOccupancySnapshotTest,
+     PlannerEsdfBaseClearanceUsesOccupiedVoxelCenters) {
+  CloudOccupancySnapshot snapshot = clearanceSnapshot();
+  snapshot.occupied[clearanceAddress(6, 5, 5)] = 1U;
+
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult free =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+          snapshot, Eigen::Vector3d::Zero(), 1.80);
+  ASSERT_EQ(free.status, CloudOccupancyStatus::KNOWN_FREE);
+  ASSERT_TRUE(free.clearance_certified);
+  EXPECT_NEAR(free.nearest_inflated_occupied_voxel_center_distance,
+              std::sqrt(2.75), 1e-12);
+
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult occupied =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+          snapshot, Eigen::Vector3d(1.5, 0.5, 0.5), 0.10);
+  EXPECT_EQ(occupied.status, CloudOccupancyStatus::OCCUPIED);
+  EXPECT_DOUBLE_EQ(
+      occupied.nearest_inflated_occupied_voxel_center_distance, 0.0);
+  EXPECT_FALSE(occupied.clearance_certified);
+
+  snapshot.occupied.assign(snapshot.occupied.size(), 0U);
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult empty =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+          snapshot, Eigen::Vector3d::Zero(), 0.45);
+  EXPECT_EQ(empty.status, CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_TRUE(empty.clearance_certified);
+  EXPECT_DOUBLE_EQ(
+      empty.nearest_inflated_occupied_voxel_center_distance, 0.45);
+}
+
+TEST(CloudOccupancySnapshotTest,
+     PlannerEsdfBaseClearanceMatchesSdfMapPositiveEdtAtGridCenters) {
+  SDFMap map;
+  map.mp_.resolution_ = 1.0;
+  map.mp_.resolution_inv_ = 1.0;
+  map.mp_.map_origin_ = Eigen::Vector3d(-5.0, -5.0, -5.0);
+  map.mp_.map_size_ = Eigen::Vector3d(10.0, 10.0, 10.0);
+  map.mp_.map_min_boundary_ = map.mp_.map_origin_;
+  map.mp_.map_max_boundary_ = map.mp_.map_origin_ + map.mp_.map_size_;
+  map.mp_.map_voxel_num_ = Eigen::Vector3i(10, 10, 10);
+  map.md_.occupancy_buffer_inflate_.assign(1000U, 0);
+  map.md_.occupancy_buffer_neg.assign(1000U, 0);
+  map.md_.distance_buffer_.assign(1000U, 0.0);
+  map.md_.distance_buffer_neg_.assign(1000U, 0.0);
+  map.md_.distance_buffer_all_.assign(1000U, 0.0);
+  map.md_.tmp_buffer1_.assign(1000U, 0.0);
+  map.md_.tmp_buffer2_.assign(1000U, 0.0);
+  map.md_.local_bound_min_ = Eigen::Vector3i::Zero();
+  map.md_.local_bound_max_ = Eigen::Vector3i::Constant(9);
+  map.md_.occupancy_buffer_inflate_[
+      (5U * 10U + 5U) * 10U + 5U] = 1;
+  map.updateESDF3d();
+
+  CloudOccupancySnapshot snapshot;
+  snapshot.valid = true;
+  snapshot.observation_sequence = 905U;
+  snapshot.map_min = map.mp_.map_min_boundary_;
+  snapshot.map_max = map.mp_.map_max_boundary_;
+  snapshot.observed_min = snapshot.map_min;
+  snapshot.observed_max = snapshot.map_max;
+  snapshot.grid_origin = map.mp_.map_origin_;
+  snapshot.voxel_count = map.mp_.map_voxel_num_;
+  snapshot.resolution = map.mp_.resolution_;
+  snapshot.occupied.assign(1000U, 0U);
+  snapshot.occupied[(5U * 10U + 5U) * 10U + 5U] = 1U;
+
+  const Eigen::Vector3i free_index(3, 5, 5);
+  const Eigen::Vector3d center = snapshot.grid_origin +
+      snapshot.resolution *
+          (free_index.cast<double>() + Eigen::Vector3d::Constant(0.5));
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult result =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(snapshot, center,
+                                                           2.20);
+  ASSERT_EQ(result.status, CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_TRUE(result.clearance_certified);
+  EXPECT_NEAR(result.nearest_inflated_occupied_voxel_center_distance,
+              map.getDistance(free_index), 1e-12);
+  EXPECT_NEAR(result.nearest_inflated_occupied_voxel_center_distance, 2.0,
+              1e-12);
+}
+
+TEST(CloudOccupancySnapshotTest,
+     PlannerEsdfBaseClearanceFrozenMismatchPointsExceedSafeDistance) {
+  const CloudOccupancySnapshot snapshot = plannerFixtureSnapshot();
+  const Eigen::Vector3d point_one(2.6643275039478231,
+                                  0.27533414135136092,
+                                  0.99994409891574243);
+  const Eigen::Vector3d point_two(2.7627822162288762,
+                                  0.28778254721111168,
+                                  0.99995064617094009);
+
+  const CloudOccupancySnapshotClearanceResult old_one =
+      queryCloudOccupancySnapshotClearance(snapshot, point_one, 0.50);
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult new_one =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(snapshot, point_one,
+                                                           0.50);
+  EXPECT_EQ(old_one.status, CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_NEAR(old_one.nearest_occupied_voxel_volume_distance,
+              0.39910242275510055, 1e-12);
+  EXPECT_EQ(new_one.status, CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_NEAR(new_one.nearest_inflated_occupied_voxel_center_distance,
+              0.46581958181362049, 1e-12);
+  EXPECT_GT(new_one.nearest_inflated_occupied_voxel_center_distance, 0.4);
+
+  const CloudOccupancySnapshotClearanceResult old_two =
+      queryCloudOccupancySnapshotClearance(snapshot, point_two, 0.50);
+  const CloudOccupancySnapshotPlannerEsdfBaseClearanceResult new_two =
+      queryCloudOccupancySnapshotPlannerEsdfBaseClearance(snapshot, point_two,
+                                                           0.50);
+  EXPECT_EQ(old_two.status, CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_NEAR(old_two.nearest_occupied_voxel_volume_distance,
+              0.38956445853076954, 1e-12);
+  EXPECT_EQ(new_two.status, CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_NEAR(new_two.nearest_inflated_occupied_voxel_center_distance,
+              0.44817903921392843, 1e-12);
+  EXPECT_GT(new_two.nearest_inflated_occupied_voxel_center_distance, 0.4);
+}
+
 TEST(CloudOccupancySnapshotTest, ClearanceDoesNotApplyIncludedInflationTwice) {
   CloudOccupancySnapshot snapshot = clearanceSnapshot();
   snapshot.occupied[clearanceAddress(6, 5, 5)] = 1U;
@@ -460,6 +614,10 @@ TEST(CloudOccupancySnapshotTest,
           fraction(random) * extent.x(), fraction(random) * extent.y(),
           fraction(random) * extent.z());
       expectDenseAndIndexedClearanceEqual(
+          dense, indexed, point,
+          radii[(snapshot_index + query_index) %
+                 (sizeof(radii) / sizeof(radii[0]))]);
+      expectDenseAndIndexedPlannerClearanceEqual(
           dense, indexed, point,
           radii[(snapshot_index + query_index) %
                  (sizeof(radii) / sizeof(radii[0]))]);

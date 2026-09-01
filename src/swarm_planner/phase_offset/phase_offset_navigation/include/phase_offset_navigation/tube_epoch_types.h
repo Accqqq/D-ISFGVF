@@ -94,8 +94,9 @@ struct TubeEpochUpdateInput {
   TubeEpochPathSamples preview_path;
   TubeBounds authority_request;
   Eigen::Vector3d actual_position = Eigen::Vector3d::Zero();
-  // G2g immutable PointCloud2 / voxel-volume certificate.  ESDF production
-  // uses this cloud-clearance query exclusively and fails closed without it.
+  // G2g immutable PointCloud2 / planner-ESDF-base occupied-centre
+  // certificate.  ESDF production uses this cloud-clearance query exclusively
+  // and fails closed without it.
   ClearanceQuery cloud_clearance_query;
   PathStateQuery path_state_query;
   PathCellBoundQuery path_cell_bound_query;

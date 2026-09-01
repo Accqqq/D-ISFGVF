@@ -96,8 +96,9 @@ struct TubeCrossSectionInput {
   bool current_delta_valid = false;
   std::uint64_t path_revision = 0U;
   std::uint64_t frame_revision = 0U;
-  // The safety-producing input.  It directly certifies clearance of the
-  // candidate centre p + N * delta against occupied voxel volumes.
+  // The safety-producing input.  It directly certifies planner-ESDF-base
+  // clearance of the candidate centre p + N * delta against inflated
+  // occupied voxel centres.
   ClearanceQuery clearance_query;
   // Compatibility-only categorical facts for old diagnostics.  It must never
   // be used to establish a cross-section safety interval.

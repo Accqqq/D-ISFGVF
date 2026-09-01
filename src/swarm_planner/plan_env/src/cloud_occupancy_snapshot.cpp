@@ -313,6 +313,87 @@ IndexedScanResult scanIndexedOccupiedVoxels(
   return IndexedScanResult::COMPLETE;
 }
 
+bool pointToOccupiedVoxelCenterDistance(
+    const CloudOccupancySnapshot& snapshot,
+    const Eigen::Vector3d& point,
+    const Eigen::Vector3i& index,
+    double& distance) {
+  const Eigen::Vector3d center = snapshot.grid_origin +
+      snapshot.resolution *
+          (index.cast<double>() + Eigen::Vector3d::Constant(0.5));
+  if (!finite(center)) return false;
+  const double candidate = (point - center).norm();
+  if (!finite(candidate)) return false;
+  distance = candidate;
+  return true;
+}
+
+IndexedScanResult scanIndexedOccupiedVoxelCenters(
+    const CloudOccupancySnapshot& snapshot,
+    const CloudOccupancyColumnIndex& column_index,
+    const Eigen::Vector3d& point,
+    const int first_x, const int last_x, const int first_y, const int last_y,
+    const int first_z, const int last_z, double& nearest) {
+  const std::size_t z_count =
+      static_cast<std::size_t>(snapshot.voxel_count.z());
+  const std::size_t y_count =
+      static_cast<std::size_t>(snapshot.voxel_count.y());
+  for (int x = first_x; x <= last_x; ++x) {
+    for (int y = first_y; y <= last_y; ++y) {
+      const std::size_t column = static_cast<std::size_t>(x) * y_count +
+          static_cast<std::size_t>(y);
+      if (column + 1U >= column_index.offsets.size()) {
+        return IndexedScanResult::FALLBACK_DENSE;
+      }
+      const std::size_t begin = column_index.offsets[column];
+      const std::size_t end = column_index.offsets[column + 1U];
+      if (begin > end || end > column_index.addresses.size()) {
+        return IndexedScanResult::FALLBACK_DENSE;
+      }
+      const std::size_t column_address =
+          columnAddress(x, y, snapshot.voxel_count);
+      if (column_address > snapshot.occupied.size() ||
+          z_count > snapshot.occupied.size() - column_address) {
+        return IndexedScanResult::FALLBACK_DENSE;
+      }
+      std::size_t previous_address = 0U;
+      for (std::size_t entry = begin; entry < end; ++entry) {
+        const std::size_t voxel_address = column_index.addresses[entry];
+        if (voxel_address < column_address ||
+            voxel_address >= column_address + z_count ||
+            voxel_address >= snapshot.occupied.size() ||
+            snapshot.occupied[voxel_address] == 0U ||
+            (entry != begin && voxel_address <= previous_address)) {
+          return IndexedScanResult::FALLBACK_DENSE;
+        }
+        previous_address = voxel_address;
+      }
+      const std::size_t first_address = column_address +
+          static_cast<std::size_t>(first_z);
+      const std::size_t last_address = column_address +
+          static_cast<std::size_t>(last_z);
+      const std::vector<std::size_t>::const_iterator z_begin =
+          std::lower_bound(column_index.addresses.begin() + begin,
+                           column_index.addresses.begin() + end,
+                           first_address);
+      for (std::vector<std::size_t>::const_iterator entry = z_begin;
+           entry != column_index.addresses.begin() + end &&
+           *entry <= last_address; ++entry) {
+        const std::size_t voxel_address = *entry;
+        const Eigen::Vector3i index(
+            x, y, static_cast<int>(voxel_address - column_address));
+        double distance = 0.0;
+        if (!pointToOccupiedVoxelCenterDistance(snapshot, point, index,
+                                                distance)) {
+          return IndexedScanResult::UNAVAILABLE;
+        }
+        nearest = std::min(nearest, distance);
+      }
+    }
+  }
+  return IndexedScanResult::COMPLETE;
+}
+
 }  // namespace
 
 bool cloudOccupancySnapshotConsistent(const CloudOccupancySnapshot& snapshot) {
@@ -541,6 +622,122 @@ queryCloudOccupancySnapshotClearance(
   }
   result.status = CloudOccupancyStatus::KNOWN_FREE;
   result.nearest_occupied_voxel_volume_distance =
+      std::isfinite(nearest) ? std::min(nearest, required_radius)
+                             : required_radius;
+  result.clearance_certified = true;
+  return result;
+}
+
+CloudOccupancySnapshotPlannerEsdfBaseClearanceResult
+queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+    const CloudOccupancySnapshot& snapshot,
+    const Eigen::Vector3d& point,
+    const double required_radius) {
+  CloudOccupancySnapshotPlannerEsdfBaseClearanceResult result;
+  if (!cloudOccupancySnapshotConsistent(snapshot) || !finite(point) ||
+      !finite(required_radius) || required_radius < 0.0) {
+    return result;
+  }
+  if (!pointInMap(point, snapshot.map_min, snapshot.map_max)) {
+    result.status = CloudOccupancyStatus::OUT_OF_MAP;
+    return result;
+  }
+  if (!pointInObservedBox(point, snapshot.observed_min, snapshot.observed_max) ||
+      !closedBallInBox(point, required_radius, snapshot.observed_min,
+                       snapshot.observed_max)) {
+    result.status = CloudOccupancyStatus::UNKNOWN;
+    return result;
+  }
+
+  Eigen::Vector3d grid_min;
+  Eigen::Vector3d grid_max;
+  if (!gridBounds(snapshot, grid_min, grid_max)) return result;
+  if (!closedBallInBox(point, required_radius, grid_min, grid_max)) {
+    result.status = CloudOccupancyStatus::OUT_OF_MAP;
+    return result;
+  }
+
+  Eigen::Vector3i point_index;
+  if (!pointToIndex(point, snapshot.grid_origin, snapshot.voxel_count,
+                    snapshot.resolution, point_index)) {
+    result.status = CloudOccupancyStatus::OUT_OF_MAP;
+    return result;
+  }
+
+  const Eigen::Vector3d lower =
+      (point.array() - required_radius - snapshot.grid_origin.array()) /
+      snapshot.resolution;
+  const Eigen::Vector3d upper =
+      (point.array() + required_radius - snapshot.grid_origin.array()) /
+      snapshot.resolution;
+  int first_x = 0;
+  int last_x = -1;
+  int first_y = 0;
+  int last_y = -1;
+  int first_z = 0;
+  int last_z = -1;
+  if (!finite(lower) || !finite(upper) ||
+      !clearanceIndexRange(lower.x(), upper.x(), snapshot.voxel_count.x(),
+                           first_x, last_x) ||
+      !clearanceIndexRange(lower.y(), upper.y(), snapshot.voxel_count.y(),
+                           first_y, last_y) ||
+      !clearanceIndexRange(lower.z(), upper.z(), snapshot.voxel_count.z(),
+                           first_z, last_z) ||
+      !boundedVoxelCount(first_x, last_x, first_y, last_y, first_z, last_z)) {
+    return result;
+  }
+
+  // Preserve categorical occupancy semantics before evaluating the
+  // centre-set clearance: an occupied containing voxel has no certificate.
+  const std::size_t point_address = address(point_index, snapshot.voxel_count);
+  if (point_address >= snapshot.occupied.size()) return result;
+  if (snapshot.occupied[point_address] != 0U) {
+    result.status = CloudOccupancyStatus::OCCUPIED;
+    return result;
+  }
+
+  double nearest = std::numeric_limits<double>::infinity();
+  const CloudOccupancyColumnIndex* const column_index =
+      usableOccupiedColumnIndex(snapshot,
+                                snapshot.occupied_column_index.get());
+  bool indexed_complete = false;
+  if (column_index != nullptr) {
+    const IndexedScanResult indexed_result = scanIndexedOccupiedVoxelCenters(
+        snapshot, *column_index, point, first_x, last_x, first_y, last_y,
+        first_z, last_z, nearest);
+    if (indexed_result == IndexedScanResult::UNAVAILABLE) {
+      return CloudOccupancySnapshotPlannerEsdfBaseClearanceResult();
+    }
+    indexed_complete = indexed_result == IndexedScanResult::COMPLETE;
+  }
+  if (!indexed_complete) {
+    nearest = std::numeric_limits<double>::infinity();
+    for (int x = first_x; x <= last_x; ++x) {
+      for (int y = first_y; y <= last_y; ++y) {
+        for (int z = first_z; z <= last_z; ++z) {
+          const Eigen::Vector3i index(x, y, z);
+          const std::size_t voxel_address = address(index, snapshot.voxel_count);
+          if (voxel_address >= snapshot.occupied.size() ||
+              snapshot.occupied[voxel_address] == 0U) {
+            continue;
+          }
+          double distance = 0.0;
+          if (!pointToOccupiedVoxelCenterDistance(snapshot, point, index,
+                                                  distance)) {
+            return CloudOccupancySnapshotPlannerEsdfBaseClearanceResult();
+          }
+          nearest = std::min(nearest, distance);
+        }
+      }
+    }
+  }
+
+  if (nearest <= 0.0) {
+    result.status = CloudOccupancyStatus::OCCUPIED;
+    return result;
+  }
+  result.status = CloudOccupancyStatus::KNOWN_FREE;
+  result.nearest_inflated_occupied_voxel_center_distance =
       std::isfinite(nearest) ? std::min(nearest, required_radius)
                              : required_radius;
   result.clearance_certified = true;

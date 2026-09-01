@@ -43,8 +43,9 @@ phase_offset_navigation::RawOccupancyQuery makeCloudOccupancyQuery(
     const CloudOccupancyQueryConfig& config);
 
 // G2g production bridge.  Captures the same immutable snapshot as the
-// diagnostics query and maps its occupied-voxel-volume clearance contract to
-// navigation without exposing ROS, PointCloud2, or plan_env there.
+// diagnostics query and maps its planner-ESDF-base occupied-centre clearance
+// contract to navigation without exposing ROS, PointCloud2, or plan_env
+// there.
 phase_offset_navigation::ClearanceQuery makeCloudOccupancyClearanceQuery(
     const std::shared_ptr<const plan_env::CloudOccupancySnapshot>& snapshot,
     const CloudOccupancyQueryConfig& config);

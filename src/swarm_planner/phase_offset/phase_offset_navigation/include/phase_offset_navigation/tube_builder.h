@@ -49,8 +49,8 @@ class TubeBuilder {
       TubeProfile& profile,
       double current_delta = 0.0) const;
 
-  // G2g production path: direct occupied-voxel-volume clearance at every
-  // cross-section centre, with adaptive exact path samples.  The categorical
+  // G2g production path: direct planner-ESDF-base occupied-centre clearance
+  // at every cross-section centre, with adaptive exact path samples.  The categorical
   // RawOccupancyQuery overloads remain only compatibility/test diagnostics and
   // must not be used to certify a Candidate ribbon.
   bool buildCloudClearance(

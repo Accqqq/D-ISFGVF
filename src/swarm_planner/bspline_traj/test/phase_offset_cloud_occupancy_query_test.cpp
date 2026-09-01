@@ -28,6 +28,47 @@ std::shared_ptr<const plan_env::CloudOccupancySnapshot> makeSnapshot() {
           plan_env::buildCloudOccupancySnapshot(input)));
 }
 
+std::shared_ptr<const plan_env::CloudOccupancySnapshot>
+makeCenterMetricSnapshot() {
+  std::shared_ptr<plan_env::CloudOccupancySnapshot> snapshot(
+      new plan_env::CloudOccupancySnapshot());
+  snapshot->valid = true;
+  snapshot->observation_sequence = 8U;
+  snapshot->map_min = Eigen::Vector3d(-5.0, -5.0, -5.0);
+  snapshot->map_max = Eigen::Vector3d(5.0, 5.0, 5.0);
+  snapshot->observed_min = Eigen::Vector3d(-2.0, -2.0, -2.0);
+  snapshot->observed_max = Eigen::Vector3d(2.0, 2.0, 2.0);
+  snapshot->grid_origin = snapshot->map_min;
+  snapshot->voxel_count = Eigen::Vector3i(10, 10, 10);
+  snapshot->resolution = 1.0;
+  snapshot->included_map_inflation = 0.10;
+  snapshot->occupied.assign(1000U, 0U);
+  snapshot->occupied[(6U * 10U + 5U) * 10U + 5U] = 1U;
+  return std::shared_ptr<const plan_env::CloudOccupancySnapshot>(snapshot);
+}
+
+std::shared_ptr<const plan_env::CloudOccupancySnapshot>
+makeFrozenGapSnapshot() {
+  std::shared_ptr<plan_env::CloudOccupancySnapshot> snapshot(
+      new plan_env::CloudOccupancySnapshot());
+  snapshot->valid = true;
+  snapshot->observation_sequence = 904U;
+  snapshot->map_min = Eigen::Vector3d(-10.0, -15.0, -0.01);
+  snapshot->map_max = Eigen::Vector3d(6.0, 3.0, 2.99);
+  // The frozen query and its complete requested ball must be observed.  Keep
+  // the production fail-closed domain checks unchanged and make only this
+  // regression fixture's observation domain complete.
+  snapshot->observed_min = snapshot->map_min;
+  snapshot->observed_max = snapshot->map_max;
+  snapshot->grid_origin = snapshot->map_min;
+  snapshot->voxel_count = Eigen::Vector3i(160, 180, 30);
+  snapshot->resolution = 0.1;
+  snapshot->included_map_inflation = 0.1;
+  snapshot->occupied.assign(160U * 180U * 30U, 0U);
+  snapshot->occupied[(128U * 180U + 148U) * 30U + 10U] = 1U;
+  return std::shared_ptr<const plan_env::CloudOccupancySnapshot>(snapshot);
+}
+
 CloudOccupancyQueryConfig usableConfig() {
   CloudOccupancyQueryConfig config;
   config.obstacle_set_complete = true;
@@ -81,7 +122,8 @@ TEST(CloudOccupancyQueryTest, DisabledOrInsufficientContractFailsClosed) {
             phase_offset_navigation::DistanceStatus::UNAVAILABLE);
 }
 
-TEST(CloudOccupancyQueryTest, ClearanceBridgeUsesVoxelVolumeAndObservedBall) {
+TEST(CloudOccupancyQueryTest,
+     ClearanceBridgeUsesPlannerEsdfBaseCentersAndObservedBall) {
   const auto snapshot = makeSnapshot();
   const auto query = makeCloudOccupancyClearanceQuery(snapshot, usableConfig());
   const auto occupied = query(Eigen::Vector3d(1.1, 0.1, 0.1), 0.45);
@@ -103,6 +145,68 @@ TEST(CloudOccupancyQueryTest, ClearanceBridgeUsesVoxelVolumeAndObservedBall) {
   EXPECT_EQ(makeCloudOccupancyClearanceQuery(snapshot, disabled)(
                 Eigen::Vector3d::Zero(), 0.45).status,
             phase_offset_navigation::DistanceStatus::UNAVAILABLE);
+}
+
+TEST(CloudOccupancyQueryTest, ClearanceBridgeSelectsPlannerEsdfBasePrimitive) {
+  const auto snapshot = makeCenterMetricSnapshot();
+  const auto query = makeCloudOccupancyClearanceQuery(snapshot, usableConfig());
+  const auto result = query(Eigen::Vector3d::Zero(), 1.80);
+  EXPECT_EQ(result.status, phase_offset_navigation::DistanceStatus::KNOWN_FREE);
+  EXPECT_TRUE(result.clearance_certified);
+  // The occupied voxel is [1,2] x [0,1] x [0,1], so its planner-ESDF-base
+  // centre is (1.5, 0.5, 0.5), 1.658... m from the query point.  The adapter
+  // must no longer route to the old closed-volume distance of 1 m.
+  EXPECT_NEAR(result.clearance, std::sqrt(2.75), 1e-12);
+}
+
+TEST(CloudOccupancyQueryTest,
+     ClearanceBridgeFeedsOneCoherentMetricIntoCrossSection) {
+  const auto snapshot = makeFrozenGapSnapshot();
+  const Eigen::Vector3d frozen_point(2.6643275039478231,
+                                     0.27533414135136092,
+                                     0.99994409891574243);
+  const plan_env::CloudOccupancySnapshotClearanceResult old_clearance =
+      plan_env::queryCloudOccupancySnapshotClearance(
+          *snapshot, frozen_point, 0.50);
+  const plan_env::CloudOccupancySnapshotPlannerEsdfBaseClearanceResult
+      planner_esdf_base_clearance =
+          plan_env::queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+              *snapshot, frozen_point, 0.50);
+  ASSERT_EQ(old_clearance.status, plan_env::CloudOccupancyStatus::KNOWN_FREE);
+  ASSERT_EQ(planner_esdf_base_clearance.status,
+            plan_env::CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_NEAR(old_clearance.nearest_occupied_voxel_volume_distance,
+              0.39910242275510055, 1e-12);
+  EXPECT_NEAR(
+      planner_esdf_base_clearance
+          .nearest_inflated_occupied_voxel_center_distance,
+      0.46581958181362049, 1e-12);
+  EXPECT_LT(old_clearance.nearest_occupied_voxel_volume_distance, 0.40);
+  EXPECT_GT(
+      planner_esdf_base_clearance
+          .nearest_inflated_occupied_voxel_center_distance,
+      0.40);
+
+  const auto query = makeCloudOccupancyClearanceQuery(snapshot, usableConfig());
+  phase_offset_navigation::TubeCrossSectionConfig cross_section_config;
+  cross_section_config.nominal_half_width = 0.50;
+  cross_section_config.ray_step = 0.05;
+  cross_section_config.planner_safe_distance = 0.40;
+
+  phase_offset_navigation::TubeCrossSectionInput input;
+  input.p = frozen_point;
+  input.N = Eigen::Vector3d::UnitY();
+  input.clearance_query = query;
+  const phase_offset_navigation::TubeCrossSectionResult result =
+      phase_offset_navigation::TubeCrossSectionSolver(cross_section_config)
+          .solve(input);
+
+  ASSERT_TRUE(result.valid);
+  EXPECT_TRUE(result.contains_zero);
+  EXPECT_GT(result.width, 0.0);
+  EXPECT_NE(result.reason,
+            phase_offset_navigation::TubeCrossSectionReason::
+                EMPTY_AFTER_OBSTACLE_BOUNDS);
 }
 
 TEST(CloudOccupancyQueryTest, DiagnosticsKeepFullAndResidualAccountingSeparate) {

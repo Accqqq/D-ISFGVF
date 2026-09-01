@@ -27,11 +27,17 @@ struct CloudOccupancyColumnIndex;
 struct CloudOccupancySnapshot;
 struct CloudOccupancySnapshotBuildInput;
 struct CloudOccupancySnapshotClearanceResult;
+struct CloudOccupancySnapshotPlannerEsdfBaseClearanceResult;
 
 CloudOccupancySnapshot buildCloudOccupancySnapshot(
     const CloudOccupancySnapshotBuildInput& input);
 CloudOccupancySnapshotClearanceResult
 queryCloudOccupancySnapshotClearance(
+    const CloudOccupancySnapshot& snapshot,
+    const Eigen::Vector3d& point,
+    double required_radius);
+CloudOccupancySnapshotPlannerEsdfBaseClearanceResult
+queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
     const CloudOccupancySnapshot& snapshot,
     const Eigen::Vector3d& point,
     double required_radius);
@@ -66,6 +72,11 @@ struct CloudOccupancySnapshot {
       const CloudOccupancySnapshotBuildInput& input);
   friend CloudOccupancySnapshotClearanceResult
   queryCloudOccupancySnapshotClearance(
+      const CloudOccupancySnapshot& snapshot,
+      const Eigen::Vector3d& point,
+      double required_radius);
+  friend CloudOccupancySnapshotPlannerEsdfBaseClearanceResult
+  queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
       const CloudOccupancySnapshot& snapshot,
       const Eigen::Vector3d& point,
       double required_radius);
@@ -105,6 +116,18 @@ struct CloudOccupancySnapshotClearanceResult {
   bool clearance_certified = false;
 };
 
+// A planner-ESDF-base clearance result.  The distance is from `point` to the
+// nearest centre of an inflated occupied voxel in the immutable snapshot,
+// matching the occupied-centre geometry that seeds SDFMap's positive EDT.
+// The result is capped at the requested radius and `clearance_certified`
+// proves the returned lower bound.  This sibling contract intentionally keeps
+// the closed-volume primitive above unchanged.
+struct CloudOccupancySnapshotPlannerEsdfBaseClearanceResult {
+  CloudOccupancyStatus status = CloudOccupancyStatus::UNAVAILABLE;
+  double nearest_inflated_occupied_voxel_center_distance = 0.0;
+  bool clearance_certified = false;
+};
+
 // Validates all metadata and the exact occupied-vector size.  Invalid values
 // are always queried fail-closed as UNAVAILABLE.
 bool cloudOccupancySnapshotConsistent(const CloudOccupancySnapshot& snapshot);
@@ -129,6 +152,18 @@ CloudOccupancySnapshotQueryResult queryCloudOccupancySnapshot(
 // or arithmetic inconsistencies fail closed as UNAVAILABLE.
 CloudOccupancySnapshotClearanceResult
 queryCloudOccupancySnapshotClearance(
+    const CloudOccupancySnapshot& snapshot,
+    const Eigen::Vector3d& point,
+    double required_radius);
+
+// Queries Euclidean clearance against the centres of inflated occupied voxels
+// in one immutable snapshot.  This is the planner-ESDF-base contract: at a
+// free grid centre it is the same centre-set distance used by SDFMap's
+// positive EDT.  Domain, completeness, bounded-work, and fail-closed
+// semantics match queryCloudOccupancySnapshotClearance(); only the geometric
+// primitive differs.
+CloudOccupancySnapshotPlannerEsdfBaseClearanceResult
+queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
     const CloudOccupancySnapshot& snapshot,
     const Eigen::Vector3d& point,
     double required_radius);

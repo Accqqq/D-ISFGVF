@@ -295,8 +295,12 @@ TEST(TubeSurfaceValidatorTest,
     // current anchor receives the same clearance, independent of traversal
     // order or callback count.  The non-anchor cell retains the larger
     // clearance needed for its sampled cover.
+    // The old closed-AABB fixture value at this world point was 0.425.  With
+    // the R1 occupied-voxel-centre metric and 0.05 m resolution, the matching
+    // centre distance is 0.45; the Validator proof and requested radius stay
+    // unchanged.
     result.clearance = std::abs(point.x()) <= 1e-12
-        ? 0.425 : std::max(5.0, required);
+        ? 0.45 : std::max(5.0, required);
     result.clearance_certified = true;
     returned.push_back(result.clearance);
     return result;

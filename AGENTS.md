@@ -2,211 +2,235 @@
 
 Scope: `/home/cxq/ISF-GVF/New_ISFGVF/gvf_ws` and all subdirectories.
 
-## 1. Project direction
+## Project
 
 The final research direction is the distributed multi-UAV PhaseOffsetSwarm
 extension of the existing ISF-GVF system.
 
-Implementation order is fixed:
+Development proceeds from the trusted single-UAV system toward the distributed
+swarm system. Single-UAV PhaseOffset work validates the per-agent core of the
+final swarm method; it is not a separate research direction.
 
-1. preserve the original single-UAV baseline;
-2. validate the single-UAV phase-offset core;
-3. validate the complete single-UAV closed loop;
-4. add isolated multi-instance simulation;
-5. add distributed swarm intent;
-6. add pairwise safety and complex scenarios.
+Trusted original single-UAV regression baseline:
 
-Single-UAV stages validate the per-agent core of the final swarm method. They
-are not a separate research direction.
-
-## 2. Stage authorization
-
-- The master roadmap describes the whole project but does not authorize all
-  stages.
-- Code changes require a dedicated current-stage execution specification.
-- `AUTO_ADVANCE=false` is the default.
-- Complete the authorized stage, test it, self-audit, report, and stop.
-- Never start the next stage without a new execution specification.
-- If no stage execution specification is provided, perform read-only inspection
-  only.
-- If a required edit is outside the stage whitelist, stop and report instead of
-  expanding scope.
-
-Reference documents:
-
-- `docs/PhaseOffsetSwarm_Single_First_Implementation_Plan_2026-08-07.md`
-- `docs/PhaseOffsetSwarm_Code_Architecture_2026-08-08.md`
-
-## 3. Trusted baseline
-
-Trusted original single-UAV baseline:
-
-- branch: `main`
 - commit: `9a0e975`
 
-User-owned retained settings in
-`src/swarm_planner/bspline_traj/launch/test_gvf.launch`:
+Preserve the original planner, map, ISF-GVF, SDF, B-spline, C2 connector,
+governor, simulator, and SO3 execution chain.
+
+User-owned settings in
+`src/swarm_planner/bspline_traj/launch/test_gvf.launch` must remain:
 
 - `gvf/circle_test/enable=false`
 - `gvf/circle_test/auto_start=false`
 
-The original single-UAV launch, planner, map, ISF-GVF, SDF, B-spline, C2
-connector, governor, simulator, and SO3 chain must remain operational.
+Detailed architecture and stage behavior belong in `docs/`, not in this file.
 
-A disabled feature flag is not proof of baseline equivalence. Each integration
-stage requires explicit regression tests.
+## Agent roles
 
-## 4. Existing prototype preservation
+The current primary conversation is the sole planner, architect, and
+orchestrator.
 
-Tracked prototype modifications are preserved in the named stash:
+- The current conversation writes and finalizes execution specifications,
+  architecture decisions, file whitelists, and acceptance criteria.
+- Sol Max is read-only. It reviews plans or completed implementations and
+  reports omissions, risks, conflicts, and evidence. It does not rewrite plans
+  or modify code.
+- Luna Max is execution-only. It implements an approved execution specification
+  and does not write a new plan, redesign frozen interfaces, expand scope, or
+  start another stage.
+- If Sol Max or Luna Max finds a material defect or blocker, it stops and
+  reports evidence to the current conversation.
+- Only the current conversation may revise the plan or authorize further work.
+
+Preferred workflow for nontrivial or control-critical work:
+
+`current conversation plans -> Sol Max reviews -> current conversation freezes
+the plan -> Luna Max implements -> current conversation verifies`
+
+Trivial localized edits already covered by an approved specification do not
+require the full workflow.
+
+## Authorization
+
+`AUTO_ADVANCE=false`.
+
+The project roadmap does not authorize implementation by itself.
+
+Code changes require an approved current execution specification defining:
+
+- authorized scope;
+- allowed files;
+- required behavior;
+- tests and acceptance criteria.
+
+If no execution specification is provided, perform read-only inspection only.
+
+Do not modify files outside the authorized whitelist. If a required change lies
+outside it, stop and report.
+
+A single execution specification may authorize several tightly coupled
+implementation batches when their target architecture and interfaces are frozen
+before implementation begins.
+
+A newer explicitly approved architecture or execution specification overrides
+older prototype planning documents when they conflict.
+
+## Repository safety
+
+Treat all existing worktree changes as user-owned.
+
+Never use:
+
+- `git reset --hard`
+- `git checkout -- .`
+- `git restore .`
+- `git clean`
+- `git stash pop` on the prototype stash
+
+Do not commit, create branches/tags, push, or stage unrelated files unless
+explicitly requested.
+
+Before and after implementation work, record:
+
+- current branch and HEAD;
+- `git status --short`;
+- relevant tracked diff.
+
+Preserve the stash:
 
 `deepseek-phaseoffset-tracked-prototype-2026-08-08`
 
-Untracked phase-offset, swarm, CBF, tube, simulator, test, map, config, and
-launch files from the previous prototype are reference material only.
+Prototype code is reference material only unless the current execution
+specification explicitly authorizes its use.
 
-- Do not delete, move, rename, modify, or connect them to CMake unless the
-  current stage explicitly authorizes the file.
-- Do not restore or pop the complete prototype stash into the baseline.
-- Migrate useful code only after line-by-line review into the new architecture.
-
-## 5. Git safety
-
-- Treat all existing changes as user-owned.
-- Do not use `git reset --hard`, `git checkout -- .`, `git restore .`, or
-  `git clean`.
-- Do not run `git stash pop` on the prototype stash.
-- Do not create commits, branches, tags, or pushes unless explicitly requested.
-- Do not stage unrelated files.
-- Record `git status --short` and the tracked diff before and after each stage.
-
-## 6. Target architecture
+## Architecture boundaries
 
 Dependency direction:
 
-1. Eigen/STL;
-2. `phase_offset_core`;
-3. `phase_offset_navigation`;
-4. thin `bspline_race` integration adapter;
-5. original governor and SO3 execution.
+`Eigen/STL`
+-> `phase_offset_core`
+-> `phase_offset_navigation`
+-> thin `bspline_race` integration
+-> original governor / SO3 execution
 
-Multi-UAV additions later use:
+Later distributed stages add:
 
-1. `phase_offset_msgs`;
-2. `phase_offset_swarm`;
-3. local `g_swarm` input to the single-UAV adapter.
-
-Target package directory:
-
-`src/swarm_planner/phase_offset/`
-
-Create a package only when its authorized stage begins. Do not scaffold future
-packages early.
-
-## 7. Module boundaries
+`phase_offset_msgs`
+-> `phase_offset_swarm`
+-> local coordination inputs to the per-agent navigation layer
 
 ### phase_offset_core
 
-- Pure C++14 and Eigen mathematics.
-- No ROS, ROS time, messages, SDF map, B-spline, manager, robot ID, neighbor,
-  swarm, tube, or CBF dependencies unless a later approved architecture change
-  explicitly revises this boundary.
-- Add geometry, matched port, single-agent port projection, and continuation
-  only in their authorized stages.
+Pure C++14/Eigen mathematics.
+
+No ROS, ROS time, SDF map, B-spline manager, robot ID, neighbor, or swarm
+dependencies.
 
 ### phase_offset_navigation
 
-- Owns single-UAV tube construction, filtering, and runtime composition.
-- Depends on `phase_offset_core`.
-- Uses an abstract distance-query interface instead of storing a concrete
-  `SDFMap` inside the algorithm.
-- Contains no neighbor aggregation or pairwise safety logic.
+Owns per-agent Path-Tube, preview/runtime feasibility, constrained phase-offset
+execution, and matched-port composition.
 
-### bspline_race integration
+Use abstract environment-query interfaces rather than storing concrete ROS map
+objects inside the algorithm.
 
-- Preserve original planning and ISF-GVF behavior.
-- Add only a thin adapter from `ContinuousPhasePathState` to the new core.
-- Do not place mathematical derivations or optimization algorithms in ROS
-  callbacks.
-- Keep phase-offset additions to `gvf_manager.cpp` orchestration-only and small;
-  target roughly 150 added lines or fewer.
-- Do not duplicate the ISF guidance formula in multiple modules.
+Neighbor discovery and swarm organization do not belong here.
 
-### phase_offset_msgs and phase_offset_swarm
+### bspline_race
 
-- Create only in an authorized multi-UAV stage.
-- Do not add PhaseOffsetSwarm messages to legacy `common_msgs`.
-- The swarm layer outputs local coordination intent `g_swarm` only.
-- The swarm layer does not own authoritative `w` or `delta` and does not publish
-  final UAV control commands.
-- Final `u_w` and `u_delta` are determined by the single-UAV runtime and applied
-  through the matched port.
-- Visualization nodes are read-only.
+The existing planner remains authoritative for the base path.
 
-## 8. Editing rules
+Keep integration thin and orchestration-focused. Do not place control
+derivations or optimization algorithms inside ROS callbacks or
+`gvf_manager.cpp`.
 
-- Modify only files explicitly allowed by the current stage specification.
-- Prefer small patches over rewrites.
-- Do not perform repository-wide formatting or unrelated cleanup.
-- Do not mix refactoring, theory changes, parameter tuning, and scenario
-  expansion in one stage.
-- One header represents one concept; do not create another mixed global types
-  header.
-- Keep algorithm implementation files focused, preferably below about 500
-  lines.
-- ROS callbacks convert data and call interfaces; they do not contain formulas.
-- Parse parameters in adapters or nodes, not throughout mathematical classes.
+Reuse the existing base-path C2 continuation mechanism.
 
-## 9. Theory and control invariants
+### phase_offset_swarm
 
-- Base path `p` and active reference `r` are distinct.
-- Active phase-offset tracking error is defined relative to `r`.
-- Use the same final executed port in the physical and internal matched
-  channels.
-- Never add swarm velocity directly to the ISF-GVF physical output.
-- Preserve the approved non-reversing phase condition and positive physical
-  tangential margin.
-- Reuse the existing base-path C2 connector. Do not implement a separate tube
-  C2 connector; validate phase-offset and tube continuation around the existing
-  path update.
-- CBF is a safety filter, not the matched-port core or swarm organization law.
+Owns distributed neighbor processing and swarm coordination.
 
-## 10. Parameter and scenario discipline
+It may provide local world-frame coordination intent and pairwise safety
+constraints to the per-agent layer.
 
-- Do not change maximum velocity, planner limits, or saturation bounds to make
-  a stage pass unless explicitly authorized.
-- When authorized, normal speed reduction scales `K1` and `K2` together and
-  preserves the existing sign convention.
-- Keep the original `pillar.pcd` baseline until another map is authorized.
-- Do not add narrow-corridor, circle, figure-eight, seven-agent, ablation, or
-  paper-statistics work before their stages.
+It does not own authoritative `w`, `delta`, `u_w`, or `u_delta`, and never
+publishes final UAV control commands.
 
-## 11. Testing and self-audit
+Do not add PhaseOffsetSwarm-specific messages to legacy `common_msgs`.
 
-Every stage must include:
+## Core invariants
 
-1. an appropriate clean or incremental build;
-2. stage-specific unit tests;
-3. regression tests for completed stages;
-4. dependency-boundary searches;
+- Preserve the original planner + ISF-GVF navigation baseline.
+- Base planner path `p` and active reference `r` are distinct.
+- Geometric Tube validity, preview feasibility, and control feasibility are
+  separate concepts.
+- Loss of nonzero transverse Tube capacity must not by itself invalidate a
+  planner-valid path.
+- `delta` is a continuous state; transverse expansion, compression, recovery,
+  and path-update transitions must not introduce reference jumps.
+- Use the same final executed `(u_w, u_delta)` in both matched channels.
+- Never add swarm velocity directly to the nominal ISF-GVF physical output.
+- Preserve non-reversing phase progression and the approved positive physical
+  tangential margin whenever feasible.
+- CBF is a safety-constraint layer, not the matched-port core or swarm
+  organization law.
+- A Tube, preview, staging, or offset-authority failure alone must not cause
+  persistent HOLD of an otherwise planner-valid navigation task.
+
+Detailed equations and algorithm contracts belong in the approved architecture
+or execution specification.
+
+## Editing
+
+Prefer the existing abstraction when it matches the approved architecture.
+
+Do not preserve an incorrect legacy contract merely to minimize diff size.
+During an authorized architecture refactor, obsolete gates, fallback stacks,
+certificate layers, or compatibility logic may be removed when required by the
+frozen design.
+
+Do not:
+
+- perform repository-wide formatting or unrelated cleanup;
+- tune planner/safety limits merely to make a test pass;
+- mix unrelated feature work into the current stage;
+- scaffold future packages before their stage;
+- duplicate the same control law across modules.
+
+Keep mathematical code out of ROS callbacks and keep central orchestration files
+focused.
+
+## Verification
+
+Every implementation batch must perform, as applicable:
+
+1. build;
+2. stage-specific tests;
+3. regression tests for completed functionality;
+4. dependency-boundary checks;
 5. `git diff --check`;
 6. final `git status --short`;
 7. verification that no unauthorized files changed;
-8. a written self-audit and explicit stop statement.
+8. written self-audit and explicit stop statement.
 
-For authorized ROS tests, check for an existing ROS master first, do not attach
-to or terminate user-owned processes, and clean up only processes started by
-the current task.
+PhaseOffset integration must not regress the original single-UAV navigation
+path.
 
-## 12. Stop conditions
+For ROS runtime tests, do not attach to or terminate user-owned processes.
+Clean up only processes started by the current task.
 
-Stop and report without expanding scope when:
+## Stop
 
+Stop and report rather than expanding scope when:
+
+- the execution specification is missing or inconsistent with the repository;
 - a required edit is outside the whitelist;
-- branch, HEAD, baseline diff, or stash preconditions differ;
-- an unrelated historical defect blocks a workspace-wide test;
-- ROS runtime is unavailable;
-- acceptance requires a later-stage feature.
+- branch, HEAD, worktree, or baseline assumptions differ materially;
+- a frozen interface must be redesigned;
+- an unrelated historical defect blocks validation;
+- ROS/runtime resources required by the specification are unavailable;
+- acceptance requires work from a later stage.
 
-Preserve the worktree and report the blocker. Do not fix unrelated problems or
-advance to the next stage.
+Do not silently redesign the plan, weaken acceptance criteria, tune around an
+architectural defect, or advance to another stage.

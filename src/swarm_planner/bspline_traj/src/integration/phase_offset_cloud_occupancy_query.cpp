@@ -122,12 +122,13 @@ phase_offset_navigation::ClearanceQuery makeCloudOccupancyClearanceQuery(
         !finite(required_radius) || required_radius < 0.0) {
       return result;
     }
-    const plan_env::CloudOccupancySnapshotClearanceResult cloud =
-        plan_env::queryCloudOccupancySnapshotClearance(
+    const plan_env::CloudOccupancySnapshotPlannerEsdfBaseClearanceResult cloud =
+        plan_env::queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
             *snapshot, point, required_radius);
     result.status = translate(cloud.status);
-    result.clearance = finite(cloud.nearest_occupied_voxel_volume_distance)
-        ? cloud.nearest_occupied_voxel_volume_distance : 0.0;
+    result.clearance =
+        finite(cloud.nearest_inflated_occupied_voxel_center_distance)
+            ? cloud.nearest_inflated_occupied_voxel_center_distance : 0.0;
     result.clearance_certified = cloud.clearance_certified;
     return result;
   };
