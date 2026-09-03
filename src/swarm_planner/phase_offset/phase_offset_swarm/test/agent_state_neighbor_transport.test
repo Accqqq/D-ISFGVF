@@ -1,0 +1,26 @@
+<launch>
+  <node pkg="phase_offset_swarm" type="agent_state_neighbor_runtime_node"
+        name="sim_c_neighbor_runtime" ns="uav_0" output="screen">
+    <param name="robot_id" value="0"/>
+    <param name="agent_count" value="2"/>
+    <param name="world_frame" value="world"/>
+    <param name="agent_state_topic" value="/sim_c_test/agent_state"/>
+    <param name="enter_radius" value="100.0"/>
+    <param name="exit_radius" value="101.0"/>
+    <remap from="~odom" to="/sim_c_test/uav_0/odom"/>
+  </node>
+  <node pkg="phase_offset_swarm" type="agent_state_neighbor_runtime_node"
+        name="sim_c_neighbor_runtime" ns="uav_1" output="screen">
+    <param name="robot_id" value="1"/>
+    <param name="agent_count" value="2"/>
+    <param name="world_frame" value="world"/>
+    <param name="agent_state_topic" value="/sim_c_test/agent_state"/>
+    <param name="enter_radius" value="100.0"/>
+    <param name="exit_radius" value="101.0"/>
+    <remap from="~odom" to="/sim_c_test/uav_1/odom"/>
+  </node>
+  <test test-name="agent_state_neighbor_transport"
+        pkg="phase_offset_swarm"
+        type="agent_state_neighbor_transport_test.py"
+        time-limit="45.0"/>
+</launch>

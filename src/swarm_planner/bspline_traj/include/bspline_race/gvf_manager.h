@@ -341,6 +341,65 @@ class gvf_manager
             // completion from overwriting an FSM reset/initialization.
             std::uint64_t generation = 0U;
         };
+        // One immutable source of truth for a successor handoff.  It is
+        // published only after the local PositionCommand, execution
+        // authority, Runtime, and authoritative phase commits have all
+        // succeeded; staging/replan consumers never synthesize this tuple
+        // from independently captured phase/authority slots.
+        struct SuccessorHandoffTransaction {
+            EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+            std::uint64_t task_generation = 0U;
+            std::uint64_t authority_session = 0U;
+            std::uint64_t authority_sequence = 0U;
+            std::uint64_t phase_generation_before = 0U;
+            std::uint64_t phase_generation_after = 0U;
+            double phase_before_w = 0.0;
+            double phase_after_w = 0.0;
+            double authority_w = 0.0;
+            double authority_proposed_next_w = 0.0;
+            double runtime_retained_delta_before = 0.0;
+            phase_offset_core::PortCommand runtime_previous_final_port_before;
+            double runtime_next_delta = 0.0;
+            phase_offset_core::PortCommand runtime_next_previous_final_port;
+            std::shared_ptr<const PathTubePair> active_pair;
+            std::uint64_t active_pair_generation = 0U;
+            std::uint64_t source_revision = 0U;
+            std::uint64_t path_revision = 0U;
+            std::uint64_t frame_revision = 0U;
+            std::uint64_t tube_revision = 0U;
+            std::uint64_t profile_revision = 0U;
+            std::uint64_t map_revision = 0U;
+            std::string obstacle_contract_id;
+            std::shared_ptr<const ContinuousPhasePath>
+                semantic_path_owner;
+            std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
+            std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
+                committed_authority_snapshot;
+            bool valid = false;
+
+            static bool sequenceAfter(std::uint64_t newer,
+                                      std::uint64_t older) {
+                return newer != older &&
+                    static_cast<std::int64_t>(newer - older) > 0;
+            }
+
+            bool structurallyValid() const {
+                return valid && task_generation != 0U &&
+                    authority_session != 0U && authority_sequence != 0U &&
+                    sequenceAfter(phase_generation_after,
+                                  phase_generation_before) &&
+                    std::isfinite(phase_before_w) &&
+                    std::isfinite(phase_after_w) &&
+                    std::isfinite(authority_w) &&
+                    std::isfinite(authority_proposed_next_w) &&
+                    active_pair && active_pair_generation != 0U &&
+                    semantic_path_owner && frame_owner &&
+                    committed_authority_snapshot &&
+                    source_revision != 0U && path_revision != 0U &&
+                    frame_revision != 0U;
+            }
+        };
         struct AuthoritativePhaseCommitToken {
             AuthoritativePhaseSnapshot expected;
             AuthoritativePhaseSnapshot committed;
@@ -386,6 +445,20 @@ class gvf_manager
         static const char* pathTubePairStageFailureName(
             PathTubePairStageFailure failure);
         AuthoritativePhaseSnapshot captureAuthoritativePhase() const;
+        std::shared_ptr<const SuccessorHandoffTransaction>
+        captureSuccessorHandoffTransaction() const;
+        void clearSuccessorHandoffTransaction();
+        void publishSuccessorHandoffTransaction(
+            const AuthoritativePhaseCommitToken& phase_token,
+            const std::shared_ptr<const PathTubePair>& command_pair,
+            const std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>&
+                committed_authority,
+            double runtime_retained_delta_before,
+            const phase_offset_core::PortCommand&
+                runtime_previous_final_port_before,
+            double runtime_next_delta,
+            const phase_offset_core::PortCommand&
+                runtime_next_previous_final_port);
         void publishAuthoritativePhaseLocked(
             double w, bool initialized, bool closed_acquired);
         void publishAuthoritativePhase(
@@ -512,10 +585,29 @@ class gvf_manager
         // construction, A*, tube construction, publication, or Runtime work.
         mutable std::mutex authoritative_phase_mutex_;
         std::uint64_t authoritative_phase_generation_ = 0U;
+        // Immutable successor-handoff source published after a fully
+        // committed command transaction.  This mutex is intentionally
+        // separate from path/phase locks so publication never creates a
+        // handoff->phase lock inversion.
+        mutable std::mutex successor_handoff_mutex_;
+        std::shared_ptr<const SuccessorHandoffTransaction>
+            successor_handoff_transaction_;
         // S3: MANUAL tube construction/visualization only.  The 50 Hz command
         // callback never calls TubeEpochManager.
         ros::Timer phase_offset_tube_timer_;
         PhaseOffsetMatchedAdapterConfig matched_config_;
+        // Exactly one main-side coordination selector is effective for this
+        // manager.  Provider/transport flags are validated against it before
+        // any SPH bridge is constructed; invalid combinations fail closed to
+        // DISABLED and leave the legacy complete-g_des APIs untouched.
+        PhaseOffsetCoordinationBackend coordination_backend_ =
+            PhaseOffsetCoordinationBackend::D1B;
+        bool coordination_backend_config_valid_ = true;
+        bool enable_neighbor_transport_ = false;
+        bool enable_sph_provider_ = false;
+        int phase_offset_robot_id_ = -1;
+        std::unique_ptr<bspline_race::integration::PhaseOffsetSphRosBridge>
+            phase_offset_sph_ros_bridge_;
         // Value-semantic boundary from the parallel interaction workstream.
         // No producer is connected in the single-UAV baseline, so the
         // adapter's frozen recenter-only fallback remains authoritative.
@@ -692,7 +784,10 @@ class gvf_manager
             Eigen::VectorXd& staged_time,
             std::vector<double>& staged_w,
             std::shared_ptr<const ContinuousPhasePath>& staged_path,
-            PathTubePairStageFailure* stage_failure = nullptr);
+            PathTubePairStageFailure* stage_failure = nullptr,
+            const std::shared_ptr<const SuccessorHandoffTransaction>&
+                successor_handoff =
+                    std::shared_ptr<const SuccessorHandoffTransaction>());
         bool consumeCompletedPathTubeHandoff(gvfManager& pm,
                                              const ros::Time& now);
         static bool samePathTubeAuthority(
@@ -737,6 +832,8 @@ class gvf_manager
         bool retireOffsetAuthorityForPlannerOwnerLocked();
         struct PathTubeReplanHandoffRequirement {
             std::shared_ptr<const PathTubePair> captured_pair;
+            std::shared_ptr<const SuccessorHandoffTransaction>
+                successor_handoff;
             bool executed_authority = false;
             bool pending_activation = false;
 
@@ -775,6 +872,26 @@ class gvf_manager
             const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
                 frozen_cloud_occupancy_snapshot,
             OffsetBootstrapAttemptResult* attempt_result = nullptr);
+        bool activatePendingOffsetAuthority(
+            gvfManager& pm,
+            const AuthoritativePhaseSnapshot& captured_phase,
+            const Eigen::Vector3d& position,
+            const guidance::IsfGains& gains,
+            double dt,
+            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
+                frozen_cloud_occupancy_snapshot,
+            const BootstrapRendezvousTicket& rendezvous_ticket,
+            OffsetBootstrapAttemptResult* attempt_result = nullptr);
+        bool activatePendingOffsetAuthorityImpl(
+            gvfManager& pm,
+            const AuthoritativePhaseSnapshot& captured_phase,
+            const Eigen::Vector3d& position,
+            const guidance::IsfGains& gains,
+            double dt,
+            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
+                frozen_cloud_occupancy_snapshot,
+            const BootstrapRendezvousTicket* rendezvous_ticket,
+            OffsetBootstrapAttemptResult* attempt_result);
         bool prepareBootstrapPathTubeTransaction(
             const std::shared_ptr<const ContinuousPhasePath>& path_owner,
             const std::vector<double>& sample_w,
@@ -787,7 +904,8 @@ class gvf_manager
             std::uint64_t authority_session,
             PathTubePairTransaction& transaction,
             std::shared_ptr<const PathTubePair>& candidate_pair,
-            OffsetBootstrapAttemptResult* attempt_result = nullptr);
+            OffsetBootstrapAttemptResult* attempt_result = nullptr,
+            const BootstrapRendezvousTicket* rendezvous_ticket = nullptr);
         bool buildMappedPhaseFrontend(
             double phase_anchor,
             double path_end_w,

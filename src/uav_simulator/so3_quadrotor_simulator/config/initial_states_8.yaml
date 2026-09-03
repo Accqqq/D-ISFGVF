@@ -1,0 +1,41 @@
+initial_states:
+  - robot_id: 0
+    x: 0.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 1
+    x: 2.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 2
+    x: 4.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 3
+    x: 6.0
+    y: 0.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 4
+    x: 0.0
+    y: 2.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 5
+    x: 2.0
+    y: 2.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 6
+    x: 4.0
+    y: 2.0
+    z: 1.0
+    yaw: 0.0
+  - robot_id: 7
+    x: 6.0
+    y: 2.0
+    z: 1.0
+    yaw: 0.0

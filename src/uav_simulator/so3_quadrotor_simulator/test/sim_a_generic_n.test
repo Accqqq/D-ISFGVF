@@ -1,0 +1,8 @@
+<launch>
+  <!-- The authorized Python test starts each case with the same executable
+       and injects only its private parameters.  No per-agent XML is copied. -->
+  <test test-name="sim_a_generic_n"
+        pkg="so3_quadrotor_simulator"
+        type="sim_a_generic_n_test.py"
+        time-limit="240.0" />
+</launch>

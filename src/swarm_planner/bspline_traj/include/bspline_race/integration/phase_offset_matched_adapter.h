@@ -27,6 +27,7 @@
 #include <bspline_race/integration/phase_offset_active_adapter.h>
 #include <bspline_race/integration/phase_offset_cloud_occupancy_query.h>
 #include <bspline_race/integration/phase_offset_raw_candidate_diagnostics.h>
+#include <bspline_race/integration/phase_offset_sph_ros_bridge.h>
 #include <plan_env/cloud_occupancy_snapshot.h>
 #include <phase_offset_navigation/phase_offset_runtime.h>
 #include <phase_offset_navigation/phase_offset_allocator.h>
@@ -46,6 +47,22 @@ struct TubeBuildRequest;
 
 enum class PhaseOffsetMatchedMode { ACTIVE = 0, MANUAL = 1 };
 
+// Main-side coordination selector.  The manager resolves the configured
+// string to one effective value before constructing the adapter.  D1B is the
+// compatibility default for direct adapter fixtures; production manager
+// configuration explicitly supplies disabled/d1b/sph as required.
+enum class PhaseOffsetCoordinationBackend {
+  DISABLED = 0,
+  D1B = 1,
+  SPH = 2,
+  kDisabled = DISABLED,
+  kD1B = D1B,
+  kSph = SPH
+};
+
+const char* phaseOffsetCoordinationBackendName(
+    PhaseOffsetCoordinationBackend backend);
+
 // This is deliberately an owning value type.  A command cycle may hand it to
 // the tube timer, but neither side may retain a mutable path/vector owned by
 // the other callback.
@@ -54,6 +71,8 @@ using MatchedAdapterPathSamples =
 
 struct PhaseOffsetMatchedAdapterConfig {
   PhaseOffsetMatchedMode mode = PhaseOffsetMatchedMode::ACTIVE;
+  PhaseOffsetCoordinationBackend coordination_backend =
+      PhaseOffsetCoordinationBackend::D1B;
   double equivalence_tolerance = 1e-10;
   int warmup_cycles = 100;
   double amplitude = 0.10;
@@ -231,6 +250,36 @@ struct PathTubePairTransaction {
   phase_offset_core::PortCommand captured_previous_final_port;
 };
 
+// Nonblocking neutral-to-offset bootstrap rendezvous.  The ticket is an
+// immutable identity/sequence token only: it deliberately carries no Tube
+// profile, cloud snapshot, Runtime state, or other heavy transaction value.
+// A manager may claim one READY ticket and perform the existing fresh
+// Path+Tube transaction outside the adapter command lock, then release the
+// claim with the result of its final Pair CAS.
+enum class BootstrapRendezvousState {
+  DISARMED,
+  ARMED,
+  READY,
+};
+
+struct BootstrapRendezvousTicket {
+  std::uint64_t claim_id = 0U;
+  std::uint64_t task_generation = 0U;
+  std::uint64_t authority_session = 0U;
+  std::uint64_t source_revision = 0U;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
+  std::uint64_t build_sequence = 0U;
+  const ContinuousPhasePath* semantic_path_owner = nullptr;
+  const ContinuousPhaseNormalFrame* frame_owner = nullptr;
+
+  bool valid() const {
+    return claim_id != 0U && task_generation != 0U &&
+        source_revision != 0U && build_sequence != 0U &&
+        semantic_path_owner != nullptr;
+  }
+};
+
 // Result of the lock-free half of an H2 handoff commit.  It contains no live
 // Runtime reference: all expensive owner evaluation, map checking and exact
 // port dry-run have already completed against a local Runtime copy.  The
@@ -313,6 +362,12 @@ struct MatchedAdapterInput {
   std::shared_ptr<const PathTubePair> successor_path_tube_pair;
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
       cloud_occupancy_snapshot;
+  // SPH is a value-semantic ROS boundary.  The manager captures one immutable
+  // bridge sample before calling update(); evaluateNormalAllocator resolves
+  // its source/receipt freshness only after successful NORMAL Preview.
+  const bspline_race::integration::PhaseOffsetSphRosBridge* sph_bridge =
+      nullptr;
+  bspline_race::integration::GCoordCapture captured_gcoord;
   // Value-semantic NORMAL interaction boundary.  A producer may provide an
   // exact desired active-reference motion for this tick.  When no producer is
   // connected (single-UAV operation), the adapter supplies the frozen
@@ -769,6 +824,21 @@ class PhaseOffsetMatchedAdapter {
   // timer event and creates at most one pending worker permit.  It never
   // performs heavy Tube construction on the caller thread.
   bool scheduleTubeBuild();
+  // Nonblocking neutral-to-offset bootstrap rendezvous.  The command side
+  // arms this state after publishing a complete no-Pair TubeBuildRequest;
+  // the timer claims at most one freshly finalized READY epoch and performs
+  // the existing handoff transaction outside this adapter.  No call waits.
+  BootstrapRendezvousState bootstrapRendezvousState() const;
+  bool claimBootstrapRendezvous(BootstrapRendezvousTicket& ticket);
+  bool validateBootstrapRendezvousClaim(
+      const BootstrapRendezvousTicket& ticket) const;
+  // `bootstrap_succeeded` is the result of the caller's final Pair CAS.  A
+  // failed transaction releases only the matching claim and leaves ARMED (or
+  // a newer READY) so a later fresh epoch can retry.  A successful CAS clears
+  // the rendezvous completely.  Late/mismatched completions are harmless.
+  bool completeBootstrapRendezvous(
+      const BootstrapRendezvousTicket& ticket,
+      bool bootstrap_succeeded);
   // Command-thread transition used when no goal/path is active.  It clears
   // only async request/tube exposure and queues one timer-side DELETE; Runtime
   // execution state (delta, previous port, profile lifecycle) is preserved.
@@ -896,12 +966,54 @@ class PhaseOffsetMatchedAdapter {
       PathTubePairCommitPreparation& preparation);
   bool finalizePreparedPathTubePairCommit(
       const PathTubePairCommitPreparation& preparation,
-      std::shared_ptr<const PathTubePair>& committed_pair);
+      std::shared_ptr<const PathTubePair>& committed_pair,
+      const BootstrapRendezvousTicket* rendezvous_ticket = nullptr);
   // Timer-only completion protocol.  It accepts a completed epoch when its
   // immutable path source is still current; its frozen map snapshot remains
   // the epoch's provenance rather than an equality key for later commands.
   bool finalizeTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
                          const TubeEpochSnapshot& snapshot);
+  struct BootstrapRendezvousIdentity {
+    std::uint64_t task_generation = 0U;
+    std::uint64_t authority_session = 0U;
+    std::uint64_t source_revision = 0U;
+    std::uint64_t path_revision = 0U;
+    std::uint64_t frame_revision = 0U;
+    const ContinuousPhasePath* semantic_path_owner = nullptr;
+    const ContinuousPhaseNormalFrame* frame_owner = nullptr;
+
+    bool valid() const {
+      return task_generation != 0U && source_revision != 0U &&
+          semantic_path_owner != nullptr;
+    }
+    bool operator==(const BootstrapRendezvousIdentity& other) const {
+      return task_generation == other.task_generation &&
+          authority_session == other.authority_session &&
+          source_revision == other.source_revision &&
+          path_revision == other.path_revision &&
+          frame_revision == other.frame_revision &&
+          semantic_path_owner == other.semantic_path_owner &&
+          frame_owner == other.frame_owner;
+    }
+    bool operator!=(const BootstrapRendezvousIdentity& other) const {
+      return !(*this == other);
+    }
+  };
+
+  void clearBootstrapRendezvousLocked();
+  bool armBootstrapRendezvousLocked(
+      const std::shared_ptr<const TubeBuildRequest>& request);
+  bool candidateBootstrapRendezvousEligibleLocked(
+      const TubeBuildRequest& request,
+      const TubeEpochSnapshot& snapshot);
+  bool claimMatchesBootstrapRendezvousLocked(
+      const BootstrapRendezvousTicket& ticket) const;
+  bool bootstrapReadyEpochMatchesLocked(
+      const BootstrapRendezvousIdentity& identity,
+      std::uint64_t build_sequence) const;
+  void demoteBootstrapReadyLocked();
+  void recordBootstrapReadyLocked(const TubeBuildRequest& request,
+                                  const TubeEpochSnapshot& snapshot);
   bool requestSourceStillCurrent(const TubeBuildRequest& request) const;
   bool requestCloudSnapshotUsable(const TubeBuildRequest& request) const;
   bool epochMatchesRequest(const TubeEpochSnapshot& epoch,
@@ -1199,6 +1311,20 @@ class PhaseOffsetMatchedAdapter {
   std::uint64_t last_consumed_epoch_build_sequence_ = 0U;
   bool command_active_ = false;
 
+  // Neutral-to-offset bootstrap rendezvous.  All fields below are protected
+  // by runtime_command_mutex_; the ticket never carries profile/cloud data.
+  BootstrapRendezvousState bootstrap_rendezvous_state_ =
+      BootstrapRendezvousState::DISARMED;
+  BootstrapRendezvousIdentity bootstrap_rendezvous_arm_;
+  BootstrapRendezvousIdentity bootstrap_rendezvous_ready_;
+  std::uint64_t bootstrap_rendezvous_ready_build_sequence_ = 0U;
+  std::uint64_t bootstrap_rendezvous_watermark_ = 0U;
+  BootstrapRendezvousTicket bootstrap_rendezvous_claim_;
+  bool bootstrap_rendezvous_claim_active_ = false;
+  std::uint64_t bootstrap_rendezvous_next_claim_id_ = 0U;
+  bool bootstrap_rendezvous_armed_logged_ = false;
+  bool bootstrap_rendezvous_ready_logged_ = false;
+
   // Cross-thread slots.  Every access uses std::atomic_load/store on the
   // shared_ptr; no raw pointer or mutable object is shared between callbacks.
   std::shared_ptr<const TubeBuildRequest> latest_build_request_;
@@ -1256,6 +1382,13 @@ class PhaseOffsetMatchedAdapter {
   std::uint64_t timer_last_publish_delete_source_revision_ = 0U;
   std::uint64_t timer_last_publish_delete_map_observation_sequence_ = 0U;
   std::uint64_t timer_last_published_epoch_build_sequence_ = 0U;
+  // Last build sequence which crossed finalizeTubeEpoch's currentness gate.
+  // It is a rendezvous watermark only; marker publication has its own
+  // timer_last_published_epoch_build_sequence_ bookkeeping.
+  // Finalization is performed by the timer worker while arming is observed
+  // by the command thread.  Keep this watermark atomic; it is deliberately
+  // separate from marker-publication bookkeeping.
+  std::atomic<std::uint64_t> timer_last_finalized_build_sequence_ {0U};
   std::uint64_t timer_last_raw_diagnostic_build_sequence_ = 0U;
   std::uint64_t timer_last_cloud_diagnostic_build_sequence_ = 0U;
   std::uint64_t timer_task_generation_ = 1U;

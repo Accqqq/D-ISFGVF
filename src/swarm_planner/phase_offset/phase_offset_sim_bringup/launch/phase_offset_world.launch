@@ -1,0 +1,30 @@
+<launch>
+  <!--
+    Shared read-only WORLD infrastructure.  This entry point deliberately
+    does not start a simulator, controller, planner, goal publisher, or any
+    swarm/control implementation.  SWARM owns those processes.
+  -->
+  <arg name="scenario_file"
+       default="$(find phase_offset_sim_bringup)/config/scenarios/sim_b_open_3.yaml"/>
+  <arg name="map_file"
+       default="$(find map_generator)/resource/phase_offset_open.pcd"/>
+  <arg name="frame_id" default="world"/>
+  <arg name="enable_rviz" default="false"/>
+  <arg name="rviz_config"
+       default="$(find phase_offset_sim_bringup)/rviz/phase_offset_sim_b.rviz"/>
+
+  <!-- Sole scenario source for the generic-N read-only visualizer. -->
+  <rosparam command="load" file="$(arg scenario_file)" ns="/sim_b_world"/>
+
+  <node pkg="map_generator" type="map_pub" name="map_pub" output="screen"
+        args="$(arg map_file)"/>
+
+  <node pkg="phase_offset_sim_bringup" type="swarm_visualizer"
+        name="phase_offset_swarm_visualizer" output="screen">
+    <param name="scenario_param" value="/sim_b_world/scenario/agents"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+  </node>
+
+  <node if="$(arg enable_rviz)" pkg="rviz" type="rviz" name="rviz"
+        output="screen" required="true" args="-d $(arg rviz_config)"/>
+</launch>

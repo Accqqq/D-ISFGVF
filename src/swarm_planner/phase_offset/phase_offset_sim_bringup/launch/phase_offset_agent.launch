@@ -1,0 +1,232 @@
+<launch>
+  <!--
+    SIM-B per-agent adapter.  The caller owns the generic-N physical plant
+    and the single nodelet manager.  This file owns exactly one
+    one SO3 controller nodelet and one protected GVF launch include (formation
+    planner plus local sensing).
+
+    spinner_threads and use_velocity_feedforward are retained only so older
+    launch callers can pass them.  They are deliberately not forwarded,
+    stored as parameters, or consumed by any control path.
+  -->
+  <arg name="robot_id" default="0"/>
+  <arg name="uav_ns" default="uav_$(arg robot_id)"/>
+  <arg name="nodelet_manager" default="/so3_nodelet_manager"/>
+
+  <arg name="init_x" default="0.0"/>
+  <arg name="init_y" default="0.0"/>
+  <arg name="init_z" default="1.0"/>
+
+  <arg name="odom_topic" default="/uav_$(arg robot_id)/sim/odom"/>
+  <arg name="imu_topic" default="/uav_$(arg robot_id)/sim/imu"/>
+  <arg name="local_map_topic" default="/uav_$(arg robot_id)/sim/local_map"/>
+  <arg name="global_map_topic" default="/mock_map"/>
+  <arg name="goal_topic" default="/uav_$(arg robot_id)/goal"/>
+  <arg name="cmd_topic" default="/uav_$(arg robot_id)/position_cmd"/>
+  <arg name="so3_cmd_topic" default="/uav_$(arg robot_id)/so3_cmd"/>
+  <arg name="frame_id" default="world"/>
+  <arg name="phase_offset_mode" default="active"/>
+  <arg name="phase_offset_coordination_backend" default="disabled"/>
+  <arg name="phase_offset_manual_observe_only" default="true"/>
+  <arg name="phase_offset_manual_tube_source" default="none"/>
+  <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false"/>
+  <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0"/>
+  <arg name="phase_offset_normal_preview_horizon_w" default=""/>
+  <arg name="phase_offset_normal_preview_sample_spacing_w" default=""/>
+  <arg name="phase_offset_normal_preview_lower_nu" default=""/>
+  <arg name="phase_offset_normal_preview_upper_nu" default=""/>
+  <arg name="phase_offset_normal_preview_b_tight" default=""/>
+  <arg name="phase_offset_normal_preview_b_open" default=""/>
+  <arg name="phase_offset_g_coord_fresh_timeout" default="0.10"/>
+  <arg name="phase_offset_future_timestamp_tolerance" default="0.02"/>
+
+  <!-- SIM-C is an opt-in data-plane process; SIM-B defaults remain intact. -->
+  <arg name="enable_neighbor_transport" default="false"/>
+  <arg name="agent_count" default="1"/>
+  <arg name="agent_state_topic" default="/phase_offset/agent_state"/>
+  <arg name="neighbor_config_file"
+       default="$(find phase_offset_swarm)/config/neighbor_transport_v1.yaml"/>
+  <arg name="neighbor_enter_radius" default="2.45"/>
+  <arg name="neighbor_exit_radius" default="2.50"/>
+  <arg name="all_visible_neighbors" default="false"/>
+  <arg name="enable_sph_provider" default="false"/>
+  <arg name="sph_beta_topic" default="/uav_$(arg robot_id)/phase_offset/sph_beta"/>
+  <arg name="sph_g_coord_topic" default="/uav_$(arg robot_id)/phase_offset/g_coord"/>
+  <arg name="beta_fresh_timeout" default="0.10"/>
+  <arg name="snapshot_fresh_timeout" default="0.10"/>
+  <arg name="future_timestamp_tolerance" default="0.02"/>
+
+  <arg name="map_resolution" default="0.20"/>
+  <arg name="map_size_x" default="20.0"/>
+  <arg name="map_size_y" default="30.0"/>
+  <arg name="map_size_z" default="2.5"/>
+
+  <!-- Compatibility-only no-op arguments; do not use these values. -->
+  <arg name="spinner_threads" default="2"/>
+  <arg name="use_velocity_feedforward" default="false"/>
+
+  <!-- One deterministic controller nodelet in the caller-owned manager. -->
+  <node pkg="nodelet" type="nodelet"
+        name="so3_control_nodelet_$(arg robot_id)"
+        args="load so3_control/SO3ControlNodelet $(arg nodelet_manager)"
+        output="screen">
+    <param name="quadrotor_name" value="$(arg uav_ns)"/>
+    <param name="so3_control/init_state_x" value="$(arg init_x)"/>
+    <param name="so3_control/init_state_y" value="$(arg init_y)"/>
+    <param name="so3_control/init_state_z" value="$(arg init_z)"/>
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <remap from="~position_cmd" to="$(arg cmd_topic)"/>
+    <remap from="~motors" to="/$(arg uav_ns)/motors"/>
+    <remap from="~corrections" to="/$(arg uav_ns)/corrections"/>
+    <remap from="~so3_cmd" to="$(arg so3_cmd_topic)"/>
+    <remap from="~imu" to="$(arg imu_topic)"/>
+    <rosparam file="$(find so3_control)/config/gains_hummingbird.yaml"/>
+    <rosparam file="$(find so3_control)/config/corrections_hummingbird.yaml"/>
+    <param name="mass" value="0.98"/>
+    <param name="use_angle_corrections" value="false"/>
+    <param name="use_external_yaw" value="false"/>
+    <param name="gains/rot/z" value="1.0"/>
+    <param name="gains/ang/z" value="0.1"/>
+  </node>
+
+  <!-- One local SIM-C runtime per UAV; no control/intent topics are owned. -->
+  <node if="$(eval arg('enable_neighbor_transport') or arg('enable_sph_provider'))"
+        pkg="phase_offset_swarm" type="agent_state_neighbor_runtime_node"
+        name="sim_c_neighbor_runtime" ns="$(arg uav_ns)" output="screen"
+        required="true">
+    <rosparam file="$(arg neighbor_config_file)" command="load"/>
+    <param name="robot_id" value="$(arg robot_id)"/>
+    <param name="agent_count" value="$(arg agent_count)"/>
+    <param name="world_frame" value="$(arg frame_id)"/>
+    <param name="agent_state_topic" value="$(arg agent_state_topic)"/>
+    <param name="enable_neighbor_transport" value="$(arg enable_neighbor_transport)"/>
+    <param name="enter_radius" value="$(arg neighbor_enter_radius)"/>
+    <param name="exit_radius" value="$(arg neighbor_exit_radius)"/>
+    <param name="enable_sph_provider" value="$(arg enable_sph_provider)"/>
+    <param name="beta_fresh_timeout" value="$(arg beta_fresh_timeout)"/>
+    <param name="snapshot_fresh_timeout" value="$(arg snapshot_fresh_timeout)"/>
+    <param name="future_timestamp_tolerance" value="$(arg future_timestamp_tolerance)"/>
+    <remap from="~beta" to="$(arg sph_beta_topic)"/>
+    <remap from="~g_coord" to="$(arg sph_g_coord_topic)"/>
+    <remap from="~odom" to="$(arg odom_topic)"/>
+  </node>
+
+  <!--
+    The protected launch contains legacy absolute planner/SDF endpoints.
+    Every such endpoint is isolated here so independent UAV instances cannot
+    collide.  The shared /mock_map input remains read-only and common.
+  -->
+  <group ns="$(arg uav_ns)">
+    <remap from="/move_base_simple/goal" to="$(arg goal_topic)"/>
+    <remap from="/gvf_force" to="/$(arg uav_ns)/gvf_force"/>
+    <remap from="/path_vis" to="/$(arg uav_ns)/path_vis"/>
+    <remap from="/goal_vis" to="/$(arg uav_ns)/goal_vis"/>
+    <remap from="/optimization_path" to="/$(arg uav_ns)/optimization_path"/>
+
+    <remap from="/particle0/path" to="/$(arg uav_ns)/particle0/path"/>
+    <remap from="/particle0/kinopath" to="/$(arg uav_ns)/particle0/kinopath"/>
+    <remap from="/particle0/circle_reference" to="/$(arg uav_ns)/particle0/circle_reference"/>
+
+    <remap from="/particle0sdf_map/occupancy" to="/$(arg uav_ns)/particle0sdf_map/occupancy"/>
+    <remap from="/particle0sdf_map/occupancy_inflate" to="/$(arg uav_ns)/particle0sdf_map/occupancy_inflate"/>
+    <remap from="/particle0sdf_map/esdf" to="/$(arg uav_ns)/particle0sdf_map/esdf"/>
+    <remap from="/particle0sdf_map/update_range" to="/$(arg uav_ns)/particle0sdf_map/update_range"/>
+    <remap from="/particle0sdf_map/map_boundary" to="/$(arg uav_ns)/particle0sdf_map/map_boundary"/>
+    <remap from="/particle0sdf_map/unknown" to="/$(arg uav_ns)/particle0sdf_map/unknown"/>
+    <remap from="/particle0sdf_map/depth_cloud" to="/$(arg uav_ns)/particle0sdf_map/depth_cloud"/>
+
+    <remap from="/particle0/gvf/occupancy" to="/$(arg uav_ns)/particle0/gvf/occupancy"/>
+    <remap from="/particle0/gvf/occupancy_inflate" to="/$(arg uav_ns)/particle0/gvf/occupancy_inflate"/>
+    <remap from="/particle0/gvf/esdf" to="/$(arg uav_ns)/particle0/gvf/esdf"/>
+    <remap from="/particle0/gvf/update_range" to="/$(arg uav_ns)/particle0/gvf/update_range"/>
+    <remap from="/particle0/gvf/traj_vis" to="/$(arg uav_ns)/particle0/gvf/traj_vis"/>
+    <remap from="/particle0/gvf/vector_field" to="/$(arg uav_ns)/particle0/gvf/vector_field"/>
+
+    <remap from="/manual_obstacle" to="/$(arg uav_ns)/manual_obstacle"/>
+    <remap from="/manual_boundary" to="/$(arg uav_ns)/manual_boundary"/>
+    <remap from="/manual_map/add_obstacle_center" to="/$(arg uav_ns)/manual_map/add_obstacle_center"/>
+    <remap from="/manual_map/add_boundary_point" to="/$(arg uav_ns)/manual_map/add_boundary_point"/>
+    <remap from="/manual_map/occupancy" to="/$(arg uav_ns)/manual_map/occupancy"/>
+    <remap from="/clicked_point" to="/$(arg uav_ns)/clicked_point"/>
+    <remap from="/dynamic/obj" to="/$(arg uav_ns)/dynamic/obj"/>
+
+    <!-- Exactly one protected planner/local-sensing stack per agent. -->
+    <include file="$(find bspline_race)/launch/test_gvf.launch">
+      <arg name="drone_id" value="$(arg robot_id)"/>
+      <arg name="robot_id" value="$(arg robot_id)"/>
+      <arg name="init_x" value="$(arg init_x)"/>
+      <arg name="init_y" value="$(arg init_y)"/>
+      <arg name="init_z" value="$(arg init_z)"/>
+      <arg name="phase_offset_mode" value="$(arg phase_offset_mode)"/>
+      <arg name="phase_offset_coordination_backend"
+           value="$(arg phase_offset_coordination_backend)"/>
+      <arg name="enable_neighbor_transport"
+           value="$(arg enable_neighbor_transport)"/>
+      <arg name="enable_sph_provider"
+           value="$(arg enable_sph_provider)"/>
+      <arg name="phase_offset_sph_beta_topic"
+           value="$(arg sph_beta_topic)"/>
+      <arg name="phase_offset_sph_g_coord_topic"
+           value="$(arg sph_g_coord_topic)"/>
+      <arg name="phase_offset_g_coord_fresh_timeout"
+           value="$(arg phase_offset_g_coord_fresh_timeout)"/>
+      <arg name="phase_offset_future_timestamp_tolerance"
+           value="$(arg phase_offset_future_timestamp_tolerance)"/>
+      <arg name="phase_offset_manual_observe_only"
+           value="$(arg phase_offset_manual_observe_only)"/>
+      <arg name="phase_offset_manual_tube_source"
+           value="$(arg phase_offset_manual_tube_source)"/>
+      <arg name="phase_offset_tube_cloud_obstacle_set_complete"
+           value="$(arg phase_offset_tube_cloud_obstacle_set_complete)"/>
+      <arg name="phase_offset_tube_preincluded_map_uncertainty"
+           value="$(arg phase_offset_tube_preincluded_map_uncertainty)"/>
+      <arg name="phase_offset_normal_preview_horizon_w"
+           value="$(arg phase_offset_normal_preview_horizon_w)"/>
+      <arg name="phase_offset_normal_preview_sample_spacing_w"
+           value="$(arg phase_offset_normal_preview_sample_spacing_w)"/>
+      <arg name="phase_offset_normal_preview_lower_nu"
+           value="$(arg phase_offset_normal_preview_lower_nu)"/>
+      <arg name="phase_offset_normal_preview_upper_nu"
+           value="$(arg phase_offset_normal_preview_upper_nu)"/>
+      <arg name="phase_offset_normal_preview_b_tight"
+           value="$(arg phase_offset_normal_preview_b_tight)"/>
+      <arg name="phase_offset_normal_preview_b_open"
+           value="$(arg phase_offset_normal_preview_b_open)"/>
+    </include>
+
+    <!-- Explicit per-instance private planner parameters. -->
+    <group ns="formation_planning">
+      <param name="phase_offset/mode" value="active" if="$(eval arg('phase_offset_mode') == 'active')"/>
+      <param name="gvf/odom_topic" value="$(arg odom_topic)"/>
+      <param name="gvf/cloud_topic" value="$(arg local_map_topic)"/>
+      <param name="gvf/cmd_topic" value="$(arg cmd_topic)"/>
+      <param name="gvf/circle_test/enable" value="false"/>
+      <param name="gvf/circle_test/auto_start" value="false"/>
+      <param name="gvf/gvf_gain1" value="2.0"/>
+      <param name="gvf/gvf_gain2" value="-2.2"/>
+      <param name="sdf_map/resolution" value="$(arg map_resolution)"/>
+      <param name="sdf_map/map_size_x" value="$(arg map_size_x)"/>
+      <param name="sdf_map/map_size_y" value="$(arg map_size_y)"/>
+      <param name="sdf_map/map_size_z" value="$(arg map_size_z)"/>
+      <param name="sdf_map/frame_id" value="world"/>
+      <param name="sdf_map/enable_manual_map" value="false"/>
+      <param name="sdf_map/manual_map_auto_load" value="false"/>
+      <param name="sdf_map/manual_map_auto_save" value="false"/>
+    </group>
+
+    <group ns="map_generator">
+      <param name="odom_topic" value="$(arg odom_topic)"/>
+      <param name="global_map_topic" value="$(arg global_map_topic)"/>
+      <param name="local_map_topic" value="$(arg local_map_topic)"/>
+      <param name="output_frame" value="world"/>
+      <param name="sensing_rate" value="10.0"/>
+      <param name="sdf_map/resolution" value="$(arg map_resolution)"/>
+      <param name="sdf_map/map_size_x" value="$(arg map_size_x)"/>
+      <param name="sdf_map/map_size_y" value="$(arg map_size_y)"/>
+      <param name="sdf_map/map_size_z" value="$(arg map_size_z)"/>
+      <param name="sdf_map/local_update_range_x" value="6.0"/>
+      <param name="sdf_map/local_update_range_y" value="6.0"/>
+      <param name="sdf_map/local_update_range_z" value="2.5"/>
+    </group>
+  </group>
+</launch>

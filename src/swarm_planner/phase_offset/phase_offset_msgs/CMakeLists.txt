@@ -10,6 +10,8 @@ find_package(catkin REQUIRED COMPONENTS
 add_message_files(
   FILES
     AgentState.msg
+    BetaSample.msg
+    GCoordSample.msg
 )
 
 generate_messages(

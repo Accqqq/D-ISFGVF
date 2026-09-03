@@ -16,6 +16,19 @@
 
 namespace FLAG_Race {
 
+const char* phaseOffsetCoordinationBackendName(
+    const PhaseOffsetCoordinationBackend backend) {
+  switch (backend) {
+    case PhaseOffsetCoordinationBackend::DISABLED:
+      return "disabled";
+    case PhaseOffsetCoordinationBackend::D1B:
+      return "d1b";
+    case PhaseOffsetCoordinationBackend::SPH:
+      return "sph";
+  }
+  return "disabled";
+}
+
 struct PathTubePairPinRegistry {
   std::mutex mutex;
   std::uint64_t next_lease_id = 0U;
@@ -1488,6 +1501,574 @@ bool PhaseOffsetMatchedAdapter::requiresPathTubePairBootstrapLocked() const {
   return runtime_->hasPendingOrActiveOffsetIntent();
 }
 
+void PhaseOffsetMatchedAdapter::clearBootstrapRendezvousLocked() {
+  bootstrap_rendezvous_state_ = BootstrapRendezvousState::DISARMED;
+  bootstrap_rendezvous_arm_ = BootstrapRendezvousIdentity();
+  bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
+  bootstrap_rendezvous_ready_build_sequence_ = 0U;
+  bootstrap_rendezvous_watermark_ = 0U;
+  bootstrap_rendezvous_claim_ = BootstrapRendezvousTicket();
+  bootstrap_rendezvous_claim_active_ = false;
+  bootstrap_rendezvous_armed_logged_ = false;
+  bootstrap_rendezvous_ready_logged_ = false;
+}
+
+bool PhaseOffsetMatchedAdapter::armBootstrapRendezvousLocked(
+    const std::shared_ptr<const TubeBuildRequest>& request) {
+  // Direct/unadvertised fixtures intentionally retain their historical
+  // synchronous bootstrap path.  Arming is still harmless there (the
+  // manager only claims tickets on its production timer), and keeping the
+  // state visible makes deterministic adapter tests exercise the same
+  // post-request rendezvous boundary.
+  // Invalidate an older arm as soon as a no-Pair request names a different
+  // task/session/source/path/frame, even if the replacement is not yet
+  // eligible to arm (for example while Runtime is non-neutral).
+  if (request && request->active && !request->base_path_tube_pair &&
+      bootstrap_rendezvous_arm_.valid() &&
+      (bootstrap_rendezvous_arm_.task_generation != request->task_generation ||
+       bootstrap_rendezvous_arm_.authority_session !=
+           request->authority_session ||
+       bootstrap_rendezvous_arm_.source_revision != request->source_revision ||
+       bootstrap_rendezvous_arm_.path_revision != request->path_revision ||
+       bootstrap_rendezvous_arm_.frame_revision != request->frame_revision ||
+       bootstrap_rendezvous_arm_.semantic_path_owner !=
+           request->semantic_path_owner.get() ||
+       bootstrap_rendezvous_arm_.frame_owner != request->frame_owner.get())) {
+    clearBootstrapRendezvousLocked();
+  }
+  const bool had_rendezvous =
+      bootstrap_rendezvous_state_ != BootstrapRendezvousState::DISARMED;
+  if (!request || !request->active || request->base_path_tube_pair ||
+      !requiresTubeTimer() || config_.observe_only ||
+      config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
+      !zero_gate_open_ || failure_latched_ || !runtime_ ||
+      capturePathTubePair() ||
+      !std::isfinite(runtime_->retainedDelta()) ||
+      runtime_->retainedDelta() != 0.0 ||
+      runtime_->hasExecutedOffsetAuthority() ||
+      !request->semantic_path_owner || request->source_revision == 0U ||
+      request->task_generation != task_generation_.load(
+          std::memory_order_acquire) ||
+      request->authority_session != authority_session_.load(
+          std::memory_order_acquire)) {
+    if (had_rendezvous) clearBootstrapRendezvousLocked();
+    return false;
+  }
+
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      execution_authority_.snapshot();
+  if (advertised_) {
+    if (authority.valid &&
+        (authority.authority_session != request->authority_session ||
+         authority.owner_mode !=
+             phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY)) {
+      if (had_rendezvous) clearBootstrapRendezvousLocked();
+      return false;
+    }
+  } else if (!execution_authority_.config().allow_test_only_runtime_owner ||
+             !runtime_->hasPendingOrActiveOffsetIntent()) {
+    if (had_rendezvous) clearBootstrapRendezvousLocked();
+    return false;
+  }
+
+  BootstrapRendezvousIdentity identity;
+  identity.task_generation = request->task_generation;
+  identity.authority_session = request->authority_session;
+  identity.source_revision = request->source_revision;
+  identity.path_revision = request->path_revision;
+  identity.frame_revision = request->frame_revision;
+  identity.semantic_path_owner = request->semantic_path_owner.get();
+  identity.frame_owner = request->frame_owner.get();
+  if (!identity.valid()) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+
+  if (bootstrap_rendezvous_arm_ != identity) {
+    // A source/path/frame/session replacement invalidates any READY or
+    // claimed ticket.  The newer request gets a fresh finalized-build
+    // watermark; a late completion can no longer match this identity.
+    clearBootstrapRendezvousLocked();
+    bootstrap_rendezvous_arm_ = identity;
+    bootstrap_rendezvous_watermark_ =
+        timer_last_finalized_build_sequence_.load(std::memory_order_acquire);
+    bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
+    if (!bootstrap_rendezvous_armed_logged_) {
+      ROS_INFO(
+          "[PHASE_OFFSET][BOOTSTRAP_RENDEZVOUS] state=ARMED task=%llu "
+          "session=%llu source=%llu path=%llu frame=%llu watermark=%llu",
+          static_cast<unsigned long long>(identity.task_generation),
+          static_cast<unsigned long long>(identity.authority_session),
+          static_cast<unsigned long long>(identity.source_revision),
+          static_cast<unsigned long long>(identity.path_revision),
+          static_cast<unsigned long long>(identity.frame_revision),
+          static_cast<unsigned long long>(bootstrap_rendezvous_watermark_));
+      bootstrap_rendezvous_armed_logged_ = true;
+    }
+  } else if (bootstrap_rendezvous_state_ ==
+             BootstrapRendezvousState::DISARMED) {
+    bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::candidateBootstrapRendezvousEligibleLocked(
+    const TubeBuildRequest& request,
+    const TubeEpochSnapshot& snapshot) {
+  if (request.task_generation != task_generation_.load(
+          std::memory_order_acquire) ||
+      request.authority_session != authority_session_.load(
+          std::memory_order_acquire)) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  if (bootstrap_rendezvous_state_ == BootstrapRendezvousState::DISARMED ||
+      !bootstrap_rendezvous_arm_.valid() ||
+      request.base_path_tube_pair || !request.active ||
+      !zero_gate_open_ || failure_latched_ ||
+      shutdown_requested_.load(std::memory_order_acquire) ||
+      snapshot.build_sequence == 0U ||
+      snapshot.build_sequence <= bootstrap_rendezvous_watermark_) {
+    return false;
+  }
+  BootstrapRendezvousIdentity request_identity;
+  request_identity.task_generation = request.task_generation;
+  request_identity.authority_session = request.authority_session;
+  request_identity.source_revision = request.source_revision;
+  request_identity.path_revision = request.path_revision;
+  request_identity.frame_revision = request.frame_revision;
+  request_identity.semantic_path_owner = request.semantic_path_owner.get();
+  request_identity.frame_owner = request.frame_owner.get();
+  if (request_identity != bootstrap_rendezvous_arm_) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  if (snapshot.task_generation != request.task_generation ||
+      snapshot.source_revision != request.source_revision ||
+      snapshot.path_revision != request.path_revision ||
+      snapshot.frame_revision != request.frame_revision ||
+      snapshot.semantic_path_owner != request.semantic_path_owner ||
+      snapshot.frame_owner != request.frame_owner) {
+    return false;
+  }
+  const std::shared_ptr<const TubeBuildRequest> latest =
+      std::atomic_load(&latest_build_request_);
+  if (!latest || !latest->active || latest->base_path_tube_pair ||
+      !requestSourceStillCurrent(request) ||
+      latest->task_generation != request.task_generation ||
+      latest->authority_session != request.authority_session ||
+      latest->source_revision != request.source_revision ||
+      latest->path_revision != request.path_revision ||
+      latest->frame_revision != request.frame_revision ||
+      latest->semantic_path_owner != request.semantic_path_owner ||
+      latest->frame_owner != request.frame_owner) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  // Keep the existing request/epoch and cloud gates authoritative.  This is
+  // deliberately checked before any rendezvous state is exposed as READY.
+  if (!epochMatchesRequest(snapshot, *latest)) return false;
+
+  const phase_offset_navigation::TubeEpochStatus& status =
+      snapshot.epoch_status;
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
+      candidate = snapshot.candidate_profile;
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& active =
+      snapshot.active_profile;
+  constexpr phase_offset_navigation::TubeProfileClassification kCertified =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  // A planner-owned ContinuousPhasePath may legitimately have no intrinsic
+  // path revision (the production owner defaults to zero).  The immutable
+  // handoff frame still carries the effective path/frame revisions used by
+  // TubeBuilder.  Compare profile provenance with that canonical frame value
+  // rather than rejecting a valid epoch merely because the request's legacy
+  // owner revision is zero.
+  const std::uint64_t expected_profile_path_revision =
+      request.path_revision != 0U
+          ? request.path_revision
+          : (request.frame_owner ? request.frame_owner->pathRevision() : 0U);
+  const std::uint64_t expected_profile_frame_revision =
+      request.frame_revision != 0U
+          ? request.frame_revision
+          : (request.frame_owner ? request.frame_owner->frameRevision() : 0U);
+  if (!candidate || !active || !candidate->complete ||
+      !active->complete || !candidate->obstacle_certified ||
+      !active->obstacle_certified || candidate->classification != kCertified ||
+      active->classification != kCertified || !status.candidate_complete ||
+      status.candidate_classification != kCertified ||
+      !status.active_available || !status.active_current_validation_valid ||
+      status.active_classification != kCertified ||
+      status.candidate_path_source_revision != request.source_revision ||
+      status.active_path_source_revision != request.source_revision ||
+      candidate->source_revision != request.source_revision ||
+      active->source_revision != request.source_revision ||
+      (expected_profile_path_revision != 0U &&
+       (candidate->path_revision != expected_profile_path_revision ||
+        active->path_revision != expected_profile_path_revision)) ||
+      (expected_profile_frame_revision != 0U &&
+       (candidate->frame_revision != expected_profile_frame_revision ||
+        active->frame_revision != expected_profile_frame_revision)) ||
+      !snapshot.full_path_samples) {
+    return false;
+  }
+  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
+    if (!snapshot.map_observation_is_snapshot ||
+        snapshot.map_observation_sequence == 0U ||
+        !status.map_observation_is_snapshot ||
+        status.candidate_map_observation_sequence !=
+            snapshot.map_observation_sequence ||
+        status.active_map_observation_sequence !=
+            snapshot.map_observation_sequence ||
+        candidate->map_revision != snapshot.map_observation_sequence ||
+        candidate->snapshot_sequence != snapshot.map_observation_sequence ||
+        !candidate->snapshot_provenance_is_immutable) {
+      return false;
+    }
+  } else if (snapshot.map_observation_is_snapshot ||
+             snapshot.map_observation_sequence != 0U ||
+             status.candidate_map_observation_sequence != 0U ||
+             status.active_map_observation_sequence != 0U ||
+             candidate->map_revision != 0U) {
+    return false;
+  }
+  return true;
+}
+
+void PhaseOffsetMatchedAdapter::recordBootstrapReadyLocked(
+    const TubeBuildRequest& request, const TubeEpochSnapshot& snapshot) {
+  if (!candidateBootstrapRendezvousEligibleLocked(request, snapshot)) return;
+  BootstrapRendezvousIdentity identity;
+  identity.task_generation = request.task_generation;
+  identity.authority_session = request.authority_session;
+  identity.source_revision = request.source_revision;
+  identity.path_revision = request.path_revision;
+  identity.frame_revision = request.frame_revision;
+  identity.semantic_path_owner = request.semantic_path_owner.get();
+  identity.frame_owner = request.frame_owner.get();
+  if (bootstrap_rendezvous_ready_.valid() &&
+      bootstrap_rendezvous_ready_ == identity &&
+      bootstrap_rendezvous_ready_build_sequence_ >= snapshot.build_sequence) {
+    return;
+  }
+  bootstrap_rendezvous_ready_ = identity;
+  bootstrap_rendezvous_ready_build_sequence_ = snapshot.build_sequence;
+  bootstrap_rendezvous_state_ = BootstrapRendezvousState::READY;
+  bootstrap_rendezvous_ready_logged_ = false;
+  if (!bootstrap_rendezvous_ready_logged_) {
+    ROS_INFO(
+        "[PHASE_OFFSET][BOOTSTRAP_RENDEZVOUS] state=READY task=%llu "
+        "session=%llu source=%llu path=%llu frame=%llu build_sequence=%llu",
+        static_cast<unsigned long long>(identity.task_generation),
+        static_cast<unsigned long long>(identity.authority_session),
+        static_cast<unsigned long long>(identity.source_revision),
+        static_cast<unsigned long long>(identity.path_revision),
+        static_cast<unsigned long long>(identity.frame_revision),
+        static_cast<unsigned long long>(snapshot.build_sequence));
+    bootstrap_rendezvous_ready_logged_ = true;
+  }
+}
+
+bool PhaseOffsetMatchedAdapter::claimMatchesBootstrapRendezvousLocked(
+    const BootstrapRendezvousTicket& ticket) const {
+  if (!bootstrap_rendezvous_claim_active_ || !ticket.valid()) return false;
+  return ticket.claim_id == bootstrap_rendezvous_claim_.claim_id &&
+      ticket.task_generation == bootstrap_rendezvous_claim_.task_generation &&
+      ticket.authority_session == bootstrap_rendezvous_claim_.authority_session &&
+      ticket.source_revision == bootstrap_rendezvous_claim_.source_revision &&
+      ticket.path_revision == bootstrap_rendezvous_claim_.path_revision &&
+      ticket.frame_revision == bootstrap_rendezvous_claim_.frame_revision &&
+      ticket.build_sequence == bootstrap_rendezvous_claim_.build_sequence &&
+      ticket.semantic_path_owner ==
+          bootstrap_rendezvous_claim_.semantic_path_owner &&
+      ticket.frame_owner == bootstrap_rendezvous_claim_.frame_owner;
+}
+
+bool PhaseOffsetMatchedAdapter::bootstrapReadyEpochMatchesLocked(
+    const BootstrapRendezvousIdentity& identity,
+    const std::uint64_t build_sequence) const {
+  if (!identity.valid() || build_sequence == 0U) return false;
+  const std::shared_ptr<const TubeEpochSnapshot> epoch =
+      std::atomic_load(&latest_epoch_snapshot_);
+  if (!epoch || !epoch->active || epoch->build_sequence != build_sequence ||
+      epoch->task_generation != identity.task_generation ||
+      epoch->source_revision != identity.source_revision ||
+      epoch->path_revision != identity.path_revision ||
+      epoch->frame_revision != identity.frame_revision ||
+      epoch->semantic_path_owner.get() != identity.semantic_path_owner ||
+      epoch->frame_owner.get() != identity.frame_owner) {
+    return false;
+  }
+
+  const phase_offset_navigation::TubeEpochStatus& status =
+      epoch->epoch_status;
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& candidate =
+      epoch->candidate_profile;
+  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& active =
+      epoch->active_profile;
+  constexpr phase_offset_navigation::TubeProfileClassification kCertified =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  if (!candidate || !active || !candidate->complete ||
+      !active->complete || !candidate->obstacle_certified ||
+      !active->obstacle_certified || candidate->classification != kCertified ||
+      active->classification != kCertified || !status.candidate_complete ||
+      status.candidate_classification != kCertified ||
+      !status.active_available || !status.active_current_validation_valid ||
+      status.active_classification != kCertified ||
+      status.candidate_path_source_revision != identity.source_revision ||
+      status.active_path_source_revision != identity.source_revision ||
+      candidate->source_revision != identity.source_revision ||
+      active->source_revision != identity.source_revision ||
+      (identity.path_revision != 0U &&
+       (candidate->path_revision != identity.path_revision ||
+        active->path_revision != identity.path_revision)) ||
+      (identity.frame_revision != 0U &&
+       (candidate->frame_revision != identity.frame_revision ||
+        active->frame_revision != identity.frame_revision)) ||
+      !epoch->full_path_samples) {
+    return false;
+  }
+
+  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
+    if (!epoch->map_observation_is_snapshot ||
+        epoch->map_observation_sequence == 0U ||
+        !status.map_observation_is_snapshot ||
+        status.candidate_map_observation_sequence !=
+            epoch->map_observation_sequence ||
+        status.active_map_observation_sequence !=
+            epoch->map_observation_sequence ||
+        candidate->map_revision != epoch->map_observation_sequence ||
+        candidate->snapshot_sequence != epoch->map_observation_sequence ||
+        !candidate->snapshot_provenance_is_immutable) {
+      return false;
+    }
+  } else if (epoch->map_observation_is_snapshot ||
+             epoch->map_observation_sequence != 0U ||
+             status.candidate_map_observation_sequence != 0U ||
+             status.active_map_observation_sequence != 0U ||
+             candidate->map_revision != 0U) {
+    return false;
+  }
+  return true;
+}
+
+void PhaseOffsetMatchedAdapter::demoteBootstrapReadyLocked() {
+  if (bootstrap_rendezvous_state_ != BootstrapRendezvousState::READY) return;
+  bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
+  bootstrap_rendezvous_ready_build_sequence_ = 0U;
+  bootstrap_rendezvous_ready_logged_ = false;
+  bootstrap_rendezvous_state_ = bootstrap_rendezvous_arm_.valid()
+      ? BootstrapRendezvousState::ARMED
+      : BootstrapRendezvousState::DISARMED;
+}
+
+BootstrapRendezvousState
+PhaseOffsetMatchedAdapter::bootstrapRendezvousState() const {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  return bootstrap_rendezvous_state_;
+}
+
+bool PhaseOffsetMatchedAdapter::claimBootstrapRendezvous(
+    BootstrapRendezvousTicket& ticket) {
+  ticket = BootstrapRendezvousTicket();
+  std::unique_lock<std::mutex> lock(runtime_command_mutex_,
+                                    std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return false;
+  }
+  if (capturePathTubePair()) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      bootstrap_rendezvous_claim_active_ ||
+      bootstrap_rendezvous_state_ != BootstrapRendezvousState::READY ||
+      !bootstrap_rendezvous_ready_.valid() ||
+      bootstrap_rendezvous_ready_build_sequence_ == 0U || !zero_gate_open_ ||
+      failure_latched_ ||
+      bootstrap_rendezvous_ready_build_sequence_ <=
+          bootstrap_rendezvous_watermark_) {
+    if (bootstrap_rendezvous_state_ == BootstrapRendezvousState::READY &&
+        bootstrap_rendezvous_ready_build_sequence_ <=
+            bootstrap_rendezvous_watermark_) {
+      bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
+      bootstrap_rendezvous_ready_build_sequence_ = 0U;
+      bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
+    }
+    return false;
+  }
+  const std::shared_ptr<const TubeBuildRequest> latest =
+      std::atomic_load(&latest_build_request_);
+  if (!latest || !latest->active || latest->base_path_tube_pair ||
+      latest->task_generation != bootstrap_rendezvous_ready_.task_generation ||
+      latest->authority_session != bootstrap_rendezvous_ready_.authority_session ||
+      latest->source_revision != bootstrap_rendezvous_ready_.source_revision ||
+      latest->path_revision != bootstrap_rendezvous_ready_.path_revision ||
+      latest->frame_revision != bootstrap_rendezvous_ready_.frame_revision ||
+      latest->semantic_path_owner.get() !=
+          bootstrap_rendezvous_ready_.semantic_path_owner ||
+      latest->frame_owner.get() != bootstrap_rendezvous_ready_.frame_owner ||
+      task_generation_.load(std::memory_order_acquire) !=
+          bootstrap_rendezvous_ready_.task_generation ||
+      authority_session_.load(std::memory_order_acquire) !=
+          bootstrap_rendezvous_ready_.authority_session) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  // READY is only a trigger.  Before consuming it, require that its exact
+  // finalized build sequence is still the current active certified epoch.
+  // The epoch/profile itself is never carried into the transaction; a
+  // missing, superseded, or no-longer-certified epoch demotes us to ARMED and
+  // fences that sequence so only a later fresh epoch can retry.
+  if (!bootstrapReadyEpochMatchesLocked(
+          bootstrap_rendezvous_ready_,
+          bootstrap_rendezvous_ready_build_sequence_)) {
+    bootstrap_rendezvous_watermark_ = std::max(
+        bootstrap_rendezvous_watermark_,
+        bootstrap_rendezvous_ready_build_sequence_);
+    demoteBootstrapReadyLocked();
+    return false;
+  }
+  // A claim may be consumed by the timer between command cycles.  Recheck
+  // the neutral/owner eligibility that was true when the request was armed;
+  // an externally committed Runtime authority without a Pair must never be
+  // allowed to turn a stale READY ticket into a second authority.
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      execution_authority_.snapshot();
+  const bool neutral_runtime = runtime_ &&
+      std::isfinite(runtime_->retainedDelta()) &&
+      runtime_->retainedDelta() == 0.0 &&
+      !runtime_->hasExecutedOffsetAuthority();
+  const bool owner_eligible = advertised_
+      ? (!authority.valid ||
+         (authority.authority_session ==
+              bootstrap_rendezvous_ready_.authority_session &&
+          authority.owner_mode ==
+              phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY))
+      : (execution_authority_.config().allow_test_only_runtime_owner &&
+         runtime_ && runtime_->hasPendingOrActiveOffsetIntent());
+  if (!neutral_runtime || !owner_eligible) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  ticket.claim_id = ++bootstrap_rendezvous_next_claim_id_;
+  ticket.task_generation = bootstrap_rendezvous_ready_.task_generation;
+  ticket.authority_session = bootstrap_rendezvous_ready_.authority_session;
+  ticket.source_revision = bootstrap_rendezvous_ready_.source_revision;
+  ticket.path_revision = bootstrap_rendezvous_ready_.path_revision;
+  ticket.frame_revision = bootstrap_rendezvous_ready_.frame_revision;
+  ticket.build_sequence = bootstrap_rendezvous_ready_build_sequence_;
+  ticket.semantic_path_owner = bootstrap_rendezvous_ready_.semantic_path_owner;
+  ticket.frame_owner = bootstrap_rendezvous_ready_.frame_owner;
+  bootstrap_rendezvous_claim_ = ticket;
+  bootstrap_rendezvous_claim_active_ = true;
+  bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
+  bootstrap_rendezvous_ready_build_sequence_ = 0U;
+  // Consuming READY advances the watermark immediately.  A failed transaction
+  // therefore cannot consume the same epoch a second time.
+  bootstrap_rendezvous_watermark_ = std::max(
+      bootstrap_rendezvous_watermark_, ticket.build_sequence);
+  bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::validateBootstrapRendezvousClaim(
+    const BootstrapRendezvousTicket& ticket) const {
+  std::unique_lock<std::mutex> lock(runtime_command_mutex_,
+                                    std::try_to_lock);
+  if (!lock.owns_lock()) return false;
+  if (!claimMatchesBootstrapRendezvousLocked(ticket) ||
+      shutdown_requested_.load(std::memory_order_acquire) ||
+      failure_latched_ || !zero_gate_open_ ||
+      capturePathTubePair()) {
+    return false;
+  }
+  BootstrapRendezvousIdentity ticket_identity;
+  ticket_identity.task_generation = ticket.task_generation;
+  ticket_identity.authority_session = ticket.authority_session;
+  ticket_identity.source_revision = ticket.source_revision;
+  ticket_identity.path_revision = ticket.path_revision;
+  ticket_identity.frame_revision = ticket.frame_revision;
+  ticket_identity.semantic_path_owner = ticket.semantic_path_owner;
+  ticket_identity.frame_owner = ticket.frame_owner;
+  if (!bootstrapReadyEpochMatchesLocked(ticket_identity,
+                                        ticket.build_sequence)) {
+    return false;
+  }
+  const phase_offset_navigation::ActiveReferenceSnapshot authority =
+      execution_authority_.snapshot();
+  const bool neutral_runtime = runtime_ &&
+      std::isfinite(runtime_->retainedDelta()) &&
+      runtime_->retainedDelta() == 0.0 &&
+      !runtime_->hasExecutedOffsetAuthority();
+  const bool owner_eligible = advertised_
+      ? (!authority.valid ||
+         (authority.authority_session == ticket.authority_session &&
+          authority.owner_mode ==
+              phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY))
+      : (execution_authority_.config().allow_test_only_runtime_owner &&
+         runtime_ && runtime_->hasPendingOrActiveOffsetIntent());
+  if (!neutral_runtime || !owner_eligible) return false;
+  const std::shared_ptr<const TubeBuildRequest> latest =
+      std::atomic_load(&latest_build_request_);
+  return latest && latest->active && !latest->base_path_tube_pair &&
+      latest->task_generation == ticket.task_generation &&
+      latest->authority_session == ticket.authority_session &&
+      latest->source_revision == ticket.source_revision &&
+      latest->path_revision == ticket.path_revision &&
+      latest->frame_revision == ticket.frame_revision &&
+      latest->semantic_path_owner.get() == ticket.semantic_path_owner &&
+      latest->frame_owner.get() == ticket.frame_owner &&
+      task_generation_.load(std::memory_order_acquire) ==
+          ticket.task_generation &&
+      authority_session_.load(std::memory_order_acquire) ==
+          ticket.authority_session;
+}
+
+bool PhaseOffsetMatchedAdapter::completeBootstrapRendezvous(
+    const BootstrapRendezvousTicket& ticket, const bool bootstrap_succeeded) {
+  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
+  if (!claimMatchesBootstrapRendezvousLocked(ticket)) {
+    return false;
+  }
+  if (task_generation_.load(std::memory_order_acquire) !=
+          ticket.task_generation ||
+      authority_session_.load(std::memory_order_acquire) !=
+          ticket.authority_session) {
+    clearBootstrapRendezvousLocked();
+    return false;
+  }
+  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
+  // The bootstrap transaction deliberately allocates a fresh source/frame
+  // revision for the installed Pair.  Recognize success by the committed
+  // authority/session and the exact planner owner captured by the ticket;
+  // never compare those newly allocated revisions with the sidecar request.
+  const bool pair_matches = pair &&
+      pair->authority_session == ticket.authority_session &&
+      authority_session_.load(std::memory_order_acquire) ==
+          ticket.authority_session &&
+      pair->path_owner.get() == ticket.semantic_path_owner &&
+      pair->active_profile && pair->epoch_snapshot &&
+      pair->epoch_status.active_available &&
+      pair->epoch_status.active_current_validation_valid;
+  if (bootstrap_succeeded && pair_matches) {
+    clearBootstrapRendezvousLocked();
+    return true;
+  }
+  // A Pair installed by another path invalidates this rendezvous even when
+  // the claimed transaction reports failure.  Otherwise retain ARMED (or a
+  // newer READY recorded while this claim was in flight) for a fresh retry.
+  bootstrap_rendezvous_claim_ = BootstrapRendezvousTicket();
+  bootstrap_rendezvous_claim_active_ = false;
+  if (pair) {
+    clearBootstrapRendezvousLocked();
+  } else if (bootstrap_rendezvous_ready_.valid()) {
+    bootstrap_rendezvous_state_ = BootstrapRendezvousState::READY;
+  } else {
+    bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
+  }
+  return !bootstrap_succeeded;
+}
+
 bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPair(
     const std::shared_ptr<const PathTubePair>& pair) const {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
@@ -1631,6 +2212,10 @@ void PhaseOffsetMatchedAdapter::requestShutdown() {
     shutdown_requested_.store(true, std::memory_order_release);
   }
   {
+    std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+    clearBootstrapRendezvousLocked();
+  }
+  {
     std::lock_guard<std::mutex> lock(worker_state_mutex_);
     worker_stop_requested_ = true;
     pending_request_.reset();
@@ -1684,6 +2269,7 @@ void PhaseOffsetMatchedAdapter::shutdown() {
                     std::shared_ptr<const ControlPublishSnapshot>());
   std::atomic_store(&authoritative_path_tube_pair_,
                     std::shared_ptr<const PathTubePair>());
+  clearBootstrapRendezvousLocked();
   authority_session_.fetch_add(1U, std::memory_order_acq_rel);
   advertised_ = false;
   active_diagnostics_pub_ = ros::Publisher();
@@ -1828,6 +2414,7 @@ std::uint64_t PhaseOffsetMatchedAdapter::retirePathTubeAuthorityLocked(
   recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
   recovery_deadline_session_ = 0U;
   recovery_deadline_target_revision_ = 0U;
+  clearBootstrapRendezvousLocked();
   return retired_session;
 }
 
@@ -2092,6 +2679,7 @@ void PhaseOffsetMatchedAdapter::deactivateLocked(
   recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
   recovery_deadline_session_ = 0U;
   recovery_deadline_target_revision_ = 0U;
+  clearBootstrapRendezvousLocked();
   if (!command_active_) return;
   command_active_ = false;
   std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
@@ -3514,7 +4102,8 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
                 expected_pair->path_revision ||
             successor_seed_authority->frame_revision !=
                 expected_pair->frame_revision ||
-            std::abs(successor_seed_authority->w - captured_w0) > 1e-12 ||
+            std::abs(successor_seed_authority->proposed_next_w - captured_w0) >
+                1e-12 ||
             !(std::abs(successor_seed_authority->delta - retained_delta) <=
                   1e-12 ||
               std::abs(successor_seed_authority->proposed_next_delta -
@@ -3533,14 +4122,24 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
         }
         ContinuousPhasePathState predecessor_state;
         phase_offset_core::NormalFrameQuery predecessor_frame;
+        ContinuousPhasePathState authority_predecessor_state;
+        phase_offset_core::NormalFrameQuery authority_predecessor_frame;
         if (!expected_pair->path_owner->evaluate(captured_w0,
                                                  predecessor_state, false) ||
             !expected_pair->frame_owner->query(captured_w0, predecessor_frame) ||
+            !expected_pair->path_owner->evaluate(
+                successor_seed_authority->w, authority_predecessor_state,
+                false) ||
+            !expected_pair->frame_owner->query(
+                successor_seed_authority->w, authority_predecessor_frame) ||
             !predecessor_state.valid || !predecessor_frame.valid ||
-            (predecessor_state.p + predecessor_frame.N *
+            !authority_predecessor_state.valid ||
+            !authority_predecessor_frame.valid ||
+            (authority_predecessor_state.p + authority_predecessor_frame.N *
                  successor_seed_authority->delta -
              successor_seed_authority->r).norm() > 1e-8 ||
-            (predecessor_state.dp_dw + predecessor_frame.N_w *
+            (authority_predecessor_state.dp_dw +
+                 authority_predecessor_frame.N_w *
                  successor_seed_authority->delta -
              successor_seed_authority->r_w).norm() > 1e-8 ||
             !successor_seed_authority->r.allFinite() ||
@@ -3583,8 +4182,8 @@ bool PhaseOffsetMatchedAdapter::stagePathTubePair(
   request.position = position;
   request.retained_delta = retained_delta;
   request.authority_request = authority_request;
-  request.cloud_snapshot = frozen_cloud_occupancy_snapshot;
   if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
+    request.cloud_snapshot = frozen_cloud_occupancy_snapshot;
     request.map_observation_is_snapshot = true;
     request.map_observation_sequence = frozen_cloud_occupancy_snapshot
         ? frozen_cloud_occupancy_snapshot->observation_sequence : 0U;
@@ -3879,7 +4478,8 @@ bool PhaseOffsetMatchedAdapter::preparePathTubePairCommit(
 
 bool PhaseOffsetMatchedAdapter::finalizePreparedPathTubePairCommit(
     const PathTubePairCommitPreparation& preparation,
-    std::shared_ptr<const PathTubePair>& committed_pair) {
+    std::shared_ptr<const PathTubePair>& committed_pair,
+    const BootstrapRendezvousTicket* const rendezvous_ticket) {
   committed_pair.reset();
   if (!preparation.valid || !preparation.transaction.candidate_pair) {
     return false;
@@ -3906,6 +4506,54 @@ bool PhaseOffsetMatchedAdapter::finalizePreparedPathTubePairCommit(
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
   const std::shared_ptr<const PathTubePair> live =
       std::atomic_load(&authoritative_path_tube_pair_);
+  if (rendezvous_ticket) {
+    // A bootstrap claim is a one-shot identity token, not a cached authority.
+    // Revalidate every lifecycle edge at the same lock boundary as the sole
+    // Pair CAS so a failure/reset/deactivate/revision change cannot slip in
+    // between the manager's last lock-free validation and publication.
+    if (replacement ||
+        !claimMatchesBootstrapRendezvousLocked(*rendezvous_ticket) ||
+        shutdown_requested_.load(std::memory_order_acquire) ||
+        failure_latched_ || !zero_gate_open_ || !command_active_ ||
+        !runtime_ || !std::isfinite(runtime_->retainedDelta()) ||
+        runtime_->retainedDelta() != 0.0 ||
+        runtime_->hasExecutedOffsetAuthority() || live ||
+        authority_session_.load(std::memory_order_acquire) !=
+            rendezvous_ticket->authority_session ||
+        candidate->authority_session != rendezvous_ticket->authority_session ||
+        candidate->path_owner.get() !=
+            rendezvous_ticket->semantic_path_owner) {
+      return false;
+    }
+    const std::shared_ptr<const TubeBuildRequest> latest =
+        std::atomic_load(&latest_build_request_);
+    if (!latest || !latest->active || latest->base_path_tube_pair ||
+        latest->task_generation != rendezvous_ticket->task_generation ||
+        latest->authority_session != rendezvous_ticket->authority_session ||
+        latest->source_revision != rendezvous_ticket->source_revision ||
+        latest->path_revision != rendezvous_ticket->path_revision ||
+        latest->frame_revision != rendezvous_ticket->frame_revision ||
+        latest->semantic_path_owner.get() !=
+            rendezvous_ticket->semantic_path_owner ||
+        latest->frame_owner.get() != rendezvous_ticket->frame_owner ||
+        task_generation_.load(std::memory_order_acquire) !=
+            rendezvous_ticket->task_generation) {
+      return false;
+    }
+    BootstrapRendezvousIdentity ticket_identity;
+    ticket_identity.task_generation = rendezvous_ticket->task_generation;
+    ticket_identity.authority_session = rendezvous_ticket->authority_session;
+    ticket_identity.source_revision = rendezvous_ticket->source_revision;
+    ticket_identity.path_revision = rendezvous_ticket->path_revision;
+    ticket_identity.frame_revision = rendezvous_ticket->frame_revision;
+    ticket_identity.semantic_path_owner =
+        rendezvous_ticket->semantic_path_owner;
+    ticket_identity.frame_owner = rendezvous_ticket->frame_owner;
+    if (!bootstrapReadyEpochMatchesLocked(
+            ticket_identity, rendezvous_ticket->build_sequence)) {
+      return false;
+    }
+  }
   if (live != transaction.expected_pair ||
       authority_session_.load(std::memory_order_acquire) !=
           transaction.authority_session ||
@@ -3943,6 +4591,12 @@ bool PhaseOffsetMatchedAdapter::finalizePreparedPathTubePairCommit(
   have_source_identity_ = true;
   source_revision_ = installed->source_revision;
   have_preflight_revision_ = false;
+  // Installing any non-bootstrap Pair invalidates an armed/ready rendezvous.
+  // For the claimed first-bootstrap CAS, retain the matching claim until the
+  // manager reports completion so the ABA-safe release API can linearize it.
+  if (!bootstrap_rendezvous_claim_active_ || transaction.expected_pair) {
+    clearBootstrapRendezvousLocked();
+  }
   committed_pair = immutable_installed;
   return true;
 }
@@ -4056,6 +4710,21 @@ bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
     std::atomic_store(&latest_epoch_snapshot_,
                       std::shared_ptr<const TubeEpochSnapshot>());
   }
+  // This is the latest finalized (currentness-gated) sequence.  Bootstrap
+  // arming snapshots it, and only a strictly newer, fully certified epoch may
+  // become READY.  Marker publication has an independent watermark below.
+  std::uint64_t finalized_sequence =
+      timer_last_finalized_build_sequence_.load(std::memory_order_acquire);
+  while (finalized_sequence < built.build_sequence &&
+         !timer_last_finalized_build_sequence_.compare_exchange_weak(
+             finalized_sequence, built.build_sequence,
+             std::memory_order_acq_rel, std::memory_order_acquire)) {
+  }
+  if (capturePathTubePair()) {
+    clearBootstrapRendezvousLocked();
+  } else if (!request->base_path_tube_pair) {
+    recordBootstrapReadyLocked(*request, *epoch);
+  }
   // Keep the short command/runtime lock through the immutable Candidate and
   // Epoch stores.  A source/frame replacement can therefore occur only
   // before the currentness check (and be rejected) or after this complete
@@ -4089,6 +4758,10 @@ void PhaseOffsetMatchedAdapter::consumeTimerTaskGeneration(
   timer_last_publish_delete_source_revision_ = 0U;
   timer_last_publish_delete_map_observation_sequence_ = 0U;
   timer_last_published_epoch_build_sequence_ = 0U;
+  {
+    std::lock_guard<std::mutex> runtime_lock(runtime_command_mutex_);
+    timer_last_finalized_build_sequence_.store(0U, std::memory_order_release);
+  }
   timer_last_raw_diagnostic_build_sequence_ = 0U;
   timer_last_cloud_diagnostic_build_sequence_ = 0U;
   latest_cloud_occupancy_query_status_ = CloudOccupancyQueryStatus();
@@ -4372,6 +5045,9 @@ void PhaseOffsetMatchedAdapter::latchFailure(
     control_failure_reason_ = reason;
   }
   failure_latched_ = true;
+  // A fatal command-side invariant invalidates any neutral bootstrap claim;
+  // a late timer completion must not resurrect offset authority.
+  clearBootstrapRendezvousLocked();
 }
 
 bool PhaseOffsetMatchedAdapter::updateGate(const MatchedAdapterInput& input,
@@ -4548,26 +5224,6 @@ bool PhaseOffsetMatchedAdapter::evaluateNormalAllocator(
     return false;
   }
 
-  // The parallel swarm workstream hands this boundary an exact value.  In
-  // single-UAV operation there is no producer, so use only the frozen
-  // recentering term and the immutable current normal; no neighbour state or
-  // swarm mathematics is reconstructed here.
-  if (input.g_des_valid) {
-    g_des = input.g_des;
-  } else if (prepared.delta == 0.0) {
-    g_des.setZero();
-  } else {
-    g_des = -config_.delta_tracking_gain * prepared.delta *
-        prepared.geometry.N;
-  }
-  if (!g_des.allFinite()) {
-    failure_reason = "NORMAL desired active-reference motion is invalid";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        INVALID_INPUT;
-    allocator.reason = failure_reason;
-    return false;
-  }
-
   // The immutable policy is the sole source of the common phase-rate
   // envelope and W-domain horizon/sampling/beta thresholds.  C3 does not
   // derive any of these values from geometry, the current command or Tube
@@ -4601,6 +5257,65 @@ bool PhaseOffsetMatchedAdapter::evaluateNormalAllocator(
         "NORMAL Preview evaluation failed" : preview.reason;
     allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
         PREVIEW_INFEASIBLE;
+    allocator.reason = failure_reason;
+    return false;
+  }
+
+  // Coordination is composed only after the same-tick NORMAL Preview has
+  // succeeded.  SPH uses exactly one immutable bridge capture and resolves
+  // source/receipt freshness here; missing, stale, or accepted-invalid data
+  // contributes a zero swarm term and therefore leaves recentering intact.
+  const Eigen::Vector3d recenter = -config_.delta_tracking_gain *
+      prepared.delta * prepared.geometry.N;
+  if (!recenter.allFinite()) {
+    failure_reason = "NORMAL desired active-reference motion is invalid";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        INVALID_INPUT;
+    allocator.reason = failure_reason;
+    return false;
+  }
+  Eigen::Vector3d g_swarm = Eigen::Vector3d::Zero();
+  switch (config_.coordination_backend) {
+    case PhaseOffsetCoordinationBackend::SPH: {
+      if (input.sph_bridge != nullptr) {
+        const bspline_race::integration::GCoordResolveResult resolved =
+            input.sph_bridge->resolveGCoord(
+                input.captured_gcoord, ros::Time::now().toSec(),
+                ros::SteadyTime::now().toSec());
+        if (resolved.usable()) {
+          g_swarm = Eigen::Vector3d(resolved.sample.g_coord.x,
+                                    resolved.sample.g_coord.y, 0.0);
+        }
+      }
+      break;
+    }
+    case PhaseOffsetCoordinationBackend::D1B:
+      // Preserve the existing complete-g_des compatibility path when D1B is
+      // explicitly selected.  This branch is never consulted for SPH.
+      if (input.g_des_valid) {
+        g_des = input.g_des;
+      } else {
+        g_des = recenter;
+      }
+      break;
+    case PhaseOffsetCoordinationBackend::DISABLED:
+      g_des = recenter;
+      break;
+  }
+  if (!g_swarm.allFinite() || !std::isfinite(prepared.delta)) {
+    failure_reason = "NORMAL desired active-reference motion is invalid";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        INVALID_INPUT;
+    allocator.reason = failure_reason;
+    return false;
+  }
+  if (config_.coordination_backend == PhaseOffsetCoordinationBackend::SPH) {
+    g_des = g_swarm + recenter;
+  }
+  if (!g_des.allFinite()) {
+    failure_reason = "NORMAL desired active-reference motion is invalid";
+    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
+        INVALID_INPUT;
     allocator.reason = failure_reason;
     return false;
   }
@@ -6662,6 +7377,10 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
   // Required ordering: publish the complete current request before reading a
   // timer result.  The timer coalesces same-source control updates.
   std::atomic_store(&latest_build_request_, request);
+  // Production neutral navigation arms the rendezvous only after the full
+  // immutable request is visible.  This is a short identity-only operation;
+  // no Tube/profile/cloud work and no wait occur under the command mutex.
+  armBootstrapRendezvousLocked(request);
   const std::shared_ptr<const TubeEpochSnapshot> latest_candidate =
       std::atomic_load(&latest_candidate_epoch_snapshot_);
   const bool candidate_source_matches = latest_candidate &&

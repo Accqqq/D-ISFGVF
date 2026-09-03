@@ -1,0 +1,80 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>phase_offset_sim_bringup</name>
+  <version>0.0.0</version>
+  <description>SIM-B generic-N PhaseOffset simulation bringup and acceptance fixtures.</description>
+
+  <maintainer email="lrc@todo.todo">lrc</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Direct runtime/build dependencies used by the assembly package. -->
+  <build_depend>roscpp</build_depend>
+  <build_depend>rospy</build_depend>
+  <build_depend>roslaunch</build_depend>
+  <build_depend>rosgraph</build_depend>
+  <build_depend>nodelet</build_depend>
+  <build_depend>geometry_msgs</build_depend>
+  <build_depend>nav_msgs</build_depend>
+  <build_depend>phase_offset_swarm</build_depend>
+  <build_depend>sensor_msgs</build_depend>
+  <build_depend>visualization_msgs</build_depend>
+  <build_depend>quadrotor_msgs</build_depend>
+  <build_depend>bspline_race</build_depend>
+  <build_depend>so3_control</build_depend>
+  <build_depend>so3_quadrotor_simulator</build_depend>
+  <build_depend>map_generator</build_depend>
+
+  <build_export_depend>roscpp</build_export_depend>
+  <build_export_depend>rospy</build_export_depend>
+  <build_export_depend>roslaunch</build_export_depend>
+  <build_export_depend>rosgraph</build_export_depend>
+  <build_export_depend>nodelet</build_export_depend>
+  <build_export_depend>geometry_msgs</build_export_depend>
+  <build_export_depend>nav_msgs</build_export_depend>
+  <build_export_depend>phase_offset_swarm</build_export_depend>
+  <build_export_depend>sensor_msgs</build_export_depend>
+  <build_export_depend>visualization_msgs</build_export_depend>
+  <build_export_depend>quadrotor_msgs</build_export_depend>
+  <build_export_depend>bspline_race</build_export_depend>
+  <build_export_depend>so3_control</build_export_depend>
+  <build_export_depend>so3_quadrotor_simulator</build_export_depend>
+  <build_export_depend>map_generator</build_export_depend>
+
+  <exec_depend>roscpp</exec_depend>
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>roslaunch</exec_depend>
+  <exec_depend>rosgraph</exec_depend>
+  <exec_depend>nodelet</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>phase_offset_swarm</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>quadrotor_msgs</exec_depend>
+  <exec_depend>bspline_race</exec_depend>
+  <exec_depend>so3_control</exec_depend>
+  <exec_depend>so3_quadrotor_simulator</exec_depend>
+  <exec_depend>map_generator</exec_depend>
+
+  <!-- The Python supervisor/publisher parse YAML directly. -->
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rviz</exec_depend>
+
+  <test_depend>rostest</test_depend>
+  <test_depend>rosnode</test_depend>
+  <test_depend>rosgraph</test_depend>
+  <test_depend>roslaunch</test_depend>
+  <test_depend>rospy</test_depend>
+  <test_depend>nodelet</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>nav_msgs</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>visualization_msgs</test_depend>
+  <test_depend>quadrotor_msgs</test_depend>
+  <test_depend>python3-yaml</test_depend>
+
+  <export>
+  </export>
+</package>

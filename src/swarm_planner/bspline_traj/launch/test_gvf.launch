@@ -1,11 +1,21 @@
 <launch>
     <!-- 集中定义参数 -->
     <arg name="drone_id" default="1" />
+    <arg name="robot_id" default="$(arg drone_id)" />
     <arg name="init_x" default="0.0" />
     <arg name="init_y" default="0.0" />
     <arg name="init_z" default="1.0" />
     <!--  disabled/manual -->
     <arg name="phase_offset_mode" default="disabled" />
+    <arg name="phase_offset_coordination_backend" default="disabled" />
+    <arg name="enable_neighbor_transport" default="false" />
+    <arg name="enable_sph_provider" default="false" />
+    <arg name="phase_offset_sph_beta_topic"
+         default="/uav_$(arg drone_id)/phase_offset/sph_beta" />
+    <arg name="phase_offset_sph_g_coord_topic"
+         default="/uav_$(arg drone_id)/phase_offset/g_coord" />
+    <arg name="phase_offset_g_coord_fresh_timeout" default="0.10" />
+    <arg name="phase_offset_future_timestamp_tolerance" default="0.02" />
     <arg name="phase_offset_shadow_delta" default="0.0" />
     <arg name="phase_offset_shadow_sample_step_w" default="0.10" />
     <arg name="phase_offset_shadow_publish_rate" default="5.0" />
@@ -28,6 +38,15 @@
     <arg name="phase_offset_manual_preflight_sample_step_w" default="0.10" />
     <!--  none/esdf/fixed -->
     <arg name="phase_offset_manual_tube_source" default="none" />
+    <!-- NORMAL Preview policy is intentionally unset by default.  The
+         integration stages pass all six values explicitly; empty values do
+         not create production parameters on the server. -->
+    <arg name="phase_offset_normal_preview_horizon_w" default="" />
+    <arg name="phase_offset_normal_preview_sample_spacing_w" default="" />
+    <arg name="phase_offset_normal_preview_lower_nu" default="" />
+    <arg name="phase_offset_normal_preview_upper_nu" default="" />
+    <arg name="phase_offset_normal_preview_b_tight" default="" />
+    <arg name="phase_offset_normal_preview_b_open" default="" />
     <arg name="phase_offset_tube_fixed_delta_max" default="0.06" />
     <arg name="phase_offset_tube_nominal_half_width" default="1.0" />
     <arg name="phase_offset_tube_sample_step_w" default="0.10" />
@@ -91,6 +110,21 @@
         <param name="gvf/odom_topic"       type="string" value="/sim/odom" />
         <param name="gvf/cmd_topic"        type="string" value="/position_cmd" />
         <param name="phase_offset/mode" value="$(arg phase_offset_mode)" />
+        <param name="robot_id" value="$(arg robot_id)" />
+        <param name="phase_offset/coordination_backend"
+               value="$(arg phase_offset_coordination_backend)" />
+        <param name="enable_neighbor_transport"
+               value="$(arg enable_neighbor_transport)" />
+        <param name="enable_sph_provider"
+               value="$(arg enable_sph_provider)" />
+        <param name="phase_offset/sph_beta_topic"
+               value="$(arg phase_offset_sph_beta_topic)" />
+        <param name="phase_offset/sph_g_coord_topic"
+               value="$(arg phase_offset_sph_g_coord_topic)" />
+        <param name="phase_offset/g_coord_fresh_timeout"
+               value="$(arg phase_offset_g_coord_fresh_timeout)" />
+        <param name="phase_offset/future_timestamp_tolerance"
+               value="$(arg phase_offset_future_timestamp_tolerance)" />
         <param name="phase_offset/shadow_delta" value="$(arg phase_offset_shadow_delta)" />
         <param name="phase_offset/shadow_sample_step_w" value="$(arg phase_offset_shadow_sample_step_w)" />
         <param name="phase_offset/shadow_publish_rate" value="$(arg phase_offset_shadow_publish_rate)" />
@@ -111,6 +145,24 @@
         <param name="phase_offset/manual/tangent_speed_min" value="$(arg phase_offset_manual_tangent_speed_min)" />
         <param name="phase_offset/manual/preflight_sample_step_w" value="$(arg phase_offset_manual_preflight_sample_step_w)" />
         <param name="phase_offset/manual/tube_source" value="$(arg phase_offset_manual_tube_source)" />
+        <param if="$(eval arg('phase_offset_normal_preview_horizon_w') != '')"
+               name="phase_offset/normal_preview/preview_horizon_w"
+               value="$(arg phase_offset_normal_preview_horizon_w)" />
+        <param if="$(eval arg('phase_offset_normal_preview_sample_spacing_w') != '')"
+               name="phase_offset/normal_preview/sample_spacing_w"
+               value="$(arg phase_offset_normal_preview_sample_spacing_w)" />
+        <param if="$(eval arg('phase_offset_normal_preview_lower_nu') != '')"
+               name="phase_offset/normal_preview/lower_nu"
+               value="$(arg phase_offset_normal_preview_lower_nu)" />
+        <param if="$(eval arg('phase_offset_normal_preview_upper_nu') != '')"
+               name="phase_offset/normal_preview/upper_nu"
+               value="$(arg phase_offset_normal_preview_upper_nu)" />
+        <param if="$(eval arg('phase_offset_normal_preview_b_tight') != '')"
+               name="phase_offset/normal_preview/b_tight"
+               value="$(arg phase_offset_normal_preview_b_tight)" />
+        <param if="$(eval arg('phase_offset_normal_preview_b_open') != '')"
+               name="phase_offset/normal_preview/b_open"
+               value="$(arg phase_offset_normal_preview_b_open)" />
         <param name="phase_offset/tube/fixed_delta_max" value="$(arg phase_offset_tube_fixed_delta_max)" />
         <param name="phase_offset/tube/nominal_half_width" value="$(arg phase_offset_tube_nominal_half_width)" />
         <param name="phase_offset/tube/sample_step_w" value="$(arg phase_offset_tube_sample_step_w)" />

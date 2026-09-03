@@ -911,6 +911,151 @@ class GvfManagerS4AnchorTestAccess {
     return probe;
   }
 
+  static BootstrapAttemptProbe activateTimerBootstrapAttemptWithTicket(
+      gvf_manager& manager,
+      const BootstrapRendezvousTicket& rendezvous_ticket,
+      const Eigen::Vector3d& position = Eigen::Vector3d(0.4, 0.0, 1.0),
+      const double dt = 0.02) {
+    gvf_manager::gvfManager fallback;
+    gvf_manager::gvfManager& frontend = manager.swarmParticlesManager.empty()
+        ? fallback : manager.swarmParticlesManager.front();
+    const gvf_manager::AuthoritativePhaseSnapshot captured =
+        manager.captureAuthoritativePhase();
+    gvf_manager::OffsetBootstrapAttemptResult result;
+    BootstrapAttemptProbe probe;
+    probe.committed = manager.activatePendingOffsetAuthority(
+        frontend, captured, position, timerBootstrapGains(), dt,
+        std::shared_ptr<const plan_env::CloudOccupancySnapshot>(),
+        rendezvous_ticket, &result);
+    probe.outcome = manager.offsetBootstrapAttemptOutcomeName(result.outcome);
+    probe.stage_failure = manager.pathTubePairStageFailureName(
+        result.stage_failure);
+    probe.captured_w0 = result.captured_w0;
+    probe.live_wc = result.live_wc;
+    probe.future_seam_w = result.future_seam_w;
+    probe.authority_session = result.authority_session;
+    probe.map_observation_sequence = result.map_observation_sequence;
+    probe.pair_generation = result.pair_generation;
+    return probe;
+  }
+
+  // Build a deterministic READY ticket for the manager-side final-CAS race
+  // tests.  The synthetic epoch carries identity/provenance only; the actual
+  // bootstrap transaction still stages a fresh pair through the production
+  // manager/adapter path.
+  static bool claimBootstrapRendezvousForTest(
+      gvf_manager& manager,
+      const std::shared_ptr<const ContinuousPhasePath>& planner_owner,
+      BootstrapRendezvousTicket& ticket) {
+    ticket = BootstrapRendezvousTicket();
+    if (!manager.phase_offset_matched_adapter_ || !planner_owner) return false;
+    PhaseOffsetMatchedAdapter& adapter =
+        *manager.phase_offset_matched_adapter_;
+    MatchedAdapterInput input = timerBootstrapGateInput(0.02);
+    input.semantic_path_owner = planner_owner;
+    input.semantic_path_identity = planner_owner.get();
+    input.semantic_path_start_w = planner_owner->startW();
+    input.semantic_path_end_w = planner_owner->endW();
+    input.frame_owner.reset();
+
+    {
+      std::lock_guard<std::mutex> lock(adapter.runtime_command_mutex_);
+      if (!adapter.runtime_) return false;
+      adapter.zero_gate_open_ = true;
+      adapter.zero_gate_consecutive_count_ = 100;
+      const std::uint64_t revision = adapter.sourceRevision(input);
+      const std::shared_ptr<const TubeBuildRequest> request =
+          adapter.makeBuildRequest(input, revision,
+                                   adapter.runtime_->retainedDelta());
+      adapter.command_active_ = true;
+      std::atomic_store(&adapter.latest_build_request_, request);
+      if (!adapter.armBootstrapRendezvousLocked(request)) return false;
+
+      const std::uint64_t build_sequence =
+          adapter.bootstrap_rendezvous_watermark_ + 1U;
+      std::shared_ptr<TubeEpochSnapshot> epoch(new TubeEpochSnapshot());
+      epoch->active = true;
+      epoch->task_generation = request->task_generation;
+      epoch->request_control_sequence = request->control_sequence;
+      epoch->build_sequence = build_sequence;
+      epoch->source_revision = request->source_revision;
+      epoch->path_revision = request->path_revision;
+      epoch->frame_revision = request->frame_revision;
+      epoch->semantic_path_owner = request->semantic_path_owner;
+      epoch->frame_owner = request->frame_owner;
+      epoch->map_observation_sequence = 0U;
+      epoch->map_observation_is_snapshot = false;
+      epoch->full_path_samples = request->supplied_path_samples;
+      if (!epoch->full_path_samples) {
+        std::shared_ptr<MatchedAdapterPathSamples> samples(
+            new MatchedAdapterPathSamples());
+        for (const double w : {planner_owner->startW(),
+                               0.5 * (planner_owner->startW() +
+                                      planner_owner->endW()),
+                               planner_owner->endW()}) {
+          ContinuousPhasePathState state;
+          if (!planner_owner->evaluate(w, state, false)) return false;
+          samples->push_back(
+              ConvertContinuousPhasePathStateForActive(state, w));
+        }
+        epoch->full_path_samples =
+            std::shared_ptr<const MatchedAdapterPathSamples>(samples);
+      }
+      std::shared_ptr<phase_offset_navigation::TubeProfile> profile(
+          new phase_offset_navigation::TubeProfile());
+      profile->source = phase_offset_navigation::TubeSource::FIXED;
+      profile->source_revision = request->source_revision;
+      profile->path_revision = request->path_revision;
+      profile->frame_revision = request->frame_revision;
+      profile->tube_revision = build_sequence;
+      profile->profile_revision = build_sequence;
+      profile->raw_complete = true;
+      profile->filtered_complete = true;
+      profile->complete = true;
+      profile->obstacle_certified = true;
+      profile->classification =
+          phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+      const std::shared_ptr<const phase_offset_navigation::TubeProfile>
+          immutable_profile(profile);
+      epoch->candidate_profile = immutable_profile;
+      epoch->active_profile = immutable_profile;
+      epoch->epoch_status.candidate_complete = true;
+      epoch->epoch_status.candidate_classification =
+          phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+      epoch->epoch_status.candidate_path_source_revision =
+          request->source_revision;
+      epoch->epoch_status.active_available = true;
+      epoch->epoch_status.active_current_validation_valid = true;
+      epoch->epoch_status.active_classification =
+          phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+      epoch->epoch_status.active_path_source_revision =
+          request->source_revision;
+      epoch->epoch_status.map_observation_is_snapshot = false;
+      epoch->epoch_status.candidate_map_observation_sequence = 0U;
+      epoch->epoch_status.active_map_observation_sequence = 0U;
+      std::atomic_store(&adapter.latest_epoch_snapshot_,
+                        std::shared_ptr<const TubeEpochSnapshot>(epoch));
+      adapter.bootstrap_rendezvous_ready_ = adapter.bootstrap_rendezvous_arm_;
+      adapter.bootstrap_rendezvous_ready_build_sequence_ = build_sequence;
+      adapter.bootstrap_rendezvous_state_ = BootstrapRendezvousState::READY;
+    }
+    return adapter.claimBootstrapRendezvous(ticket);
+  }
+
+  static void latchBootstrapFailure(gvf_manager& manager) {
+    if (!manager.phase_offset_matched_adapter_) return;
+    std::lock_guard<std::mutex> lock(
+        manager.phase_offset_matched_adapter_->runtime_command_mutex_);
+    manager.phase_offset_matched_adapter_->latchFailure(
+        phase_offset_navigation::ControlFailureReason::GEOMETRY_INVARIANT);
+  }
+
+  static void deactivateBootstrapAdapter(gvf_manager& manager) {
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->deactivate(ros::Time(9.0));
+    }
+  }
+
   static std::string bootstrapOutcomeName(const int ordinal) {
     return gvf_manager::offsetBootstrapAttemptOutcomeName(
         static_cast<gvf_manager::OffsetBootstrapAttemptOutcome>(ordinal));
@@ -2204,8 +2349,12 @@ TEST(GvfManagerC3,
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::authoritySnapshot(
                    manager).valid);
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(
-      manager));
+                   manager));
   FLAG_Race::GvfManagerS4AnchorTestAccess::openManualGate(manager);
+  // The rendezvous is armed on the command-side no-Pair request after the
+  // gate opens.  Re-run one command cycle so the timer can claim a
+  // post-arm READY epoch instead of attempting the pre-gate request.
+  FLAG_Race::GvfManagerS4AnchorTestAccess::runCommand(manager);
   for (int attempt = 0; attempt < 200 &&
            !FLAG_Race::GvfManagerS4AnchorTestAccess::bootstrapAuthority(manager);
        ++attempt) {
@@ -2296,6 +2445,68 @@ TEST(GvfTimerBootstrap, ResetDuringStageRejectsWithoutPublishingAuthority) {
   const auto after = FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
   EXPECT_FALSE(after.initialized);
   EXPECT_DOUBLE_EQ(0.0, after.w);
+}
+
+TEST(GvfTimerBootstrap,
+     FailureLatchAfterFinalValidationRejectsBootstrapPairCas) {
+  FLAG_Race::gvf_manager manager;
+  const auto owner = makeTimerBootstrapPath(std::function<void()>());
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                  installTimerBootstrapFixture(manager, owner));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setOdom(
+      manager, Eigen::Vector3d(0.4, 0.0, 1.0));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, 0.4, true, false);
+
+  FLAG_Race::BootstrapRendezvousTicket ticket;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                  claimBootstrapRendezvousForTest(manager, owner, ticket));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setBootstrapBeforeFinalCasHook(
+      manager, [&manager]() {
+        FLAG_Race::GvfManagerS4AnchorTestAccess::latchBootstrapFailure(
+            manager);
+      });
+
+  const auto attempt = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      activateTimerBootstrapAttemptWithTicket(manager, ticket);
+  EXPECT_FALSE(attempt.committed);
+  EXPECT_EQ("FINAL_CAS", attempt.outcome);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   bootstrapAuthority(manager));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setBootstrapBeforeFinalCasHook(
+      manager, std::function<void()>());
+}
+
+TEST(GvfTimerBootstrap,
+     DeactivateAfterFinalValidationRejectsBootstrapPairCas) {
+  FLAG_Race::gvf_manager manager;
+  const auto owner = makeTimerBootstrapPath(std::function<void()>());
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                  installTimerBootstrapFixture(manager, owner));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setOdom(
+      manager, Eigen::Vector3d(0.4, 0.0, 1.0));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, 0.4, true, false);
+
+  FLAG_Race::BootstrapRendezvousTicket ticket;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                  claimBootstrapRendezvousForTest(manager, owner, ticket));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setBootstrapBeforeFinalCasHook(
+      manager, [&manager]() {
+        FLAG_Race::GvfManagerS4AnchorTestAccess::
+            deactivateBootstrapAdapter(manager);
+      });
+
+  const auto attempt = FLAG_Race::GvfManagerS4AnchorTestAccess::
+      activateTimerBootstrapAttemptWithTicket(manager, ticket);
+  EXPECT_FALSE(attempt.committed);
+  EXPECT_EQ("FINAL_CAS", attempt.outcome);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   bootstrapAuthority(manager));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setBootstrapBeforeFinalCasHook(
+      manager, std::function<void()>());
 }
 
 TEST(GvfTimerBootstrap, PlannerOwnerDriftDuringStageRejectsWithoutAuthority) {
@@ -3072,7 +3283,7 @@ TEST(SeededRecoveryE2E,
   FLAG_Race::GvfManagerS4AnchorTestAccess::setAdapterAdvertised(manager, true);
   FLAG_Race::GvfManagerS4AnchorTestAccess::setTestOnlyRuntimeOwnerAllowed(
       manager, false);
-  const double captured_w0 = authority.w;
+  const double captured_w0 = authority.proposed_next_w;
   ASSERT_TRUE(std::isfinite(captured_w0));
   ASSERT_TRUE(std::isfinite(old_pair->future_seam_w));
   ASSERT_TRUE(std::isfinite(old_pair->existing_future_horizon_end_w));

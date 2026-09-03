@@ -1,0 +1,6 @@
+<launch>
+  <test test-name="sim_b_bringup"
+        pkg="phase_offset_sim_bringup"
+        type="sim_b_bringup_test.py"
+        time-limit="900.0"/>
+</launch>

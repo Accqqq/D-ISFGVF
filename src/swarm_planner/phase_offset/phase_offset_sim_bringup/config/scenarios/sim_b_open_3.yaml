@@ -1,0 +1,13 @@
+scenario:
+  name: sim_b_open_3
+  frame_id: world
+  agents:
+    - robot_id: 0
+      initial: {x: -9.0, y: -10.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: -9.0, y: 2.0, z: 0.0}
+    - robot_id: 1
+      initial: {x: -7.0, y: -10.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: -7.0, y: 2.0, z: 0.0}
+    - robot_id: 2
+      initial: {x: -5.0, y: -10.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: -5.0, y: 2.0, z: 0.0}

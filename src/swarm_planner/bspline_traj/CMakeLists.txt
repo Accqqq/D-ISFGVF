@@ -15,10 +15,12 @@ find_package(catkin REQUIRED COMPONENTS
   message_filters
   cv_bridge
   common_msgs
+  quadrotor_msgs
   plan_env
   path_searching
   phase_offset_core
   phase_offset_navigation
+  phase_offset_msgs
 )
 
 find_package(Eigen3 REQUIRED)
@@ -26,8 +28,8 @@ find_package(PCL 1.7 REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES bspline_race
-  CATKIN_DEPENDS roscpp rospy tf std_msgs visualization_msgs message_runtime common_msgs plan_env path_searching phase_offset_core phase_offset_navigation
+  LIBRARIES bspline_race phase_offset_sph_ros_bridge
+  CATKIN_DEPENDS roscpp rospy tf std_msgs visualization_msgs message_runtime common_msgs quadrotor_msgs plan_env path_searching phase_offset_core phase_offset_navigation phase_offset_msgs
   DEPENDS message_generation
 )
 include_directories(
@@ -53,6 +55,10 @@ add_library(bspline_gvf
    src/bspline_opt_3d.cpp 
    src/gvf_manager.cpp
    src/gvf.cpp
+)
+add_dependencies(bspline_gvf
+  ${catkin_EXPORTED_TARGETS}
+  ${quadrotor_msgs_EXPORTED_TARGETS}
 )
 
 add_library(isf_reference_kernel
@@ -85,6 +91,17 @@ target_link_libraries(phase_offset_environment_evidence_query
   ${catkin_LIBRARIES}
 )
 
+add_library(phase_offset_sph_ros_bridge
+  src/integration/phase_offset_sph_ros_bridge.cpp
+)
+target_link_libraries(phase_offset_sph_ros_bridge
+  ${catkin_LIBRARIES}
+)
+add_dependencies(phase_offset_sph_ros_bridge
+  ${catkin_EXPORTED_TARGETS}
+  ${phase_offset_msgs_EXPORTED_TARGETS}
+)
+
 # Standalone, immutable path/snapshot margin-accounting seam.  It deliberately
 # has no Runtime or publisher dependency and leaves existing diagnostics sizes
 # unchanged.
@@ -114,6 +131,7 @@ target_link_libraries(phase_offset_matched_adapter
   plan_env
   isf_reference_kernel
   phase_offset_active_adapter
+  phase_offset_sph_ros_bridge
   ${catkin_LIBRARIES}
 )
 
@@ -129,6 +147,7 @@ target_link_libraries(bspline_gvf
   isf_reference_kernel
   phase_offset_active_adapter
   phase_offset_matched_adapter
+  phase_offset_sph_ros_bridge
 )
 
 

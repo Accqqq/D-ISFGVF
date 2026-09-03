@@ -1,0 +1,15 @@
+# SIM-C AgentState transport defaults.  Every per-UAV runtime receives its
+# robot_id and agent_count from the canonical generic-N scenario generator.
+world_frame: world
+agent_state_topic: /phase_offset/agent_state
+publish_rate_hz: 20.0
+own_odom_timeout: 0.20
+fresh_timeout: 0.30
+lost_timeout: 0.60
+retention_timeout: 1.50
+prediction_horizon_max: 0.30
+future_timestamp_tolerance: 0.02
+source_too_old_timeout: 0.60
+enter_radius: 2.45
+exit_radius: 2.50
+max_neighbors: 0

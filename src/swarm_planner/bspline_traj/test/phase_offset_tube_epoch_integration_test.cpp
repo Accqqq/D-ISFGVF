@@ -213,6 +213,86 @@ void ExpectThreeActions(const visualization_msgs::MarkerArray& markers, int acti
   for (const auto& marker : markers.markers) EXPECT_EQ(marker.action, action);
 }
 
+// Small deterministic rendezvous fixture.  It exercises the adapter's
+// identity/sequence protocol directly, without constructing a Tube or
+// touching ROS timers.  Production still reaches the same arm/READY/claim
+// transitions through update()/finalizeTubeEpoch().
+struct BootstrapRendezvousFixture {
+  PhaseOffsetMatchedAdapter adapter;
+  std::shared_ptr<const ContinuousPhasePath> owner;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame;
+  std::shared_ptr<const TubeBuildRequest> request;
+
+  BootstrapRendezvousFixture()
+      : adapter(Config(TubeSource::FIXED)), owner(BootstrapOwner()) {
+    const_cast<ContinuousPhasePath*>(owner.get())->setPathRevision(1U);
+    frame = std::make_shared<const ContinuousPhaseNormalFrame>(owner, 1U, 1U);
+    MatchedAdapterInput input = Input(Path(), owner.get(), 1.0);
+    input.semantic_path_owner = owner;
+    input.frame_owner = frame;
+    input.semantic_path_identity = owner.get();
+    input.semantic_path_start_w = owner->startW();
+    input.semantic_path_end_w = owner->endW();
+    const std::uint64_t revision = adapter.sourceRevision(input);
+    request = adapter.makeBuildRequest(input, revision, 0.0);
+    std::lock_guard<std::mutex> lock(adapter.runtime_command_mutex_);
+    adapter.zero_gate_open_ = true;
+    adapter.command_active_ = true;
+    std::atomic_store(&adapter.latest_build_request_, request);
+    EXPECT_TRUE(adapter.armBootstrapRendezvousLocked(request));
+  }
+
+  void ready(std::uint64_t build_sequence) {
+    std::lock_guard<std::mutex> lock(adapter.runtime_command_mutex_);
+    adapter.bootstrap_rendezvous_ready_ = adapter.bootstrap_rendezvous_arm_;
+    adapter.bootstrap_rendezvous_ready_build_sequence_ = build_sequence;
+    adapter.bootstrap_rendezvous_state_ = BootstrapRendezvousState::READY;
+
+    // Keep the synthetic READY transition bound to the same immutable active
+    // epoch that production claim() now requires.  This fixture does not run
+    // TubeEpochManager, so populate only the identity/provenance facts used by
+    // the rendezvous freshness gate; no profile is ever handed to authority.
+    auto epoch = std::make_shared<TubeEpochSnapshot>();
+    epoch->active = true;
+    epoch->task_generation = adapter.bootstrap_rendezvous_arm_.task_generation;
+    epoch->request_control_sequence = request->control_sequence;
+    epoch->build_sequence = build_sequence;
+    epoch->source_revision = adapter.bootstrap_rendezvous_arm_.source_revision;
+    epoch->path_revision = adapter.bootstrap_rendezvous_arm_.path_revision;
+    epoch->frame_revision = adapter.bootstrap_rendezvous_arm_.frame_revision;
+    epoch->semantic_path_owner = owner;
+    epoch->frame_owner = frame;
+    epoch->full_path_samples = request->supplied_path_samples;
+    auto profile = std::make_shared<phase_offset_navigation::TubeProfile>();
+    profile->source = TubeSource::FIXED;
+    profile->source_revision = epoch->source_revision;
+    profile->path_revision = epoch->path_revision;
+    profile->frame_revision = epoch->frame_revision;
+    profile->tube_revision = build_sequence;
+    profile->profile_revision = build_sequence;
+    profile->raw_complete = true;
+    profile->filtered_complete = true;
+    profile->complete = true;
+    profile->obstacle_certified = true;
+    profile->classification =
+        phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+    epoch->candidate_profile = profile;
+    epoch->active_profile = profile;
+    epoch->epoch_status.candidate_complete = true;
+    epoch->epoch_status.candidate_classification =
+        phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+    epoch->epoch_status.candidate_path_source_revision =
+        epoch->source_revision;
+    epoch->epoch_status.active_available = true;
+    epoch->epoch_status.active_current_validation_valid = true;
+    epoch->epoch_status.active_classification =
+        phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+    epoch->epoch_status.active_path_source_revision = epoch->source_revision;
+    std::atomic_store(&adapter.latest_epoch_snapshot_,
+                      std::shared_ptr<const TubeEpochSnapshot>(epoch));
+  }
+};
+
 TEST(TubeEpochIntegrationTest, FiftyControlCyclesProduceTenBuildAttemptsAndNoMarkerResampling) {
   const auto path = Path(); int identity = 1; int callback_calls = 0;
   PhaseOffsetMatchedAdapter adapter(Config(TubeSource::FIXED));
@@ -575,6 +655,238 @@ TEST(TubeEpochIntegrationTest, ManualAndEpochDiagnosticsHaveExactIndependentSche
   const auto payload = makeTubeEpochDiagnostics(epoch);
   EXPECT_EQ(payload.size(), kTubeEpochDiagnosticCount);
   for (double value : payload) EXPECT_TRUE(std::isfinite(value));
+}
+
+TEST(BootstrapRendezvous, GateClosedDoesNotArmOrUsePreGateEpoch) {
+  BootstrapRendezvousFixture fixture;
+  {
+    std::lock_guard<std::mutex> lock(fixture.adapter.runtime_command_mutex_);
+    fixture.adapter.clearBootstrapRendezvousLocked();
+    fixture.adapter.zero_gate_open_ = false;
+    EXPECT_FALSE(fixture.adapter.armBootstrapRendezvousLocked(
+        fixture.request));
+    EXPECT_EQ(BootstrapRendezvousState::DISARMED,
+              fixture.adapter.bootstrap_rendezvous_state_);
+  }
+  BootstrapRendezvousTicket ticket;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(ticket));
+  EXPECT_FALSE(ticket.valid());
+}
+
+TEST(BootstrapRendezvous, PostArmFreshEpochClaimsExactlyOnce) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(1U);
+  BootstrapRendezvousTicket first;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(first));
+  EXPECT_TRUE(first.valid());
+  BootstrapRendezvousTicket duplicate;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(duplicate));
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(first, false));
+  EXPECT_EQ(BootstrapRendezvousState::ARMED,
+            fixture.adapter.bootstrapRendezvousState());
+
+  fixture.ready(1U);  // Consumed build sequence is fenced by the watermark.
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(duplicate));
+  fixture.ready(2U);
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(duplicate));
+  EXPECT_NE(first.claim_id, duplicate.claim_id);
+  EXPECT_EQ(2U, duplicate.build_sequence);
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(duplicate, false));
+}
+
+TEST(BootstrapRendezvous, NoPostArmCertificateRemainsArmed) {
+  BootstrapRendezvousFixture fixture;
+  EXPECT_EQ(BootstrapRendezvousState::ARMED,
+            fixture.adapter.bootstrapRendezvousState());
+  BootstrapRendezvousTicket ticket;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(ticket));
+  EXPECT_FALSE(fixture.adapter.capturePathTubePair());
+}
+
+TEST(BootstrapRendezvous, ExpiredReadyEpochDemotesAndRequiresFreshSequence) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(3U);
+  {
+    std::lock_guard<std::mutex> lock(fixture.adapter.runtime_command_mutex_);
+    // Simulate a newer/incomplete finalization or deactivation removing the
+    // active epoch after READY was published.  The ticket must not preserve
+    // that old profile as an authority trigger.
+    std::atomic_store(&fixture.adapter.latest_epoch_snapshot_,
+                      std::shared_ptr<const TubeEpochSnapshot>());
+  }
+
+  BootstrapRendezvousTicket expired;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(expired));
+  EXPECT_FALSE(expired.valid());
+  EXPECT_EQ(BootstrapRendezvousState::ARMED,
+            fixture.adapter.bootstrapRendezvousState());
+
+  // Re-presenting the expired sequence is fenced by the consumed watermark;
+  // only a later finalized sequence may become READY/claimable.
+  fixture.ready(3U);
+  BootstrapRendezvousTicket same_sequence;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(same_sequence));
+  fixture.ready(4U);
+  BootstrapRendezvousTicket fresh;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(fresh));
+  EXPECT_EQ(4U, fresh.build_sequence);
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(fresh, false));
+
+  // The same freshness contract is checked again at each transaction seam;
+  // an epoch expiring after claim cannot authorize a late commit.
+  fixture.ready(5U);
+  BootstrapRendezvousTicket claimed;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(claimed));
+  {
+    std::lock_guard<std::mutex> lock(fixture.adapter.runtime_command_mutex_);
+    std::atomic_store(&fixture.adapter.latest_epoch_snapshot_,
+                      std::shared_ptr<const TubeEpochSnapshot>());
+  }
+  EXPECT_FALSE(fixture.adapter.validateBootstrapRendezvousClaim(claimed));
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(claimed, false));
+  EXPECT_EQ(BootstrapRendezvousState::ARMED,
+            fixture.adapter.bootstrapRendezvousState());
+}
+
+TEST(BootstrapRendezvous, TaskSessionRevisionAndFailureInvalidateLateClaim) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(3U);
+  BootstrapRendezvousTicket ticket;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(ticket));
+  fixture.adapter.authority_session_.fetch_add(1U, std::memory_order_acq_rel);
+  EXPECT_FALSE(fixture.adapter.completeBootstrapRendezvous(ticket, false));
+  EXPECT_EQ(BootstrapRendezvousState::DISARMED,
+            fixture.adapter.bootstrapRendezvousState());
+
+  BootstrapRendezvousFixture revision_fixture;
+  revision_fixture.ready(4U);
+  BootstrapRendezvousTicket revision_ticket;
+  ASSERT_TRUE(revision_fixture.adapter.claimBootstrapRendezvous(
+      revision_ticket));
+  const auto replacement_owner = BootstrapOwner();
+  const_cast<ContinuousPhasePath*>(replacement_owner.get())
+      ->setPathRevision(2U);
+  const auto replacement_frame =
+      std::make_shared<const ContinuousPhaseNormalFrame>(
+          replacement_owner, 2U, 2U);
+  MatchedAdapterInput replacement_input =
+      Input(Path(), replacement_owner.get(), 2.0);
+  replacement_input.semantic_path_owner = replacement_owner;
+  replacement_input.frame_owner = replacement_frame;
+  replacement_input.semantic_path_identity = replacement_owner.get();
+  replacement_input.semantic_path_start_w = replacement_owner->startW();
+  replacement_input.semantic_path_end_w = replacement_owner->endW();
+  const std::uint64_t replacement_revision =
+      revision_fixture.adapter.sourceRevision(replacement_input);
+  const auto replacement_request = revision_fixture.adapter.makeBuildRequest(
+      replacement_input, replacement_revision, 0.0);
+  {
+    std::lock_guard<std::mutex> lock(
+        revision_fixture.adapter.runtime_command_mutex_);
+    std::atomic_store(&revision_fixture.adapter.latest_build_request_,
+                      replacement_request);
+    revision_fixture.adapter.armBootstrapRendezvousLocked(
+        replacement_request);
+  }
+  EXPECT_FALSE(revision_fixture.adapter.completeBootstrapRendezvous(
+      revision_ticket, false));
+
+  BootstrapRendezvousFixture failure_fixture;
+  failure_fixture.ready(5U);
+  BootstrapRendezvousTicket failure_ticket;
+  ASSERT_TRUE(failure_fixture.adapter.claimBootstrapRendezvous(
+      failure_ticket));
+  {
+    std::lock_guard<std::mutex> lock(
+        failure_fixture.adapter.runtime_command_mutex_);
+    failure_fixture.adapter.latchFailure(
+        phase_offset_navigation::ControlFailureReason::GEOMETRY_INVARIANT);
+  }
+  EXPECT_FALSE(failure_fixture.adapter.completeBootstrapRendezvous(
+      failure_ticket, false));
+  EXPECT_EQ(BootstrapRendezvousState::DISARMED,
+            failure_fixture.adapter.bootstrapRendezvousState());
+}
+
+TEST(BootstrapRendezvous, ExistingPairPreventsSecondAuthority) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(5U);
+  auto pair = std::make_shared<PathTubePair>();
+  std::atomic_store(&fixture.adapter.authoritative_path_tube_pair_,
+                    std::shared_ptr<const PathTubePair>(pair));
+  BootstrapRendezvousTicket ticket;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(ticket));
+  EXPECT_EQ(BootstrapRendezvousState::DISARMED,
+            fixture.adapter.bootstrapRendezvousState());
+}
+
+TEST(BootstrapRendezvous, FailedClaimConsumesEpochAndRequiresFreshSequence) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(7U);
+  BootstrapRendezvousTicket ticket;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(ticket));
+  ASSERT_TRUE(fixture.adapter.completeBootstrapRendezvous(ticket, false));
+  fixture.ready(7U);
+  BootstrapRendezvousTicket stale;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(stale));
+  fixture.ready(8U);
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(stale));
+  EXPECT_EQ(8U, stale.build_sequence);
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(stale, false));
+}
+
+TEST(BootstrapRendezvous, NewerReadyMayReplaceClaimedEpoch) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(9U);
+  BootstrapRendezvousTicket claimed;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(claimed));
+  // A worker can finalize a newer epoch while the manager is still proving
+  // the older ticket.  Keep the newer READY independently of the claim.
+  fixture.ready(10U);
+  BootstrapRendezvousTicket blocked;
+  EXPECT_FALSE(fixture.adapter.claimBootstrapRendezvous(blocked));
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(claimed, false));
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(blocked));
+  EXPECT_EQ(10U, blocked.build_sequence);
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(blocked, false));
+}
+
+TEST(BootstrapRendezvous, NavigationStateRemainsAvailableWhileArmed) {
+  BootstrapRendezvousFixture fixture;
+  EXPECT_EQ(BootstrapRendezvousState::ARMED,
+            fixture.adapter.bootstrapRendezvousState());
+  // Arming is identity-only: it does not install a Pair or mutate Runtime's
+  // retained offset/port history, so the ordinary command path remains the
+  // planner-owned neutral path.
+  EXPECT_DOUBLE_EQ(0.0, fixture.adapter.runtime_->retainedDelta());
+  EXPECT_FALSE(fixture.adapter.capturePathTubePair());
+}
+
+TEST(BootstrapRendezvous, SuccessfulPairCasClearsWithFreshStagedRevision) {
+  BootstrapRendezvousFixture fixture;
+  fixture.ready(11U);
+  BootstrapRendezvousTicket ticket;
+  ASSERT_TRUE(fixture.adapter.claimBootstrapRendezvous(ticket));
+
+  auto pair = std::make_shared<PathTubePair>();
+  pair->authority_session = ticket.authority_session;
+  pair->source_revision = ticket.source_revision + 1U;
+  pair->path_revision = ticket.path_revision;
+  pair->frame_revision = ticket.frame_revision + 1U;
+  pair->path_owner = fixture.owner;
+  auto profile = std::make_shared<phase_offset_navigation::TubeProfile>();
+  profile->complete = true;
+  profile->classification =
+      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
+  pair->active_profile = profile;
+  pair->epoch_snapshot = std::make_shared<TubeEpochSnapshot>();
+  pair->epoch_status.active_available = true;
+  pair->epoch_status.active_current_validation_valid = true;
+  std::atomic_store(&fixture.adapter.authoritative_path_tube_pair_,
+                    std::shared_ptr<const PathTubePair>(pair));
+  EXPECT_TRUE(fixture.adapter.completeBootstrapRendezvous(ticket, true));
+  EXPECT_EQ(BootstrapRendezvousState::DISARMED,
+            fixture.adapter.bootstrapRendezvousState());
 }
 
 }  // namespace

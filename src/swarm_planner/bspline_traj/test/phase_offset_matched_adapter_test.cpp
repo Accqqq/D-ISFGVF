@@ -6292,7 +6292,10 @@ TEST(PhaseOffsetMatchedAdapterTest,
   ASSERT_TRUE(predecessor_authority.valid);
   ASSERT_EQ(predecessor_authority.owner_mode,
             phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL);
-  const double replacement_captured_w0 = predecessor_authority.w;
+  // The successor must begin at the predecessor command's committed phase
+  // (the authority proposed_next_w / phase-after witness), not its phase-before
+  // authority.w snapshot.
+  const double replacement_captured_w0 = predecessor_authority.proposed_next_w;
   const double successor_end_w = 2.8;
   const std::shared_ptr<const ContinuousPhasePath> successor_owner =
       MakeH2ProductionNewOwner(old_owner, replacement_captured_w0,

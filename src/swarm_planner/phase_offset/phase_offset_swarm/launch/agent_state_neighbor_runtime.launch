@@ -1,0 +1,36 @@
+<launch>
+  <arg name="robot_id" default="0"/>
+  <arg name="agent_count" default="1"/>
+  <arg name="uav_ns" default="uav_$(arg robot_id)"/>
+  <arg name="odom_topic" default="/uav_$(arg robot_id)/sim/odom"/>
+  <arg name="agent_state_topic" default="/phase_offset/agent_state"/>
+  <arg name="world_frame" default="world"/>
+  <arg name="neighbor_config_file"
+       default="$(find phase_offset_swarm)/config/neighbor_transport_v1.yaml"/>
+  <arg name="neighbor_enter_radius" default="2.45"/>
+  <arg name="neighbor_exit_radius" default="2.50"/>
+  <arg name="enable_sph_provider" default="false"/>
+  <arg name="sph_beta_topic" default="/uav_$(arg robot_id)/phase_offset/sph_beta"/>
+  <arg name="sph_g_coord_topic" default="/uav_$(arg robot_id)/phase_offset/g_coord"/>
+  <arg name="beta_fresh_timeout" default="0.10"/>
+  <arg name="snapshot_fresh_timeout" default="0.10"/>
+  <arg name="future_timestamp_tolerance" default="0.02"/>
+
+  <node pkg="phase_offset_swarm" type="agent_state_neighbor_runtime_node"
+        name="sim_c_neighbor_runtime" ns="$(arg uav_ns)" output="screen">
+    <rosparam file="$(arg neighbor_config_file)" command="load"/>
+    <param name="robot_id" value="$(arg robot_id)"/>
+    <param name="agent_count" value="$(arg agent_count)"/>
+    <param name="world_frame" value="$(arg world_frame)"/>
+    <param name="agent_state_topic" value="$(arg agent_state_topic)"/>
+    <param name="enter_radius" value="$(arg neighbor_enter_radius)"/>
+    <param name="exit_radius" value="$(arg neighbor_exit_radius)"/>
+    <param name="enable_sph_provider" value="$(arg enable_sph_provider)"/>
+    <param name="beta_fresh_timeout" value="$(arg beta_fresh_timeout)"/>
+    <param name="snapshot_fresh_timeout" value="$(arg snapshot_fresh_timeout)"/>
+    <param name="future_timestamp_tolerance" value="$(arg future_timestamp_tolerance)"/>
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <remap from="~beta" to="$(arg sph_beta_topic)"/>
+    <remap from="~g_coord" to="$(arg sph_g_coord_topic)"/>
+  </node>
+</launch>

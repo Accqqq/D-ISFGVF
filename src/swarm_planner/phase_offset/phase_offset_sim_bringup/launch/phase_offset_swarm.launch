@@ -1,0 +1,105 @@
+<launch>
+  <!--
+    SWARM is a thin configuration/process supervisor.  It validates one
+    scenario, starts one generic-N simulator, one shared nodelet manager and
+    N agent wrappers, then invokes the package-owned goal publisher once for
+    each ready goal subscriber.  Launch WORLD separately for the common map
+    and read-only visualization infrastructure.
+  -->
+  <arg name="scenario_file"
+       default="$(find phase_offset_sim_bringup)/config/scenarios/sim_b_open_3.yaml"/>
+  <arg name="simulation_rate" default="1000.0"/>
+  <arg name="odom_rate" default="100.0"/>
+  <arg name="start_at_hover" default="true"/>
+  <arg name="frame_id" default="world"/>
+  <arg name="map_resolution" default="0.20"/>
+  <arg name="map_size_x" default="20.0"/>
+  <arg name="map_size_y" default="30.0"/>
+  <arg name="map_size_z" default="2.5"/>
+  <arg name="nodelet_manager" default="/so3_nodelet_manager"/>
+  <arg name="goal_connection_timeout" default="30.0"/>
+  <arg name="goal_publish_timeout" default="25.0"/>
+  <arg name="phase_offset_mode" default="active"/>
+  <arg name="phase_offset_coordination_backend" default="disabled"/>
+  <arg name="phase_offset_manual_observe_only" default="true"/>
+  <arg name="phase_offset_manual_tube_source" default="none"/>
+  <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false"/>
+  <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0"/>
+  <arg name="phase_offset_normal_preview_horizon_w" default=""/>
+  <arg name="phase_offset_normal_preview_sample_spacing_w" default=""/>
+  <arg name="phase_offset_normal_preview_lower_nu" default=""/>
+  <arg name="phase_offset_normal_preview_upper_nu" default=""/>
+  <arg name="phase_offset_normal_preview_b_tight" default=""/>
+  <arg name="phase_offset_normal_preview_b_open" default=""/>
+  <arg name="phase_offset_g_coord_fresh_timeout" default="0.10"/>
+  <arg name="phase_offset_future_timestamp_tolerance" default="0.02"/>
+  <arg name="enable_neighbor_transport" default="false"/>
+  <arg name="agent_state_topic" default="/phase_offset/agent_state"/>
+  <arg name="neighbor_config_file"
+       default="$(find phase_offset_swarm)/config/neighbor_transport_v1.yaml"/>
+  <arg name="neighbor_enter_radius" default="2.45"/>
+  <arg name="neighbor_exit_radius" default="2.50"/>
+  <arg name="all_visible_neighbors" default="false"/>
+  <arg name="enable_sph_provider" default="false"/>
+  <arg name="sph_beta_topic_pattern" default="/uav_{robot_id}/phase_offset/sph_beta"/>
+  <arg name="sph_g_coord_topic_pattern" default="/uav_{robot_id}/phase_offset/g_coord"/>
+  <arg name="beta_fresh_timeout" default="0.10"/>
+  <arg name="snapshot_fresh_timeout" default="0.10"/>
+  <arg name="future_timestamp_tolerance" default="0.02"/>
+
+  <node pkg="phase_offset_sim_bringup" type="swarm_orchestrator.py"
+        name="phase_offset_swarm_orchestrator" output="screen"
+        required="true">
+    <param name="scenario_file" value="$(arg scenario_file)"/>
+    <param name="simulation_rate" value="$(arg simulation_rate)"/>
+    <param name="odom_rate" value="$(arg odom_rate)"/>
+    <param name="start_at_hover" value="$(arg start_at_hover)"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+    <param name="map_resolution" value="$(arg map_resolution)"/>
+    <param name="map_size_x" value="$(arg map_size_x)"/>
+    <param name="map_size_y" value="$(arg map_size_y)"/>
+    <param name="map_size_z" value="$(arg map_size_z)"/>
+    <param name="nodelet_manager" value="$(arg nodelet_manager)"/>
+    <param name="goal_connection_timeout" value="$(arg goal_connection_timeout)"/>
+    <param name="goal_publish_timeout" value="$(arg goal_publish_timeout)"/>
+    <param name="phase_offset_mode" value="$(arg phase_offset_mode)"/>
+    <param name="phase_offset_coordination_backend"
+           value="$(arg phase_offset_coordination_backend)"/>
+    <param name="phase_offset_manual_observe_only"
+           value="$(arg phase_offset_manual_observe_only)"/>
+    <param name="phase_offset_manual_tube_source"
+           value="$(arg phase_offset_manual_tube_source)"/>
+    <param name="phase_offset_tube_cloud_obstacle_set_complete"
+           value="$(arg phase_offset_tube_cloud_obstacle_set_complete)"/>
+    <param name="phase_offset_tube_preincluded_map_uncertainty"
+           value="$(arg phase_offset_tube_preincluded_map_uncertainty)"/>
+    <param name="phase_offset_normal_preview_horizon_w"
+           value="$(arg phase_offset_normal_preview_horizon_w)"/>
+    <param name="phase_offset_normal_preview_sample_spacing_w"
+           value="$(arg phase_offset_normal_preview_sample_spacing_w)"/>
+    <param name="phase_offset_normal_preview_lower_nu"
+           value="$(arg phase_offset_normal_preview_lower_nu)"/>
+    <param name="phase_offset_normal_preview_upper_nu"
+           value="$(arg phase_offset_normal_preview_upper_nu)"/>
+    <param name="phase_offset_normal_preview_b_tight"
+           value="$(arg phase_offset_normal_preview_b_tight)"/>
+    <param name="phase_offset_normal_preview_b_open"
+           value="$(arg phase_offset_normal_preview_b_open)"/>
+    <param name="phase_offset_g_coord_fresh_timeout"
+           value="$(arg phase_offset_g_coord_fresh_timeout)"/>
+    <param name="phase_offset_future_timestamp_tolerance"
+           value="$(arg phase_offset_future_timestamp_tolerance)"/>
+    <param name="enable_neighbor_transport" value="$(arg enable_neighbor_transport)"/>
+    <param name="agent_state_topic" value="$(arg agent_state_topic)"/>
+    <param name="neighbor_config_file" value="$(arg neighbor_config_file)"/>
+    <param name="neighbor_enter_radius" value="$(arg neighbor_enter_radius)"/>
+    <param name="neighbor_exit_radius" value="$(arg neighbor_exit_radius)"/>
+    <param name="all_visible_neighbors" value="$(arg all_visible_neighbors)"/>
+    <param name="enable_sph_provider" value="$(arg enable_sph_provider)"/>
+    <param name="sph_beta_topic_pattern" value="$(arg sph_beta_topic_pattern)"/>
+    <param name="sph_g_coord_topic_pattern" value="$(arg sph_g_coord_topic_pattern)"/>
+    <param name="beta_fresh_timeout" value="$(arg beta_fresh_timeout)"/>
+    <param name="snapshot_fresh_timeout" value="$(arg snapshot_fresh_timeout)"/>
+    <param name="future_timestamp_tolerance" value="$(arg future_timestamp_tolerance)"/>
+  </node>
+</launch>

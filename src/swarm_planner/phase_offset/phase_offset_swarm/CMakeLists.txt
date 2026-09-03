@@ -11,13 +11,14 @@ find_package(catkin REQUIRED COMPONENTS
   phase_offset_msgs
   roscpp
   std_msgs
+  std_srvs
 )
 find_package(Eigen3 REQUIRED)
 
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES phase_offset_swarm_core
-  CATKIN_DEPENDS geometry_msgs nav_msgs phase_offset_msgs roscpp std_msgs
+  CATKIN_DEPENDS geometry_msgs nav_msgs phase_offset_msgs roscpp std_msgs std_srvs
   DEPENDS Eigen3
 )
 
@@ -26,6 +27,9 @@ add_library(phase_offset_swarm_core
   src/elastic_interaction.cpp
   src/conflict_friction.cpp
   src/swarm_intent.cpp
+  src/sph_intent.cpp
+  src/swarm_backend.cpp
+  src/sph_provider_runtime.cpp
 )
 
 target_include_directories(phase_offset_swarm_core
@@ -55,6 +59,23 @@ target_link_libraries(swarm_intent_shadow_node
   ${catkin_LIBRARIES}
 )
 add_dependencies(swarm_intent_shadow_node
+  ${catkin_EXPORTED_TARGETS}
+  ${phase_offset_msgs_EXPORTED_TARGETS}
+)
+
+add_executable(agent_state_neighbor_runtime_node
+  src/agent_state_neighbor_runtime_node.cpp
+)
+target_include_directories(agent_state_neighbor_runtime_node
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${catkin_INCLUDE_DIRS}
+)
+target_link_libraries(agent_state_neighbor_runtime_node
+  phase_offset_swarm_core
+  ${catkin_LIBRARIES}
+)
+add_dependencies(agent_state_neighbor_runtime_node
   ${catkin_EXPORTED_TARGETS}
   ${phase_offset_msgs_EXPORTED_TARGETS}
 )
@@ -99,9 +120,11 @@ if(CATKIN_ENABLE_TESTING)
   endif()
 
   add_rostest(test/swarm_intent_shadow.test)
+  add_rostest(test/agent_state_neighbor_transport.test)
 endif()
 
 install(TARGETS phase_offset_swarm_core swarm_intent_shadow_node
+                agent_state_neighbor_runtime_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -112,6 +135,8 @@ install(DIRECTORY include/
 install(DIRECTORY config launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
-catkin_install_python(PROGRAMS test/swarm_intent_shadow_test.py
+catkin_install_python(PROGRAMS
+  test/swarm_intent_shadow_test.py
+  test/agent_state_neighbor_transport_test.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

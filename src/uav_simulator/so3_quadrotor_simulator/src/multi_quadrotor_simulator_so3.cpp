@@ -1,7 +1,6 @@
 #include <quadrotor_simulator/multi_quadrotor_simulator.h>
 
 #include <algorithm>
-#include <limits>
 
 #include <xmlrpcpp/XmlRpcValue.h>
 
@@ -25,24 +24,25 @@ bool finiteNumber(const XmlRpc::XmlRpcValue& value, double& output) {
   return false;
 }
 
-bool readInitialStates(const ros::NodeHandle& node, int num_agents,
-                       std::vector<InitialState>& states) {
+bool readInitialStates(const ros::NodeHandle& node,
+                       std::vector<InitialState>& states,
+                       int& num_agents) {
   XmlRpc::XmlRpcValue value;
   if (!node.getParam("initial_states", value) ||
       value.getType() != XmlRpc::XmlRpcValue::TypeArray ||
-      value.size() != num_agents) {
-    ROS_ERROR("[B0_MULTI] initial_states must contain exactly %d entries",
-              num_agents);
+      value.size() <= 0) {
+    ROS_ERROR("[B0_MULTI] initial_states must be a non-empty array");
     return false;
   }
 
+  num_agents = static_cast<int>(value.size());
   states.clear();
   states.resize(static_cast<std::size_t>(num_agents));
   std::vector<bool> seen(static_cast<std::size_t>(num_agents), false);
   for (int index = 0; index < num_agents; ++index) {
     const XmlRpc::XmlRpcValue& item = value[index];
     if (item.getType() != XmlRpc::XmlRpcValue::TypeStruct ||
-        item.size() != 5 || !item.hasMember("robot_id") ||
+        !item.hasMember("robot_id") ||
         !item.hasMember("x") || !item.hasMember("y") ||
         !item.hasMember("z") || !item.hasMember("yaw")) {
       ROS_ERROR("[B0_MULTI] initial_states[%d] has an invalid field set",
@@ -158,8 +158,7 @@ bool MultiQuadrotorSimulator::initialize(
     ros::NodeHandle& node, int num_agents, const std::string& frame_id,
     bool start_at_hover, const std::vector<Eigen::Vector3d>& positions,
     const std::vector<double>& yaws) {
-  if ((num_agents != 1 && num_agents != 3) ||
-      positions.size() != static_cast<std::size_t>(num_agents) ||
+  if (positions.size() != static_cast<std::size_t>(num_agents) ||
       yaws.size() != static_cast<std::size_t>(num_agents)) {
     return false;
   }
@@ -259,13 +258,6 @@ int main(int argc, char** argv) {
   ros::init(argc, argv, "multi_quadrotor_simulator_so3");
   ros::NodeHandle node("~");
 
-  int num_agents = 3;
-  node.param("num_agents", num_agents, 3);
-  if (num_agents != 1 && num_agents != 3) {
-    ROS_FATAL("[B0_MULTI] num_agents must be exactly 1 or 3");
-    return 1;
-  }
-
   std::string frame_id = "world";
   node.param("frame_id", frame_id, frame_id);
   double simulation_rate = 1000.0;
@@ -282,7 +274,27 @@ int main(int argc, char** argv) {
   }
 
   std::vector<InitialState> initial_states;
-  if (!readInitialStates(node, num_agents, initial_states)) {
+  int num_agents = 0;
+  if (!readInitialStates(node, initial_states, num_agents)) {
+    return 1;
+  }
+
+  XmlRpc::XmlRpcValue compatibility_num_agents;
+  if (node.getParam("num_agents", compatibility_num_agents)) {
+    if (compatibility_num_agents.getType() != XmlRpc::XmlRpcValue::TypeInt) {
+      ROS_FATAL("[B0_MULTI] num_agents must be an XML-RPC integer when present");
+      return 1;
+    }
+    const int declared_num_agents = static_cast<int>(compatibility_num_agents);
+    if (declared_num_agents != num_agents) {
+      ROS_FATAL("[B0_MULTI] num_agents (%d) must equal initial_states size (%d)",
+                declared_num_agents, num_agents);
+      return 1;
+    }
+  }
+
+  if (num_agents <= 0) {
+    ROS_FATAL("[B0_MULTI] initial_states must contain at least one state");
     return 1;
   }
   std::vector<Eigen::Vector3d> positions;

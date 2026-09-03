@@ -1,0 +1,313 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+  - Class: rviz/Time
+    Name: Time
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Enabled: true
+      Name: World grid
+      Plane: XY
+      Plane Cell Count: 30
+      Cell Size: 1
+      Reference Frame: world
+      Value: true
+    - Class: rviz/PointCloud2
+      Enabled: true
+      Name: Common open map
+      Topic: /mock_map
+      Queue Size: 10
+      Style: Flat Squares
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV bodies and labels
+      Marker Topic: /phase_offset_swarm/vis/uavs
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV trajectories
+      Marker Topic: /phase_offset_swarm/vis/trajectories
+      Queue Size: 100
+      Value: true
+    - Class: rviz/PointCloud2
+      Enabled: true
+      Name: UAV0 ESDF occupancy inflated
+      Topic: /uav_0/particle0sdf_map/occupancy_inflate
+      Queue Size: 10
+      Style: Points
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: true
+    - Class: rviz/PointCloud2
+      Enabled: true
+      Name: UAV0 ESDF
+      Topic: /uav_0/particle0sdf_map/esdf
+      Queue Size: 10
+      Style: Points
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: true
+    - Class: rviz/Path
+      Enabled: true
+      Name: UAV0 planner path
+      Topic: /uav_0/particle0/path
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Path
+      Enabled: true
+      Name: UAV0 kino path
+      Topic: /uav_0/particle0/kinopath
+      Queue Size: 10
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Name: UAV0 path visualization
+      Marker Topic: /uav_0/path_vis
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Name: UAV0 goal
+      Marker Topic: /uav_0/goal_vis
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV0 GVF frontend
+      Marker Topic: /uav_0/particle0/gvf/traj_vis
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV0 GVF vector field
+      Marker Topic: /uav_0/particle0/gvf/vector_field
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Name: UAV0 Tube base path
+      Marker Topic: /uav_0/formation_planning/phase_offset_manual/base_path
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Name: UAV0 Tube active path
+      Marker Topic: /uav_0/formation_planning/phase_offset_manual/active_path
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV0 Tube frame
+      Marker Topic: /uav_0/formation_planning/phase_offset_manual/frame
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV0 Tube candidate
+      Marker Topic: /uav_0/formation_planning/phase_offset_manual/tube_candidate
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: UAV0 Tube certified
+      Marker Topic: /uav_0/formation_planning/phase_offset_manual/tube
+      Queue Size: 100
+      Value: true
+    - Class: rviz/PointCloud2
+      Enabled: false
+      Name: UAV1 ESDF occupancy inflated
+      Topic: /uav_1/particle0sdf_map/occupancy_inflate
+      Queue Size: 10
+      Style: Points
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: false
+    - Class: rviz/PointCloud2
+      Enabled: false
+      Name: UAV1 ESDF
+      Topic: /uav_1/particle0sdf_map/esdf
+      Queue Size: 10
+      Style: Points
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: false
+    - Class: rviz/Path
+      Enabled: false
+      Name: UAV1 planner path
+      Topic: /uav_1/particle0/path
+      Queue Size: 10
+      Value: false
+    - Class: rviz/Path
+      Enabled: false
+      Name: UAV1 kino path
+      Topic: /uav_1/particle0/kinopath
+      Queue Size: 10
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV1 path visualization
+      Marker Topic: /uav_1/path_vis
+      Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV1 goal
+      Marker Topic: /uav_1/goal_vis
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV1 GVF frontend
+      Marker Topic: /uav_1/particle0/gvf/traj_vis
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV1 GVF vector field
+      Marker Topic: /uav_1/particle0/gvf/vector_field
+      Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV1 Tube base path
+      Marker Topic: /uav_1/formation_planning/phase_offset_manual/base_path
+      Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV1 Tube active path
+      Marker Topic: /uav_1/formation_planning/phase_offset_manual/active_path
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV1 Tube frame
+      Marker Topic: /uav_1/formation_planning/phase_offset_manual/frame
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV1 Tube candidate
+      Marker Topic: /uav_1/formation_planning/phase_offset_manual/tube_candidate
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV1 Tube certified
+      Marker Topic: /uav_1/formation_planning/phase_offset_manual/tube
+      Queue Size: 100
+      Value: false
+    - Class: rviz/PointCloud2
+      Enabled: false
+      Name: UAV2 ESDF occupancy inflated
+      Topic: /uav_2/particle0sdf_map/occupancy_inflate
+      Queue Size: 10
+      Style: Points
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: false
+    - Class: rviz/PointCloud2
+      Enabled: false
+      Name: UAV2 ESDF
+      Topic: /uav_2/particle0sdf_map/esdf
+      Queue Size: 10
+      Style: Points
+      Size (Pixels): 2
+      Use Fixed Frame: true
+      Value: false
+    - Class: rviz/Path
+      Enabled: false
+      Name: UAV2 planner path
+      Topic: /uav_2/particle0/path
+      Queue Size: 10
+      Value: false
+    - Class: rviz/Path
+      Enabled: false
+      Name: UAV2 kino path
+      Topic: /uav_2/particle0/kinopath
+      Queue Size: 10
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV2 path visualization
+      Marker Topic: /uav_2/path_vis
+      Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV2 goal
+      Marker Topic: /uav_2/goal_vis
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV2 GVF frontend
+      Marker Topic: /uav_2/particle0/gvf/traj_vis
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV2 GVF vector field
+      Marker Topic: /uav_2/particle0/gvf/vector_field
+      Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV2 Tube base path
+      Marker Topic: /uav_2/formation_planning/phase_offset_manual/base_path
+      Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: false
+      Name: UAV2 Tube active path
+      Marker Topic: /uav_2/formation_planning/phase_offset_manual/active_path
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV2 Tube frame
+      Marker Topic: /uav_2/formation_planning/phase_offset_manual/frame
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV2 Tube candidate
+      Marker Topic: /uav_2/formation_planning/phase_offset_manual/tube_candidate
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Name: UAV2 Tube certified
+      Marker Topic: /uav_2/formation_planning/phase_offset_manual/tube
+      Queue Size: 100
+      Value: false
+  Enabled: true
+  Global Options:
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 35
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 1
+      Pitch: 0.6
+      Yaw: 0.8
+Window Geometry:
+  Height: 900
+  Width: 1400
