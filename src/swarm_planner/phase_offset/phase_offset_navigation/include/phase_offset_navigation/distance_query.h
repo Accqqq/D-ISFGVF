@@ -30,6 +30,10 @@ struct ClearanceQueryResult {
   DistanceStatus status = DistanceStatus::UNAVAILABLE;
   double clearance = 0.0;
   bool clearance_certified = false;
+  // True only when `clearance` is the exact nearest-centre distance.  A
+  // certified value equal to (or capped at) the requested radius is a lower
+  // bound and must remain conservatively distinguishable by proof consumers.
+  bool clearance_is_exact = false;
 };
 
 using ClearanceQuery = std::function<ClearanceQueryResult(

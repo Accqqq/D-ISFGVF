@@ -53,6 +53,46 @@ enum class TubeStopReason {
   REGULARITY,
 };
 
+// Typed outcomes emitted by the continuous surface validator.  These values
+// intentionally form a separate proof vocabulary from TubeStopReason: a
+// certified lower bound that is too small to close a cell is not an exact
+// contract violation and therefore remains INCONCLUSIVE/REFINE evidence.
+enum class TubeSurfaceOutcome {
+  SAFE,
+  CONTRACT_UNSAFE,
+  REFINE,
+  INCONCLUSIVE,
+};
+
+enum class TubeSurfaceInconclusiveReason {
+  NONE,
+  INVALID_INPUT,
+  CELL_CERTIFICATE_MISSING,
+  CELL_CERTIFICATE_MALFORMED,
+  CELL_CERTIFICATE_MISMATCH,
+  REGULARITY_UNPROVEN,
+  CLEARANCE_UNAVAILABLE,
+  CLEARANCE_OUT_OF_MAP,
+  CLEARANCE_UNKNOWN,
+  CLEARANCE_UNCERTIFIED,
+  NUMERICAL_FAILURE,
+  DEPTH_GUARD,
+  QUERY_BUDGET,
+  NO_CERTIFIED_REFINEMENT_IMPROVEMENT,
+};
+
+// Profile-level truncation is kept typed so a retained SAFE component is not
+// confused with a globally complete preview.  The enum is append-only for
+// diagnostics consumers.
+enum class TubeSurfaceTruncationOutcome {
+  NONE,
+  PREFIX,
+  SUFFIX,
+  PREFIX_AND_SUFFIX,
+  ANCHOR_EXCLUDED,
+  NO_NONDEGENERATE_COMPONENT,
+};
+
 struct ErosionMargins {
   double uav_radius = 0.25;
   double localization_margin = 0.05;
@@ -186,6 +226,98 @@ struct TubeValidatorKnotEvidence {
   bool zero_surface_covered = false;
 };
 
+// Diagnostic-only provenance for the nearest terminal non-SAFE leaf directly
+// beyond a retained current-containing SAFE component.  This sidecar is not
+// consulted by Builder, Runtime, or any acceptance predicate.
+struct TubeSurfaceForwardExcludedEvidence {
+  bool valid = false;
+  double w0 = 0.0;
+  double w1 = 0.0;
+  double v0 = 0.0;
+  double v1 = 0.0;
+  int depth = -1;
+  TubeSurfaceOutcome outcome = TubeSurfaceOutcome::INCONCLUSIVE;
+  TubeSurfaceInconclusiveReason inconclusive_reason =
+      TubeSurfaceInconclusiveReason::NONE;
+
+  bool clearance_query_attempted = false;
+  DistanceStatus clearance_status = DistanceStatus::UNAVAILABLE;
+  bool witness_clearance_valid = false;
+  bool witness_clearance_certified = false;
+  bool witness_clearance_exact = false;
+  double witness_clearance = 0.0;
+  bool exact_d_c_valid = false;
+  double exact_d_c = 0.0;
+  bool requested_clearance_valid = false;
+  double requested_clearance = 0.0;
+
+  bool cell_certificate_attempted = false;
+  bool cell_certificate_complete = false;
+  bool cell_certificate_revision_match = false;
+
+  bool query_budget_exhausted = false;
+  bool max_depth_reached = false;
+
+  bool geometric_evidence_valid = false;
+  double midpoint_position_cover = 0.0;
+  double normal_variation_cover = 0.0;
+  double delta_slope_cover = 0.0;
+  double v_span_cover = 0.0;
+  double geometric_cover = 0.0;
+  double support_alignment_bound = 0.0;
+  double numerical_epsilon = 0.0;
+  double allowable_cover = 0.0;
+  double proof_residual = 0.0;
+};
+
+// Evidence for one final certified/refinement leaf.  The fields are
+// deliberately plain in-memory values; no ROS schema or Runtime policy is
+// coupled to this type.  A cell is centreline-certifiable only when the full
+// matching PWL interval contains delta=0 and outcome==SAFE.
+struct TubeSurfaceCellEvidence {
+  double w0 = 0.0;
+  double w1 = 0.0;
+  double v0 = 0.0;
+  double v1 = 1.0;
+  int depth = 0;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
+  std::uint64_t profile_revision = 0U;
+  TubeSurfaceOutcome outcome = TubeSurfaceOutcome::INCONCLUSIVE;
+  TubeSurfaceInconclusiveReason inconclusive_reason =
+      TubeSurfaceInconclusiveReason::NONE;
+  bool terminal = false;
+  bool complete_filtered_pwl_contains_zero = false;
+  // Compatibility aliases used by diagnostics/tests that predate the longer
+  // theorem wording above.
+  bool filtered_pwl_contains_zero = false;
+  bool contains_zero = false;
+  bool witness_clearance_exact = false;
+  TubeStopReason witness_legacy_reason = TubeStopReason::NONE;
+  double witness_clearance = 0.0;
+  double allowable_cover = 0.0;
+  double midpoint_position_cover = 0.0;
+  double normal_variation_cover = 0.0;
+  double delta_slope_cover = 0.0;
+  double v_span_cover = 0.0;
+  double geometric_cover = 0.0;
+  double support_alignment_bound = 0.0;
+  double numerical_epsilon = 0.0;
+  double proof_residual = 0.0;
+  // Already-computed query/certificate provenance for the diagnostic sidecar.
+  // These fields do not participate in validation semantics.
+  bool geometric_evidence_valid = false;
+  bool clearance_query_attempted = false;
+  DistanceStatus clearance_status = DistanceStatus::UNAVAILABLE;
+  bool witness_clearance_valid = false;
+  bool witness_clearance_certified = false;
+  bool requested_clearance_valid = false;
+  double requested_clearance = 0.0;
+  bool cell_certificate_attempted = false;
+  bool cell_certificate_complete = false;
+  bool cell_certificate_revision_match = false;
+};
+
 struct TubeBuildDiagnostics {
   std::size_t sample_count = 0U;
   std::size_t invalid_count = 0U;
@@ -219,6 +351,37 @@ struct TubeBuildDiagnostics {
       TubeNominalWidthSource::DEFAULT_ABSENT;
   bool nominal_width_legacy_conflict = false;
   double effective_nominal_half_width_m = 0.0;
+
+  // Permanent typed SurfaceValidator summary.  Numeric fields serialize as
+  // zero when unavailable; the outcome/reason and presence bits carry the
+  // distinction between an actual zero and absent evidence.
+  TubeSurfaceOutcome surface_outcome = TubeSurfaceOutcome::INCONCLUSIVE;
+  TubeSurfaceInconclusiveReason surface_inconclusive_reason =
+      TubeSurfaceInconclusiveReason::NONE;
+  TubeSurfaceTruncationOutcome surface_truncation_outcome =
+      TubeSurfaceTruncationOutcome::NONE;
+  double surface_terminal_w = 0.0;
+  double surface_witness_clearance = 0.0;
+  bool surface_witness_clearance_exact = false;
+  double surface_midpoint_position_cover = 0.0;
+  double surface_normal_variation_cover = 0.0;
+  double surface_delta_slope_cover = 0.0;
+  double surface_v_span_cover = 0.0;
+  double surface_geometric_cover = 0.0;
+  double surface_support_alignment_bound = 0.0;
+  double surface_numerical_epsilon = 0.0;
+  double surface_proof_residual = 0.0;
+  int surface_max_depth_observed = 0;
+  std::size_t surface_query_sample_count = 0U;
+  bool surface_depth_guard_reached = false;
+  bool surface_query_budget_reached = false;
+  std::size_t surface_split_w_count = 0U;
+  std::size_t surface_split_v_count = 0U;
+  std::size_t surface_split_both_count = 0U;
+  bool zero_centerline_contiguous = false;
+  double zero_centerline_start_w = 0.0;
+  double zero_centerline_end_w = 0.0;
+  bool surface_summary_present = false;
 };
 
 struct TubeProfile {
@@ -232,6 +395,7 @@ struct TubeProfile {
   std::vector<TubeRawSample, Eigen::aligned_allocator<TubeRawSample>>
       raw_build_samples;
   std::vector<TubeValidatorKnotEvidence> validator_knot_evidence;
+  std::vector<TubeSurfaceCellEvidence> surface_cell_evidence;
   TubeSource source = TubeSource::NONE;
   // preview_start_w/preview_end_w are always the retained, current-containing
   // certified segment.  Keep the original request separately so a raw map
@@ -283,6 +447,7 @@ struct TubeProfile {
   // tube when the post-inset interval excluded zero.
   bool zero_centerline_continuously_certified = false;
   TubeBuildDiagnostics diagnostics;
+  TubeSurfaceForwardExcludedEvidence forward_excluded_evidence;
 };
 
 struct TubeBounds {
@@ -321,5 +486,10 @@ const char* tubeSourceName(TubeSource source);
 const char* tubeStopReasonName(TubeStopReason reason);
 const char* tubeProofLevelName(TubeProofLevel level);
 const char* tubeComponentSelectionName(TubeComponentSelection selection);
+const char* tubeSurfaceOutcomeName(TubeSurfaceOutcome outcome);
+const char* tubeSurfaceInconclusiveReasonName(
+    TubeSurfaceInconclusiveReason reason);
+const char* tubeSurfaceTruncationOutcomeName(
+    TubeSurfaceTruncationOutcome outcome);
 
 }  // namespace phase_offset_navigation

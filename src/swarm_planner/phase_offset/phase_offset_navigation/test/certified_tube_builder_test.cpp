@@ -208,9 +208,12 @@ ClearanceQuery Open() {
 // lets the deterministic reproduction preserve a nonzero raw ribbon but make
 // the full-width continuous surface observe UNKNOWN at its outer side.
 ClearanceQuery FullWidthOuterUnknown() {
-  return [](const Eigen::Vector3d& point, const double required) {
+  return [](const Eigen::Vector3d&, const double required) {
     ClearanceQueryResult result;
-    if (required > 0.4000001 && std::abs(point.y()) > 0.02) {
+    // Raw Builder probes request exactly 0.40 m.  Every larger centre-ball
+    // request is deliberately unknown, so the Validator fails at its first
+    // witness without permitting a sampled or inward repair path.
+    if (required > 0.4000001) {
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }
@@ -221,16 +224,188 @@ ClearanceQuery FullWidthOuterUnknown() {
   };
 }
 
-ClearanceQuery OutsideNarrowAuthorityUnknown() {
-  return [](const Eigen::Vector3d& point, const double required) {
+struct OutsideAuthorityObservations {
+  bool raw_lower_bound_tuple_correct = true;
+  std::size_t raw_calls = 0U;
+  std::size_t validator_calls = 0U;
+  std::size_t next_validator_event = 0U;
+  std::size_t exact_current_anchor_event =
+      std::numeric_limits<std::size_t>::max();
+  std::size_t first_remote_unknown_event =
+      std::numeric_limits<std::size_t>::max();
+  bool exact_current_anchor_reached = false;
+  bool exact_current_anchor_known_free = false;
+  double exact_current_anchor_clearance = 0.0;
+  bool first_non_degenerate_inside_reached = false;
+  bool first_non_degenerate_inside_known_free = false;
+  double first_non_degenerate_inside_clearance = 0.0;
+  bool remote_witness_reached = false;
+  bool remote_witness_unknown = false;
+};
+
+ClearanceQuery OutsideNarrowAuthorityUnknown(
+    OutsideAuthorityObservations* observations) {
+  return [observations](const Eigen::Vector3d& point, const double required) {
     ClearanceQueryResult result;
-    if (required > 0.4000001 && std::abs(point.y()) > 0.20) {
+    if (required <= 0.4000001) {
+      ++observations->raw_calls;
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = required;
+      result.clearance_certified = true;
+      result.clearance_is_exact = false;
+      observations->raw_lower_bound_tuple_correct =
+          observations->raw_lower_bound_tuple_correct &&
+          result.clearance == required && result.clearance_certified &&
+          !result.clearance_is_exact;
+      return result;
+    }
+
+    ++observations->validator_calls;
+    const std::size_t event = observations->next_validator_event++;
+    const bool exact_current_anchor =
+        std::abs(point.x()) <= 1e-12 && std::abs(point.y()) <= 1e-12 &&
+        std::abs(point.z() - 1.0) <= 1e-12;
+    const bool first_non_degenerate_inside =
+        std::abs(point.x() - 0.025) <= 1e-12 &&
+        std::abs(point.y()) <= 1e-12 &&
+        std::abs(point.z() - 1.0) <= 1e-12;
+    const bool inside_authority = std::abs(point.y()) <= 0.10 + 1e-12;
+    if (inside_authority) {
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = 0.41;
+      result.clearance_certified = true;
+      result.clearance_is_exact = true;
+      if (exact_current_anchor) {
+        observations->exact_current_anchor_reached = true;
+        observations->exact_current_anchor_known_free = true;
+        observations->exact_current_anchor_clearance = result.clearance;
+        observations->exact_current_anchor_event = std::min(
+            observations->exact_current_anchor_event, event);
+      }
+      if (first_non_degenerate_inside) {
+        observations->first_non_degenerate_inside_reached = true;
+        observations->first_non_degenerate_inside_known_free = true;
+        observations->first_non_degenerate_inside_clearance = result.clearance;
+      }
+      return result;
+    }
+
+    observations->remote_witness_reached = true;
+    observations->remote_witness_unknown = true;
+    observations->first_remote_unknown_event = std::min(
+        observations->first_remote_unknown_event, event);
+    result.status = DistanceStatus::UNKNOWN;
+    return result;
+  };
+}
+
+struct NegativeSideObservations {
+  bool raw_lower_bound_tuple_correct = true;
+  bool raw_lower_bound_is_physical_lower_bound = true;
+  std::size_t raw_calls = 0U;
+  std::size_t validator_calls = 0U;
+  bool exact_current_anchor_reached = false;
+  bool exact_current_anchor_known_free = false;
+  double exact_current_anchor_clearance = 0.0;
+  bool first_non_degenerate_centre_reached = false;
+  bool first_non_degenerate_centre_known_free = false;
+  double first_non_degenerate_centre_clearance = 0.0;
+  double first_non_degenerate_centre_required_radius = 0.0;
+  bool positive_child_reached = false;
+  bool positive_child_known_free = false;
+  double positive_child_clearance = 0.0;
+  double positive_child_required_radius = 0.0;
+  bool negative_child_reached = false;
+  bool negative_child_unknown = false;
+  double negative_child_physical_clearance = 0.0;
+  double negative_child_required_radius = 0.0;
+};
+
+ClearanceQuery NegativeSideUnknown(NegativeSideObservations* observations) {
+  return [observations](const Eigen::Vector3d& point, const double required) {
+    ClearanceQueryResult result;
+    if (required <= 0.4000001) {
+      ++observations->raw_calls;
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = required;
+      result.clearance_certified = true;
+      result.clearance_is_exact = false;
+      const double physical_clearance = std::sqrt(
+          0.8 * 0.8 + point.y() * point.y());
+      observations->raw_lower_bound_tuple_correct =
+          observations->raw_lower_bound_tuple_correct &&
+          result.clearance == required && result.clearance_certified &&
+          !result.clearance_is_exact;
+      observations->raw_lower_bound_is_physical_lower_bound =
+          observations->raw_lower_bound_is_physical_lower_bound &&
+          std::isfinite(physical_clearance) &&
+          required <= physical_clearance + 1e-12;
+      return result;
+    }
+
+    ++observations->validator_calls;
+    const bool exact_current_anchor =
+        std::abs(point.x()) <= 1e-12 && std::abs(point.y()) <= 1e-12 &&
+        std::abs(point.z() - 1.0) <= 1e-12;
+    const bool first_non_degenerate_centre =
+        std::abs(point.x() - 0.025) <= 1e-12 &&
+        std::abs(point.y()) <= 1e-12 &&
+        std::abs(point.z() - 1.0) <= 1e-12;
+    if (std::abs(point.y()) <= 1e-12) {
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = 0.8;
+      result.clearance_certified = true;
+      result.clearance_is_exact = true;
+      if (exact_current_anchor) {
+        observations->exact_current_anchor_reached = true;
+        observations->exact_current_anchor_known_free = true;
+        observations->exact_current_anchor_clearance = result.clearance;
+      }
+      if (first_non_degenerate_centre) {
+        observations->first_non_degenerate_centre_reached = true;
+        observations->first_non_degenerate_centre_known_free = true;
+        observations->first_non_degenerate_centre_clearance = result.clearance;
+        observations->first_non_degenerate_centre_required_radius = required;
+      }
+      return result;
+    }
+
+    const double physical_clearance = std::sqrt(
+        0.8 * 0.8 + point.y() * point.y());
+    const bool first_positive_child =
+        std::abs(point.x() - 0.025) <= 1e-12 &&
+        std::abs(point.y() - 0.5) <= 1e-12 &&
+        std::abs(point.z() - 1.0) <= 1e-12;
+    const bool first_negative_child =
+        std::abs(point.x() - 0.025) <= 1e-12 &&
+        std::abs(point.y() + 0.5) <= 1e-12 &&
+        std::abs(point.z() - 1.0) <= 1e-12;
+    if (point.y() > 1e-12) {
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = physical_clearance;
+      result.clearance_certified = true;
+      result.clearance_is_exact = true;
+      if (first_positive_child) {
+        observations->positive_child_reached = true;
+        observations->positive_child_known_free = true;
+        observations->positive_child_clearance = result.clearance;
+        observations->positive_child_required_radius = required;
+      }
+      return result;
+    }
+
+    if (point.y() < -1e-12) {
+      if (first_negative_child) {
+        observations->negative_child_reached = true;
+        observations->negative_child_unknown = true;
+        observations->negative_child_physical_clearance = physical_clearance;
+        observations->negative_child_required_radius = required;
+      }
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }
-    result.status = DistanceStatus::KNOWN_FREE;
-    result.clearance = std::max(10.0, required);
-    result.clearance_certified = true;
+
+    result.status = DistanceStatus::UNKNOWN;
     return result;
   };
 }
@@ -264,9 +439,9 @@ ClearanceQuery CenterlineUnavailableAfterBase() {
 }
 
 ClearanceQuery AnyNonzeroOffsetUnknown() {
-  return [](const Eigen::Vector3d& point, const double required) {
+  return [](const Eigen::Vector3d&, const double required) {
     ClearanceQueryResult result;
-    if (required > 0.4000001 && std::abs(point.y()) > 1e-12) {
+    if (required > 0.4000001) {
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }
@@ -282,20 +457,6 @@ ClearanceQuery CountingCenterlineUnknown(std::size_t* calls) {
     ++(*calls);
     ClearanceQueryResult result;
     if (required > 0.4000001 && std::abs(point.y()) <= 1e-12) {
-      result.status = DistanceStatus::UNKNOWN;
-      return result;
-    }
-    result.status = DistanceStatus::KNOWN_FREE;
-    result.clearance = std::max(10.0, required);
-    result.clearance_certified = true;
-    return result;
-  };
-}
-
-ClearanceQuery NegativeSideUnknown() {
-  return [](const Eigen::Vector3d& point, const double required) {
-    ClearanceQueryResult result;
-    if (required > 0.4000001 && point.y() < -0.02) {
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }
@@ -338,10 +499,9 @@ ClearanceQuery ExactCurrentZeroWithOuterUnknown(QueryCounts* counts) {
       }
     } else {
       ++counts->validator_calls;
-      // Full-width continuous validation fails away from the zero line, but
-      // the exact current line remains queryable.  This is the D0 fixture:
-      // the current interval is zero before any inward candidate exists.
-      if (std::abs(point.y()) > 0.02) {
+      // Every full-width centre-ball query is unknown.  Raw probes above keep
+      // the current sample's zero-capacity fact intact.
+      if (required > 0.4000001) {
         result.status = DistanceStatus::UNKNOWN;
         return result;
       }
@@ -559,12 +719,14 @@ TEST(CertifiedTubeBuilderTest,
   input.map_observation_sequence = 17U;
   input.map_observation_is_snapshot = true;
   CertifiedTubeBuildResult result;
-  ASSERT_TRUE(CertifiedTubeBuilder(Config(), FilterConfig(),
-                                   TubeSurfaceValidatorConfig())
-                  .build(input, result));
+  EXPECT_FALSE(CertifiedTubeBuilder(Config(), FilterConfig(),
+                                    TubeSurfaceValidatorConfig())
+                   .build(input, result));
   EXPECT_TRUE(result.raw_complete);
   EXPECT_FALSE(result.profile.cell_geometry_certified);
   EXPECT_NE(result.profile.proof_level, TubeProofLevel::FRAME_CELL_PROOF);
+  EXPECT_NE(result.profile.proof_level, TubeProofLevel::CONTINUOUS_COVER_PROOF);
+  EXPECT_FALSE(result.profile.complete);
 }
 
 TEST(CertifiedTubeBuilderTest,
@@ -573,6 +735,13 @@ TEST(CertifiedTubeBuilderTest,
                                      TubeSurfaceValidatorConfig());
   CertifiedTubeBuildResult baseline;
   ASSERT_TRUE(builder.build(CloudInput(), baseline));
+  ASSERT_TRUE(baseline.surface_validation_attempted);
+  ASSERT_TRUE(baseline.surface_validation.complete);
+  ASSERT_EQ(baseline.profile.classification,
+            TubeProfileClassification::OFFSET_CERTIFIED);
+  ASSERT_TRUE(baseline.profile.obstacle_certified);
+  EXPECT_EQ(baseline.surface_validation.outcome, TubeSurfaceOutcome::SAFE);
+  EXPECT_DOUBLE_EQ(baseline.surface_validation.support_alignment_bound, 0.0);
   std::vector<TubeBounds> invalid_requests;
   invalid_requests.push_back(TubeBounds());
   invalid_requests.push_back(Authority(0.20, 0.10));
@@ -587,6 +756,13 @@ TEST(CertifiedTubeBuilderTest,
     input.authority_request = request;
     CertifiedTubeBuildResult result;
     ASSERT_TRUE(builder.build(input, result));
+    EXPECT_TRUE(result.surface_validation_attempted);
+    EXPECT_TRUE(result.surface_validation.complete);
+    EXPECT_EQ(result.profile.classification,
+              TubeProfileClassification::OFFSET_CERTIFIED);
+    EXPECT_TRUE(result.profile.obstacle_certified);
+    EXPECT_EQ(result.surface_validation.outcome, TubeSurfaceOutcome::SAFE);
+    EXPECT_DOUBLE_EQ(result.surface_validation.support_alignment_bound, 0.0);
     EXPECT_EQ(result.profile.samples.size(), baseline.profile.samples.size());
     ASSERT_EQ(result.profile.samples.size(), result.profile.raw_build_samples.size());
     for (std::size_t index = 0U; index < result.profile.samples.size(); ++index) {
@@ -595,6 +771,18 @@ TEST(CertifiedTubeBuilderTest,
       EXPECT_DOUBLE_EQ(result.profile.samples[index].filtered_upper,
                        baseline.profile.samples[index].filtered_upper);
     }
+    EXPECT_EQ(result.surface_validation.query_sample_count,
+              baseline.surface_validation.query_sample_count);
+    EXPECT_EQ(result.surface_validation.geometry_cell_count,
+              baseline.surface_validation.geometry_cell_count);
+    EXPECT_EQ(result.surface_validation.clearance_leaf_cell_count,
+              baseline.surface_validation.clearance_leaf_cell_count);
+    EXPECT_EQ(result.surface_validation.split_w_count,
+              baseline.surface_validation.split_w_count);
+    EXPECT_EQ(result.surface_validation.split_v_count,
+              baseline.surface_validation.split_v_count);
+    EXPECT_EQ(result.surface_validation.split_both_count,
+              baseline.surface_validation.split_both_count);
   }
 }
 
@@ -603,7 +791,17 @@ TEST(CertifiedTubeBuilderTest,
   TubeBuilderConfig builder_config = Config();
   builder_config.fixed_delta_max = 0.04;
   builder_config.cross_section.search_extent = 3.0;
-  CertifiedTubeBuildInput input = CloudInput();
+  CertifiedTubeBuildInput baseline_input = CloudInput();
+  CertifiedTubeBuildResult baseline;
+  ASSERT_TRUE(CertifiedTubeBuilder(builder_config, FilterConfig(),
+                                   TubeSurfaceValidatorConfig())
+                  .build(baseline_input, baseline));
+  ASSERT_TRUE(baseline.surface_validation.complete);
+  ASSERT_EQ(baseline.profile.classification,
+            TubeProfileClassification::OFFSET_CERTIFIED);
+  EXPECT_EQ(baseline.surface_validation.outcome, TubeSurfaceOutcome::SAFE);
+  EXPECT_DOUBLE_EQ(baseline.surface_validation.support_alignment_bound, 0.0);
+  CertifiedTubeBuildInput input = baseline_input;
   input.authority_request = Authority(-0.10, 0.10);
   CertifiedTubeBuildResult result;
   ASSERT_TRUE(CertifiedTubeBuilder(builder_config, FilterConfig(),
@@ -613,6 +811,9 @@ TEST(CertifiedTubeBuilderTest,
   ASSERT_TRUE(result.surface_validation.complete);
   ASSERT_EQ(result.profile.classification,
             TubeProfileClassification::OFFSET_CERTIFIED);
+  EXPECT_TRUE(result.profile.obstacle_certified);
+  EXPECT_EQ(result.surface_validation.outcome, TubeSurfaceOutcome::SAFE);
+  EXPECT_DOUBLE_EQ(result.surface_validation.support_alignment_bound, 0.0);
   ASSERT_EQ(result.profile.samples.size(),
             result.profile.raw_build_samples.size());
   ASSERT_GT(result.profile.samples.size(), 1U);
@@ -634,6 +835,18 @@ TEST(CertifiedTubeBuilderTest,
   EXPECT_FALSE(broad_raw_observed);
   EXPECT_DOUBLE_EQ(result.profile.diagnostics.effective_nominal_half_width_m,
                    1.0);
+  EXPECT_EQ(result.surface_validation.query_sample_count,
+            baseline.surface_validation.query_sample_count);
+  EXPECT_EQ(result.surface_validation.geometry_cell_count,
+            baseline.surface_validation.geometry_cell_count);
+  EXPECT_EQ(result.surface_validation.clearance_leaf_cell_count,
+            baseline.surface_validation.clearance_leaf_cell_count);
+  EXPECT_EQ(result.surface_validation.split_w_count,
+            baseline.surface_validation.split_w_count);
+  EXPECT_EQ(result.surface_validation.split_v_count,
+            baseline.surface_validation.split_v_count);
+  EXPECT_EQ(result.surface_validation.split_both_count,
+            baseline.surface_validation.split_both_count);
   EXPECT_GT(result.profile.samples.front().filtered_upper -
                 result.profile.samples.front().filtered_lower,
             2.0 * builder_config.fixed_delta_max);
@@ -654,7 +867,15 @@ TEST(CertifiedTubeBuilderTest,
      ZeroCapacityAuthorityDoesNotCollapseGeometricProfile) {
   TubeBuilderConfig builder_config = Config();
   builder_config.cross_section.search_extent = 3.0;
-  CertifiedTubeBuildInput input = CloudInput();
+  CertifiedTubeBuildInput baseline_input = CloudInput();
+  CertifiedTubeBuildResult baseline;
+  ASSERT_TRUE(CertifiedTubeBuilder(builder_config, FilterConfig(),
+                                   TubeSurfaceValidatorConfig())
+                  .build(baseline_input, baseline));
+  ASSERT_TRUE(baseline.surface_validation.complete);
+  ASSERT_EQ(baseline.profile.classification,
+            TubeProfileClassification::OFFSET_CERTIFIED);
+  CertifiedTubeBuildInput input = baseline_input;
   input.authority_request = Authority(0.0, 0.0);
   CertifiedTubeBuildResult result;
   ASSERT_TRUE(CertifiedTubeBuilder(builder_config, FilterConfig(),
@@ -664,6 +885,21 @@ TEST(CertifiedTubeBuilderTest,
   EXPECT_EQ(result.profile.classification,
             TubeProfileClassification::OFFSET_CERTIFIED);
   EXPECT_TRUE(result.profile.obstacle_certified);
+  EXPECT_FALSE(result.profile.zero_only);
+  EXPECT_EQ(result.surface_validation.outcome, TubeSurfaceOutcome::SAFE);
+  EXPECT_DOUBLE_EQ(result.surface_validation.support_alignment_bound, 0.0);
+  EXPECT_EQ(result.surface_validation.query_sample_count,
+            baseline.surface_validation.query_sample_count);
+  EXPECT_EQ(result.surface_validation.geometry_cell_count,
+            baseline.surface_validation.geometry_cell_count);
+  EXPECT_EQ(result.surface_validation.clearance_leaf_cell_count,
+            baseline.surface_validation.clearance_leaf_cell_count);
+  EXPECT_EQ(result.surface_validation.split_w_count,
+            baseline.surface_validation.split_w_count);
+  EXPECT_EQ(result.surface_validation.split_v_count,
+            baseline.surface_validation.split_v_count);
+  EXPECT_EQ(result.surface_validation.split_both_count,
+            baseline.surface_validation.split_both_count);
   for (const TubeRawSample& sample : result.profile.samples) {
     EXPECT_DOUBLE_EQ(sample.filtered_lower, sample.raw_lower);
     EXPECT_DOUBLE_EQ(sample.filtered_upper, sample.raw_upper);
@@ -691,6 +927,9 @@ TEST(CertifiedTubeBuilderTest,
                      builder_config.cross_section.planner_safe_distance,
                      builder_config.cross_section.regularity_margin,
                      raw_validation);
+  ASSERT_TRUE(raw_validation.complete);
+  EXPECT_EQ(raw_validation.outcome, TubeSurfaceOutcome::SAFE);
+  EXPECT_DOUBLE_EQ(raw_validation.support_alignment_bound, 0.0);
 
   CertifiedTubeBuildInput narrow_input = input;
   narrow_input.authority_request = Authority(-0.10, 0.10);
@@ -707,8 +946,13 @@ TEST(CertifiedTubeBuilderTest,
             raw_validation.geometry_cell_count);
   EXPECT_EQ(narrow.surface_validation.clearance_leaf_cell_count,
             raw_validation.clearance_leaf_cell_count);
+  EXPECT_EQ(narrow.surface_validation.split_w_count,
+            raw_validation.split_w_count);
   EXPECT_EQ(narrow.surface_validation.split_v_count,
             raw_validation.split_v_count);
+  EXPECT_EQ(narrow.surface_validation.split_both_count,
+            raw_validation.split_both_count);
+  EXPECT_DOUBLE_EQ(narrow.surface_validation.support_alignment_bound, 0.0);
   std::cout << "G17_COST raw_queries=" << raw_validation.query_sample_count
             << " narrow_queries="
             << narrow.surface_validation.query_sample_count
@@ -722,7 +966,9 @@ TEST(CertifiedTubeBuilderTest,
 
 TEST(CertifiedTubeBuilderTest,
      ValidatorFailureOutsideLegacyAuthorityIsIncompleteFailClosed) {
-  CertifiedTubeBuildInput input = CloudInput(OutsideNarrowAuthorityUnknown());
+  OutsideAuthorityObservations observations;
+  CertifiedTubeBuildInput input = CloudInput(
+      OutsideNarrowAuthorityUnknown(&observations));
   input.authority_request = Authority(-0.10, 0.10);
   CertifiedTubeBuildResult result;
   EXPECT_FALSE(CertifiedTubeBuilder(Config(), FilterConfig(),
@@ -734,6 +980,70 @@ TEST(CertifiedTubeBuilderTest,
   EXPECT_EQ(result.profile.classification, TubeProfileClassification::NONE);
   EXPECT_EQ(result.profile.diagnostics.surface_validator_invocation_count, 1U);
   EXPECT_EQ(result.profile.diagnostics.inward_search_attempt_count, 0U);
+  EXPECT_TRUE(observations.raw_lower_bound_tuple_correct);
+  EXPECT_GT(observations.raw_calls, 0U);
+
+  const bool outside_authority_inside_witness_reached =
+      observations.first_non_degenerate_inside_reached;
+  const bool outside_authority_inside_witness_known_free =
+      observations.first_non_degenerate_inside_known_free &&
+      observations.first_non_degenerate_inside_clearance == 0.41;
+  const bool outside_authority_remote_witness_reached =
+      observations.remote_witness_reached;
+  const bool outside_authority_remote_witness_unknown =
+      observations.remote_witness_unknown;
+  const bool outside_authority_failure_not_premature =
+      observations.exact_current_anchor_reached &&
+      observations.exact_current_anchor_known_free &&
+      observations.exact_current_anchor_clearance == 0.41 &&
+      observations.first_non_degenerate_inside_reached &&
+      observations.first_non_degenerate_inside_known_free &&
+      observations.first_remote_unknown_event !=
+          std::numeric_limits<std::size_t>::max() &&
+      observations.exact_current_anchor_event <
+          observations.first_remote_unknown_event;
+  const bool outside_authority_intended_typed_result_correct =
+      result.surface_validation_attempted &&
+      !result.surface_validation.complete &&
+      result.surface_validation.outcome == TubeSurfaceOutcome::INCONCLUSIVE &&
+      result.surface_validation.inconclusive_reason ==
+          TubeSurfaceInconclusiveReason::CLEARANCE_UNKNOWN &&
+      !result.filtered_complete && !result.complete &&
+      !result.profile.complete &&
+      result.profile.classification == TubeProfileClassification::NONE &&
+      !result.profile.obstacle_certified &&
+      result.profile.diagnostics.surface_validator_invocation_count == 1U &&
+      result.profile.diagnostics.inward_search_attempt_count == 0U;
+
+  bool two_sided_profile_retained = false;
+  for (const TubeRawSample& sample : result.profile.samples) {
+    two_sided_profile_retained = two_sided_profile_retained ||
+        (sample.filtered_lower < -1e-12 && sample.filtered_upper > 1e-12);
+  }
+  EXPECT_TRUE(two_sided_profile_retained);
+  EXPECT_EQ(result.surface_validation.outcome,
+            TubeSurfaceOutcome::INCONCLUSIVE);
+  EXPECT_EQ(result.surface_validation.inconclusive_reason,
+            TubeSurfaceInconclusiveReason::CLEARANCE_UNKNOWN);
+  EXPECT_TRUE(outside_authority_inside_witness_reached);
+  EXPECT_TRUE(outside_authority_inside_witness_known_free);
+  EXPECT_TRUE(outside_authority_remote_witness_reached);
+  EXPECT_TRUE(outside_authority_remote_witness_unknown);
+  EXPECT_TRUE(outside_authority_failure_not_premature);
+  EXPECT_TRUE(outside_authority_intended_typed_result_correct);
+  std::cout << "OUTSIDE_AUTHORITY_INSIDE_WITNESS_REACHED="
+            << (outside_authority_inside_witness_reached ? 1 : 0)
+            << " OUTSIDE_AUTHORITY_INSIDE_WITNESS_KNOWN_FREE="
+            << (outside_authority_inside_witness_known_free ? 1 : 0)
+            << " OUTSIDE_AUTHORITY_REMOTE_WITNESS_REACHED="
+            << (outside_authority_remote_witness_reached ? 1 : 0)
+            << " OUTSIDE_AUTHORITY_REMOTE_WITNESS_UNKNOWN="
+            << (outside_authority_remote_witness_unknown ? 1 : 0)
+            << " OUTSIDE_AUTHORITY_FAILURE_NOT_PREMATURE="
+            << (outside_authority_failure_not_premature ? 1 : 0)
+            << " OUTSIDE_AUTHORITY_INTENDED_TYPED_RESULT_CORRECT="
+            << (outside_authority_intended_typed_result_correct ? 1 : 0)
+            << "\n";
 }
 
 TEST(CertifiedTubeBuilderTest,
@@ -795,15 +1105,9 @@ TEST(CertifiedTubeBuilderTest,
       expected_input.cloud_snapshot_resolution,
       Config().cross_section.planner_safe_distance,
       Config().cross_section.regularity_margin, expected_full));
-  MakeExactZeroFilteredProfile(expected_profile);
-  TubeSurfaceValidationResult expected_zero;
-  EXPECT_FALSE(TubeSurfaceValidator().validate(
-      expected_profile, expected_input.current_w, expected_input.path_state_query,
-      expected_input.path_cell_bound_query, expected_input.cloud_clearance_query,
-      expected_input.cloud_snapshot_resolution,
-      Config().cross_section.planner_safe_distance,
-      Config().cross_section.regularity_margin, expected_zero));
-  EXPECT_FALSE(expected_zero.complete);
+  EXPECT_EQ(expected_full.outcome, TubeSurfaceOutcome::INCONCLUSIVE);
+  EXPECT_EQ(expected_full.inconclusive_reason,
+            TubeSurfaceInconclusiveReason::CLEARANCE_UNKNOWN);
 
   std::size_t actual_calls = 0U;
   CertifiedTubeBuildInput actual_input = CloudInput(
@@ -818,6 +1122,13 @@ TEST(CertifiedTubeBuilderTest,
   EXPECT_FALSE(result.profile.obstacle_certified);
   EXPECT_EQ(result.profile.diagnostics.surface_validator_invocation_count, 1U);
   EXPECT_EQ(result.profile.diagnostics.inward_search_attempt_count, 0U);
+  EXPECT_EQ(result.surface_validation.outcome, TubeSurfaceOutcome::INCONCLUSIVE);
+  EXPECT_EQ(result.surface_validation.inconclusive_reason,
+            TubeSurfaceInconclusiveReason::CLEARANCE_UNKNOWN);
+  EXPECT_EQ(result.profile.diagnostics.surface_outcome,
+            result.surface_validation.outcome);
+  EXPECT_EQ(result.profile.diagnostics.surface_inconclusive_reason,
+            result.surface_validation.inconclusive_reason);
 }
 
 TEST(CertifiedTubeBuilderTest,
@@ -850,15 +1161,21 @@ TEST(CertifiedTubeBuilderTest,
 TEST(CertifiedTubeBuilderTest,
      ValidatorQueryBudgetFailureDoesNotRetry) {
   TubeSurfaceValidatorConfig validator_config;
-  validator_config.max_query_samples = 18U;
+  // The retained component has more than one root leaf.  A one-query budget
+  // must therefore exhaust pending work during this single Validator pass.
+  validator_config.max_query_samples = 1U;
   validator_config.max_subdivision_depth = 0;
   TubeBuilderConfig builder_config = Config();
-  CertifiedTubeBuildInput input = CloudInput(FullWidthOuterUnknown());
+  // Keep the anchor SAFE so the one-query budget is exhausted by pending
+  // surface work, rather than being consumed by the first UNKNOWN witness.
+  CertifiedTubeBuildInput input = CloudInput(Open());
   CertifiedTubeBuildResult result;
   EXPECT_FALSE(CertifiedTubeBuilder(builder_config, FilterConfig(), validator_config)
                    .build(input, result));
   EXPECT_EQ(result.profile.classification, TubeProfileClassification::NONE);
   EXPECT_FALSE(result.profile.complete);
+  EXPECT_TRUE(result.surface_validation.query_budget_reached);
+  EXPECT_TRUE(result.surface_validation.limit_exceeded);
   EXPECT_EQ(result.profile.diagnostics.inward_search_attempt_count, 0U);
 }
 
@@ -1025,13 +1342,14 @@ TEST(CertifiedTubeBuilderTest, DenormalCapacityRemainsNonzeroEvidence) {
 
 TEST(CertifiedTubeBuilderTest, SurfaceFailureWithoutCompleteZeroEvidenceFailsClosed) {
   TubeSurfaceValidatorConfig validator_config;
-  validator_config.max_query_samples = 9U;
+  validator_config.max_query_samples = 1U;
   CertifiedTubeBuildResult result;
   EXPECT_FALSE(CertifiedTubeBuilder(Config(), FilterConfig(), validator_config)
                    .build(CloudInput(), result));
   EXPECT_TRUE(result.surface_validation_attempted);
   EXPECT_FALSE(result.surface_validation.complete);
   EXPECT_TRUE(result.surface_validation.limit_exceeded);
+  EXPECT_TRUE(result.surface_validation.query_budget_reached);
   EXPECT_FALSE(result.complete);
   EXPECT_EQ(result.profile.classification, TubeProfileClassification::NONE);
   EXPECT_EQ(result.profile.diagnostics.first_stop_reason,
@@ -1049,8 +1367,7 @@ TEST(CertifiedTubeBuilderTest,
       ExactCurrentZeroWithOuterUnknown(&expected_counts));
 
   // Establish the one full-width Validator invocation that is the only proof
-  // needed for the D0 fixture.  This is the expected call count after the
-  // proof-local short circuit, not a production cache or memoized result.
+  // needed for the D0 fixture.  No equivalent zero-width retry is expected.
   TubeProfile expected_profile;
   ASSERT_TRUE(TubeBuilder(Config()).buildCloudClearance(
       input.source, input.preview_path, input.cloud_clearance_query,
@@ -1068,7 +1385,6 @@ TEST(CertifiedTubeBuilderTest,
       Config().cross_section.regularity_margin, expected_validation));
   ASSERT_GT(expected_counts.validator_calls, 0U);
   const std::size_t expected_validator_calls = expected_counts.validator_calls;
-
   QueryCounts actual_counts;
   CertifiedTubeBuildInput actual_input = CloudInput(
       ExactCurrentZeroWithOuterUnknown(&actual_counts));
@@ -1080,7 +1396,7 @@ TEST(CertifiedTubeBuilderTest,
   std::cout << "G16_D0 expected_validator_queries="
             << expected_validator_calls
             << " actual_validator_queries=" << actual_counts.validator_calls
-            << " inward_attempts_before=101 inward_attempts_after=0\n";
+            << " inward_attempts=0\n";
   EXPECT_GT(actual_counts.validator_calls, 0U);
   EXPECT_EQ(result.profile.classification, TubeProfileClassification::NONE);
   EXPECT_FALSE(result.complete);
@@ -1152,16 +1468,101 @@ TEST(CertifiedTubeBuilderTest,
 
 TEST(CertifiedTubeBuilderTest,
      AsymmetricUnsafeSideValidatorFailureDoesNotSynthesizeOneSidedRibbon) {
+  NegativeSideObservations observations;
+  CertifiedTubeBuildInput input = CloudInput(
+      NegativeSideUnknown(&observations));
   CertifiedTubeBuildResult result;
   EXPECT_FALSE(CertifiedTubeBuilder(Config(), FilterConfig(),
                                     TubeSurfaceValidatorConfig())
-                   .build(CloudInput(NegativeSideUnknown()), result));
+                   .build(input, result));
   EXPECT_FALSE(result.complete);
   EXPECT_EQ(result.profile.classification, TubeProfileClassification::NONE);
   EXPECT_FALSE(result.profile.obstacle_certified);
   EXPECT_EQ(result.profile.diagnostics.first_stop_reason,
             static_cast<int>(TubeStopReason::UNKNOWN));
   EXPECT_EQ(result.profile.diagnostics.inward_search_attempt_count, 0U);
+
+  const double expected_positive_child_clearance = std::sqrt(
+      0.8 * 0.8 + 0.5 * 0.5);
+  const bool negative_side_parent_refinement_reached =
+      observations.first_non_degenerate_centre_reached &&
+      observations.first_non_degenerate_centre_known_free &&
+      observations.first_non_degenerate_centre_clearance == 0.8 &&
+      observations.first_non_degenerate_centre_required_radius > 0.8 &&
+      result.surface_validation.split_v_count > 0U &&
+      observations.positive_child_reached &&
+      observations.negative_child_reached;
+  const bool negative_side_centre_not_unknown =
+      observations.exact_current_anchor_reached &&
+      observations.exact_current_anchor_known_free &&
+      observations.exact_current_anchor_clearance == 0.8 &&
+      observations.first_non_degenerate_centre_reached &&
+      observations.first_non_degenerate_centre_known_free;
+  const bool negative_side_positive_child_reached =
+      observations.positive_child_reached;
+  const bool negative_side_positive_child_known_free =
+      observations.positive_child_known_free &&
+      std::abs(observations.positive_child_clearance -
+               expected_positive_child_clearance) <= 1e-15 &&
+      observations.positive_child_clearance >=
+          observations.positive_child_required_radius;
+  const bool negative_side_negative_child_reached =
+      observations.negative_child_reached;
+  const bool negative_side_negative_child_unknown =
+      observations.negative_child_unknown &&
+      std::abs(observations.negative_child_physical_clearance -
+               expected_positive_child_clearance) <= 1e-15;
+  const bool negative_side_intended_typed_result_correct =
+      result.surface_validation_attempted &&
+      !result.surface_validation.complete &&
+      result.surface_validation.outcome == TubeSurfaceOutcome::INCONCLUSIVE &&
+      result.surface_validation.inconclusive_reason ==
+          TubeSurfaceInconclusiveReason::CLEARANCE_UNKNOWN &&
+      !result.filtered_complete && !result.complete &&
+      !result.profile.complete &&
+      result.profile.classification == TubeProfileClassification::NONE &&
+      !result.profile.obstacle_certified &&
+      result.profile.diagnostics.surface_validator_invocation_count == 1U &&
+      result.profile.diagnostics.inward_search_attempt_count == 0U;
+
+  bool positive_side_retained = false;
+  bool negative_side_retained = false;
+  for (const TubeRawSample& sample : result.profile.samples) {
+    positive_side_retained = positive_side_retained ||
+        sample.filtered_upper > 1e-12;
+    negative_side_retained = negative_side_retained ||
+        sample.filtered_lower < -1e-12;
+  }
+  EXPECT_TRUE(observations.raw_lower_bound_tuple_correct);
+  EXPECT_TRUE(observations.raw_lower_bound_is_physical_lower_bound);
+  EXPECT_TRUE(positive_side_retained);
+  EXPECT_TRUE(negative_side_retained);
+  EXPECT_EQ(result.surface_validation.outcome,
+            TubeSurfaceOutcome::INCONCLUSIVE);
+  EXPECT_EQ(result.surface_validation.inconclusive_reason,
+            TubeSurfaceInconclusiveReason::CLEARANCE_UNKNOWN);
+  EXPECT_TRUE(negative_side_parent_refinement_reached);
+  EXPECT_TRUE(negative_side_centre_not_unknown);
+  EXPECT_TRUE(negative_side_positive_child_reached);
+  EXPECT_TRUE(negative_side_positive_child_known_free);
+  EXPECT_TRUE(negative_side_negative_child_reached);
+  EXPECT_TRUE(negative_side_negative_child_unknown);
+  EXPECT_TRUE(negative_side_intended_typed_result_correct);
+  std::cout << "NEGATIVE_SIDE_PARENT_REFINEMENT_REACHED="
+            << (negative_side_parent_refinement_reached ? 1 : 0)
+            << " NEGATIVE_SIDE_CENTRE_NOT_UNKNOWN="
+            << (negative_side_centre_not_unknown ? 1 : 0)
+            << " NEGATIVE_SIDE_POSITIVE_CHILD_REACHED="
+            << (negative_side_positive_child_reached ? 1 : 0)
+            << " NEGATIVE_SIDE_POSITIVE_CHILD_KNOWN_FREE="
+            << (negative_side_positive_child_known_free ? 1 : 0)
+            << " NEGATIVE_SIDE_NEGATIVE_CHILD_REACHED="
+            << (negative_side_negative_child_reached ? 1 : 0)
+            << " NEGATIVE_SIDE_NEGATIVE_CHILD_UNKNOWN="
+            << (negative_side_negative_child_unknown ? 1 : 0)
+            << " NEGATIVE_SIDE_INTENDED_TYPED_RESULT_CORRECT="
+            << (negative_side_intended_typed_result_correct ? 1 : 0)
+            << "\n";
 }
 
 TEST(CertifiedTubeBuilderTest,

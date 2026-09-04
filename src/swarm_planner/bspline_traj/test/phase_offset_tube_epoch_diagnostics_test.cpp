@@ -73,8 +73,8 @@ TubeEpochDiagnosticsInput MakeInput() {
   return input;
 }
 
-TEST(TubeEpochDiagnosticsTest, SchemaContainsOnlyFiftyLiveFields) {
-  static_assert(kTubeEpochDiagnosticCount == 50U, "schema count changed");
+TEST(TubeEpochDiagnosticsTest, SchemaAppendsSurfaceFieldsWithoutMovingLegacyFields) {
+  static_assert(kTubeEpochDiagnosticCount == 74U, "schema count changed");
   static_assert(kEpochControlSelected == 45U, "live index moved");
   const auto& names = tubeEpochDiagnosticFieldNames();
   ASSERT_EQ(names.size(), kTubeEpochDiagnosticCount);
@@ -90,7 +90,7 @@ TEST(TubeEpochDiagnosticsTest, SchemaContainsOnlyFiftyLiveFields) {
 TEST(TubeEpochDiagnosticsTest, MapsAuthoritativeEpochAndNonSnapshotObservation) {
   const auto values = makeTubeEpochDiagnostics(MakeInput());
   ASSERT_EQ(values.size(), kTubeEpochDiagnosticCount);
-  EXPECT_DOUBLE_EQ(values[kEpochSchemaVersion], 3.0);
+  EXPECT_DOUBLE_EQ(values[kEpochSchemaVersion], 4.0);
   EXPECT_DOUBLE_EQ(values[kEpochCandidateSequence], 17.0);
   EXPECT_DOUBLE_EQ(values[kEpochActiveTubeEpoch], 4.0);
   EXPECT_DOUBLE_EQ(values[kEpochCandidateMapObservationSequence], 23.0);
@@ -131,6 +131,105 @@ TEST(TubeEpochDiagnosticsTest, PayloadIsFiniteAndDeterministicForUnavailableProf
   for (double value : first) EXPECT_TRUE(std::isfinite(value));
   EXPECT_DOUBLE_EQ(first[kEpochCandidateSampleCount], 0.0);
   EXPECT_DOUBLE_EQ(first[kEpochActiveSampleCount], 0.0);
+}
+
+TEST(TubeEpochDiagnosticsTest, ForwardExcludedStructuredLogMapsEveryField) {
+  phase_offset_navigation::TubeSurfaceForwardExcludedEvidence evidence;
+  evidence.valid = true;
+  evidence.w0 = 1.2345678901234567;
+  evidence.w1 = 1.3456789012345678;
+  evidence.v0 = 0.125;
+  evidence.v1 = 0.875;
+  evidence.depth = 7;
+  evidence.outcome = phase_offset_navigation::TubeSurfaceOutcome::CONTRACT_UNSAFE;
+  evidence.inconclusive_reason =
+      phase_offset_navigation::TubeSurfaceInconclusiveReason::NONE;
+  evidence.clearance_query_attempted = true;
+  evidence.clearance_status = phase_offset_navigation::DistanceStatus::KNOWN_FREE;
+  evidence.witness_clearance_valid = true;
+  evidence.witness_clearance_certified = true;
+  evidence.witness_clearance_exact = true;
+  evidence.witness_clearance = 0.98765432101234567;
+  evidence.exact_d_c_valid = true;
+  evidence.exact_d_c = evidence.witness_clearance;
+  evidence.requested_clearance_valid = true;
+  evidence.requested_clearance = 0.87654321098765432;
+  evidence.cell_certificate_attempted = true;
+  evidence.cell_certificate_complete = true;
+  evidence.cell_certificate_revision_match = true;
+  evidence.query_budget_exhausted = false;
+  evidence.max_depth_reached = false;
+  evidence.geometric_evidence_valid = true;
+  evidence.midpoint_position_cover = 0.11;
+  evidence.normal_variation_cover = 0.22;
+  evidence.delta_slope_cover = 0.33;
+  evidence.v_span_cover = 0.44;
+  evidence.geometric_cover = 0.55;
+  evidence.support_alignment_bound = 0.0;
+  evidence.numerical_epsilon = 1e-10;
+  evidence.allowable_cover = 0.66;
+  evidence.proof_residual = 0.77;
+
+  TubeSurfaceForwardExcludedLogInput input;
+  input.build_sequence = 101U;
+  input.candidate_sequence = 102U;
+  input.task_generation = 103U;
+  input.authority_session = 104U;
+  input.source_revision = 105U;
+  input.path_revision = 106U;
+  input.frame_revision = 107U;
+  input.map_observation_sequence = 108U;
+  input.current_w = 1.1122334455667789;
+  input.certified_segment_end_w = 1.2233445566778899;
+  input.evidence = &evidence;
+  const std::string log = formatTubeSurfaceForwardExcludedLog(input);
+  EXPECT_NE(log.find("[PHASE_OFFSET][TUBE][FORWARD_EXCLUDED]"),
+            std::string::npos);
+  EXPECT_NE(log.find("schema=1 valid=1 build_sequence=101"),
+            std::string::npos);
+  EXPECT_NE(log.find("candidate_sequence=102 task_generation=103"),
+            std::string::npos);
+  EXPECT_NE(log.find("authority_session=104 source_revision=105"),
+            std::string::npos);
+  EXPECT_NE(log.find("path_revision=106 frame_revision=107 map_observation_sequence=108"),
+            std::string::npos);
+  EXPECT_NE(log.find("depth=7 outcome=1 reason=0"), std::string::npos);
+  EXPECT_NE(log.find("clearance_query_attempted=1 clearance_status=3"),
+            std::string::npos);
+  EXPECT_NE(log.find("witness_clearance_valid=1 witness_clearance_certified=1 witness_clearance_exact=1"),
+            std::string::npos);
+  EXPECT_NE(log.find("exact_d_c_valid=1"), std::string::npos);
+  EXPECT_NE(log.find("requested_clearance_valid=1"), std::string::npos);
+  EXPECT_NE(log.find("cell_certificate_attempted=1 cell_certificate_complete=1 cell_certificate_revision_match=1"),
+            std::string::npos);
+  EXPECT_NE(log.find("geometric_evidence_valid=1 midpoint_position_cover=0.11"),
+            std::string::npos);
+  EXPECT_NE(log.find("proof_residual=0.77000000000000002"),
+            std::string::npos);
+}
+
+TEST(TubeEpochDiagnosticsTest, ForwardExcludedStructuredLogUsesUnavailableSentinels) {
+  phase_offset_navigation::TubeSurfaceForwardExcludedEvidence evidence;
+  const TubeSurfaceForwardExcludedLogInput input = [&evidence]() {
+    TubeSurfaceForwardExcludedLogInput value;
+    value.build_sequence = 201U;
+    value.evidence = &evidence;
+    return value;
+  }();
+  const std::string log = formatTubeSurfaceForwardExcludedLog(input);
+  EXPECT_NE(log.find("schema=1 valid=0 build_sequence=201"),
+            std::string::npos);
+  EXPECT_NE(log.find("w0=0 w1=0 v0=0 v1=0 depth=-1 outcome=-1 reason=-1"),
+            std::string::npos);
+  EXPECT_NE(log.find("clearance_query_attempted=0 clearance_status=-1"),
+            std::string::npos);
+  EXPECT_NE(log.find("witness_clearance_valid=0 witness_clearance_certified=0 witness_clearance_exact=0 witness_clearance=0"),
+            std::string::npos);
+  EXPECT_NE(log.find("exact_d_c_valid=0 exact_d_c=0 requested_clearance_valid=0 requested_clearance=0"),
+            std::string::npos);
+  EXPECT_NE(log.find("cell_certificate_attempted=0 cell_certificate_complete=0 cell_certificate_revision_match=0"),
+            std::string::npos);
+  EXPECT_NE(log.find("geometric_evidence_valid=0"), std::string::npos);
 }
 
 }  // namespace

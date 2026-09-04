@@ -546,9 +546,9 @@ bool BuildCertifiedCellInsets(
     }
     // The certificate is consumed by the Validator as one complete cover
     // proof (p variation, N*delta variation, PWL delta variation, and the
-    // single half-voxel residual).  Builder therefore applies the proven
-    // nonnegative local erosion zero here; charging chord/normal a second
-    // time would unnecessarily exclude delta=0 at a narrow knot.
+    // geometric residual).  Builder therefore applies the proven nonnegative
+    // local erosion zero here; charging chord/normal a second time would
+    // unnecessarily exclude delta=0 at a narrow knot.
     const double residual = 0.0;
     if (!IsFinite(residual) || residual < 0.0) {
       sample_insets.clear();

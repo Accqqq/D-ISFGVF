@@ -31,7 +31,8 @@ bool HasNonzeroCapacity(const TubeProfile& profile) {
 
 bool ZeroCentrelineCoveredEvidence(const TubeProfile& profile,
                                    const TubeSurfaceValidationResult& validation) {
-  if (validation.zero_centerline_continuously_certified) return true;
+  if (validation.outcome != TubeSurfaceOutcome::SAFE ||
+      !validation.zero_centerline_continuously_certified) return false;
   if (profile.samples.empty()) return false;
   // TubeSurfaceValidator records per-knot evidence before returning a failed
   // proof.  Treat the planner centreline as continuously covered only when
@@ -50,6 +51,47 @@ bool ZeroCentrelineCoveredEvidence(const TubeProfile& profile,
     if (!found) return false;
   }
   return true;
+}
+
+void PreserveSurfaceValidationEvidence(
+    TubeProfile& profile, const TubeSurfaceValidationResult& validation) {
+  profile.surface_cell_evidence = validation.cell_evidence;
+  profile.diagnostics.surface_summary_present = true;
+  profile.diagnostics.surface_outcome = validation.outcome;
+  profile.diagnostics.surface_inconclusive_reason =
+      validation.inconclusive_reason;
+  profile.diagnostics.surface_truncation_outcome =
+      validation.truncation_outcome;
+  profile.diagnostics.surface_terminal_w = validation.terminal_w;
+  profile.diagnostics.surface_witness_clearance = validation.witness_clearance;
+  profile.diagnostics.surface_witness_clearance_exact =
+      validation.witness_clearance_exact;
+  profile.diagnostics.surface_midpoint_position_cover =
+      validation.midpoint_position_cover;
+  profile.diagnostics.surface_normal_variation_cover =
+      validation.normal_variation_cover;
+  profile.diagnostics.surface_delta_slope_cover = validation.delta_slope_cover;
+  profile.diagnostics.surface_v_span_cover = validation.v_span_cover;
+  profile.diagnostics.surface_geometric_cover = validation.geometric_cover;
+  profile.diagnostics.surface_support_alignment_bound =
+      validation.support_alignment_bound;
+  profile.diagnostics.surface_numerical_epsilon = validation.numerical_epsilon;
+  profile.diagnostics.surface_proof_residual = validation.proof_residual;
+  profile.diagnostics.surface_max_depth_observed =
+      validation.max_depth_observed;
+  profile.diagnostics.surface_query_sample_count =
+      validation.query_sample_count;
+  profile.diagnostics.surface_depth_guard_reached =
+      validation.depth_guard_reached;
+  profile.diagnostics.surface_query_budget_reached =
+      validation.query_budget_reached;
+  profile.diagnostics.surface_split_w_count = validation.split_w_count;
+  profile.diagnostics.surface_split_v_count = validation.split_v_count;
+  profile.diagnostics.surface_split_both_count = validation.split_both_count;
+  profile.diagnostics.zero_centerline_contiguous =
+      validation.zero_centerline_continuously_certified;
+  profile.diagnostics.zero_centerline_start_w = validation.certified_start_w;
+  profile.diagnostics.zero_centerline_end_w = validation.certified_end_w;
 }
 
 TubeSurfaceValidatorConfig NormalizeValidatorConfig(
@@ -227,8 +269,8 @@ bool CertifiedTubeBuilder::build(const CertifiedTubeBuildInput& input,
         candidate.diagnostics.adaptive_refinement_centerline_query_count +
         candidate.diagnostics.adaptive_sample_base_clearance_query_count +
         candidate.diagnostics.validator_surface_query_count;
-    candidate.diagnostics.total_tube_construction_query_count =
-        candidate.diagnostics.total_tube_construction_clearance_query_count +
+      candidate.diagnostics.total_tube_construction_query_count =
+          candidate.diagnostics.total_tube_construction_clearance_query_count +
         candidate.diagnostics.certified_cell_bound_query_count;
     const std::size_t validator_cell_bound_count =
         candidate.diagnostics.validator_certified_cell_bound_query_count;
@@ -249,6 +291,12 @@ bool CertifiedTubeBuilder::build(const CertifiedTubeBuildInput& input,
           candidate.validator_knot_evidence;
       candidate = full_width_profile;
       candidate.validator_knot_evidence = validator_knot_evidence;
+      if (candidate.proof_level == TubeProofLevel::CONTINUOUS_COVER_PROOF) {
+        candidate.proof_level = candidate.cell_geometry_certified
+            ? TubeProofLevel::FRAME_CELL_PROOF
+            : TubeProofLevel::SAMPLED_EVIDENCE;
+      }
+      PreserveSurfaceValidationEvidence(candidate, result.surface_validation);
       PreserveValidationFailureProvenance(candidate,
                                           result.surface_validation);
       candidate.diagnostics.validator_certified_cell_bound_query_count =

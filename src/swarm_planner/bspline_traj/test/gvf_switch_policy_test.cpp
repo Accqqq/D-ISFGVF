@@ -1398,6 +1398,53 @@ std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeTimerBootstrapPath(
   return path;
 }
 
+std::shared_ptr<const FLAG_Race::ContinuousPhasePath>
+makeTimerBootstrapCertificatePath() {
+  auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  const auto point_evaluator = [](
+      const double w, FLAG_Race::ContinuousPhasePathState& state) {
+    state.p = Eigen::Vector3d(w, 0.0, 1.0);
+    state.dp_dw = Eigen::Vector3d::UnitX();
+    state.d2p_dw2.setZero();
+    state.vel = state.dp_dw;
+    state.valid = std::isfinite(w) && w >= -1e-12 && w <= 3.0 + 1e-12;
+    return state.valid;
+  };
+  const auto cell_bound_evaluator = [](
+      const double w0, const double w1,
+      phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 3.0;
+    certificate.segment_identity = 1U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.sup_p_ww_norm = 0.0;
+    certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
+    certificate.sup_N_w_norm = 0.0;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
+    certificate.curvature_variation_bound = 0.0;
+    certificate.midpoint_position_variation_bound = 0.0;
+    certificate.chord_deviation_bound = 0.0;
+    certificate.valid = std::isfinite(w0) && std::isfinite(w1) &&
+        w1 > w0 && w0 >= -1e-12 && w1 <= 3.0 + 1e-12;
+    certificate.complete = certificate.valid;
+    return certificate.valid;
+  };
+  EXPECT_TRUE(path->appendSegment(
+      0.0, 3.0, "timer_bootstrap_certificate_path",
+      FLAG_Race::ContinuousPhasePath::Evaluator(
+          point_evaluator, cell_bound_evaluator)));
+  return path;
+}
+
 void initializeProductionFreeMap(SDFMap& map) {
   map.mp_.resolution_ = map.mp_.resolution_inv_ = 1.0;
   map.mp_.map_origin_ = Eigen::Vector3d(-5.0, -5.0, -5.0);
@@ -2335,7 +2382,7 @@ TEST(GvfManagerC3,
   initializeProductionFreeMap(*map);
   installProductionCloudSnapshot(*map, 1U);
   const std::shared_ptr<const FLAG_Race::ContinuousPhasePath> owner =
-      makeTimerBootstrapPath(std::function<void()>());
+      makeTimerBootstrapCertificatePath();
   ASSERT_TRUE(owner);
   FLAG_Race::gvf_manager manager;
   ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::

@@ -764,7 +764,7 @@ phase_offset_navigation::PathCellBoundQuery MakeTimerPathCellBoundQuery(
   }
   // Both pure queries capture the same immutable owner.  A query crossing
   // source segments, or touching an unsupported/low-speed evaluator, returns
-  // false and the navigation layer retains the fixed inset.
+  // false and the navigation layer retains an inconclusive certificate.
   // Production requests carry shared_frame; the construction below is only a
   // legacy synthetic-owner fallback.
   const std::shared_ptr<const ContinuousPhaseNormalFrame> immutable_frame =
@@ -4666,6 +4666,28 @@ bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
   // became stale while the build ran.  They never authorize Candidate,
   // Runtime, or Certified exposure, so emit them before the source gate.
   if (shutdown_requested_.load(std::memory_order_acquire)) return false;
+  const bool forward_log_due =
+      config_.mode == PhaseOffsetMatchedMode::MANUAL &&
+      config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
+      built.raw_candidate_diagnostics_generated &&
+      timer_last_raw_diagnostic_build_sequence_ != built.build_sequence;
+  if (forward_log_due) {
+    TubeSurfaceForwardExcludedLogInput log_input;
+    log_input.build_sequence = built.build_sequence;
+    log_input.candidate_sequence = built.epoch_status.candidate_sequence;
+    log_input.task_generation = request->task_generation;
+    log_input.authority_session = request->authority_session;
+    log_input.source_revision = request->source_revision;
+    log_input.path_revision = request->path_revision;
+    log_input.frame_revision = request->frame_revision;
+    log_input.map_observation_sequence = request->map_observation_sequence;
+    log_input.current_w = request->current_path.w;
+    log_input.certified_segment_end_w = built.candidate_profile
+        ? built.candidate_profile->certified_segment_end_w : 0.0;
+    log_input.evidence = built.candidate_profile
+        ? &built.candidate_profile->forward_excluded_evidence : nullptr;
+    ROS_INFO_STREAM(formatTubeSurfaceForwardExcludedLog(log_input));
+  }
   publishBuildDiagnostics(built);
   // Serialize the currentness check/ordinary-state commit with the command
   // writer.  This closes the owner/frame replacement race between

@@ -4,6 +4,8 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <string>
 
 namespace FLAG_Race {
 
@@ -58,11 +60,37 @@ enum TubeEpochDiagnosticIndex : std::size_t {
   kEpochTransientBlocked,
   kEpochGenuineFatalInvariant,
   kEpochRuntimeFailureReason,
+  // SurfaceValidator v4 fields.  Append only: the first 50 indices above are
+  // permanent live schema and must never move.
+  kCandidateSurfaceOutcome,
+  kCandidateSurfaceInconclusiveReason,
+  kCandidateSurfaceTruncationOutcome,
+  kCandidateSurfaceTerminalW,
+  kCandidateSurfaceWitnessClearance,
+  kCandidateSurfaceWitnessClearanceExact,
+  kCandidateSurfaceMidpointPositionCover,
+  kCandidateSurfaceNormalVariationCover,
+  kCandidateSurfaceDeltaSlopeCover,
+  kCandidateSurfaceVSpanCover,
+  kCandidateSurfaceGeometricCover,
+  kCandidateSurfaceSupportAlignmentBound,
+  kCandidateSurfaceNumericalEpsilon,
+  kCandidateSurfaceProofResidual,
+  kCandidateSurfaceMaxDepthObserved,
+  kCandidateSurfaceQuerySampleCount,
+  kCandidateSurfaceDepthGuardReached,
+  kCandidateSurfaceQueryBudgetReached,
+  kCandidateSurfaceSplitWCount,
+  kCandidateSurfaceSplitVCount,
+  kCandidateSurfaceSplitBothCount,
+  kCandidateZeroCenterlineContiguous,
+  kCandidateZeroCenterlineStartW,
+  kCandidateZeroCenterlineEndW,
   kTubeEpochDiagnosticCount,
 };
 
-static_assert(kTubeEpochDiagnosticCount == 50U,
-              "S6 tube epoch diagnostics must contain exactly 50 live fields");
+static_assert(kTubeEpochDiagnosticCount == 74U,
+              "S6 tube epoch diagnostics must contain exactly 74 live fields");
 
 struct TubeEpochDiagnosticsInput {
   phase_offset_navigation::TubeSource source =
@@ -85,5 +113,26 @@ tubeEpochDiagnosticFieldNames();
 
 std::array<double, kTubeEpochDiagnosticCount> makeTubeEpochDiagnostics(
     const TubeEpochDiagnosticsInput& input);
+
+// Independent structured-log transport for the diagnostic-only nearest
+// forward excluded leaf.  This value never participates in the 74-field
+// epoch diagnostics array or any Runtime/authority decision.
+struct TubeSurfaceForwardExcludedLogInput {
+  std::uint64_t build_sequence = 0U;
+  std::uint64_t candidate_sequence = 0U;
+  std::uint64_t task_generation = 0U;
+  std::uint64_t authority_session = 0U;
+  std::uint64_t source_revision = 0U;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
+  std::uint64_t map_observation_sequence = 0U;
+  double current_w = 0.0;
+  double certified_segment_end_w = 0.0;
+  const phase_offset_navigation::TubeSurfaceForwardExcludedEvidence*
+      evidence = nullptr;
+};
+
+std::string formatTubeSurfaceForwardExcludedLog(
+    const TubeSurfaceForwardExcludedLogInput& input);
 
 }  // namespace FLAG_Race

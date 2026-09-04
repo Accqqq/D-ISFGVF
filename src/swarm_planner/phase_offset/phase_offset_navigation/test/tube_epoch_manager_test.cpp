@@ -4,7 +4,9 @@
 
 #include <cmath>
 #include <limits>
+#include <map>
 #include <memory>
+#include <utility>
 
 namespace phase_offset_navigation {
 namespace {
@@ -76,6 +78,14 @@ PathStateQuery ExactPathQuery() {
     state.p = Eigen::Vector3d(w, 0.0, 1.0 + 0.1 * w);
     state.p_w = Eigen::Vector3d(1.0, 0.0, 0.1);
     state.p_ww = Eigen::Vector3d::Zero();
+    state.T = state.p_w.normalized();
+    state.N = Eigen::Vector3d::UnitY();
+    state.N_w = Eigen::Vector3d::Zero();
+    state.path_revision = 1U;
+    state.frame_revision = 1U;
+    state.frame_valid = true;
+    state.frame_provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
     state.w = w;
     state.valid = std::isfinite(w);
     return state.valid;
@@ -110,32 +120,64 @@ ClearanceQuery CloudCorridorQuery(const double positive_wall,
   };
 }
 
-PathCellBoundQuery InvalidOffsetCertificate() {
+PathCellBoundQuery MatchingCloudCellCertificate() {
   return [](const double w0, const double w1,
             phase_offset_core::PathCellGeometryCertificate& certificate) {
     certificate = phase_offset_core::PathCellGeometryCertificate();
     certificate.w0 = w0;
     certificate.w1 = w1;
+    certificate.path_revision = 1U;
+    certificate.frame_revision = 1U;
+    certificate.segment_identity = 1U;
     certificate.segment_w0 = 0.0;
     certificate.segment_w1 = 1.0;
-    certificate.segment_identity = 17U;
-    certificate.inf_p_w_norm = 0.1;
-    certificate.inf_horizontal_p_w_norm = 0.1;
-    certificate.sup_p_w_norm = 1.0;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.01;
     certificate.sup_p_ww_norm = 0.0;
     certificate.sup_p_www_norm = 0.0;
     certificate.sup_horizontal_p_ww_norm = 0.0;
     certificate.horizontal_acceleration_bound_complete = true;
-    certificate.sup_N_w_norm = 2.0;
-    certificate.sup_abs_curvature = 10.0;
-    certificate.normal_variation_bound = 0.2 * (w1 - w0);
+    certificate.sup_N_w_norm = 0.0;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound = 0.0;
     certificate.tangent_variation_bound = 0.0;
     certificate.curvature_variation_bound = 0.0;
-    certificate.midpoint_position_variation_bound = 0.5 * (w1 - w0);
+    certificate.midpoint_position_variation_bound = 0.0;
     certificate.chord_deviation_bound = 0.0;
-    certificate.valid = true;
-    certificate.complete = true;
-    return true;
+    certificate.normal_frame_proof_complete = true;
+    certificate.combined_regularity_proof_complete = true;
+    certificate.regularity_speed_min = 1.0;
+    certificate.regularity_speed_max = 1.01;
+    certificate.provenance =
+        "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
+    certificate.valid = std::isfinite(w0) && std::isfinite(w1) && w1 > w0;
+    certificate.complete = certificate.valid;
+    return certificate.valid;
+  };
+}
+
+PathCellBoundQuery InvalidOffsetCertificate() {
+  // Builder consumes one complete certificate per active interval.  Return
+  // those valid premises on the first pass, then make each Validator witness
+  // explicitly malformed on its second hit so the owner cannot rescue it with
+  // a fixed inset.  Keying by the actual interval keeps this deterministic
+  // even when Validator scheduling visits a different cell first.
+  return [valid = MatchingCloudCellCertificate(),
+          hits = std::map<std::pair<double, double>, std::size_t>()](
+      const double w0, const double w1,
+      phase_offset_core::PathCellGeometryCertificate& certificate) mutable {
+    const std::pair<double, double> key(w0, w1);
+    const std::size_t hit = hits[key]++;
+    if (hit >= 1U) {
+      certificate = phase_offset_core::PathCellGeometryCertificate();
+      certificate.w0 = w0;
+      certificate.w1 = w1;
+      certificate.valid = false;
+      certificate.complete = false;
+      return true;
+    }
+    return valid(w0, w1, certificate);
   };
 }
 
@@ -144,6 +186,7 @@ TubeEpochUpdateInput MakeCloudInput(const ClearanceQuery& clearance = CloudOpenQ
   TubeEpochUpdateInput input = MakeInput(TubeSource::ESDF, end_w);
   input.cloud_clearance_query = clearance;
   input.path_state_query = ExactPathQuery();
+  input.path_cell_bound_query = MatchingCloudCellCertificate();
   input.cloud_snapshot_resolution = 0.05;
   input.map_observation_is_snapshot = true;
   return input;
@@ -306,18 +349,35 @@ TEST(TubeEpochManagerTest,
   TubeEpochUpdateInput input = MakeCloudInput();
   input.path_cell_bound_query = InvalidOffsetCertificate();
   TubeEpochUpdateResult result;
-  ASSERT_TRUE(manager.update(input, result));
-  EXPECT_TRUE(result.status.candidate_complete);
-  EXPECT_TRUE(result.status.active_available);
-  ASSERT_FALSE(result.active_profile.samples.empty());
-  EXPECT_FALSE(result.active_profile.cell_geometry_certified);
-  EXPECT_DOUBLE_EQ(result.active_profile.samples.front().continuous_inset,
+  EXPECT_FALSE(manager.update(input, result));
+  EXPECT_FALSE(result.status.candidate_complete);
+  EXPECT_FALSE(result.status.candidate_filtered_complete);
+  EXPECT_EQ(result.status.candidate_classification,
+            TubeProfileClassification::NONE);
+  EXPECT_FALSE(result.status.active_available);
+  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
+  EXPECT_EQ(result.status.reason, TubeEpochReason::CANDIDATE_INCOMPLETE);
+  EXPECT_FALSE(result.candidate_profile.complete);
+  EXPECT_FALSE(result.candidate_profile.obstacle_certified);
+  EXPECT_EQ(result.candidate_profile.classification,
+            TubeProfileClassification::NONE);
+  EXPECT_TRUE(result.candidate_profile.cell_geometry_certified);
+  EXPECT_EQ(result.candidate_profile.diagnostics.surface_outcome,
+            TubeSurfaceOutcome::INCONCLUSIVE);
+  EXPECT_EQ(result.candidate_profile.diagnostics.surface_inconclusive_reason,
+            TubeSurfaceInconclusiveReason::CELL_CERTIFICATE_MALFORMED);
+  EXPECT_EQ(result.candidate_profile.diagnostics.inward_search_attempt_count,
+            0U);
+  ASSERT_FALSE(result.candidate_profile.samples.empty());
+  EXPECT_DOUBLE_EQ(result.candidate_profile.samples.front().continuous_inset,
                    0.0);
 }
 
 TEST(TubeEpochManagerTest, NonzeroSurfaceProofLimitFailsClosedWithoutRetry) {
   TubeEpochManagerConfig config = MakeConfig();
-  config.surface_validator.max_query_samples = 9U;
+  // The anchor consumes the only allowed centre query; all nondegenerate
+  // pending cells therefore terminate as typed QUERY_BUDGET evidence.
+  config.surface_validator.max_query_samples = 1U;
   TubeEpochManager manager(config);
   TubeEpochUpdateResult result;
   EXPECT_FALSE(manager.update(MakeCloudInput(), result));
@@ -326,6 +386,28 @@ TEST(TubeEpochManagerTest, NonzeroSurfaceProofLimitFailsClosedWithoutRetry) {
             TubeProfileClassification::NONE);
   EXPECT_FALSE(result.status.active_available);
   EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
+  EXPECT_EQ(result.candidate_profile.classification,
+            TubeProfileClassification::NONE);
+  EXPECT_FALSE(result.candidate_profile.complete);
+  EXPECT_FALSE(result.candidate_profile.obstacle_certified);
+  EXPECT_EQ(result.candidate_profile.diagnostics.surface_outcome,
+            TubeSurfaceOutcome::INCONCLUSIVE);
+  EXPECT_EQ(result.candidate_profile.diagnostics.surface_inconclusive_reason,
+            TubeSurfaceInconclusiveReason::QUERY_BUDGET);
+  EXPECT_TRUE(result.candidate_profile.diagnostics.surface_query_budget_reached);
+  EXPECT_EQ(result.candidate_profile.diagnostics.inward_search_attempt_count,
+            0U);
+  ASSERT_EQ(result.candidate_profile.samples.size(),
+            result.candidate_profile.raw_build_samples.size());
+  for (std::size_t index = 0U;
+       index < result.candidate_profile.samples.size(); ++index) {
+    const TubeRawSample& sample = result.candidate_profile.samples[index];
+    const TubeRawSample& raw = result.candidate_profile.raw_build_samples[index];
+    EXPECT_DOUBLE_EQ(sample.filtered_lower, raw.filtered_lower);
+    EXPECT_DOUBLE_EQ(sample.filtered_upper, raw.filtered_upper);
+    EXPECT_GE(sample.filtered_lower, -1.0 - 1e-12);
+    EXPECT_LE(sample.filtered_upper, 1.0 + 1e-12);
+  }
 }
 
 TEST(TubeEpochManagerTest, CandidateAndActiveProfilesAreIndependentObjects) {
@@ -908,13 +990,18 @@ TEST(TubeEpochManagerTest, CloudGeometricContainmentStaysSeparateFromInteriorMar
   TubeEpochManagerConfig config = MakeConfig();
   config.builder.interior_margin = 0.05;
   TubeEpochUpdateInput input = MakeCloudInput(CloudCorridorQuery(1.00, 1.00));
-  input.retained_delta = 0.04;
-  input.actual_position += Eigen::Vector3d(0.0, 0.04, 0.0);
+  // The corridor's geometric interval is approximately [-0.60,+0.60].  A
+  // retained offset near its upper boundary is outside the legacy interior
+  // margin but remains geometrically contained for ESDF installation.
+  input.retained_delta = 0.58;
+  input.actual_position += Eigen::Vector3d(0.0, 0.58, 0.0);
   TubeEpochManager manager(config);
   TubeEpochUpdateResult result;
-  EXPECT_FALSE(manager.update(input, result));
-  EXPECT_FALSE(result.status.current_state_admissible);
-  EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
+  ASSERT_TRUE(manager.update(input, result));
+  EXPECT_FALSE(result.status.retained_delta_current_inside);
+  EXPECT_TRUE(result.status.current_interval_contains_retained_delta);
+  EXPECT_TRUE(result.status.current_state_admissible);
+  EXPECT_EQ(result.status.state, TubeEpochState::ROLLING);
 }
 
 TEST(TubeEpochManagerTest, CloudExcludingZeroCandidateInstallsNeutralZeroOnly) {
@@ -1056,11 +1143,12 @@ TEST(TubeEpochManagerTest,
   EXPECT_FALSE(result.candidate_profile.certified_segment_truncated_before);
   EXPECT_GE(result.candidate_profile.samples.size(), 2U);
   EXPECT_NEAR(result.candidate_profile.requested_preview_end_w, 0.6, 1e-12);
-  EXPECT_LT(result.candidate_profile.certified_segment_end_w, 0.20);
-  EXPECT_LT(result.status.certified_forward_w, 0.20);
+  EXPECT_NEAR(result.candidate_profile.certified_segment_end_w, 0.20, 1e-12);
+  EXPECT_NEAR(result.status.certified_forward_w, 0.20, 1e-12);
   EXPECT_FALSE(result.status.forward_horizon_sufficient);
   EXPECT_EQ(result.status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
   EXPECT_EQ(result.status.reason, TubeEpochReason::FORWARD_HORIZON_SHORT);
+  EXPECT_NEAR(result.candidate_profile.first_truncated_w, 0.20, 1e-12);
   EXPECT_EQ(result.candidate_profile.first_truncated_reason,
             TubeStopReason::UNKNOWN);
 }
@@ -1120,6 +1208,10 @@ TEST(TubeEpochManagerTest,
 
 TEST(TubeEpochManagerTest, EsdfWithoutCloudClearanceFailsClosed) {
   TubeEpochUpdateInput input = MakeInput(TubeSource::ESDF);
+  // This fixture intentionally omits both cloud and cell-certificate
+  // callbacks; keep the missing-certificate condition explicit now that the
+  // normal cloud fixture is certificate-backed.
+  input.path_cell_bound_query = PathCellBoundQuery();
   TubeEpochManager manager(MakeConfig());
   TubeEpochUpdateResult result;
   EXPECT_FALSE(manager.update(input, result));

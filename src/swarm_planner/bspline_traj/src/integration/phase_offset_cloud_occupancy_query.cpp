@@ -130,6 +130,12 @@ phase_offset_navigation::ClearanceQuery makeCloudOccupancyClearanceQuery(
         finite(cloud.nearest_inflated_occupied_voxel_center_distance)
             ? cloud.nearest_inflated_occupied_voxel_center_distance : 0.0;
     result.clearance_certified = cloud.clearance_certified;
+    // The immutable planner-ESDF query caps a larger distance at the
+    // requested radius.  Equality is therefore conservatively treated as a
+    // certified lower bound; only a strict interior value is exact evidence.
+    result.clearance_is_exact = result.status ==
+            phase_offset_navigation::DistanceStatus::KNOWN_FREE &&
+        result.clearance_certified && result.clearance < required_radius;
     return result;
   };
 }

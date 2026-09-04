@@ -17,6 +17,11 @@
 #include <thread>
 #include <vector>
 
+#include <log4cxx/appenderskeleton.h>
+#include <log4cxx/helpers/transcoder.h>
+#include <log4cxx/logger.h>
+#include <log4cxx/spi/loggingevent.h>
+
 #define private public
 #include <plan_env/sdf_map.h>
 #undef private
@@ -30,6 +35,72 @@
 
 namespace FLAG_Race {
 namespace {
+
+class ForwardExcludedLogAppender : public log4cxx::AppenderSkeleton {
+ public:
+  void close() override { closed = true; }
+  bool requiresLayout() const override { return false; }
+
+  std::size_t count() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return messages.size();
+  }
+
+  std::string latest() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return messages.empty() ? std::string() : messages.back();
+  }
+
+ protected:
+  void append(const log4cxx::spi::LoggingEventPtr& event,
+              log4cxx::helpers::Pool&) override {
+    if (!event) return;
+    std::string text;
+    log4cxx::helpers::Transcoder::encode(event->getRenderedMessage(), text);
+    if (text.find("[PHASE_OFFSET][TUBE][FORWARD_EXCLUDED]") ==
+        std::string::npos) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    messages.push_back(text);
+  }
+
+ private:
+  mutable std::mutex mutex;
+  std::vector<std::string> messages;
+};
+
+class ScopedForwardExcludedLogCapture {
+ public:
+  ScopedForwardExcludedLogCapture()
+      : root(log4cxx::Logger::getRootLogger()),
+        appender_raw(new ForwardExcludedLogAppender()),
+        appender(appender_raw) {
+    root->addAppender(appender);
+  }
+  ~ScopedForwardExcludedLogCapture() {
+    if (root && appender) root->removeAppender(appender);
+    if (appender_raw) appender_raw->close();
+    appender = 0;
+    root = 0;
+  }
+  ScopedForwardExcludedLogCapture(
+      const ScopedForwardExcludedLogCapture&) = delete;
+  ScopedForwardExcludedLogCapture& operator=(
+      const ScopedForwardExcludedLogCapture&) = delete;
+
+  std::size_t count() const {
+    return appender_raw == nullptr ? 0U : appender_raw->count();
+  }
+  std::string latest() const {
+    return appender_raw == nullptr ? std::string() : appender_raw->latest();
+  }
+
+  private:
+  log4cxx::LoggerPtr root;
+  ForwardExcludedLogAppender* appender_raw;
+  log4cxx::AppenderPtr appender;
+};
 
 constexpr double kDt = 0.02;
 using phase_offset_navigation::DistanceStatus;
@@ -200,6 +271,82 @@ ContinuousPhasePath::Evaluator MakeCertifiedLinePiece(
                                         cell_bound_evaluator);
 }
 
+std::shared_ptr<const ContinuousPhasePath> MakeCertifiedStraightSyntheticOwner() {
+  auto owner = std::make_shared<ContinuousPhasePath>();
+  EXPECT_TRUE(owner->appendSegment(
+      0.0, 3.0, "prepared-certified-straight-synthetic",
+      MakeCertifiedLinePiece(0.0, 3.0)));
+  return std::shared_ptr<const ContinuousPhasePath>(owner);
+}
+
+std::shared_ptr<const ContinuousPhasePath> MakeBlockingCertifiedStraightSyntheticOwner(
+    const std::shared_ptr<BlockingOwnerEvaluation>& control) {
+  auto owner = std::make_shared<ContinuousPhasePath>();
+  const auto point_evaluator = [control](
+      const double w, ContinuousPhasePathState& state) {
+    const std::size_t call =
+        control->call_count.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+    if (control->armed.load(std::memory_order_acquire) &&
+        call == control->block_on_call) {
+      std::unique_lock<std::mutex> lock(control->mutex);
+      control->paused = true;
+      control->condition.notify_all();
+      control->condition.wait(lock, [&control]() {
+        return control->release;
+      });
+    }
+    state.p = Eigen::Vector3d(w, 0.0, 1.0);
+    state.dp_dw = Eigen::Vector3d::UnitX();
+    state.d2p_dw2.setZero();
+    state.vel = state.dp_dw;
+    state.valid = std::isfinite(w) && w >= -1e-12 && w <= 3.0 + 1e-12;
+    return state.valid;
+  };
+  const auto cell_bound_evaluator = [](
+      const double w0, const double w1,
+      phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 3.0;
+    certificate.segment_identity = 1U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.sup_p_ww_norm = 0.0;
+    certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
+    certificate.sup_N_w_norm = 0.0;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
+    certificate.curvature_variation_bound = 0.0;
+    certificate.midpoint_position_variation_bound = 0.0;
+    certificate.chord_deviation_bound = 0.0;
+    certificate.valid = std::isfinite(w0) && std::isfinite(w1) &&
+        w1 > w0 && w0 >= -1e-12 && w1 <= 3.0 + 1e-12;
+    certificate.complete = certificate.valid;
+    return certificate.valid;
+  };
+  EXPECT_TRUE(owner->appendSegment(
+      0.0, 3.0, "prepared-blocking-certified-straight-synthetic",
+      ContinuousPhasePath::Evaluator(point_evaluator,
+                                     cell_bound_evaluator)));
+  return std::shared_ptr<const ContinuousPhasePath>(owner);
+}
+
+std::shared_ptr<const ContinuousPhaseNormalFrame> MakeFixtureFrame(
+    const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::uint64_t effective_revision = 1U) {
+  if (!owner || owner->empty() || effective_revision == 0U) {
+    return std::shared_ptr<const ContinuousPhaseNormalFrame>();
+  }
+  return std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, effective_revision, effective_revision);
+}
+
 std::shared_ptr<const ContinuousPhasePath> MakeCertifiedThreePieceOwner() {
   auto owner = std::make_shared<ContinuousPhasePath>();
   EXPECT_TRUE(owner->appendSegment(
@@ -308,6 +455,23 @@ MatchedAdapterPathSamples SampleOwner(
   for (const double w : sample_w) {
     ContinuousPhasePathState state;
     if (!owner->evaluate(w, state, false)) {
+      samples.clear();
+      return samples;
+    }
+    samples.push_back(ConvertContinuousPhasePathStateForActive(state, w));
+  }
+  return samples;
+}
+
+MatchedAdapterPathSamples SampleOwnerWithFrame(
+    const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame,
+    const std::vector<double>& sample_w) {
+  MatchedAdapterPathSamples samples;
+  if (!owner || !frame) return samples;
+  for (const double w : sample_w) {
+    ContinuousPhasePathState state;
+    if (!frame->evaluatePathState(w, state)) {
       samples.clear();
       return samples;
     }
@@ -4327,6 +4491,56 @@ void SetInputPositionAndLegacy(MatchedAdapterInput& input,
       zero_output.guidance.valid);
 }
 
+MatchedAdapterInput MakeCertifiedInput(
+    const SyntheticPath& path,
+    const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame,
+    const double stamp = 0.0,
+    const void* identity = nullptr) {
+  MatchedAdapterInput input = MakeInput(
+      path, identity != nullptr ? identity : owner.get(), stamp);
+  if (!owner || !frame || owner->empty()) return input;
+
+  input.semantic_path_owner = owner;
+  input.frame_owner = frame;
+  input.semantic_path_identity =
+      identity != nullptr ? identity : static_cast<const void*>(owner.get());
+  input.semantic_path_start_w = owner->startW();
+  input.semantic_path_end_w = owner->endW();
+  input.path_state_query = [owner, frame](
+      const double w, phase_offset_core::PathDifferentialState& state) {
+    ContinuousPhasePathState continuous;
+    if (!frame->evaluatePathState(w, continuous)) return false;
+    state = ConvertContinuousPhasePathStateForActive(continuous, w);
+    return state.valid;
+  };
+
+  std::vector<double> sample_w;
+  sample_w.reserve(path.samples.size());
+  for (const auto& sample : path.samples) sample_w.push_back(sample.w);
+  input.sampled_path = SampleOwnerWithFrame(owner, frame, sample_w);
+
+  ContinuousPhasePathState current;
+  if (frame->evaluatePathState(path.current.w, current)) {
+    input.path = ConvertContinuousPhasePathStateForActive(
+        current, path.current.w);
+  }
+  input.position = input.path.p;
+  PhaseOffsetActiveAdapter zero;
+  ActiveAdapterInput zero_input;
+  zero_input.path = input.path;
+  zero_input.position = input.position;
+  zero_input.gains = input.gains;
+  ActiveAdapterOutput zero_output;
+  EXPECT_TRUE(zero.evaluate(zero_input, zero_output));
+  input.legacy = LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+  return input;
+}
+
 const TubeRawSample* FindSampleAtCurrentW(const TubeProfile& profile,
                                           const double current_w) {
   for (const TubeRawSample& sample : profile.samples) {
@@ -4508,7 +4722,11 @@ TEST(PhaseOffsetMatchedAdapterTest,
   SyntheticPath path = MakePath();
   MakeStraightRawPath(path);
   const std::shared_ptr<const ContinuousPhasePath> owner =
-      MakeStraightSyntheticOwner();
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   SDFMap map;
   InitializeFineKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 901U);
@@ -4522,11 +4740,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
   const std::array<double, 3U> current_w = {{0.435, 0.783, 1.127}};
   for (std::size_t index = 0U; index < current_w.size(); ++index) {
     SetStraightCurrent(path, current_w[index]);
-    MatchedAdapterInput input = MakeInput(path, owner.get(),
-                                          static_cast<double>(index) * kDt);
-    input.semantic_path_owner = owner;
-    input.semantic_path_start_w = owner->startW();
-    input.semantic_path_end_w = owner->endW();
+    MatchedAdapterInput input = MakeCertifiedInput(
+        path, owner, frame, static_cast<double>(index) * kDt);
     input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
     SetInputPositionAndLegacy(input, path.current.p);
 
@@ -4719,10 +4934,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
 TEST(PhaseOffsetMatchedAdapterTest,
      PreparedEsdfPairBuildKeepsOffGridCapturedPhaseAtStartBoundary) {
   const std::shared_ptr<const ContinuousPhasePath> owner =
-      MakeStraightSyntheticOwner();
+      MakeCertifiedStraightSyntheticOwner();
   ASSERT_TRUE(owner);
-  const MatchedAdapterPathSamples supplied = SampleOwner(
-      owner, {0.40, 0.80, 1.20, 1.60, 2.00, 2.40, 2.80});
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(frame);
+  const MatchedAdapterPathSamples supplied = SampleOwnerWithFrame(
+      owner, frame, {0.40, 0.80, 1.20, 1.60, 2.00, 2.40, 2.80});
   ASSERT_EQ(supplied.size(), 7U);
   constexpr double kCapturedW = 0.435;
   SDFMap map;
@@ -4761,9 +4979,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
       kCapturedW, 0.80, kFutureSeamW, 1.60, 2.00,
       kExistingHorizonEndW, 2.80};
   const std::shared_ptr<const ContinuousPhasePath> old_owner =
-      MakeStraightSyntheticOwner();
+      MakeCertifiedStraightSyntheticOwner();
   ASSERT_TRUE(old_owner);
-  const MatchedAdapterPathSamples old_samples = SampleOwner(old_owner, sample_w);
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> old_frame =
+      MakeFixtureFrame(old_owner);
+  ASSERT_TRUE(old_frame);
+  const MatchedAdapterPathSamples old_samples =
+      SampleOwnerWithFrame(old_owner, old_frame, sample_w);
   ASSERT_EQ(old_samples.size(), sample_w.size());
 
   SDFMap map;
@@ -4809,9 +5031,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
   const std::shared_ptr<BlockingOwnerEvaluation> control(
       new BlockingOwnerEvaluation());
   const std::shared_ptr<const ContinuousPhasePath> new_owner =
-      MakeBlockingStraightSyntheticOwner(control);
+      MakeBlockingCertifiedStraightSyntheticOwner(control);
   ASSERT_TRUE(new_owner);
-  const MatchedAdapterPathSamples new_samples = SampleOwner(new_owner, sample_w);
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame =
+      MakeFixtureFrame(new_owner);
+  ASSERT_TRUE(new_frame);
+  const MatchedAdapterPathSamples new_samples =
+      SampleOwnerWithFrame(new_owner, new_frame, sample_w);
   ASSERT_EQ(new_samples.size(), sample_w.size());
   control->call_count.store(0U, std::memory_order_release);
   control->block_on_call = new_samples.size() + 1U;
@@ -4902,7 +5128,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
   // complete cloud-observation snapshot is the only production backing.
   InstallCompleteCloudSnapshot(map, 17U);
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
-  MatchedAdapterInput input = MakeInput(path, &path);
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
+  MatchedAdapterInput input = MakeCertifiedInput(path, owner, frame);
   input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   MatchedAdapterOutput output;
   BuildAndConsume(adapter, input, output);
@@ -4949,7 +5181,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
   InitializeKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 23U);
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
-  MatchedAdapterInput input = MakeInput(path, &path);
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
+  MatchedAdapterInput input = MakeCertifiedInput(path, owner, frame);
   input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   MatchedAdapterOutput output;
   BuildAndConsume(adapter, input, output);
@@ -4976,7 +5214,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
                 kCloudSnapshotObservationSequence], 23.0);
   EXPECT_FALSE(output.selected);
   for (int cycle = 1; cycle <= 4; ++cycle) {
-    input = MakeInput(path, &path, cycle * kDt);
+    input = MakeCertifiedInput(path, owner, frame, cycle * kDt);
     input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
     adapter.update(input, output);
     EXPECT_FALSE(output.tube_update_due_this_cycle);
@@ -5008,7 +5246,13 @@ TEST(PhaseOffsetMatchedAdapterTest,
   InstallCompleteCloudSnapshot(map, 31U);
 
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
-  MatchedAdapterInput input = MakeInput(path, &path);
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
+  MatchedAdapterInput input = MakeCertifiedInput(path, owner, frame);
   SetInputPositionAndLegacy(input, path.current.p);
   input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   MatchedAdapterOutput output;
@@ -5069,7 +5313,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
   const auto* candidate_before_non_due = output.candidate_profile.get();
   const std::uint64_t sequence_before_non_due =
       output.tube_epoch_status.candidate_sequence;
-  MatchedAdapterInput non_due = MakeInput(path, &path, kDt);
+  MatchedAdapterInput non_due = MakeCertifiedInput(path, owner, frame, kDt);
   SetInputPositionAndLegacy(non_due, path.current.p + Eigen::Vector3d(1.0, 0.0, 0.0));
   non_due.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   adapter.update(non_due, output);
@@ -7259,16 +7503,19 @@ TEST(PhaseOffsetMatchedAdapterPairPublication,
   InitializeFineKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 801U);
   const std::shared_ptr<const ContinuousPhasePath> owner =
-      MakeStraightSyntheticOwner();
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
-  MatchedAdapterInput input = MakeInput(path, owner.get());
-  input.semantic_path_owner = owner;
+  MatchedAdapterInput input = MakeCertifiedInput(path, owner, frame);
   input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   SetInputPositionAndLegacy(input, path.current.p);
 
   PathTubePairTransaction bootstrap;
   ASSERT_TRUE(adapter.stagePathTubePair(
-      std::shared_ptr<const PathTubePair>(), owner, path.samples,
+      std::shared_ptr<const PathTubePair>(), owner, input.sampled_path,
       path.current.w, 1.0, 2.4, input.position, input.gains, input.dt,
       input.cloud_occupancy_snapshot, bootstrap));
   std::shared_ptr<const PathTubePair> installed;
@@ -7790,16 +8037,20 @@ TEST(PhaseOffsetMatchedAdapterTest,
   InitializeFineKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 701U);
   const std::shared_ptr<const ContinuousPhasePath> owner =
-      MakeStraightSyntheticOwner();
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
-  MatchedAdapterInput input = MakeInput(path, owner.get());
-  input.semantic_path_owner = owner;
+  MatchedAdapterInput input = MakeCertifiedInput(path, owner, frame);
   SetInputPositionAndLegacy(input, path.current.p);
   input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
 
   PathTubePairTransaction transaction;
   ASSERT_TRUE(adapter.stagePathTubePair(
-      std::shared_ptr<const PathTubePair>(), owner, path.samples, path.current.w,
+      std::shared_ptr<const PathTubePair>(), owner, input.sampled_path,
+      path.current.w,
       1.0, 2.4, input.position, input.gains, input.dt,
       input.cloud_occupancy_snapshot, transaction));
   std::shared_ptr<const PathTubePair> installed;
@@ -7973,16 +8224,20 @@ TEST(PhaseOffsetMatchedAdapterTest,
   InitializeFineKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 601U);
   const std::shared_ptr<const ContinuousPhasePath> owner =
-      MakeStraightSyntheticOwner();
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
-  MatchedAdapterInput input = MakeInput(path, owner.get());
-  input.semantic_path_owner = owner;
+  MatchedAdapterInput input = MakeCertifiedInput(path, owner, frame);
   SetInputPositionAndLegacy(input, path.current.p);
   input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
 
   PathTubePairTransaction transaction;
   ASSERT_TRUE(adapter.stagePathTubePair(
-      std::shared_ptr<const PathTubePair>(), owner, path.samples, path.current.w,
+      std::shared_ptr<const PathTubePair>(), owner, input.sampled_path,
+      path.current.w,
       1.0, 2.4, input.position, input.gains, input.dt,
       input.cloud_occupancy_snapshot, transaction));
   std::shared_ptr<const PathTubePair> installed;
@@ -8095,13 +8350,20 @@ TEST(PhaseOffsetMatchedAdapterTest,
      EsdfMapAdvanceSampleHoldsFrozenActiveUntilNextSameSourceEpoch) {
   SyntheticPath path = MakePath();
   MakeStraightRawPath(path);
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   SDFMap map;
   InitializeFineKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 51U);
   int identity = 103;
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
   MatchedAdapterOutput output;
-  MatchedAdapterInput first = MakeInput(path, &identity);
+  MatchedAdapterInput first = MakeCertifiedInput(path, owner, frame, 0.0,
+                                                 &identity);
   SetInputPositionAndLegacy(first, path.current.p);
   first.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   BuildAndConsume(adapter, first, output);
@@ -8109,7 +8371,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
   const auto* first_active = output.active_profile.get();
 
   InstallCompleteCloudSnapshot(map, 52U);
-  MatchedAdapterInput revised = MakeInput(path, &identity, kDt);
+  MatchedAdapterInput revised = MakeCertifiedInput(path, owner, frame, kDt,
+                                                   &identity);
   SetInputPositionAndLegacy(revised, path.current.p);
   revised.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   // A 10 Hz map advance during an asynchronous build does not invalidate the
@@ -8131,6 +8394,12 @@ TEST(PhaseOffsetMatchedAdapterTest,
      ContinuouslyAdvancingMapStillInstallsEachFrozenSameSourceEpoch) {
   SyntheticPath path = MakePath();
   MakeStraightRawPath(path);
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   SDFMap map;
   InitializeFineKnownRawFreeMap(map);
   int identity = 109;
@@ -8139,7 +8408,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
 
   auto input_for = [&](const std::uint64_t sequence, const double stamp) {
     InstallCompleteCloudSnapshot(map, sequence);
-    MatchedAdapterInput input = MakeInput(path, &identity, stamp);
+    MatchedAdapterInput input = MakeCertifiedInput(
+        path, owner, frame, stamp, &identity);
     SetInputPositionAndLegacy(input, path.current.p);
     input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
     return input;
@@ -8233,6 +8503,7 @@ TEST(PhaseOffsetMatchedAdapterTest,
   int first_identity = 110;
   int revised_identity = 111;
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+  ScopedForwardExcludedLogCapture log_capture;
   MatchedAdapterOutput output;
   MatchedAdapterInput captured = MakeInput(path, &first_identity, 0.0);
   SetInputPositionAndLegacy(captured, path.current.p);
@@ -8252,6 +8523,16 @@ TEST(PhaseOffsetMatchedAdapterTest,
   EXPECT_FALSE(adapter.update(revised, output));
   EXPECT_FALSE(adapter.requestSourceStillCurrent(*captured_request));
   EXPECT_FALSE(adapter.finalizeTubeEpoch(captured_request, built));
+  EXPECT_EQ(log_capture.count(), 1U);
+  const std::string log = log_capture.latest();
+  EXPECT_NE(log.find("[PHASE_OFFSET][TUBE][FORWARD_EXCLUDED]"),
+            std::string::npos);
+  EXPECT_NE(log.find("build_sequence=" + std::to_string(built.build_sequence)),
+            std::string::npos);
+  EXPECT_NE(log.find("task_generation=" +
+      std::to_string(captured_request->task_generation)), std::string::npos);
+  EXPECT_NE(log.find("authority_session=" +
+      std::to_string(captured_request->authority_session)), std::string::npos);
   EXPECT_EQ(adapter.timer_last_raw_diagnostic_build_sequence_,
             built.build_sequence);
   EXPECT_EQ(adapter.timer_last_cloud_diagnostic_build_sequence_,
@@ -8262,12 +8543,132 @@ TEST(PhaseOffsetMatchedAdapterTest,
   // The delivery decision is one-shot even when the same historical build is
   // inspected again; no path-stale Candidate/Runtime object is resurrected.
   adapter.publishBuildDiagnostics(built);
+  EXPECT_EQ(log_capture.count(), 1U);
   EXPECT_EQ(adapter.timer_last_raw_diagnostic_build_sequence_,
             built.build_sequence);
   EXPECT_EQ(adapter.timer_last_cloud_diagnostic_build_sequence_,
             built.build_sequence);
   EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
   EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+}
+
+TEST(PhaseOffsetMatchedAdapterTest,
+     TaskGenerationOrShutdownInvalidBuildEmitsNoForwardExcludedLog) {
+  SyntheticPath path = MakePath();
+  MakeStraightRawPath(path);
+  SDFMap map;
+  InitializeFineKnownRawFreeMap(map);
+  InstallCompleteCloudSnapshot(map, 302U);
+
+  {
+    PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+    ScopedForwardExcludedLogCapture scoped_capture;
+    int identity = 112;
+    MatchedAdapterInput input = MakeInput(path, &identity, 0.0);
+    SetInputPositionAndLegacy(input, path.current.p);
+    input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
+    MatchedAdapterOutput output;
+    EXPECT_FALSE(adapter.update(input, output));
+    const std::shared_ptr<const TubeBuildRequest> request =
+        std::atomic_load(&adapter.latest_build_request_);
+    ASSERT_TRUE(request);
+    TubeEpochSnapshot built;
+    (void)adapter.buildTubeEpoch(request, built);
+    ASSERT_TRUE(built.raw_candidate_diagnostics_generated);
+    ASSERT_TRUE(built.cloud_snapshot_diagnostics_generated);
+    std::uint64_t retired = 0U;
+    ASSERT_TRUE(adapter.resetForNewNavigationTask(
+        request->authority_session, retired));
+    const std::shared_ptr<const TubeEpochSnapshot> candidate_before =
+        std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+    const std::shared_ptr<const TubeEpochSnapshot> epoch_before =
+        std::atomic_load(&adapter.latest_epoch_snapshot_);
+    const std::shared_ptr<const ControlPublishSnapshot> control_before =
+        std::atomic_load(&adapter.latest_control_snapshot_);
+    const double retained_delta_before = adapter.runtime_->retainedDelta();
+    const phase_offset_core::PortCommand previous_final_port_before =
+        adapter.runtime_->previousFinalPort();
+    const bool pending_or_active_intent_before =
+        adapter.runtime_->hasPendingOrActiveOffsetIntent();
+    const auto authority_before = adapter.execution_authority_.snapshot();
+    EXPECT_FALSE(candidate_before);
+    EXPECT_FALSE(epoch_before);
+    EXPECT_FALSE(adapter.finalizeTubeEpoch(request, built));
+    EXPECT_EQ(scoped_capture.count(), 0U);
+    EXPECT_EQ(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_).get(),
+              candidate_before.get());
+    EXPECT_EQ(std::atomic_load(&adapter.latest_epoch_snapshot_).get(),
+              epoch_before.get());
+    EXPECT_EQ(std::atomic_load(&adapter.latest_control_snapshot_).get(),
+              control_before.get());
+    EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), retained_delta_before);
+    EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_w,
+                     previous_final_port_before.u_w);
+    EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_delta,
+                     previous_final_port_before.u_delta);
+    EXPECT_EQ(adapter.runtime_->hasPendingOrActiveOffsetIntent(),
+              pending_or_active_intent_before);
+    const auto authority_after = adapter.execution_authority_.snapshot();
+    EXPECT_EQ(authority_after.snapshotId(), authority_before.snapshotId());
+    EXPECT_EQ(authority_after.valid, authority_before.valid);
+    EXPECT_EQ(authority_after.sequence, authority_before.sequence);
+    EXPECT_EQ(authority_after.authority_session,
+              authority_before.authority_session);
+  }
+
+  {
+    PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
+    ScopedForwardExcludedLogCapture scoped_capture;
+    int identity = 113;
+    MatchedAdapterInput input = MakeInput(path, &identity, 0.0);
+    SetInputPositionAndLegacy(input, path.current.p);
+    input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
+    MatchedAdapterOutput output;
+    EXPECT_FALSE(adapter.update(input, output));
+    const std::shared_ptr<const TubeBuildRequest> request =
+        std::atomic_load(&adapter.latest_build_request_);
+    ASSERT_TRUE(request);
+    TubeEpochSnapshot built;
+    (void)adapter.buildTubeEpoch(request, built);
+    ASSERT_TRUE(built.raw_candidate_diagnostics_generated);
+    ASSERT_TRUE(built.cloud_snapshot_diagnostics_generated);
+    adapter.requestShutdown();
+    const std::shared_ptr<const TubeEpochSnapshot> candidate_before =
+        std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+    const std::shared_ptr<const TubeEpochSnapshot> epoch_before =
+        std::atomic_load(&adapter.latest_epoch_snapshot_);
+    const std::shared_ptr<const ControlPublishSnapshot> control_before =
+        std::atomic_load(&adapter.latest_control_snapshot_);
+    const double retained_delta_before = adapter.runtime_->retainedDelta();
+    const phase_offset_core::PortCommand previous_final_port_before =
+        adapter.runtime_->previousFinalPort();
+    const bool pending_or_active_intent_before =
+        adapter.runtime_->hasPendingOrActiveOffsetIntent();
+    const auto authority_before = adapter.execution_authority_.snapshot();
+    EXPECT_FALSE(candidate_before);
+    EXPECT_FALSE(epoch_before);
+    EXPECT_FALSE(adapter.finalizeTubeEpoch(request, built));
+    EXPECT_EQ(scoped_capture.count(), 0U);
+    EXPECT_EQ(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_).get(),
+              candidate_before.get());
+    EXPECT_EQ(std::atomic_load(&adapter.latest_epoch_snapshot_).get(),
+              epoch_before.get());
+    EXPECT_EQ(std::atomic_load(&adapter.latest_control_snapshot_).get(),
+              control_before.get());
+    EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), retained_delta_before);
+    EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_w,
+                     previous_final_port_before.u_w);
+    EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_delta,
+                     previous_final_port_before.u_delta);
+    EXPECT_EQ(adapter.runtime_->hasPendingOrActiveOffsetIntent(),
+              pending_or_active_intent_before);
+    const auto authority_after = adapter.execution_authority_.snapshot();
+    EXPECT_EQ(authority_after.snapshotId(), authority_before.snapshotId());
+    EXPECT_EQ(authority_after.valid, authority_before.valid);
+    EXPECT_EQ(authority_after.sequence, authority_before.sequence);
+    EXPECT_EQ(authority_after.authority_session,
+              authority_before.authority_session);
+  }
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,

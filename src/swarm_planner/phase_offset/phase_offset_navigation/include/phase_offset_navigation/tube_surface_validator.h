@@ -20,6 +20,31 @@ struct TubeSurfaceValidatorConfig {
 };
 
 struct TubeSurfaceValidationResult {
+  // Typed aggregate proof result.  Legacy bool/first_failure fields below are
+  // retained for source compatibility and are derived from these facts after
+  // validation has completed.
+  TubeSurfaceOutcome outcome = TubeSurfaceOutcome::INCONCLUSIVE;
+  TubeSurfaceInconclusiveReason inconclusive_reason =
+      TubeSurfaceInconclusiveReason::NONE;
+  TubeSurfaceTruncationOutcome truncation_outcome =
+      TubeSurfaceTruncationOutcome::NONE;
+  double terminal_w = 0.0;
+  double witness_clearance = 0.0;
+  bool witness_clearance_exact = false;
+  double midpoint_position_cover = 0.0;
+  double normal_variation_cover = 0.0;
+  double delta_slope_cover = 0.0;
+  double v_span_cover = 0.0;
+  double geometric_cover = 0.0;
+  double support_alignment_bound = 0.0;
+  double numerical_epsilon = 0.0;
+  double proof_residual = 0.0;
+  bool depth_guard_reached = false;
+  bool query_budget_reached = false;
+  bool witness_evidence_present = false;
+  // Final leaves, sorted by canonical cell key.  Traversal/refinement order
+  // must not affect this evidence or the aggregate verdict.
+  std::vector<TubeSurfaceCellEvidence> cell_evidence;
   bool complete = false;
   bool current_anchor_valid = false;
   bool truncated_before = false;
@@ -53,6 +78,9 @@ struct TubeSurfaceValidationResult {
   double min_clearance_margin = 0.0;
   TubeStopReason first_failure_reason = TubeStopReason::NONE;
   double first_failure_w = 0.0;
+  // Diagnostic-only forward exclusion sidecar.  It is selected after the
+  // retained SAFE component is known and never feeds validator decisions.
+  TubeSurfaceForwardExcludedEvidence forward_excluded_evidence;
 };
 
 // Validates the complete filtered ribbon surface with a conservative

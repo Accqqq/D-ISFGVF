@@ -42,7 +42,12 @@ guidance::IsfGains Gains() {
 }
 
 MatchedAdapterInput Input(const phase_offset_navigation::RuntimePathSamples& path,
-                          const void* identity, double stamp) {
+                          const void* identity, double stamp,
+                          const std::shared_ptr<const ContinuousPhasePath>& owner =
+                              std::shared_ptr<const ContinuousPhasePath>(),
+                          const std::shared_ptr<const ContinuousPhaseNormalFrame>&
+                              frame =
+                                  std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
   MatchedAdapterInput input;
   input.path = State(0.4); input.semantic_path_identity = identity;
   input.path_state_query = [](const double w,
@@ -59,6 +64,13 @@ MatchedAdapterInput Input(const phase_offset_navigation::RuntimePathSamples& pat
   input.legacy = LegacyGuidanceSnapshot(zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
       zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
       zero_output.guidance.ref_pt, zero_output.guidance.tangent, zero_output.guidance.valid);
+  if (owner) {
+    input.semantic_path_owner = owner;
+    input.frame_owner = frame;
+    input.semantic_path_identity = owner.get();
+    input.semantic_path_start_w = owner->startW();
+    input.semantic_path_end_w = owner->endW();
+  }
   return input;
 }
 
@@ -101,8 +113,7 @@ PhaseOffsetMatchedAdapterConfig Config(TubeSource source) {
 
 std::shared_ptr<const ContinuousPhasePath> BootstrapOwner() {
   auto owner = std::make_shared<ContinuousPhasePath>();
-  EXPECT_TRUE(owner->appendSegment(
-      0.0, 3.0, "integration-bootstrap-owner",
+  ContinuousPhasePath::PointEvaluator point_evaluator =
       [](const double w, ContinuousPhasePathState& state) {
         state.p = Eigen::Vector3d(w, 0.0, 1.0 + 0.1 * w);
         state.dp_dw = Eigen::Vector3d(1.0, 0.0, 0.1);
@@ -110,8 +121,50 @@ std::shared_ptr<const ContinuousPhasePath> BootstrapOwner() {
         state.vel = state.dp_dw;
         state.valid = true;
         return true;
-      }));
+      };
+  ContinuousPhasePath::CellBoundEvaluator cell_bound_evaluator =
+      [](const double w0, const double w1,
+         phase_offset_core::PathCellGeometryCertificate& certificate) {
+        certificate = phase_offset_core::PathCellGeometryCertificate();
+        certificate.w0 = w0;
+        certificate.w1 = w1;
+        certificate.segment_w0 = 0.0;
+        certificate.segment_w1 = 3.0;
+        certificate.segment_identity = 1U;
+        certificate.inf_p_w_norm = 1.0;
+        certificate.inf_horizontal_p_w_norm = 1.0;
+        certificate.sup_p_w_norm = 1.01;
+        certificate.sup_p_ww_norm = 0.0;
+        certificate.sup_p_www_norm = 0.0;
+        certificate.sup_horizontal_p_ww_norm = 0.0;
+        certificate.horizontal_acceleration_bound_complete = true;
+        certificate.sup_N_w_norm = 0.0;
+        certificate.sup_abs_curvature = 0.0;
+        certificate.normal_variation_bound = 0.0;
+        certificate.tangent_variation_bound = 0.0;
+        certificate.curvature_variation_bound = 0.0;
+        certificate.midpoint_position_variation_bound = 0.0;
+        certificate.chord_deviation_bound = 0.0;
+        certificate.valid = std::isfinite(w0) && std::isfinite(w1) &&
+            w1 > w0;
+        certificate.complete = certificate.valid;
+        return certificate.valid;
+      };
+  EXPECT_TRUE(owner->appendSegment(
+      0.0, 3.0, "integration-bootstrap-owner",
+      ContinuousPhasePath::Evaluator(point_evaluator,
+                                     cell_bound_evaluator)));
   return std::shared_ptr<const ContinuousPhasePath>(owner);
+}
+
+std::shared_ptr<const ContinuousPhaseNormalFrame> BootstrapFrame(
+    const std::shared_ptr<const ContinuousPhasePath>& owner,
+    const std::uint64_t effective_revision) {
+  if (!owner || owner->empty() || effective_revision == 0U) {
+    return std::shared_ptr<const ContinuousPhaseNormalFrame>();
+  }
+  return std::make_shared<const ContinuousPhaseNormalFrame>(
+      owner, effective_revision, effective_revision);
 }
 
 bool PrepareAndFinalizePair(
@@ -136,11 +189,17 @@ bool BootstrapMatchingPair(
     const phase_offset_navigation::RuntimePathSamples& path,
     const void* identity,
     const std::shared_ptr<const plan_env::CloudOccupancySnapshot>& snapshot,
-    std::shared_ptr<const PathTubePair>& committed) {
-  const auto owner = BootstrapOwner();
-  if (!owner || !adapter.requiresPathTubePairBootstrap()) return false;
-  MatchedAdapterInput activation = Input(path, owner.get(), 2.0);
+    std::shared_ptr<const PathTubePair>& committed,
+    const std::shared_ptr<const ContinuousPhasePath>& supplied_owner =
+        std::shared_ptr<const ContinuousPhasePath>(),
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& supplied_frame =
+        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
+  const auto owner = supplied_owner ? supplied_owner : BootstrapOwner();
+  const auto frame = supplied_frame ? supplied_frame : BootstrapFrame(owner, 1U);
+  if (!owner || !frame || !adapter.requiresPathTubePairBootstrap()) return false;
+  MatchedAdapterInput activation = Input(path, owner.get(), 2.0, owner, frame);
   activation.semantic_path_owner = owner;
+  activation.frame_owner = frame;
   activation.semantic_path_start_w = owner->startW();
   activation.semantic_path_end_w = owner->endW();
   activation.semantic_path_identity = identity;
@@ -429,6 +488,10 @@ TEST(TubeEpochIntegrationTest,
 TEST(TubeEpochIntegrationTest,
      ArmedEsdfTrackingRecoveryUsesLatestFreeSnapshotWithoutCertificateDenial) {
   const auto path = Path();
+  const auto owner = BootstrapOwner();
+  const auto frame = BootstrapFrame(owner, 1U);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
   int identity = 82;
   SDFMap map;
   InitMap(map);
@@ -436,24 +499,36 @@ TEST(TubeEpochIntegrationTest,
   PhaseOffsetMatchedAdapter adapter(Config(TubeSource::ESDF));
   MatchedAdapterOutput output;
   for (int cycle = 0; cycle < 99; ++cycle) {
-    MatchedAdapterInput input = Input(path, &identity, cycle * kDt);
+    MatchedAdapterInput input =
+        Input(path, owner.get(), cycle * kDt, owner, frame);
     input.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
     ASSERT_FALSE(adapter.update(input, output));
     if (cycle == 0) adapter.timerTick();
   }
-  MatchedAdapterInput armed = Input(path, &identity, 99.0 * kDt);
+  MatchedAdapterInput armed =
+      Input(path, owner.get(), 99.0 * kDt, owner, frame);
   armed.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   ASSERT_FALSE(adapter.update(armed, output));
+  ASSERT_TRUE(output.candidate_profile);
+  ASSERT_TRUE(output.candidate_profile->complete);
+  ASSERT_EQ(output.candidate_profile->classification,
+            phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED);
+  ASSERT_TRUE(output.tube_epoch_status.candidate_complete);
+  ASSERT_EQ(output.tube_epoch_status.candidate_classification,
+            phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED);
   ASSERT_TRUE(output.zero_gate_open);
+  ASSERT_TRUE(adapter.requiresPathTubePairBootstrap());
   std::shared_ptr<const PathTubePair> pair;
   ASSERT_TRUE(BootstrapMatchingPair(adapter, path, &identity,
-                                    map.cloudOccupancySnapshot(), pair));
+                                    map.cloudOccupancySnapshot(), pair,
+                                    owner, frame));
   armed.path_tube_pair = pair;
   RebaseInputToAuthority(adapter, armed);
   ASSERT_TRUE(adapter.update(armed, output));
   ASSERT_TRUE(output.selected);
 
-  MatchedAdapterInput tracking = Input(path, &identity, 100.0 * kDt);
+  MatchedAdapterInput tracking =
+      Input(path, owner.get(), 100.0 * kDt, owner, frame);
   tracking.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   tracking.path_tube_pair = pair;
   RebaseInputToAuthority(adapter, tracking);
@@ -480,7 +555,8 @@ TEST(TubeEpochIntegrationTest,
   EXPECT_FALSE(output.failure_latched);
   EXPECT_TRUE(output.tube_epoch_status.raw_cross_section_path_used);
   MatchedAdapterMarkerBundle markers;
-  MatchedAdapterInput marker_tracking = Input(path, &identity, 100.0 * kDt);
+  MatchedAdapterInput marker_tracking =
+      Input(path, owner.get(), 100.0 * kDt, owner, frame);
   marker_tracking.position = tracking.position;
   marker_tracking.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   marker_tracking.path_tube_pair = pair;
@@ -619,16 +695,28 @@ TEST(TubeEpochIntegrationTest, EsdfDoesNotFabricateObservationSequenceWithoutSna
 }
 
 TEST(TubeEpochIntegrationTest, RejectedEsdfCandidateMasksStaleActiveAndDeletesCertified) {
-  const auto path = Path(); int identity = 6; SDFMap map; InitMap(map);
+  const auto path = Path();
+  const auto owner = BootstrapOwner();
+  const auto frame = BootstrapFrame(owner, 1U);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
+  int identity = 6; SDFMap map; InitMap(map);
   InstallCompleteCloudSnapshot(map, 41U);
   PhaseOffsetMatchedAdapter adapter(Config(TubeSource::ESDF));
-  MatchedAdapterInput valid = Input(path, &identity, 0.0);
+  MatchedAdapterInput valid = Input(path, owner.get(), 0.0, owner, frame);
   valid.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
   MatchedAdapterOutput installed; BuildAndConsume(adapter, valid, installed);
+  ASSERT_TRUE(installed.tube_epoch_status.candidate_complete);
+  ASSERT_EQ(installed.tube_epoch_status.candidate_classification,
+            phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED);
   ASSERT_TRUE(installed.active_profile);
+  ASSERT_TRUE(installed.tube_epoch_status.active_available);
+  ASSERT_EQ(installed.active_profile->classification,
+            phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED);
   MatchedAdapterOutput rejected;
   for (int cycle = 1; cycle <= 5; ++cycle) {
-    MatchedAdapterInput unavailable = Input(path, &identity, cycle * kDt);
+    MatchedAdapterInput unavailable =
+        Input(path, owner.get(), cycle * kDt, owner, frame);
     adapter.update(unavailable, rejected);
     if (cycle == 1) adapter.timerTick();
   }
@@ -638,7 +726,9 @@ TEST(TubeEpochIntegrationTest, RejectedEsdfCandidateMasksStaleActiveAndDeletesCe
   EXPECT_FALSE(rejected.tube_epoch_status.active_available);
   EXPECT_EQ(rejected.tube_epoch_status.state, TubeEpochState::WAITING_FOR_CANDIDATE);
   MatchedAdapterMarkerBundle markers;
-  ASSERT_TRUE(adapter.buildMarkers(Input(path, &identity, 1.0), rejected, markers));
+  MatchedAdapterInput marker_input =
+      Input(path, owner.get(), 1.0, owner, frame);
+  ASSERT_TRUE(adapter.buildMarkers(marker_input, rejected, markers));
   ExpectThreeActions(markers.tube, visualization_msgs::Marker::DELETE);
 }
 
