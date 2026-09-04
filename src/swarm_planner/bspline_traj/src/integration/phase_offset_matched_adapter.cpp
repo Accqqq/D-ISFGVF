@@ -4686,6 +4686,8 @@ bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
         ? built.candidate_profile->certified_segment_end_w : 0.0;
     log_input.evidence = built.candidate_profile
         ? &built.candidate_profile->forward_excluded_evidence : nullptr;
+    log_input.snapshot = request->cloud_snapshot.get();
+    log_input.cloud_status = built.cloud_status;
     ROS_INFO_STREAM(formatTubeSurfaceForwardExcludedLog(log_input));
   }
   publishBuildDiagnostics(built);

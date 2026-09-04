@@ -1,5 +1,7 @@
 #pragma once
 
+#include "bspline_race/integration/phase_offset_cloud_occupancy_query.h"
+
 #include <phase_offset_navigation/phase_offset_runtime.h>
 
 #include <array>
@@ -130,6 +132,12 @@ struct TubeSurfaceForwardExcludedLogInput {
   double certified_segment_end_w = 0.0;
   const phase_offset_navigation::TubeSurfaceForwardExcludedEvidence*
       evidence = nullptr;
+  // Synchronous, non-owning view of the exact immutable snapshot captured by
+  // TubeBuildRequest.  The formatter never retains this pointer.
+  const plan_env::CloudOccupancySnapshot* snapshot = nullptr;
+  // Status is copied from the already-computed clearance-query inspection for
+  // this same request; the formatter performs no map query of its own.
+  CloudOccupancyQueryStatus cloud_status;
 };
 
 std::string formatTubeSurfaceForwardExcludedLog(

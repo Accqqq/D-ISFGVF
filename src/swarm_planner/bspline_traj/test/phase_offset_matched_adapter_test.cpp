@@ -8500,14 +8500,33 @@ TEST(PhaseOffsetMatchedAdapterTest,
   SDFMap map;
   InitializeFineKnownRawFreeMap(map);
   InstallCompleteCloudSnapshot(map, 301U);
+  const std::shared_ptr<plan_env::CloudOccupancySnapshot> bounded_snapshot =
+      std::const_pointer_cast<plan_env::CloudOccupancySnapshot>(
+          map.cloudOccupancySnapshot());
+  ASSERT_TRUE(bounded_snapshot);
+  bounded_snapshot->observed_max.x() = 2.0;
+  ASSERT_TRUE(plan_env::cloudOccupancySnapshotConsistent(*bounded_snapshot));
+  const std::shared_ptr<const ContinuousPhasePath> owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame =
+      MakeFixtureFrame(owner);
+  const std::shared_ptr<const ContinuousPhasePath> revised_owner =
+      MakeCertifiedStraightSyntheticOwner();
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> revised_frame =
+      MakeFixtureFrame(revised_owner);
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(frame);
+  ASSERT_TRUE(revised_owner);
+  ASSERT_TRUE(revised_frame);
   int first_identity = 110;
   int revised_identity = 111;
   PhaseOffsetMatchedAdapter adapter(MakeManualConfig(TubeSource::ESDF));
   ScopedForwardExcludedLogCapture log_capture;
   MatchedAdapterOutput output;
-  MatchedAdapterInput captured = MakeInput(path, &first_identity, 0.0);
+  MatchedAdapterInput captured = MakeCertifiedInput(
+      path, owner, frame, 0.0, &first_identity);
   SetInputPositionAndLegacy(captured, path.current.p);
-  captured.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
+  captured.cloud_occupancy_snapshot = bounded_snapshot;
   EXPECT_FALSE(adapter.update(captured, output));
   const std::shared_ptr<const TubeBuildRequest> captured_request =
       std::atomic_load(&adapter.latest_build_request_);
@@ -8516,23 +8535,275 @@ TEST(PhaseOffsetMatchedAdapterTest,
   adapter.buildTubeEpoch(captured_request, built);
   ASSERT_TRUE(built.raw_candidate_diagnostics_generated);
   ASSERT_TRUE(built.cloud_snapshot_diagnostics_generated);
+  ASSERT_TRUE(built.candidate_profile);
+  ASSERT_TRUE(built.candidate_profile->forward_excluded_evidence.valid);
+  ASSERT_TRUE(built.candidate_profile->forward_excluded_evidence.witness_valid);
+  ASSERT_TRUE(built.candidate_profile->forward_excluded_evidence
+                  .map_observation_sequence_valid);
+  EXPECT_EQ(built.candidate_profile->forward_excluded_evidence
+                .map_observation_sequence,
+            captured_request->map_observation_sequence);
 
-  MatchedAdapterInput revised = MakeInput(path, &revised_identity, kDt);
+  MatchedAdapterInput revised = MakeCertifiedInput(
+      path, revised_owner, revised_frame, kDt, &revised_identity);
   SetInputPositionAndLegacy(revised, path.current.p);
-  revised.cloud_occupancy_snapshot = map.cloudOccupancySnapshot();
+  revised.cloud_occupancy_snapshot = bounded_snapshot;
   EXPECT_FALSE(adapter.update(revised, output));
   EXPECT_FALSE(adapter.requestSourceStillCurrent(*captured_request));
+  const std::shared_ptr<const TubeEpochSnapshot> candidate_before =
+      std::atomic_load(&adapter.latest_candidate_epoch_snapshot_);
+  const std::shared_ptr<const TubeEpochSnapshot> epoch_before =
+      std::atomic_load(&adapter.latest_epoch_snapshot_);
+  const std::shared_ptr<const ControlPublishSnapshot> control_before =
+      std::atomic_load(&adapter.latest_control_snapshot_);
+  const double retained_delta_before = adapter.runtime_->retainedDelta();
+  const phase_offset_core::PortCommand previous_final_port_before =
+      adapter.runtime_->previousFinalPort();
+  const bool pending_or_active_intent_before =
+      adapter.runtime_->hasPendingOrActiveOffsetIntent();
+  const bool executed_offset_authority_before =
+      adapter.runtime_->hasExecutedOffsetAuthority();
+  const bool recenter_requested_before = adapter.runtime_->recenterRequested();
+  const bool profile_started_before = adapter.runtime_->profile_started_;
+  const bool profile_completed_before = adapter.runtime_->profile_completed_;
+  const bool returning_to_center_before = adapter.runtime_->returning_to_center_;
+  const auto authority_before = adapter.execution_authority_.snapshot();
+  // Diagnostic finalization is forbidden from mutating any successor,
+  // handoff, or pending PositionCommand transaction state.  Capture the
+  // existing test-visible ownership/state before exercising each finalize
+  // path, then compare the same values after every path below.
+  const std::shared_ptr<const PathTubePair> pending_normal_source_before =
+      adapter.pending_normal_source_pair_;
+  const std::shared_ptr<const PathTubePair> authoritative_pair_before =
+      adapter.capturePathTubePair();
+  const std::shared_ptr<const PathTubePair> pending_recovery_source_before =
+      adapter.pending_recovery_source_pair_;
+  const std::shared_ptr<const PathTubePair> pending_recovery_execution_before =
+      adapter.pending_recovery_execution_pair_;
+  const std::shared_ptr<const PathTubePair> pending_recovery_target_before =
+      adapter.pending_recovery_target_pair_;
+  const auto pending_position_before =
+      adapter.capturePendingPositionCommand();
+  const auto pending_runtime_commit_before = adapter.pending_runtime_commit_;
+  const auto pending_authority_prepared_before =
+      adapter.pending_authority_prepared_;
+  const auto pending_recovery_step_before = adapter.pending_recovery_step_;
+  const auto pending_handoff_input_before = adapter.pending_handoff_input_;
+  const auto pending_handoff_decision_before = adapter.pending_handoff_decision_;
+  const bool pending_handoff_valid_before = adapter.pending_handoff_valid_;
+  const auto pending_handoff_state_before = adapter.handoff_state_machine_.state();
+  const std::uint64_t pending_handoff_sequence_before =
+      adapter.handoff_state_machine_.transitionSequence();
+  const double recovery_deadline_before = adapter.recovery_deadline_;
+  const std::uint64_t recovery_deadline_session_before =
+      adapter.recovery_deadline_session_;
+  const std::uint64_t recovery_deadline_target_revision_before =
+      adapter.recovery_deadline_target_revision_;
+  const std::uint64_t pending_authority_session_before =
+      adapter.pending_authority_session_;
+  const bool pending_authority_valid_before = adapter.pending_authority_valid_;
+  const bool pending_recovery_step_valid_before =
+      adapter.pending_recovery_step_valid_;
+  const auto expect_diagnostic_state_preserved = [&]() {
+    const PendingPositionCommandCapture pending_after =
+        adapter.capturePendingPositionCommand();
+    EXPECT_EQ(pending_after.pending, pending_position_before.pending);
+    EXPECT_EQ(pending_after.valid, pending_position_before.valid);
+    EXPECT_EQ(pending_after.identity, pending_position_before.identity);
+    EXPECT_EQ(pending_after.reference_query.get(),
+              pending_position_before.reference_query.get());
+
+    EXPECT_EQ(adapter.pending_normal_source_pair_.get(),
+              pending_normal_source_before.get());
+    EXPECT_EQ(adapter.capturePathTubePair().get(),
+              authoritative_pair_before.get());
+    EXPECT_EQ(adapter.pending_recovery_source_pair_.get(),
+              pending_recovery_source_before.get());
+    EXPECT_EQ(adapter.pending_recovery_execution_pair_.get(),
+              pending_recovery_execution_before.get());
+    EXPECT_EQ(adapter.pending_recovery_target_pair_.get(),
+              pending_recovery_target_before.get());
+
+    const auto& runtime_commit = adapter.pending_runtime_commit_;
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.expected_previous_final_port.u_w,
+                             &pending_runtime_commit_before
+                                  .expected_previous_final_port.u_w,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.expected_previous_final_port.u_delta,
+                             &pending_runtime_commit_before
+                                  .expected_previous_final_port.u_delta,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.expected_delta,
+                             &pending_runtime_commit_before.expected_delta,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.next_previous_final_port.u_w,
+                             &pending_runtime_commit_before
+                                  .next_previous_final_port.u_w,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.next_previous_final_port.u_delta,
+                             &pending_runtime_commit_before
+                                  .next_previous_final_port.u_delta,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.next_delta,
+                             &pending_runtime_commit_before.next_delta,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&runtime_commit.dt,
+                             &pending_runtime_commit_before.dt,
+                             sizeof(double)));
+    EXPECT_EQ(runtime_commit.selected,
+              pending_runtime_commit_before.selected);
+    EXPECT_EQ(runtime_commit.valid, pending_runtime_commit_before.valid);
+    EXPECT_EQ(runtime_commit.safety_priority,
+              pending_runtime_commit_before.safety_priority);
+    EXPECT_EQ(runtime_commit.should_start_profile,
+              pending_runtime_commit_before.should_start_profile);
+    EXPECT_EQ(runtime_commit.profile_active,
+              pending_runtime_commit_before.profile_active);
+    EXPECT_EQ(runtime_commit.complete_profile,
+              pending_runtime_commit_before.complete_profile);
+    EXPECT_EQ(runtime_commit.exact_terminal_predicate,
+              pending_runtime_commit_before.exact_terminal_predicate);
+
+    const auto& authority_prepared = adapter.pending_authority_prepared_;
+    EXPECT_EQ(authority_prepared.candidate.snapshotId(),
+              pending_authority_prepared_before.candidate.snapshotId());
+    EXPECT_EQ(authority_prepared.expected.snapshotId(),
+              pending_authority_prepared_before.expected.snapshotId());
+    EXPECT_EQ(authority_prepared.committed_snapshot.get(),
+              pending_authority_prepared_before.committed_snapshot.get());
+    EXPECT_EQ(authority_prepared.expected_snapshot_id,
+              pending_authority_prepared_before.expected_snapshot_id);
+    EXPECT_EQ(authority_prepared.status,
+              pending_authority_prepared_before.status);
+    EXPECT_EQ(authority_prepared.valid,
+              pending_authority_prepared_before.valid);
+    EXPECT_EQ(authority_prepared.side_effect_free,
+              pending_authority_prepared_before.side_effect_free);
+    EXPECT_EQ(authority_prepared.failure_reason,
+              pending_authority_prepared_before.failure_reason);
+
+    const auto& recovery_step = adapter.pending_recovery_step_;
+    EXPECT_EQ(recovery_step.recovery_session,
+              pending_recovery_step_before.recovery_session);
+    EXPECT_EQ(recovery_step.source_path_revision,
+              pending_recovery_step_before.source_path_revision);
+    EXPECT_EQ(recovery_step.target_path_revision,
+              pending_recovery_step_before.target_path_revision);
+    EXPECT_EQ(recovery_step.source_frame_revision,
+              pending_recovery_step_before.source_frame_revision);
+    EXPECT_EQ(recovery_step.target_frame_revision,
+              pending_recovery_step_before.target_frame_revision);
+    EXPECT_EQ(recovery_step.valid, pending_recovery_step_before.valid);
+    EXPECT_EQ(recovery_step.status, pending_recovery_step_before.status);
+    EXPECT_EQ(recovery_step.selected_u_owner,
+              pending_recovery_step_before.selected_u_owner);
+    EXPECT_EQ(0, std::memcmp(&recovery_step.selected_u.u_w,
+                             &pending_recovery_step_before.selected_u.u_w,
+                             sizeof(double)));
+    EXPECT_EQ(0, std::memcmp(&recovery_step.selected_u.u_delta,
+                             &pending_recovery_step_before.selected_u.u_delta,
+                             sizeof(double)));
+    EXPECT_DOUBLE_EQ(recovery_step.current_delta,
+                     pending_recovery_step_before.current_delta);
+    EXPECT_DOUBLE_EQ(recovery_step.next_delta,
+                     pending_recovery_step_before.next_delta);
+    EXPECT_EQ(recovery_step.committed_status.get(),
+              pending_recovery_step_before.committed_status.get());
+    EXPECT_EQ(adapter.pending_recovery_step_valid_,
+              pending_recovery_step_valid_before);
+    EXPECT_DOUBLE_EQ(adapter.recovery_deadline_, recovery_deadline_before);
+    EXPECT_EQ(adapter.recovery_deadline_session_,
+              recovery_deadline_session_before);
+    EXPECT_EQ(adapter.recovery_deadline_target_revision_,
+              recovery_deadline_target_revision_before);
+    EXPECT_EQ(adapter.pending_authority_session_,
+              pending_authority_session_before);
+    EXPECT_EQ(adapter.pending_authority_valid_, pending_authority_valid_before);
+
+    const auto& handoff_input = adapter.pending_handoff_input_;
+    EXPECT_EQ(handoff_input.state, pending_handoff_input_before.state);
+    EXPECT_EQ(handoff_input.owner_mode, pending_handoff_input_before.owner_mode);
+    EXPECT_DOUBLE_EQ(handoff_input.delta, pending_handoff_input_before.delta);
+    EXPECT_DOUBLE_EQ(handoff_input.target_delta,
+                     pending_handoff_input_before.target_delta);
+    EXPECT_DOUBLE_EQ(handoff_input.neutral_tolerance,
+                     pending_handoff_input_before.neutral_tolerance);
+    EXPECT_EQ(handoff_input.current_state_safe,
+              pending_handoff_input_before.current_state_safe);
+    EXPECT_EQ(handoff_input.planner_valid,
+              pending_handoff_input_before.planner_valid);
+    EXPECT_EQ(handoff_input.successor_available,
+              pending_handoff_input_before.successor_available);
+    EXPECT_EQ(handoff_input.successor_zero_only,
+              pending_handoff_input_before.successor_zero_only);
+    EXPECT_EQ(handoff_input.successor_contains_current_delta,
+              pending_handoff_input_before.successor_contains_current_delta);
+    EXPECT_EQ(handoff_input.successor_disconnected,
+              pending_handoff_input_before.successor_disconnected);
+    EXPECT_EQ(handoff_input.preview_feasible,
+              pending_handoff_input_before.preview_feasible);
+    EXPECT_EQ(handoff_input.preview_target_overlap,
+              pending_handoff_input_before.preview_target_overlap);
+    EXPECT_EQ(handoff_input.preview_denied,
+              pending_handoff_input_before.preview_denied);
+    EXPECT_EQ(handoff_input.stale, pending_handoff_input_before.stale);
+    EXPECT_EQ(handoff_input.recovery_progress_certified,
+              pending_handoff_input_before.recovery_progress_certified);
+    EXPECT_EQ(handoff_input.neutral_handoff_committed,
+              pending_handoff_input_before.neutral_handoff_committed);
+    EXPECT_EQ(handoff_input.event, pending_handoff_input_before.event);
+
+    const auto& handoff_decision = adapter.pending_handoff_decision_;
+    EXPECT_EQ(handoff_decision.previous_state,
+              pending_handoff_decision_before.previous_state);
+    EXPECT_EQ(handoff_decision.next_state,
+              pending_handoff_decision_before.next_state);
+    EXPECT_EQ(handoff_decision.event, pending_handoff_decision_before.event);
+    EXPECT_EQ(handoff_decision.retain_current_owner,
+              pending_handoff_decision_before.retain_current_owner);
+    EXPECT_EQ(handoff_decision.request_recovery,
+              pending_handoff_decision_before.request_recovery);
+    EXPECT_EQ(handoff_decision.request_recenter,
+              pending_handoff_decision_before.request_recenter);
+    EXPECT_EQ(handoff_decision.neutral_handoff_ready,
+              pending_handoff_decision_before.neutral_handoff_ready);
+    EXPECT_EQ(handoff_decision.planner_only_allowed,
+              pending_handoff_decision_before.planner_only_allowed);
+    EXPECT_EQ(handoff_decision.planner_veto,
+              pending_handoff_decision_before.planner_veto);
+    EXPECT_EQ(handoff_decision.transition_sequence,
+              pending_handoff_decision_before.transition_sequence);
+    EXPECT_EQ(handoff_decision.reason, pending_handoff_decision_before.reason);
+    EXPECT_EQ(adapter.pending_handoff_valid_, pending_handoff_valid_before);
+    EXPECT_EQ(adapter.handoff_state_machine_.state(),
+              pending_handoff_state_before);
+    EXPECT_EQ(adapter.handoff_state_machine_.transitionSequence(),
+              pending_handoff_sequence_before);
+  };
   EXPECT_FALSE(adapter.finalizeTubeEpoch(captured_request, built));
+  expect_diagnostic_state_preserved();
   EXPECT_EQ(log_capture.count(), 1U);
   const std::string log = log_capture.latest();
   EXPECT_NE(log.find("[PHASE_OFFSET][TUBE][FORWARD_EXCLUDED]"),
             std::string::npos);
+  EXPECT_NE(log.find("schema=2"), std::string::npos);
   EXPECT_NE(log.find("build_sequence=" + std::to_string(built.build_sequence)),
             std::string::npos);
   EXPECT_NE(log.find("task_generation=" +
       std::to_string(captured_request->task_generation)), std::string::npos);
   EXPECT_NE(log.find("authority_session=" +
       std::to_string(captured_request->authority_session)), std::string::npos);
+  EXPECT_NE(log.find("map_observation_sequence=" +
+      std::to_string(captured_request->map_observation_sequence)),
+            std::string::npos);
+  EXPECT_NE(log.find("snapshot_observation_sequence_valid=1"),
+            std::string::npos);
+  EXPECT_NE(log.find("snapshot_observation_sequence=" +
+      std::to_string(captured_request->map_observation_sequence)),
+            std::string::npos);
+  EXPECT_NE(log.find("snapshot_identity_match=1"), std::string::npos);
+  EXPECT_NE(log.find("observed_bounds_valid=1"), std::string::npos);
+  EXPECT_NE(log.find("domain_predicates_valid=1"), std::string::npos);
   EXPECT_EQ(adapter.timer_last_raw_diagnostic_build_sequence_,
             built.build_sequence);
   EXPECT_EQ(adapter.timer_last_cloud_diagnostic_build_sequence_,
@@ -8542,7 +8813,8 @@ TEST(PhaseOffsetMatchedAdapterTest,
 
   // The delivery decision is one-shot even when the same historical build is
   // inspected again; no path-stale Candidate/Runtime object is resurrected.
-  adapter.publishBuildDiagnostics(built);
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(captured_request, built));
+  expect_diagnostic_state_preserved();
   EXPECT_EQ(log_capture.count(), 1U);
   EXPECT_EQ(adapter.timer_last_raw_diagnostic_build_sequence_,
             built.build_sequence);
@@ -8550,6 +8822,70 @@ TEST(PhaseOffsetMatchedAdapterTest,
             built.build_sequence);
   EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
   EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+
+  EXPECT_EQ(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_).get(),
+            candidate_before.get());
+  EXPECT_EQ(std::atomic_load(&adapter.latest_epoch_snapshot_).get(),
+            epoch_before.get());
+  EXPECT_EQ(std::atomic_load(&adapter.latest_control_snapshot_).get(),
+            control_before.get());
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), retained_delta_before);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_w,
+                   previous_final_port_before.u_w);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_delta,
+                   previous_final_port_before.u_delta);
+  EXPECT_EQ(adapter.runtime_->hasPendingOrActiveOffsetIntent(),
+            pending_or_active_intent_before);
+  EXPECT_EQ(adapter.runtime_->hasExecutedOffsetAuthority(),
+            executed_offset_authority_before);
+  EXPECT_EQ(adapter.runtime_->recenterRequested(), recenter_requested_before);
+  EXPECT_EQ(adapter.runtime_->profile_started_, profile_started_before);
+  EXPECT_EQ(adapter.runtime_->profile_completed_, profile_completed_before);
+  EXPECT_EQ(adapter.runtime_->returning_to_center_, returning_to_center_before);
+  const auto authority_after = adapter.execution_authority_.snapshot();
+  EXPECT_EQ(authority_after.snapshotId(), authority_before.snapshotId());
+  EXPECT_EQ(authority_after.valid, authority_before.valid);
+  EXPECT_EQ(authority_after.sequence, authority_before.sequence);
+  EXPECT_EQ(authority_after.authority_session,
+            authority_before.authority_session);
+  EXPECT_EQ(authority_after.owner_mode, authority_before.owner_mode);
+  EXPECT_EQ(authority_after.selected_u_owner,
+            authority_before.selected_u_owner);
+  EXPECT_DOUBLE_EQ(authority_after.selected_u.u_w,
+                   authority_before.selected_u.u_w);
+  EXPECT_DOUBLE_EQ(authority_after.selected_u.u_delta,
+                   authority_before.selected_u.u_delta);
+
+  // A deterministic mismatch in one already-computed status identity operand
+  // suppresses observed-domain derivation while preserving the same stale
+  // publication safety boundary.
+  TubeEpochSnapshot mismatched = built;
+  mismatched.build_sequence = built.build_sequence + 1U;
+  ++mismatched.cloud_status.observation_sequence;
+  EXPECT_FALSE(adapter.finalizeTubeEpoch(captured_request, mismatched));
+  expect_diagnostic_state_preserved();
+  EXPECT_EQ(log_capture.count(), 2U);
+  const std::string mismatch_log = log_capture.latest();
+  EXPECT_NE(mismatch_log.find("schema=2"), std::string::npos);
+  EXPECT_NE(mismatch_log.find("snapshot_identity_match=0"),
+            std::string::npos);
+  EXPECT_NE(mismatch_log.find("domain_predicates_valid=0"),
+            std::string::npos);
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_candidate_epoch_snapshot_));
+  EXPECT_FALSE(std::atomic_load(&adapter.latest_epoch_snapshot_));
+  EXPECT_EQ(std::atomic_load(&adapter.latest_control_snapshot_).get(),
+            control_before.get());
+  EXPECT_DOUBLE_EQ(adapter.runtime_->retainedDelta(), retained_delta_before);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_w,
+                   previous_final_port_before.u_w);
+  EXPECT_DOUBLE_EQ(adapter.runtime_->previousFinalPort().u_delta,
+                   previous_final_port_before.u_delta);
+  const auto authority_after_mismatch = adapter.execution_authority_.snapshot();
+  EXPECT_EQ(authority_after_mismatch.snapshotId(), authority_before.snapshotId());
+  EXPECT_EQ(authority_after_mismatch.valid, authority_before.valid);
+  EXPECT_EQ(authority_after_mismatch.sequence, authority_before.sequence);
+  EXPECT_EQ(authority_after_mismatch.authority_session,
+            authority_before.authority_session);
 }
 
 TEST(PhaseOffsetMatchedAdapterTest,

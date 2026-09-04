@@ -149,6 +149,12 @@ struct CellEvaluation {
   bool cell_certificate_revision_match = false;
   double proof_residual = 0.0;
   bool geometry_valid = false;
+  // Exact operands copied from the successful EvaluateSurfacePoint call.
+  // They are transport-only diagnostic facts and never feed validation.
+  bool witness_valid = false;
+  double center_w = 0.0;
+  double center_v = 0.0;
+  Eigen::Vector3d witness = Eigen::Vector3d::Zero();
 };
 
 struct ValidationContext {
@@ -432,6 +438,12 @@ void RecordCellEvidence(ValidationContext& context, const SurfaceCell& cell,
       evaluation.breakdown.support_alignment_bound;
   evidence.numerical_epsilon = evaluation.breakdown.numerical_epsilon;
   evidence.proof_residual = evaluation.proof_residual;
+  evidence.witness_valid = evaluation.witness_valid;
+  evidence.center_w = evaluation.center_w;
+  evidence.center_v = evaluation.center_v;
+  evidence.witness_x = evaluation.witness.x();
+  evidence.witness_y = evaluation.witness.y();
+  evidence.witness_z = evaluation.witness.z();
   evidence.complete_filtered_pwl_contains_zero =
       evaluation.outcome == TubeSurfaceOutcome::SAFE &&
       CellContainsZero(*context.profile, cell);
@@ -494,6 +506,14 @@ CellEvaluation EvaluateCell(ValidationContext& context,
     evaluation.reason = TubeSurfaceInconclusiveReason::INVALID_INPUT;
     return evaluation;
   }
+  // Copy the exact centre parameters and witness returned by the existing
+  // geometry invocation before the clearance callback below.  Do not
+  // reconstruct these values from the path owner or profile later.
+  evaluation.center_w = center_w;
+  evaluation.center_v = center_v;
+  evaluation.witness = evaluation.center.point;
+  evaluation.witness_valid = IsFinite(center_w) && IsFinite(center_v) &&
+      IsFinite(evaluation.witness);
   evaluation.geometry_valid = MatchingCellCertificate(
       context, cell, evaluation.breakdown);
   evaluation.cell_certificate_attempted =
@@ -1025,6 +1045,20 @@ void CopyForwardExcludedEvidence(
   evidence.numerical_epsilon = selected->numerical_epsilon;
   evidence.allowable_cover = selected->allowable_cover;
   evidence.proof_residual = selected->proof_residual;
+  evidence.witness_valid = selected->witness_valid &&
+      IsFinite(selected->center_w) && IsFinite(selected->center_v) &&
+      IsFinite(selected->witness_x) && IsFinite(selected->witness_y) &&
+      IsFinite(selected->witness_z);
+  evidence.center_w = evidence.witness_valid ? selected->center_w : 0.0;
+  evidence.center_v = evidence.witness_valid ? selected->center_v : 0.0;
+  evidence.witness_x = evidence.witness_valid ? selected->witness_x : 0.0;
+  evidence.witness_y = evidence.witness_valid ? selected->witness_y : 0.0;
+  evidence.witness_z = evidence.witness_valid ? selected->witness_z : 0.0;
+  evidence.map_observation_sequence_valid =
+      profile.snapshot_provenance_is_immutable &&
+      profile.snapshot_sequence != 0U;
+  evidence.map_observation_sequence = evidence.map_observation_sequence_valid
+      ? profile.snapshot_sequence : 0U;
   result.forward_excluded_evidence = evidence;
   profile.forward_excluded_evidence = evidence;
 }

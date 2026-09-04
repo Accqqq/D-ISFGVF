@@ -1,7 +1,11 @@
 #include "bspline_race/integration/phase_offset_tube_epoch_diagnostics.h"
 
+#include <Eigen/Core>
+
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace FLAG_Race {
@@ -208,7 +212,7 @@ std::string formatTubeSurfaceForwardExcludedLog(
   std::ostringstream stream;
   stream << std::setprecision(17) << std::defaultfloat;
   stream << "[PHASE_OFFSET][TUBE][FORWARD_EXCLUDED]";
-  stream << " schema=1";
+  stream << " schema=2";
   stream << " valid=" << bool_value(valid);
   stream << " build_sequence=" << input.build_sequence;
   stream << " candidate_sequence=" << input.candidate_sequence;
@@ -287,6 +291,238 @@ std::string formatTubeSurfaceForwardExcludedLog(
       ? finite_or_zero(evidence->allowable_cover) : 0.0);
   stream << " proof_residual=" << (geometric_valid
       ? finite_or_zero(evidence->proof_residual) : 0.0);
+
+  // Schema-2 observed-domain operands are diagnostic-only.  The witness is
+  // copied from the exact validator EvaluateSurfacePoint invocation, while
+  // the snapshot is a synchronous non-owning view of the request's immutable
+  // cloud snapshot.  No map/query helper is called here.
+  const bool exact_witness_valid = valid && evidence->witness_valid &&
+      std::isfinite(evidence->center_w) && std::isfinite(evidence->center_v) &&
+      std::isfinite(evidence->witness_x) &&
+      std::isfinite(evidence->witness_y) &&
+      std::isfinite(evidence->witness_z);
+  stream << " witness_valid=" << bool_value(exact_witness_valid);
+  stream << " center_w=" << (exact_witness_valid
+      ? finite_or_zero(evidence->center_w) : 0.0);
+  stream << " center_v=" << (exact_witness_valid
+      ? finite_or_zero(evidence->center_v) : 0.0);
+  stream << " witness_x=" << (exact_witness_valid
+      ? finite_or_zero(evidence->witness_x) : 0.0);
+  stream << " witness_y=" << (exact_witness_valid
+      ? finite_or_zero(evidence->witness_y) : 0.0);
+  stream << " witness_z=" << (exact_witness_valid
+      ? finite_or_zero(evidence->witness_z) : 0.0);
+
+  const bool snapshot_available = input.cloud_status.snapshot_available;
+  const bool snapshot_valid = input.cloud_status.snapshot_valid;
+  const bool snapshot_usable = input.cloud_status.usable;
+  const bool request_sequence_valid = input.map_observation_sequence != 0U;
+  const bool snapshot_sequence_present = input.snapshot != nullptr &&
+      input.snapshot->observation_sequence != 0U;
+  const bool status_sequence_valid =
+      input.cloud_status.observation_sequence != 0U;
+  const bool sidecar_sequence_valid = valid &&
+      evidence->map_observation_sequence_valid &&
+      evidence->map_observation_sequence != 0U;
+  const bool snapshot_observation_sequence_valid = sidecar_sequence_valid &&
+      request_sequence_valid && snapshot_sequence_present &&
+      status_sequence_valid;
+  const bool snapshot_identity_match = snapshot_observation_sequence_valid &&
+      evidence->map_observation_sequence == input.map_observation_sequence &&
+      input.snapshot->observation_sequence == input.map_observation_sequence &&
+      input.cloud_status.observation_sequence == input.map_observation_sequence;
+  stream << " snapshot_available=" << bool_value(snapshot_available);
+  stream << " snapshot_valid=" << bool_value(snapshot_valid);
+  stream << " snapshot_usable=" << bool_value(snapshot_usable);
+  stream << " snapshot_observation_sequence_valid=" <<
+      bool_value(snapshot_observation_sequence_valid);
+  stream << " snapshot_observation_sequence=" <<
+      (snapshot_observation_sequence_valid
+          ? input.snapshot->observation_sequence : 0U);
+  stream << " snapshot_identity_match=" <<
+      bool_value(snapshot_identity_match);
+
+  const bool snapshot_domain_valid = snapshot_available && snapshot_valid &&
+      snapshot_usable && snapshot_identity_match && input.snapshot != nullptr &&
+      input.snapshot->valid;
+  const bool finite_ordered_bounds = input.snapshot != nullptr &&
+      std::isfinite(input.snapshot->observed_min.x()) &&
+      std::isfinite(input.snapshot->observed_min.y()) &&
+      std::isfinite(input.snapshot->observed_min.z()) &&
+      std::isfinite(input.snapshot->observed_max.x()) &&
+      std::isfinite(input.snapshot->observed_max.y()) &&
+      std::isfinite(input.snapshot->observed_max.z()) &&
+      input.snapshot->observed_min.x() <= input.snapshot->observed_max.x() &&
+      input.snapshot->observed_min.y() <= input.snapshot->observed_max.y() &&
+      input.snapshot->observed_min.z() <= input.snapshot->observed_max.z();
+  const bool observed_bounds_valid = snapshot_domain_valid &&
+      finite_ordered_bounds;
+  stream << " observed_bounds_valid=" << bool_value(observed_bounds_valid);
+  stream << " observed_min_x=" << (observed_bounds_valid
+      ? finite_or_zero(input.snapshot->observed_min.x()) : 0.0);
+  stream << " observed_min_y=" << (observed_bounds_valid
+      ? finite_or_zero(input.snapshot->observed_min.y()) : 0.0);
+  stream << " observed_min_z=" << (observed_bounds_valid
+      ? finite_or_zero(input.snapshot->observed_min.z()) : 0.0);
+  stream << " observed_max_x=" << (observed_bounds_valid
+      ? finite_or_zero(input.snapshot->observed_max.x()) : 0.0);
+  stream << " observed_max_y=" << (observed_bounds_valid
+      ? finite_or_zero(input.snapshot->observed_max.y()) : 0.0);
+  stream << " observed_max_z=" << (observed_bounds_valid
+      ? finite_or_zero(input.snapshot->observed_max.z()) : 0.0);
+
+  const bool requested_radius_valid = valid &&
+      evidence->requested_clearance_valid &&
+      std::isfinite(evidence->requested_clearance) &&
+      evidence->requested_clearance >= 0.0;
+  const double requested_radius = requested_radius_valid
+      ? evidence->requested_clearance : 0.0;
+  const bool base_radius_valid = exact_witness_valid &&
+      snapshot_domain_valid && observed_bounds_valid &&
+      requested_radius_valid;
+  stream << " requested_radius_valid=" << bool_value(requested_radius_valid);
+  stream << " requested_radius=" << finite_or_zero(requested_radius);
+  stream << " base_radius_valid=" << bool_value(base_radius_valid);
+  stream << " base_radius=" << (base_radius_valid ? 0.4 : 0.0);
+
+  const bool domain_predicates_valid = exact_witness_valid &&
+      snapshot_domain_valid && observed_bounds_valid &&
+      requested_radius_valid;
+  bool point_in_observed_box = false;
+  bool requested_ball_in_observed_box = false;
+  bool base_ball_in_observed_box = false;
+  if (domain_predicates_valid) {
+    const Eigen::Vector3d witness(evidence->witness_x, evidence->witness_y,
+                                  evidence->witness_z);
+    const Eigen::Vector3d& observed_min = input.snapshot->observed_min;
+    const Eigen::Vector3d& observed_max = input.snapshot->observed_max;
+    point_in_observed_box = witness.x() >= observed_min.x() &&
+        witness.x() <= observed_max.x() &&
+        witness.y() >= observed_min.y() &&
+        witness.y() <= observed_max.y() &&
+        witness.z() >= observed_min.z() &&
+        witness.z() <= observed_max.z();
+    requested_ball_in_observed_box =
+        witness.x() - requested_radius >= observed_min.x() &&
+        witness.x() + requested_radius <= observed_max.x() &&
+        witness.y() - requested_radius >= observed_min.y() &&
+        witness.y() + requested_radius <= observed_max.y() &&
+        witness.z() - requested_radius >= observed_min.z() &&
+        witness.z() + requested_radius <= observed_max.z();
+    constexpr double kBaseRadius = 0.4;
+    base_ball_in_observed_box = witness.x() - kBaseRadius >= observed_min.x() &&
+        witness.x() + kBaseRadius <= observed_max.x() &&
+        witness.y() - kBaseRadius >= observed_min.y() &&
+        witness.y() + kBaseRadius <= observed_max.y() &&
+        witness.z() - kBaseRadius >= observed_min.z() &&
+        witness.z() + kBaseRadius <= observed_max.z();
+  }
+  stream << " domain_predicates_valid=" << bool_value(domain_predicates_valid);
+  stream << " point_in_observed_box=" << bool_value(point_in_observed_box);
+  stream << " requested_ball_in_observed_box=" <<
+      bool_value(requested_ball_in_observed_box);
+  stream << " base_0p4_ball_in_observed_box=" <<
+      bool_value(base_ball_in_observed_box);
+
+  // Compute each raw signed difference before accepting the margin group.  A
+  // finite-input subtraction may still overflow (for example, DBL_MAX -
+  // (-DBL_MAX)); one nonfinite result invalidates the whole group so a
+  // partially useful set of faces is never serialized as a certificate.
+  const bool margin_operands_valid = exact_witness_valid &&
+      snapshot_domain_valid && observed_bounds_valid;
+  const double unavailable_margin =
+      std::numeric_limits<double>::quiet_NaN();
+  double raw_x_minus_margin = unavailable_margin;
+  double raw_x_plus_margin = unavailable_margin;
+  double raw_y_minus_margin = unavailable_margin;
+  double raw_y_plus_margin = unavailable_margin;
+  double raw_z_minus_margin = unavailable_margin;
+  double raw_z_plus_margin = unavailable_margin;
+  if (margin_operands_valid) {
+    const Eigen::Vector3d& observed_min = input.snapshot->observed_min;
+    const Eigen::Vector3d& observed_max = input.snapshot->observed_max;
+    raw_x_minus_margin = evidence->witness_x - observed_min.x();
+    raw_x_plus_margin = observed_max.x() - evidence->witness_x;
+    raw_y_minus_margin = evidence->witness_y - observed_min.y();
+    raw_y_plus_margin = observed_max.y() - evidence->witness_y;
+    raw_z_minus_margin = evidence->witness_z - observed_min.z();
+    raw_z_plus_margin = observed_max.z() - evidence->witness_z;
+  }
+  const bool raw_margins_finite =
+      std::isfinite(raw_x_minus_margin) && std::isfinite(raw_x_plus_margin) &&
+      std::isfinite(raw_y_minus_margin) && std::isfinite(raw_y_plus_margin) &&
+      std::isfinite(raw_z_minus_margin) && std::isfinite(raw_z_plus_margin);
+  const bool margins_valid = raw_margins_finite;
+  double x_minus_margin = 0.0;
+  double x_plus_margin = 0.0;
+  double y_minus_margin = 0.0;
+  double y_plus_margin = 0.0;
+  double z_minus_margin = 0.0;
+  double z_plus_margin = 0.0;
+  double min_observed_margin = 0.0;
+  if (margins_valid) {
+    x_minus_margin = raw_x_minus_margin;
+    x_plus_margin = raw_x_plus_margin;
+    y_minus_margin = raw_y_minus_margin;
+    y_plus_margin = raw_y_plus_margin;
+    z_minus_margin = raw_z_minus_margin;
+    z_plus_margin = raw_z_plus_margin;
+    min_observed_margin = std::min({x_minus_margin, x_plus_margin,
+                                    y_minus_margin, y_plus_margin,
+                                    z_minus_margin, z_plus_margin});
+  }
+  stream << " margins_valid=" << bool_value(margins_valid);
+  stream << " x_minus_margin=" << (margins_valid ? x_minus_margin : 0.0);
+  stream << " x_plus_margin=" << (margins_valid ? x_plus_margin : 0.0);
+  stream << " y_minus_margin=" << (margins_valid ? y_minus_margin : 0.0);
+  stream << " y_plus_margin=" << (margins_valid ? y_plus_margin : 0.0);
+  stream << " z_minus_margin=" << (margins_valid ? z_minus_margin : 0.0);
+  stream << " z_plus_margin=" << (margins_valid ? z_plus_margin : 0.0);
+  stream << " min_observed_margin=" <<
+      (margins_valid ? min_observed_margin : 0.0);
+
+  int limiting_axis = -1;
+  int limiting_side = -1;
+  if (margins_valid) {
+    double limiting_margin = x_minus_margin;
+    limiting_axis = 0;
+    limiting_side = 0;
+    const auto consider_face = [&](const double margin, const int axis,
+                                   const int side) {
+      if (margin < limiting_margin) {
+        limiting_margin = margin;
+        limiting_axis = axis;
+        limiting_side = side;
+      }
+    };
+    // Stable order is X_MINUS, X_PLUS, Y_MINUS, Y_PLUS, Z_MINUS, Z_PLUS;
+    // strict replacement preserves the first face on exact ties.
+    consider_face(x_plus_margin, 0, 1);
+    consider_face(y_minus_margin, 1, 0);
+    consider_face(y_plus_margin, 1, 1);
+    consider_face(z_minus_margin, 2, 0);
+    consider_face(z_plus_margin, 2, 1);
+  }
+  const bool limiting_face_valid = margins_valid && limiting_axis >= 0 &&
+      limiting_side >= 0;
+  stream << " limiting_face_valid=" << bool_value(limiting_face_valid);
+  stream << " limiting_axis=" << limiting_axis;
+  stream << " limiting_side=" << limiting_side;
+  const bool deficit_operands_valid = requested_radius_valid && margins_valid &&
+      std::isfinite(requested_radius) && std::isfinite(min_observed_margin);
+  double raw_requested_ball_deficit =
+      std::numeric_limits<double>::quiet_NaN();
+  if (deficit_operands_valid) {
+    raw_requested_ball_deficit = requested_radius - min_observed_margin;
+  }
+  const bool requested_ball_deficit_valid =
+      std::isfinite(raw_requested_ball_deficit);
+  const double requested_ball_deficit = requested_ball_deficit_valid
+      ? std::max(0.0, raw_requested_ball_deficit) : 0.0;
+  stream << " requested_ball_deficit_valid=" <<
+      bool_value(requested_ball_deficit_valid);
+  stream << " requested_ball_deficit=" <<
+      finite_or_zero(requested_ball_deficit);
   return stream.str();
 }
 

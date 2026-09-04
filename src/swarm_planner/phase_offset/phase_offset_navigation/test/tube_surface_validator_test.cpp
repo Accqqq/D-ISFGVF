@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -659,9 +660,14 @@ TEST(TubeSurfaceValidatorTest, StaleContinuousProofIsClearedOnFailure) {
 TEST(TubeSurfaceValidatorTest,
      ForwardExcludedSidecarDoesNotOverwriteBackwardCanonicalFailure) {
   TubeProfile profile = MakeProfile({0.0, 0.10, 0.20, 0.30}, 0.0, 0.0);
+  profile.snapshot_sequence = 777U;
+  profile.snapshot_provenance_is_immutable = true;
   std::size_t calls = 0U;
-  const ClearanceQuery query = [&calls](const Eigen::Vector3d& point,
-                                        const double) {
+  std::size_t path_state_calls = 0U;
+  std::size_t path_cell_bound_calls = 0U;
+  Eigen::Vector3d forward_query_point = Eigen::Vector3d::Zero();
+  const ClearanceQuery query = [&calls, &forward_query_point](
+      const Eigen::Vector3d& point, const double) {
     ++calls;
     ClearanceQueryResult result;
     if (point.x() < 0.075) {
@@ -669,6 +675,7 @@ TEST(TubeSurfaceValidatorTest,
       return result;
     }
     if (point.x() >= 0.20) {
+      forward_query_point = point;
       result.status = DistanceStatus::OCCUPIED;
       return result;
     }
@@ -678,10 +685,22 @@ TEST(TubeSurfaceValidatorTest,
     result.clearance_is_exact = true;
     return result;
   };
+  const PathStateQuery path_state = [base = LinePath(), &path_state_calls](
+      const double w, phase_offset_core::PathDifferentialState& state) {
+    ++path_state_calls;
+    return base(w, state);
+  };
+  const PathCellBoundQuery path_cells = [base = CertifiedLineCells(),
+                                         &path_cell_bound_calls](
+      const double w0, const double w1,
+      phase_offset_core::PathCellGeometryCertificate& certificate) {
+    ++path_cell_bound_calls;
+    return base(w0, w1, certificate);
+  };
   TubeSurfaceValidationResult result;
   ASSERT_TRUE(TubeSurfaceValidator().validate(
-      profile, 0.10, LinePath(), CertifiedLineCells(), query, 0.05, 0.40,
-      0.10, result));
+      profile, 0.10, path_state, path_cells, query, 0.05, 0.40, 0.10,
+      result));
 
   // Existing canonical evidence remains the closer backward UNKNOWN cell.
   EXPECT_EQ(result.first_failure_reason, TubeStopReason::UNKNOWN);
@@ -714,11 +733,91 @@ TEST(TubeSurfaceValidatorTest,
   EXPECT_FALSE(forward.witness_clearance_exact);
   EXPECT_FALSE(forward.exact_d_c_valid);
   EXPECT_TRUE(forward.geometric_evidence_valid);
+  EXPECT_TRUE(forward.witness_valid);
+  EXPECT_TRUE(forward.map_observation_sequence_valid);
+  EXPECT_EQ(forward.map_observation_sequence, 777U);
   EXPECT_EQ(calls, result.query_sample_count);
   EXPECT_EQ(calls, 4U);
+  EXPECT_EQ(path_state_calls, 4U);
+  EXPECT_EQ(path_cell_bound_calls, 3U);
+  EXPECT_EQ(result.split_w_count, 0U);
+  EXPECT_EQ(result.split_v_count, 0U);
+  EXPECT_EQ(result.split_both_count, 0U);
   EXPECT_EQ(profile.surface_cell_evidence.size(), result.cell_evidence.size());
   EXPECT_EQ(profile.forward_excluded_evidence.w0, forward.w0);
   EXPECT_EQ(profile.forward_excluded_evidence.w1, forward.w1);
+  const TubeSurfaceCellEvidence* selected_cell = nullptr;
+  for (const TubeSurfaceCellEvidence& cell : result.cell_evidence) {
+    if (cell.w0 == forward.w0 && cell.w1 == forward.w1 &&
+        cell.v0 == forward.v0 && cell.v1 == forward.v1 &&
+        cell.outcome == forward.outcome) {
+      selected_cell = &cell;
+      break;
+    }
+  }
+  ASSERT_NE(selected_cell, nullptr);
+  EXPECT_TRUE(selected_cell->witness_valid);
+  EXPECT_DOUBLE_EQ(forward.witness_x, forward_query_point.x());
+  EXPECT_DOUBLE_EQ(forward.witness_y, forward_query_point.y());
+  EXPECT_DOUBLE_EQ(forward.witness_z, forward_query_point.z());
+  EXPECT_DOUBLE_EQ(forward.center_w, selected_cell->center_w);
+  EXPECT_DOUBLE_EQ(forward.center_v, selected_cell->center_v);
+  EXPECT_DOUBLE_EQ(forward.witness_x, selected_cell->witness_x);
+  EXPECT_DOUBLE_EQ(forward.witness_y, selected_cell->witness_y);
+  EXPECT_DOUBLE_EQ(forward.witness_z, selected_cell->witness_z);
+
+  // The sidecar carries the exact centre/witness produced by the selected
+  // EvaluateCell invocation and the exact point received by the existing
+  // clearance callback; no reconstruction from profile samples is allowed.
+  EXPECT_DOUBLE_EQ(forward.center_w, 0.25);
+  EXPECT_DOUBLE_EQ(forward.center_v, 0.50);
+  EXPECT_DOUBLE_EQ(forward.witness_x, 0.25);
+  EXPECT_DOUBLE_EQ(forward.witness_y, 0.0);
+  EXPECT_DOUBLE_EQ(forward.witness_z, 0.0);
+  const double callback_x = forward_query_point.x();
+  const double callback_y = forward_query_point.y();
+  const double callback_z = forward_query_point.z();
+  EXPECT_EQ(0, std::memcmp(&forward.witness_x, &callback_x,
+                           sizeof(forward.witness_x)));
+  EXPECT_EQ(0, std::memcmp(&forward.witness_y, &callback_y,
+                           sizeof(forward.witness_y)));
+  EXPECT_EQ(0, std::memcmp(&forward.witness_z, &callback_z,
+                           sizeof(forward.witness_z)));
+
+  const auto expect_bitwise_equal = [](const double first,
+                                       const double second) {
+    EXPECT_EQ(0, std::memcmp(&first, &second, sizeof(double)));
+  };
+  expect_bitwise_equal(forward.w0, selected_cell->w0);
+  expect_bitwise_equal(forward.w1, selected_cell->w1);
+  expect_bitwise_equal(forward.v0, selected_cell->v0);
+  expect_bitwise_equal(forward.v1, selected_cell->v1);
+  expect_bitwise_equal(forward.witness_clearance,
+                       selected_cell->witness_clearance);
+  expect_bitwise_equal(forward.exact_d_c, selected_cell->witness_clearance);
+  expect_bitwise_equal(forward.requested_clearance,
+                       selected_cell->requested_clearance);
+  expect_bitwise_equal(forward.midpoint_position_cover,
+                       selected_cell->midpoint_position_cover);
+  expect_bitwise_equal(forward.normal_variation_cover,
+                       selected_cell->normal_variation_cover);
+  expect_bitwise_equal(forward.delta_slope_cover,
+                       selected_cell->delta_slope_cover);
+  expect_bitwise_equal(forward.v_span_cover, selected_cell->v_span_cover);
+  expect_bitwise_equal(forward.geometric_cover,
+                       selected_cell->geometric_cover);
+  expect_bitwise_equal(forward.support_alignment_bound,
+                       selected_cell->support_alignment_bound);
+  expect_bitwise_equal(forward.numerical_epsilon,
+                       selected_cell->numerical_epsilon);
+  expect_bitwise_equal(forward.allowable_cover,
+                       selected_cell->allowable_cover);
+  expect_bitwise_equal(forward.proof_residual, selected_cell->proof_residual);
+  expect_bitwise_equal(forward.center_w, selected_cell->center_w);
+  expect_bitwise_equal(forward.center_v, selected_cell->center_v);
+  expect_bitwise_equal(forward.witness_x, selected_cell->witness_x);
+  expect_bitwise_equal(forward.witness_y, selected_cell->witness_y);
+  expect_bitwise_equal(forward.witness_z, selected_cell->witness_z);
 }
 
 TEST(TubeSurfaceValidatorTest,
@@ -779,6 +878,53 @@ TEST(TubeSurfaceValidatorTest,
   EXPECT_EQ(first_result.query_sample_count, second_result.query_sample_count);
 }
 
+TEST(TubeSurfaceValidatorTest,
+     ForwardExcludedSidecarSequenceRequiresImmutableSnapshotProvenance) {
+  const ClearanceQuery query = [](const Eigen::Vector3d& point,
+                                  const double) {
+    ClearanceQueryResult result;
+    if (point.x() < 0.20) {
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = 5.0;
+      result.clearance_certified = true;
+      result.clearance_is_exact = true;
+      return result;
+    }
+    result.status = DistanceStatus::OCCUPIED;
+    return result;
+  };
+
+  TubeProfile non_immutable = MakeProfile({0.0, 0.10, 0.20, 0.30}, 0.0, 0.0);
+  non_immutable.snapshot_sequence = 777U;
+  non_immutable.snapshot_provenance_is_immutable = false;
+  TubeSurfaceValidationResult non_immutable_result;
+  ASSERT_TRUE(TubeSurfaceValidator().validate(
+      non_immutable, 0.10, LinePath(), CertifiedLineCells(), query, 0.05,
+      0.40, 0.10, non_immutable_result));
+  ASSERT_TRUE(non_immutable_result.forward_excluded_evidence.valid);
+  EXPECT_TRUE(non_immutable_result.forward_excluded_evidence.witness_valid);
+  EXPECT_FALSE(non_immutable_result.forward_excluded_evidence
+                   .map_observation_sequence_valid);
+  EXPECT_EQ(non_immutable_result.forward_excluded_evidence
+                .map_observation_sequence,
+            0U);
+
+  TubeProfile zero_sequence = MakeProfile({0.0, 0.10, 0.20, 0.30}, 0.0, 0.0);
+  zero_sequence.snapshot_sequence = 0U;
+  zero_sequence.snapshot_provenance_is_immutable = true;
+  TubeSurfaceValidationResult zero_sequence_result;
+  ASSERT_TRUE(TubeSurfaceValidator().validate(
+      zero_sequence, 0.10, LinePath(), CertifiedLineCells(), query, 0.05,
+      0.40, 0.10, zero_sequence_result));
+  ASSERT_TRUE(zero_sequence_result.forward_excluded_evidence.valid);
+  EXPECT_TRUE(zero_sequence_result.forward_excluded_evidence.witness_valid);
+  EXPECT_FALSE(zero_sequence_result.forward_excluded_evidence
+                   .map_observation_sequence_valid);
+  EXPECT_EQ(zero_sequence_result.forward_excluded_evidence
+                .map_observation_sequence,
+            0U);
+}
+
 TEST(TubeSurfaceValidatorTest, InvalidForwardExcludedSidecarUsesSentinels) {
   TubeProfile profile = MakeProfile({0.0, 0.20});
   TubeSurfaceValidationResult result;
@@ -788,6 +934,9 @@ TEST(TubeSurfaceValidatorTest, InvalidForwardExcludedSidecarUsesSentinels) {
   const TubeSurfaceForwardExcludedEvidence& forward =
       result.forward_excluded_evidence;
   EXPECT_FALSE(forward.valid);
+  EXPECT_FALSE(forward.witness_valid);
+  EXPECT_FALSE(forward.map_observation_sequence_valid);
+  EXPECT_EQ(forward.map_observation_sequence, 0U);
   EXPECT_EQ(forward.depth, -1);
   EXPECT_EQ(forward.clearance_status, DistanceStatus::UNAVAILABLE);
   EXPECT_FALSE(forward.clearance_query_attempted);

@@ -268,6 +268,19 @@ struct TubeSurfaceForwardExcludedEvidence {
   double numerical_epsilon = 0.0;
   double allowable_cover = 0.0;
   double proof_residual = 0.0;
+  // Exact centre/witness operands copied from the existing EvaluateCell
+  // invocation.  These fields are diagnostic-only and never participate in
+  // validation or profile acceptance.
+  bool witness_valid = false;
+  double center_w = 0.0;
+  double center_v = 0.0;
+  double witness_x = 0.0;
+  double witness_y = 0.0;
+  double witness_z = 0.0;
+  // Independent immutable-snapshot provenance copied only from the profile's
+  // retained snapshot identity; never inferred from a later log request.
+  bool map_observation_sequence_valid = false;
+  std::uint64_t map_observation_sequence = 0U;
 };
 
 // Evidence for one final certified/refinement leaf.  The fields are
@@ -316,6 +329,15 @@ struct TubeSurfaceCellEvidence {
   bool cell_certificate_attempted = false;
   bool cell_certificate_complete = false;
   bool cell_certificate_revision_match = false;
+  // Exact centre/witness operands copied from EvaluateCell before its
+  // existing clearance callback.  They are not reconstructed from profile or
+  // owner state and are never consumed by validation semantics.
+  bool witness_valid = false;
+  double center_w = 0.0;
+  double center_v = 0.0;
+  double witness_x = 0.0;
+  double witness_y = 0.0;
+  double witness_z = 0.0;
 };
 
 struct TubeBuildDiagnostics {
