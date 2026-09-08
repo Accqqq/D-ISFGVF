@@ -25,6 +25,11 @@
 
 #include "plan_env/sdf_map.h"
 
+#include <climits>
+#include <chrono>
+#include <cmath>
+#include <limits>
+
 // #define current_img_ md_.depth_image_[image_cnt_ & 1]
 // #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
 
@@ -57,11 +62,254 @@ bool isInBaseMapBounds(const MappingParameters& mp, const Eigen::Vector3d& pos) 
          pos(2) <= mp.map_max_boundary_(2) - 1e-4;
 }
 
+bool finiteVector(const Eigen::Vector3d& value) { return value.allFinite(); }
+
+bool validCaptureMapGeometry(const MappingParameters& mp) {
+  return finiteVector(mp.map_origin_) && finiteVector(mp.map_size_) &&
+      finiteVector(mp.map_min_boundary_) && finiteVector(mp.map_max_boundary_) &&
+      !mp.frame_id_.empty() && finiteVector(mp.local_update_range_) &&
+      (mp.local_update_range_.array() > 0.0).all() &&
+      std::isfinite(mp.resolution_) && mp.resolution_ > 0.0 &&
+      std::isfinite(mp.obstacles_inflation_) &&
+      mp.obstacles_inflation_ >= 0.0 &&
+      mp.map_voxel_num_.x() > 0 && mp.map_voxel_num_.y() > 0 &&
+      mp.map_voxel_num_.z() > 0 &&
+      (mp.map_max_boundary_.array() > mp.map_min_boundary_.array()).all();
+}
+
+bool effectiveCaptureDomainV2(const MappingParameters& mp,
+                             const MappingData& md,
+                             Eigen::Vector3d& lower,
+                             Eigen::Vector3d& upper) {
+  lower = mp.map_min_boundary_;
+  upper = mp.map_max_boundary_;
+  if (!md.manual_boundary_enabled_) {
+    return finiteVector(lower) && finiteVector(upper) &&
+        (upper.array() > lower.array()).all();
+  }
+  // SDFMap::isInMap() treats this mutable manual box as an additional
+  // admissible domain.  Use the unexpanded box here so the immutable capture
+  // is a conservative subset of that planner domain; never widen it by the
+  // legacy 1e-4 point threshold.
+  if (!finiteVector(md.manual_boundary_min_) ||
+      !finiteVector(md.manual_boundary_max_) ||
+      (md.manual_boundary_max_.array() <
+       md.manual_boundary_min_.array()).any()) {
+    return false;
+  }
+  lower = lower.cwiseMax(md.manual_boundary_min_);
+  upper = upper.cwiseMin(md.manual_boundary_max_);
+  return finiteVector(lower) && finiteVector(upper) &&
+      (upper.array() > lower.array()).all();
+}
+
+struct DirectedBoundsV2 {
+  double lower = 0.0;
+  double upper = 0.0;
+};
+
+bool finiteBoundsV2(const DirectedBoundsV2& bounds) {
+  return std::isfinite(bounds.lower) && std::isfinite(bounds.upper) &&
+      bounds.lower <= bounds.upper;
+}
+
+bool directedAddV2(const DirectedBoundsV2& left,
+                   const DirectedBoundsV2& right,
+                   DirectedBoundsV2& result) {
+  const double lower = left.lower + right.lower;
+  const double upper = left.upper + right.upper;
+  if (!std::isfinite(lower) || !std::isfinite(upper)) return false;
+  result.lower = std::nextafter(lower, -std::numeric_limits<double>::infinity());
+  result.upper = std::nextafter(upper, std::numeric_limits<double>::infinity());
+  return finiteBoundsV2(result);
+}
+
+bool directedSubV2(const DirectedBoundsV2& left,
+                   const DirectedBoundsV2& right,
+                   DirectedBoundsV2& result) {
+  const double lower = left.lower - right.upper;
+  const double upper = left.upper - right.lower;
+  if (!std::isfinite(lower) || !std::isfinite(upper)) return false;
+  result.lower = std::nextafter(lower, -std::numeric_limits<double>::infinity());
+  result.upper = std::nextafter(upper, std::numeric_limits<double>::infinity());
+  return finiteBoundsV2(result);
+}
+
+bool directedDivV2(const DirectedBoundsV2& left, const double divisor,
+                   DirectedBoundsV2& result) {
+  if (!std::isfinite(divisor) || divisor <= 0.0) return false;
+  const double lower = left.lower / divisor;
+  const double upper = left.upper / divisor;
+  if (!std::isfinite(lower) || !std::isfinite(upper)) return false;
+  result.lower = std::nextafter(lower, -std::numeric_limits<double>::infinity());
+  result.upper = std::nextafter(upper, std::numeric_limits<double>::infinity());
+  return finiteBoundsV2(result);
+}
+
+DirectedBoundsV2 scalarBoundsV2(const double value) {
+  DirectedBoundsV2 result;
+  result.lower = value;
+  result.upper = value;
+  return result;
+}
+
+bool captureIndexRangeForRegion(const DirectedBoundsV2& lower_coordinate,
+                                const DirectedBoundsV2& upper_coordinate,
+                                const int count, int& first, int& last) {
+  if (!finiteBoundsV2(lower_coordinate) ||
+      !finiteBoundsV2(upper_coordinate) || count <= 0 ||
+      lower_coordinate.lower > upper_coordinate.upper) {
+    return false;
+  }
+  // The interval endpoints already enclose every operation used to form the
+  // requested region and map-space coordinates.  Use the outer endpoints
+  // directly; no long-double-to-double narrowing or ordinary arithmetic is
+  // allowed to shrink the set of intersected closed voxels.
+  const double lower_value = lower_coordinate.lower;
+  const double upper_value = upper_coordinate.upper;
+  const double lower_out = std::nextafter(
+      lower_value, -std::numeric_limits<double>::infinity());
+  const double upper_out = std::nextafter(
+      upper_value, std::numeric_limits<double>::infinity());
+  const double first_value = std::ceil(std::nextafter(
+      lower_out - 1.0, -std::numeric_limits<double>::infinity()));
+  const double last_value = std::floor(upper_out);
+  if (!std::isfinite(first_value) || !std::isfinite(last_value) ||
+      first_value < static_cast<double>(INT_MIN) ||
+      first_value > static_cast<double>(INT_MAX) ||
+      last_value < static_cast<double>(INT_MIN) ||
+      last_value > static_cast<double>(INT_MAX)) return false;
+  first = std::max(0, static_cast<int>(first_value));
+  last = std::min(count - 1, static_cast<int>(last_value));
+  return first <= last;
+}
+
+std::size_t mapAddressChecked(const Eigen::Vector3i& index,
+                              const Eigen::Vector3i& count) {
+  return (static_cast<std::size_t>(index.x()) *
+              static_cast<std::size_t>(count.y()) +
+          static_cast<std::size_t>(index.y())) *
+             static_cast<std::size_t>(count.z()) +
+      static_cast<std::size_t>(index.z());
+}
+
+bool anyNonzero(const std::vector<char>& values) {
+  for (const char value : values) {
+    if (value != 0) return true;
+  }
+  return false;
+}
+
+bool validMapVoxelCount(const Eigen::Vector3i& count, std::size_t& size) {
+  if (count.x() <= 0 || count.y() <= 0 || count.z() <= 0) return false;
+  const std::size_t x = static_cast<std::size_t>(count.x());
+  const std::size_t y = static_cast<std::size_t>(count.y());
+  const std::size_t z = static_cast<std::size_t>(count.z());
+  if (x > std::numeric_limits<std::size_t>::max() / y) return false;
+  const std::size_t xy = x * y;
+  if (xy > std::numeric_limits<std::size_t>::max() / z) return false;
+  size = xy * z;
+  return true;
+}
+
+std::uint64_t steadyTicksV2() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::uint64_t captureConfigurationKeyV2(
+    const MappingParameters& mp, const bool manual_boundary_enabled,
+    const Eigen::Vector3d& manual_boundary_min,
+    const Eigen::Vector3d& manual_boundary_max) {
+  std::uint64_t key = 1469598103934665603ULL;
+  const auto mix = [&key](const void* data, const std::size_t size) {
+    const unsigned char* bytes = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0U; i < size; ++i) {
+      key ^= static_cast<std::uint64_t>(bytes[i]);
+      key *= 1099511628211ULL;
+    }
+  };
+  mix(mp.map_origin_.data(), sizeof(double) * 3U);
+  mix(mp.map_size_.data(), sizeof(double) * 3U);
+  mix(mp.map_min_boundary_.data(), sizeof(double) * 3U);
+  mix(mp.map_max_boundary_.data(), sizeof(double) * 3U);
+  mix(mp.map_voxel_num_.data(), sizeof(int) * 3U);
+  mix(&mp.resolution_, sizeof(mp.resolution_));
+  mix(&mp.obstacles_inflation_, sizeof(mp.obstacles_inflation_));
+  mix(mp.local_update_range_.data(), sizeof(double) * 3U);
+  mix(mp.frame_id_.data(), mp.frame_id_.size());
+  mix(&mp.fx_, sizeof(mp.fx_));
+  mix(&mp.fy_, sizeof(mp.fy_));
+  mix(&mp.cx_, sizeof(mp.cx_));
+  mix(&mp.cy_, sizeof(mp.cy_));
+  mix(&mp.virtual_ceil_height_, sizeof(mp.virtual_ceil_height_));
+  mix(&mp.enable_manual_map_, sizeof(mp.enable_manual_map_));
+  mix(&mp.static_preinflated_map_enable_,
+      sizeof(mp.static_preinflated_map_enable_));
+  mix(&manual_boundary_enabled, sizeof(manual_boundary_enabled));
+  // Disabled manual boundaries may have never been initialized in a synthetic
+  // SDFMap fixture.  Do not read or hash those vectors unless the domain is
+  // actually enabled and its values are part of the active map identity.
+  if (manual_boundary_enabled) {
+    mix(manual_boundary_min.data(), sizeof(double) * 3U);
+    mix(manual_boundary_max.data(), sizeof(double) * 3U);
+  }
+  return key == 0U ? 1U : key;
+}
+
 }  // namespace
+
+namespace plan_env {
+
+namespace {
+
+std::uint64_t allocateCaptureInstanceIdV2() {
+  static std::atomic<std::uint64_t> next_id(1U);
+  std::uint64_t current = next_id.load(std::memory_order_relaxed);
+  for (;;) {
+    if (current == 0U || current == std::numeric_limits<std::uint64_t>::max()) {
+      return 0U;
+    }
+    if (next_id.compare_exchange_weak(current, current + 1U,
+                                      std::memory_order_relaxed,
+                                      std::memory_order_relaxed)) {
+      return current;
+    }
+  }
+}
+
+}  // namespace
+
+SDFMapCaptureMutexV2::SDFMapCaptureMutexV2()
+    : instance_id(allocateCaptureInstanceIdV2()) {}
+
+SDFMapCaptureMutexV2::SDFMapCaptureMutexV2(const SDFMapCaptureMutexV2&)
+    : instance_id(allocateCaptureInstanceIdV2()) {}
+
+SDFMapCaptureMutexV2& SDFMapCaptureMutexV2::operator=(
+    const SDFMapCaptureMutexV2&) {
+  instance_id = allocateCaptureInstanceIdV2();
+  observed_configuration_key = 0U;
+  support_binding_invalidated = false;
+  return *this;
+}
+
+}  // namespace plan_env
 
 void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std::string& odom, const std::string& cloud) {
 
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
+
   /* get parameter */
+  cloud_complete_param_v2_ = nh.resolveName("phase_offset/tube/cloud_obstacle_set_complete");
+  cloud_odom_topic_v2_ = nh.resolveName(odom);
+  cloud_odom_history_v2_.clear();
+  cloud_support_last_stamp_v2_ = ros::Time();
+  cloud_source_contract_v2_ = false;
+  cloud_source_name_v2_.clear();
+  cloud_complete_declared_v2_ = false;
   double x_size, y_size, z_size;
   nh.param("sdf_map/resolution", mp_.resolution_, -1.0);
   nh.param("sdf_map/map_size_x", x_size, -1.0);
@@ -148,6 +396,40 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   md_.static_preinflated_map_loaded_ = false;
   md_.static_preinflated_map_ready_ = false;
   md_.static_preinflated_voxel_count_ = 0;
+  md_.authoritative_support_buffer_v2_.assign(buffer_size, 0);
+  md_.authoritative_support_valid_v2_ = false;
+  md_.authoritative_support_complete_v2_ = false;
+  md_.authoritative_support_evidence_basis_v2_ =
+      plan_env::kSDFMapCaptureSupportEvidenceNone;
+  md_.authoritative_support_sequence_v2_ = 0U;
+  md_.authoritative_support_map_instance_id_v2_ = 0U;
+  md_.authoritative_support_configuration_generation_v2_ = 0U;
+  md_.authoritative_support_configuration_key_v2_ = 0U;
+  md_.authoritative_support_frame_id_v2_.clear();
+  md_.authoritative_support_accepted_ticks_v2_ = 0U;
+  md_.authoritative_support_valid_until_ticks_v2_ = 0U;
+  md_.authoritative_support_stamp_v2_ = ros::Time();
+  md_.authoritative_support_valid_until_v2_ = ros::Time();
+  md_.authoritative_support_min_v2_ = Eigen::Vector3d::Zero();
+  md_.authoritative_support_max_v2_ = Eigen::Vector3d::Zero();
+  md_.authoritative_support_halo_v2_ = 0.0;
+  md_.authoritative_support_halo_reconciled_v2_ = false;
+  md_.authoritative_state_sequence_v2_ = 0U;
+  md_.authoritative_state_notification_sequence_v2_ = 0U;
+  md_.authoritative_state_time_ticks_v2_ = 0U;
+  md_.authoritative_state_stamp_v2_ = ros::Time();
+  if (!md_.authoritative_configuration_identity_exhausted_v2_) {
+    if (md_.authoritative_configuration_generation_v2_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      md_.authoritative_configuration_identity_exhausted_v2_ = true;
+      md_.authoritative_configuration_generation_v2_ = 0U;
+    } else {
+      ++md_.authoritative_configuration_generation_v2_;
+      if (md_.authoritative_configuration_generation_v2_ == 0U) {
+        md_.authoritative_configuration_generation_v2_ = 1U;
+      }
+    }
+  }
   md_.manual_boundary_enabled_ = false;
   md_.manual_obstacle_centers_.clear();
   md_.manual_boundary_points_.clear();
@@ -172,7 +454,7 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
 
   // use odometry and point cloud
   
-  indep_cloud_sub_ = nh.subscribe<sensor_msgs::PointCloud2>(cloud, 10, &SDFMap::cloudCallback, this);
+  indep_cloud_sub_ = nh.subscribe(cloud, 10, &SDFMap::cloudObservationCallbackV2, this);
   indep_odom_sub_ = nh.subscribe<nav_msgs::Odometry>(odom, 10, &SDFMap::odomCallback, this);
 
   occ_timer_ = nh.createTimer(ros::Duration(0.10), &SDFMap::updateOccupancyCallback, this);
@@ -228,6 +510,9 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
 }
 
 void SDFMap::initMap(ros::NodeHandle& nh) {
+
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   
   /* get parameter */
   double x_size, y_size, z_size;
@@ -315,6 +600,40 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   md_.static_preinflated_map_loaded_ = false;
   md_.static_preinflated_map_ready_ = false;
   md_.static_preinflated_voxel_count_ = 0;
+  md_.authoritative_support_buffer_v2_.assign(buffer_size, 0);
+  md_.authoritative_support_valid_v2_ = false;
+  md_.authoritative_support_complete_v2_ = false;
+  md_.authoritative_support_evidence_basis_v2_ =
+      plan_env::kSDFMapCaptureSupportEvidenceNone;
+  md_.authoritative_support_sequence_v2_ = 0U;
+  md_.authoritative_support_map_instance_id_v2_ = 0U;
+  md_.authoritative_support_configuration_generation_v2_ = 0U;
+  md_.authoritative_support_configuration_key_v2_ = 0U;
+  md_.authoritative_support_frame_id_v2_.clear();
+  md_.authoritative_support_accepted_ticks_v2_ = 0U;
+  md_.authoritative_support_valid_until_ticks_v2_ = 0U;
+  md_.authoritative_support_stamp_v2_ = ros::Time();
+  md_.authoritative_support_valid_until_v2_ = ros::Time();
+  md_.authoritative_support_min_v2_ = Eigen::Vector3d::Zero();
+  md_.authoritative_support_max_v2_ = Eigen::Vector3d::Zero();
+  md_.authoritative_support_halo_v2_ = 0.0;
+  md_.authoritative_support_halo_reconciled_v2_ = false;
+  md_.authoritative_state_sequence_v2_ = 0U;
+  md_.authoritative_state_notification_sequence_v2_ = 0U;
+  md_.authoritative_state_time_ticks_v2_ = 0U;
+  md_.authoritative_state_stamp_v2_ = ros::Time();
+  if (!md_.authoritative_configuration_identity_exhausted_v2_) {
+    if (md_.authoritative_configuration_generation_v2_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      md_.authoritative_configuration_identity_exhausted_v2_ = true;
+      md_.authoritative_configuration_generation_v2_ = 0U;
+    } else {
+      ++md_.authoritative_configuration_generation_v2_;
+      if (md_.authoritative_configuration_generation_v2_ == 0U) {
+        md_.authoritative_configuration_generation_v2_ = 1U;
+      }
+    }
+  }
   md_.manual_boundary_enabled_ = false;
   md_.manual_obstacle_centers_.clear();
   md_.manual_boundary_points_.clear();
@@ -395,7 +714,240 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   ROS_INFO("success init!");
 }
 
+void SDFMap::noteAuthoritativeMapMutationV2Locked(const ros::Time& stamp) {
+  if (md_.authoritative_configuration_generation_v2_ == 0U &&
+      !md_.authoritative_configuration_identity_exhausted_v2_) {
+    md_.authoritative_configuration_generation_v2_ = 1U;
+  }
+  if (md_.authoritative_state_identity_exhausted_v2_) return;
+  if (md_.authoritative_state_sequence_v2_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    md_.authoritative_state_identity_exhausted_v2_ = true;
+    return;
+  }
+  ++md_.authoritative_state_sequence_v2_;
+  // The notification is a copied accepted-state fact, not a raw-cloud
+  // arrival counter.  Keep it monotone with the accepted identity and never
+  // advance it on rejected/unaccepted callbacks.
+  md_.authoritative_state_notification_sequence_v2_ =
+      md_.authoritative_state_sequence_v2_;
+  md_.authoritative_state_time_ticks_v2_ = steadyTicksV2();
+  if (!stamp.isZero() &&
+      (md_.authoritative_state_stamp_v2_.isZero() ||
+       stamp >= md_.authoritative_state_stamp_v2_)) {
+    md_.authoritative_state_stamp_v2_ = stamp;
+  }
+}
+
+void SDFMap::invalidateAuthoritativeSupportV2Locked(
+    const Eigen::Vector3i& min_id, const Eigen::Vector3i& max_id) {
+  if (md_.authoritative_support_buffer_v2_.empty() ||
+      mp_.map_voxel_num_.x() <= 0 || mp_.map_voxel_num_.y() <= 0 ||
+      mp_.map_voxel_num_.z() <= 0) {
+    md_.authoritative_support_valid_v2_ = false;
+    md_.authoritative_support_complete_v2_ = false;
+    md_.authoritative_support_evidence_basis_v2_ =
+        plan_env::kSDFMapCaptureSupportEvidenceNone;
+    return;
+  }
+  Eigen::Vector3i lower = min_id;
+  Eigen::Vector3i upper = max_id;
+  for (int axis = 0; axis < 3; ++axis) {
+    lower(axis) = std::max(0, std::min(lower(axis), mp_.map_voxel_num_(axis) - 1));
+    upper(axis) = std::max(0, std::min(upper(axis), mp_.map_voxel_num_(axis) - 1));
+  }
+  if ((lower.array() > upper.array()).any()) return;
+  for (int x = lower.x(); x <= upper.x(); ++x)
+    for (int y = lower.y(); y <= upper.y(); ++y)
+      for (int z = lower.z(); z <= upper.z(); ++z) {
+        const std::size_t address = mapAddressChecked(
+            Eigen::Vector3i(x, y, z), mp_.map_voxel_num_);
+        if (address < md_.authoritative_support_buffer_v2_.size()) {
+          md_.authoritative_support_buffer_v2_[address] = 0;
+        }
+      }
+  // A complete support declaration over a box is no longer true after any
+  // relied-on cell is cleared.  Preserve the mask for diagnostics but require
+  // fresh attributed evidence before another V2 certificate.
+  md_.authoritative_support_valid_v2_ = false;
+  md_.authoritative_support_complete_v2_ = false;
+  md_.authoritative_support_evidence_basis_v2_ =
+      plan_env::kSDFMapCaptureSupportEvidenceNone;
+  md_.authoritative_support_sequence_v2_ = 0U;
+  md_.authoritative_support_map_instance_id_v2_ = 0U;
+  md_.authoritative_support_configuration_generation_v2_ = 0U;
+  md_.authoritative_support_configuration_key_v2_ = 0U;
+  md_.authoritative_support_frame_id_v2_.clear();
+  md_.authoritative_support_accepted_ticks_v2_ = 0U;
+  md_.authoritative_support_valid_until_ticks_v2_ = 0U;
+  md_.authoritative_support_stamp_v2_ = ros::Time();
+  md_.authoritative_support_valid_until_v2_ = ros::Time();
+  md_.authoritative_support_min_v2_ = Eigen::Vector3d::Zero();
+  md_.authoritative_support_max_v2_ = Eigen::Vector3d::Zero();
+  md_.authoritative_support_halo_reconciled_v2_ = false;
+}
+
+void SDFMap::markAuthoritativeSupportV2Locked(
+    const Eigen::Vector3i& index, const std::uint32_t evidence_basis,
+    const ros::Time& stamp) {
+  if (md_.authoritative_support_buffer_v2_.empty() ||
+      !isInMap(index) || evidence_basis ==
+          plan_env::kSDFMapCaptureSupportEvidenceNone) {
+    return;
+  }
+  const std::size_t address = mapAddressChecked(index, mp_.map_voxel_num_);
+  if (address >= md_.authoritative_support_buffer_v2_.size()) return;
+  const bool complete_evidence =
+      (evidence_basis &
+       plan_env::kSDFMapCaptureSupportEvidenceCompletePreknownDomain) != 0U;
+  const bool depth_evidence =
+      (evidence_basis & plan_env::kSDFMapCaptureSupportEvidenceDepthRaycast) != 0U;
+  const std::uint64_t current_configuration_key =
+      captureConfigurationKeyV2(
+          mp_, md_.manual_boundary_enabled_, md_.manual_boundary_min_,
+          md_.manual_boundary_max_);
+  const bool support_binding_mismatch =
+      md_.authoritative_support_valid_v2_ &&
+      md_.authoritative_support_complete_v2_ &&
+      (md_.authoritative_support_map_instance_id_v2_ !=
+           authoritative_capture_mutex_v2_.instance_id ||
+       md_.authoritative_support_configuration_generation_v2_ !=
+           md_.authoritative_configuration_generation_v2_ ||
+       md_.authoritative_support_configuration_key_v2_ !=
+           current_configuration_key ||
+       md_.authoritative_support_frame_id_v2_ != mp_.frame_id_);
+  const bool support_expiry_invalid_or_expired =
+      (md_.authoritative_support_valid_until_v2_.isZero() !=
+       (md_.authoritative_support_valid_until_ticks_v2_ == 0U)) ||
+      (md_.authoritative_support_valid_until_ticks_v2_ != 0U &&
+       (md_.authoritative_support_valid_until_ticks_v2_ <
+            md_.authoritative_support_accepted_ticks_v2_ ||
+        steadyTicksV2() > md_.authoritative_support_valid_until_ticks_v2_));
+  if (support_binding_mismatch) {
+    invalidateAuthoritativeSupportV2Locked(
+        Eigen::Vector3i::Zero(),
+        mp_.map_voxel_num_ - Eigen::Vector3i::Ones());
+  }
+  // Once a complete support domain is authoritative, ordinary depth/raycast
+  // provenance outside that declared domain must not enlarge or relabel the
+  // certified mask.  It remains ordinary map evidence, not V2 support.
+  if (depth_evidence && !complete_evidence &&
+      md_.authoritative_support_valid_v2_ &&
+      md_.authoritative_support_complete_v2_) {
+    return;
+  }
+  // A complete declaration after a provenance/configuration invalidation is a
+  // new support cohort.  Clear every old mask cell before recording the
+  // supplied voxel; otherwise restoring an old frame/configuration (or
+  // clearing a prior invalid/expired declaration) could resurrect support for
+  // cells that this fresh declaration never covered.  The producer must
+  // explicitly re-establish any broader complete domain after this reset.
+  if (complete_evidence &&
+      (authoritative_capture_mutex_v2_.support_binding_invalidated ||
+       support_expiry_invalid_or_expired ||
+       !md_.authoritative_support_valid_v2_ ||
+       (md_.authoritative_support_evidence_basis_v2_ &
+        plan_env::kSDFMapCaptureSupportEvidenceCompletePreknownDomain) == 0U)) {
+    invalidateAuthoritativeSupportV2Locked(
+        Eigen::Vector3i::Zero(),
+        mp_.map_voxel_num_ - Eigen::Vector3i::Ones());
+  }
+  // Do not scan the full map for every traversed ray voxel.  The producer's
+  // support-valid bit is the serialization-boundary fact; bounds are updated
+  // incrementally below and rebuilt only by explicit maintenance paths.
+  const bool had_support = md_.authoritative_support_valid_v2_;
+  md_.authoritative_support_buffer_v2_[address] = 1;
+  // Per-voxel depth/raycast observations are recorded as provenance but do
+  // not by themselves establish a complete, persistent forward domain.  Only
+  // an explicitly attributed complete-domain declaration may make the support
+  // usable by V2; ordinary source updates leave these false.
+  if (complete_evidence) {
+    md_.authoritative_support_valid_v2_ = true;
+    md_.authoritative_support_complete_v2_ = true;
+    md_.authoritative_support_map_instance_id_v2_ =
+        authoritative_capture_mutex_v2_.instance_id;
+    md_.authoritative_support_configuration_generation_v2_ =
+        md_.authoritative_configuration_generation_v2_;
+    md_.authoritative_support_configuration_key_v2_ =
+        current_configuration_key;
+    md_.authoritative_support_frame_id_v2_ = mp_.frame_id_;
+    md_.authoritative_support_accepted_ticks_v2_ =
+        md_.authoritative_state_time_ticks_v2_;
+    authoritative_capture_mutex_v2_.support_binding_invalidated = false;
+  }
+  md_.authoritative_support_evidence_basis_v2_ |= evidence_basis;
+  md_.authoritative_support_sequence_v2_ =
+      std::max(md_.authoritative_support_sequence_v2_,
+               md_.authoritative_state_sequence_v2_);
+  if (md_.authoritative_support_sequence_v2_ == 0U) {
+    md_.authoritative_support_sequence_v2_ = 1U;
+  }
+  if (!stamp.isZero() &&
+      (md_.authoritative_support_stamp_v2_.isZero() ||
+       stamp >= md_.authoritative_support_stamp_v2_)) {
+    md_.authoritative_support_stamp_v2_ = stamp;
+  }
+  Eigen::Vector3d lower;
+  Eigen::Vector3d upper;
+  indexToPos(index, lower);
+  lower.array() -= 0.5 * mp_.resolution_;
+  upper = lower.array() + mp_.resolution_;
+  if (!had_support) {
+    md_.authoritative_support_min_v2_ = lower;
+    md_.authoritative_support_max_v2_ = upper;
+  } else {
+    md_.authoritative_support_min_v2_ =
+        md_.authoritative_support_min_v2_.cwiseMin(lower);
+    md_.authoritative_support_max_v2_ =
+        md_.authoritative_support_max_v2_.cwiseMax(upper);
+  }
+}
+
+void SDFMap::rebuildAuthoritativeSupportBoundsV2Locked() {
+  if (md_.authoritative_support_buffer_v2_.empty() ||
+      !anyNonzero(md_.authoritative_support_buffer_v2_)) {
+    md_.authoritative_support_valid_v2_ = false;
+    md_.authoritative_support_complete_v2_ = false;
+    md_.authoritative_support_evidence_basis_v2_ =
+        plan_env::kSDFMapCaptureSupportEvidenceNone;
+    md_.authoritative_support_min_v2_ = Eigen::Vector3d::Zero();
+    md_.authoritative_support_max_v2_ = Eigen::Vector3d::Zero();
+    return;
+  }
+  Eigen::Vector3d lower = Eigen::Vector3d::Constant(
+      std::numeric_limits<double>::infinity());
+  Eigen::Vector3d upper = Eigen::Vector3d::Constant(
+      -std::numeric_limits<double>::infinity());
+  for (int x = 0; x < mp_.map_voxel_num_.x(); ++x)
+    for (int y = 0; y < mp_.map_voxel_num_.y(); ++y)
+      for (int z = 0; z < mp_.map_voxel_num_.z(); ++z) {
+        const Eigen::Vector3i index(x, y, z);
+        const std::size_t address = mapAddressChecked(index, mp_.map_voxel_num_);
+        if (address >= md_.authoritative_support_buffer_v2_.size() ||
+            md_.authoritative_support_buffer_v2_[address] == 0) continue;
+        Eigen::Vector3d cell_lower;
+        indexToPos(index, cell_lower);
+        cell_lower.array() -= 0.5 * mp_.resolution_;
+        const Eigen::Vector3d cell_upper =
+            cell_lower.array() + mp_.resolution_;
+        lower = lower.cwiseMin(cell_lower);
+        upper = upper.cwiseMax(cell_upper);
+      }
+  if (!finiteVector(lower) || !finiteVector(upper) ||
+      (upper.array() < lower.array()).any()) {
+    md_.authoritative_support_valid_v2_ = false;
+    md_.authoritative_support_complete_v2_ = false;
+    md_.authoritative_support_evidence_basis_v2_ =
+        plan_env::kSDFMapCaptureSupportEvidenceNone;
+    return;
+  }
+  md_.authoritative_support_min_v2_ = lower;
+  md_.authoritative_support_max_v2_ = upper;
+}
+
 void SDFMap::resetBuffer() {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   Eigen::Vector3d min_pos = mp_.map_min_boundary_;
   Eigen::Vector3d max_pos = mp_.map_max_boundary_;
 
@@ -406,6 +958,8 @@ void SDFMap::resetBuffer() {
 }
 
 void SDFMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
 
   Eigen::Vector3i min_id, max_id;
   posToIndex(min_pos, min_id);
@@ -423,9 +977,13 @@ void SDFMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
       }
 
   applyStaticPreinflatedLayer();
+  invalidateAuthoritativeSupportV2Locked(min_id, max_id);
+  noteAuthoritativeMapMutationV2Locked();
 }
 
 void SDFMap::gradualResetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   // 渐进式清空缓冲区，避免突然清空造成闪烁
   Eigen::Vector3i min_id, max_id;
   posToIndex(min_pos, min_id);
@@ -502,9 +1060,15 @@ void SDFMap::gradualResetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos
   if (cleared_count == 0 && !is_clearing) {
     resetBuffer(min_pos, max_pos);
   }
+  if (cleared_count > 0) {
+    invalidateAuthoritativeSupportV2Locked(min_id, max_id);
+    noteAuthoritativeMapMutationV2Locked();
+  }
 }
 
 void SDFMap::manualObstacleCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!mp_.enable_manual_map_) return;
 
   Eigen::Vector3d center(msg->point.x, msg->point.y, msg->point.z);
@@ -520,6 +1084,7 @@ void SDFMap::manualObstacleCallback(const geometry_msgs::PointStamped::ConstPtr&
   md_.local_bound_max_ = mp_.map_max_idx_;
   applyManualLayer();
   applyStaticPreinflatedLayer();
+  noteAuthoritativeMapMutationV2Locked();
   md_.esdf_need_update_ = true;
   publishManualMap();
   saveManualMapFile();
@@ -529,6 +1094,8 @@ void SDFMap::manualObstacleCallback(const geometry_msgs::PointStamped::ConstPtr&
 }
 
 void SDFMap::manualBoundaryCallback(const geometry_msgs::PointStamped::ConstPtr& msg) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!mp_.enable_manual_map_) return;
 
   Eigen::Vector3d point(msg->point.x, msg->point.y, msg->point.z);
@@ -538,6 +1105,13 @@ void SDFMap::manualBoundaryCallback(const geometry_msgs::PointStamped::ConstPtr&
     return;
   }
 
+  // Boundary updates first clear the prior manual occupancy and may shrink
+  // the planner-admissible domain.  Neither operation is evidence that the
+  // cleared cells are free, so invalidate all relied-on support before the
+  // destructive update rather than allowing an old complete mask to survive.
+  invalidateAuthoritativeSupportV2Locked(
+      Eigen::Vector3i::Zero(),
+      mp_.map_voxel_num_ - Eigen::Vector3i::Ones());
   for (size_t i = 0; i < md_.manual_occupancy_buffer_.size(); ++i) {
     if (md_.manual_occupancy_buffer_[i] == 0) continue;
     md_.occupancy_buffer_inflate_[i] = 0;
@@ -577,6 +1151,7 @@ void SDFMap::manualBoundaryCallback(const geometry_msgs::PointStamped::ConstPtr&
   md_.local_bound_max_ = mp_.map_max_idx_;
   applyManualLayer();
   applyStaticPreinflatedLayer();
+  noteAuthoritativeMapMutationV2Locked();
   md_.esdf_need_update_ = true;
   publishManualMap();
 
@@ -639,6 +1214,8 @@ void SDFMap::addManualBoundaryWalls() {
 }
 
 void SDFMap::applyManualLayer() {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!mp_.enable_manual_map_ || md_.manual_occupancy_buffer_.empty()) return;
 
   bool has_manual_voxel = false;
@@ -650,10 +1227,15 @@ void SDFMap::applyManualLayer() {
     has_manual_voxel = true;
   }
 
-  if (has_manual_voxel) md_.esdf_need_update_ = true;
+  if (has_manual_voxel) {
+    md_.esdf_need_update_ = true;
+    noteAuthoritativeMapMutationV2Locked();
+  }
 }
 
 void SDFMap::applyStaticPreinflatedLayer() {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!mp_.static_preinflated_map_enable_ ||
       md_.static_preinflated_buffer_.empty()) {
     return;
@@ -667,6 +1249,7 @@ void SDFMap::applyStaticPreinflatedLayer() {
       md_.occupancy_buffer_inflate_[addr] = 1;
     }
   }
+  noteAuthoritativeMapMutationV2Locked();
 }
 
 void SDFMap::publishManualMap() {
@@ -911,6 +1494,8 @@ void SDFMap::fillESDF(F_get_val f_get_val, F_set_val f_set_val, int start, int e
 }
 
 void SDFMap::updateESDF3d() {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   Eigen::Vector3i min_esdf = md_.local_bound_min_;
   Eigen::Vector3i max_esdf = md_.local_bound_max_;
     // ROS_INFO_STREAM("min_esdf: " << min_esdf.transpose() << ", max_esdf: " << max_esdf.transpose());
@@ -1131,6 +1716,8 @@ void SDFMap::updateESDF3d() {
 // }
 
 int SDFMap::setCacheOccupancy(Eigen::Vector3d pos, int occ) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (occ != 1 && occ != 0) return INVALID_IDX;
 
   Eigen::Vector3i id;
@@ -1256,6 +1843,8 @@ void SDFMap::projectDepthImage() {
 }
 
 void SDFMap::raycastProcess() {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   // if (md_.proj_points_.size() == 0)
   if (md_.proj_points_cnt == 0) return;
 
@@ -1389,9 +1978,13 @@ void SDFMap::raycastProcess() {
     md_.count_hit_[idx_ctns] = md_.count_hit_and_miss_[idx_ctns] = 0;
 
     if (log_odds_update >= 0 && md_.occupancy_buffer_[idx_ctns] >= mp_.clamp_max_log_) {
+      markAuthoritativeSupportV2Locked(
+          idx, plan_env::kSDFMapCaptureSupportEvidenceDepthRaycast);
       continue;
     } else if (log_odds_update <= 0 && md_.occupancy_buffer_[idx_ctns] <= mp_.clamp_min_log_) {
       md_.occupancy_buffer_[idx_ctns] = mp_.clamp_min_log_;
+      markAuthoritativeSupportV2Locked(
+          idx, plan_env::kSDFMapCaptureSupportEvidenceDepthRaycast);
       continue;
     }
 
@@ -1404,7 +1997,10 @@ void SDFMap::raycastProcess() {
     md_.occupancy_buffer_[idx_ctns] =
         std::min(std::max(md_.occupancy_buffer_[idx_ctns] + log_odds_update, mp_.clamp_min_log_),
                  mp_.clamp_max_log_);
+    markAuthoritativeSupportV2Locked(
+        idx, plan_env::kSDFMapCaptureSupportEvidenceDepthRaycast);
   }
+  noteAuthoritativeMapMutationV2Locked();
 }
 
 Eigen::Vector3d SDFMap::closetPointInMap(const Eigen::Vector3d& pt, const Eigen::Vector3d& camera_pt) {
@@ -1429,6 +2025,8 @@ Eigen::Vector3d SDFMap::closetPointInMap(const Eigen::Vector3d& pt, const Eigen:
 }
 
 void SDFMap::clearAndInflateLocalMap() {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   /*clear outside local*/
   const int vec_margin = 5;
   // Eigen::Vector3i min_vec_margin = min_vec - Eigen::Vector3i(vec_margin,
@@ -1553,6 +2151,9 @@ void SDFMap::clearAndInflateLocalMap() {
         }
     }
   }
+  invalidateAuthoritativeSupportV2Locked(md_.local_bound_min_,
+                                         md_.local_bound_max_);
+  noteAuthoritativeMapMutationV2Locked();
 }
 
 void SDFMap::visCallback(const ros::TimerEvent& /*event*/) {
@@ -1568,6 +2169,8 @@ void SDFMap::visCallback(const ros::TimerEvent& /*event*/) {
 }
 
 void SDFMap::bufferRefreshCallback(const ros::TimerEvent& /*event*/){
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!md_.has_odom_) return;
   
   // 检查无人机是否在移动，如果移动速度过快则延迟清空
@@ -1600,6 +2203,8 @@ void SDFMap::bufferRefreshCallback(const ros::TimerEvent& /*event*/){
 }
 
 void SDFMap::updateOccupancyCallback(const ros::TimerEvent& /*event*/) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!md_.occ_need_update_) return;
 
   /* update occupancy */
@@ -1652,6 +2257,8 @@ void SDFMap::updateESDFCallback(const ros::TimerEvent& /*event*/) {
 
 void SDFMap::depthPoseCallback(const sensor_msgs::ImageConstPtr& img,
                                const geometry_msgs::PoseStampedConstPtr& pose) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   /* get depth image */
   cv_bridge::CvImagePtr cv_ptr;
   cv_ptr = cv_bridge::toCvCopy(img, img->encoding);
@@ -1679,6 +2286,8 @@ void SDFMap::depthPoseCallback(const sensor_msgs::ImageConstPtr& img,
 }
 
 void SDFMap::odomCallback(const nav_msgs::OdometryConstPtr& odom) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (md_.has_first_depth_) return;
 
   md_.camera_pos_(0) = odom->pose.pose.position.x;
@@ -1686,12 +2295,197 @@ void SDFMap::odomCallback(const nav_msgs::OdometryConstPtr& odom) {
   md_.camera_pos_(2) = odom->pose.pose.position.z;
 
   md_.has_odom_ = true;
+
+  // Keep source-time evidence separately: the planner still consumes exactly
+  // the latest camera position above.  Out-of-order or ambiguous identities
+  // cannot be used to establish a sensing box.
+  if (!cloud_odom_history_v2_.empty() &&
+      (odom->header.stamp <= cloud_odom_history_v2_.back().header.stamp ||
+       odom->header.frame_id != cloud_odom_history_v2_.back().header.frame_id)) {
+    cloud_odom_history_v2_.clear();
+    return;
+  }
+  if (odom->header.stamp.isZero() || odom->header.frame_id.empty() ||
+      !md_.camera_pos_.allFinite()) {
+    cloud_odom_history_v2_.clear();
+    return;
+  }
+  cloud_odom_history_v2_.push_back(*odom);
+  // Storage bound, not an interpolation or a timing/safety margin.
+  if (cloud_odom_history_v2_.size() > 256U) cloud_odom_history_v2_.pop_front();
+}
+
+void SDFMap::cloudObservationCallbackV2(
+    const ros::MessageEvent<sensor_msgs::PointCloud2 const>& event) {
+  // The explicit deployment declaration applies only to the immutable static
+  // local_sensing producer and its fixed launch configuration, not arbitrary
+  // registered obstacle clouds.  Inspect that publisher's actual namespace;
+  // never guess a source box from the receiver's camera or point extrema.
+  bool declared = false;
+  ros::param::getCached(cloud_complete_param_v2_, declared);
+  Eigen::Vector3d range = Eigen::Vector3d::Zero();
+  std::string frame = "world", odom_topic = "/sim/odom";
+  double rate = 10.0;
+  const std::string source = event.getPublisherName();
+  bool contract = false;
+  if (declared && !source.empty()) {
+    ros::NodeHandle source_nh(source);
+    contract = source_nh.getParamCached("sdf_map/local_update_range_x", range.x()) &&
+        source_nh.getParamCached("sdf_map/local_update_range_y", range.y()) &&
+        source_nh.getParamCached("sdf_map/local_update_range_z", range.z());
+    source_nh.getParamCached("output_frame", frame);
+    source_nh.getParamCached("odom_topic", odom_topic);
+    source_nh.getParamCached("sensing_rate", rate);
+    contract = contract && source_nh.resolveName(odom_topic) == cloud_odom_topic_v2_ &&
+        std::isfinite(rate) && rate >= 1.0 && range.allFinite() &&
+        (range.array() > 0.0).all();
+  }
+  const std::lock_guard<std::recursive_mutex> lock(authoritative_capture_mutex_v2_.mutex);
+  cloud_complete_declared_v2_ = declared;
+  cloud_source_contract_v2_ = contract && frame == mp_.frame_id_ &&
+      (cloud_source_name_v2_.empty() ||
+       (cloud_source_contract_v2_ && cloud_source_name_v2_ == source &&
+        (range.array() == cloud_source_range_v2_.array()).all() &&
+        cloud_source_period_v2_ == 1.0 / rate));
+  // This source holds a fixed static map and launch configuration.  A changed
+  // source/configuration cannot relabel an in-flight cloud or resurrect its
+  // support; reinitialization is required to establish a new source contract.
+  if (cloud_source_contract_v2_) cloud_source_name_v2_ = source;
+  cloud_source_range_v2_ = range;
+  cloud_source_period_v2_ = contract ? 1.0 / rate : 0.0;
+  cloudCallback(event.getConstMessage());
+}
+
+void SDFMap::acceptCloudSupportV2Locked(
+    const sensor_msgs::PointCloud2& cloud,
+    const pcl::PointCloud<pcl::PointXYZ>& points) {
+  if (!cloud_complete_declared_v2_ && cloud_source_name_v2_.empty()) return;
+  const auto invalidate = [this]() {
+    invalidateAuthoritativeSupportV2Locked(Eigen::Vector3i::Zero(),
+        mp_.map_voxel_num_ - Eigen::Vector3i::Ones());
+  };
+  if (!cloud_complete_declared_v2_ || !cloud_source_contract_v2_ ||
+      !plan_env::sdfMapCaptureV2FloatingPointEnvironmentSupported() ||
+      !validCaptureMapGeometry(mp_) || !md_.camera_pos_.allFinite() ||
+      cloud.header.frame_id != mp_.frame_id_ || cloud.header.stamp.isZero() ||
+      !cloud_source_range_v2_.allFinite() ||
+      (cloud_source_range_v2_.array() <= 0.0).any() ||
+      !std::isfinite(cloud_source_period_v2_) || cloud_source_period_v2_ <= 0.0) {
+    invalidate();
+    return;
+  }
+  // A late/duplicate raw observation does not invalidate an incumbent static
+  // capture, nor can it resurrect support after clearing.
+  if (cloud.header.stamp <= cloud_support_last_stamp_v2_) return;
+  cloud_support_last_stamp_v2_ = cloud.header.stamp;
+  const auto found = std::find_if(cloud_odom_history_v2_.begin(),
+      cloud_odom_history_v2_.end(), [&cloud](const nav_msgs::Odometry& odom) {
+        return odom.header.stamp == cloud.header.stamp;
+      });
+  const ros::Time now = ros::Time::now();
+  if (found == cloud_odom_history_v2_.end() || now < cloud.header.stamp ||
+      (now - cloud.header.stamp).toSec() > cloud_source_period_v2_) {
+    invalidate();
+    return;
+  }
+  const Eigen::Vector3d source(found->pose.pose.position.x,
+      found->pose.pose.position.y, found->pose.pose.position.z);
+  // local_sensing copies the numerical odometry coordinates without a frame
+  // transform (legacy simulator odom uses /simulator, output uses world).
+  // Exact matching on the SAME configured odom stream preserves that existing
+  // convention; a changed odom frame clears the history in odomCallback.
+  if (!source.allFinite()) { invalidate(); return; }
+  for (const auto& point : points) {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) {
+      invalidate(); return;
+    }
+  }
+  std::size_t size = 0U;
+  if (!validMapVoxelCount(mp_.map_voxel_num_, size) ||
+      md_.occupancy_buffer_inflate_.size() != size) { invalidate(); return; }
+  Eigen::Vector3d lower, upper;
+  if (!effectiveCaptureDomainV2(mp_, md_, lower, upper)) { invalidate(); return; }
+  const double inf_step = std::ceil(mp_.obstacles_inflation_ / mp_.resolution_);
+  if (!std::isfinite(inf_step) || inf_step > INT_MAX - 2) { invalidate(); return; }
+  Eigen::Vector3i first, last;
+  double max_halo = 0.0;
+  for (int axis = 0; axis < 3; ++axis) {
+    DirectedBoundsV2 sl, su, rl, ru, lo, hi, index_lo, index_hi, offset;
+    // Include one seed-voxel width beyond the actual XY/z inflation stencil.
+    const double halo = std::nextafter((axis == 2 ? 2.0 : inf_step + 1.0) *
+        mp_.resolution_, std::numeric_limits<double>::infinity());
+    const DirectedBoundsV2 total_halo = scalarBoundsV2(halo);
+    if (!directedSubV2(scalarBoundsV2(source(axis)), scalarBoundsV2(cloud_source_range_v2_(axis)), sl) ||
+        !directedAddV2(scalarBoundsV2(source(axis)), scalarBoundsV2(cloud_source_range_v2_(axis)), su) ||
+        !directedSubV2(scalarBoundsV2(md_.camera_pos_(axis)), scalarBoundsV2(mp_.local_update_range_(axis)), rl) ||
+        !directedAddV2(scalarBoundsV2(md_.camera_pos_(axis)), scalarBoundsV2(mp_.local_update_range_(axis)), ru)) {
+      invalidate(); return;
+    }
+    lower(axis) = std::max(lower(axis), std::max(sl.upper, rl.upper));
+    upper(axis) = std::min(upper(axis), std::min(su.lower, ru.lower));
+    if (!directedAddV2(scalarBoundsV2(lower(axis)), total_halo, lo) ||
+        !directedSubV2(scalarBoundsV2(upper(axis)), total_halo, hi) ||
+        !directedSubV2(scalarBoundsV2(lo.upper), scalarBoundsV2(mp_.map_origin_(axis)), offset) ||
+        !directedDivV2(offset, mp_.resolution_, index_lo)) { invalidate(); return; }
+    lower(axis) = lo.upper;
+    upper(axis) = hi.lower;
+    if (!directedSubV2(scalarBoundsV2(hi.lower), scalarBoundsV2(mp_.map_origin_(axis)), offset) ||
+        !directedDivV2(offset, mp_.resolution_, index_hi)) { invalidate(); return; }
+    const double start = std::ceil(index_lo.upper);
+    const double end = std::floor(index_hi.lower) - 1.0;
+    if (start < 0.0 || end >= mp_.map_voxel_num_(axis) || start > end) {
+      invalidate(); return;
+    }
+    first(axis) = static_cast<int>(start);
+    last(axis) = static_cast<int>(end);
+    max_halo = std::max(max_halo, total_halo.upper);
+  }
+  std::vector<char> mask(size, 0);
+  for (int x = first.x(); x <= last.x(); ++x)
+    for (int y = first.y(); y <= last.y(); ++y)
+      for (int z = first.z(); z <= last.z(); ++z)
+        mask[mapAddressChecked(Eigen::Vector3i(x,y,z), mp_.map_voxel_num_)] = 1;
+  // Empty complete observations also advance the authoritative evidence state
+  // without touching occupancy, layers, local bounds, or the ESDF update flag.
+  if (points.empty()) noteAuthoritativeMapMutationV2Locked(cloud.header.stamp);
+  if (md_.authoritative_state_identity_exhausted_v2_) { invalidate(); return; }
+  md_.authoritative_support_buffer_v2_.swap(mask);
+  md_.authoritative_support_valid_v2_ = true;
+  md_.authoritative_support_complete_v2_ = true;
+  md_.authoritative_support_evidence_basis_v2_ =
+      plan_env::kSDFMapCaptureSupportEvidenceCompletePreknownDomain;
+  md_.authoritative_support_sequence_v2_ = md_.authoritative_state_sequence_v2_;
+  md_.authoritative_support_accepted_ticks_v2_ = md_.authoritative_state_time_ticks_v2_;
+  md_.authoritative_support_stamp_v2_ = cloud.header.stamp;
+  // The selected producer retains one immutable static map.  This is a
+  // timeless physical-domain assumption, NOT a grace period for dynamic data.
+  // Native clearing/reset still invalidates the current backing's support.
+  md_.authoritative_support_valid_until_v2_ = ros::Time();
+  md_.authoritative_support_valid_until_ticks_v2_ = 0U;
+  md_.authoritative_support_map_instance_id_v2_ = authoritative_capture_mutex_v2_.instance_id;
+  md_.authoritative_support_configuration_generation_v2_ = md_.authoritative_configuration_generation_v2_;
+  md_.authoritative_support_configuration_key_v2_ = captureConfigurationKeyV2(
+      mp_, md_.manual_boundary_enabled_, md_.manual_boundary_min_, md_.manual_boundary_max_);
+  md_.authoritative_support_frame_id_v2_ = mp_.frame_id_;
+  md_.authoritative_support_min_v2_ = lower;
+  md_.authoritative_support_max_v2_ = upper;
+  md_.authoritative_support_halo_v2_ = max_halo;
+  md_.authoritative_support_halo_reconciled_v2_ = true;
+  authoritative_capture_mutex_v2_.support_binding_invalidated = false;
 }
 
 void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
 
+  const std::lock_guard<std::recursive_mutex> map_lock(
+      authoritative_capture_mutex_v2_.mutex);
+
   pcl::PointCloud<pcl::PointXYZ> latest_cloud;
-  pcl::fromROSMsg(*img, latest_cloud);
+  // PCL 1.10's empty PointCloud2 conversion dereferences &cloud[0].  Keep
+  // empty clouds as genuine observations, but avoid that library bug; the
+  // remainder of the callback still publishes the valid all-free snapshot.
+  if (img->width != 0U && img->height != 0U) {
+    pcl::fromROSMsg(*img, latest_cloud);
+  }
 
   md_.has_cloud_ = true;
 
@@ -1745,7 +2539,10 @@ void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
     }
   }
 
-  if (latest_cloud.points.size() == 0) return;
+  if (latest_cloud.points.size() == 0) {
+    acceptCloudSupportV2Locked(*img, latest_cloud);
+    return;
+  }
 
   if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2))) return;
 
@@ -1824,6 +2621,8 @@ void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
 
   applyManualLayer();
   applyStaticPreinflatedLayer();
+  noteAuthoritativeMapMutationV2Locked(img->header.stamp);
+  acceptCloudSupportV2Locked(*img, latest_cloud);
   md_.esdf_need_update_ = true;
 }
 
@@ -2205,6 +3004,394 @@ SDFMap::cloudOccupancySnapshot() const {
   return snapshot_store->latest;
 }
 
+plan_env::SDFMapAcceptedStateVisibilityV2
+SDFMap::acceptedStateVisibilityV2() const {
+  plan_env::SDFMapAcceptedStateVisibilityV2 visibility;
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
+  visibility.map_instance_id = authoritative_capture_mutex_v2_.instance_id;
+  visibility.accepted_state_sequence = md_.authoritative_state_sequence_v2_;
+  visibility.accepted_state_notification_sequence =
+      md_.authoritative_state_notification_sequence_v2_;
+  visibility.accepted_time_ticks = md_.authoritative_state_time_ticks_v2_;
+  visibility.configuration_generation =
+      md_.authoritative_configuration_generation_v2_;
+  visibility.configuration_key = captureConfigurationKeyV2(
+      mp_, md_.manual_boundary_enabled_, md_.manual_boundary_min_,
+      md_.manual_boundary_max_);
+  visibility.frame_id = mp_.frame_id_;
+  visibility.accepted_state_stamp = md_.authoritative_state_stamp_v2_;
+  visibility.support.valid = md_.authoritative_support_valid_v2_;
+  visibility.support.complete = md_.authoritative_support_complete_v2_;
+  visibility.support.evidence_basis =
+      md_.authoritative_support_evidence_basis_v2_;
+  visibility.support.evidence_sequence =
+      md_.authoritative_support_sequence_v2_;
+  visibility.support.evidence_accepted_ticks =
+      md_.authoritative_support_accepted_ticks_v2_;
+  visibility.support.map_instance_id =
+      md_.authoritative_support_map_instance_id_v2_;
+  visibility.support.configuration_generation =
+      md_.authoritative_support_configuration_generation_v2_;
+  visibility.support.configuration_key =
+      md_.authoritative_support_configuration_key_v2_;
+  visibility.support.frame_id = md_.authoritative_support_frame_id_v2_;
+  visibility.support.evidence_stamp = md_.authoritative_support_stamp_v2_;
+  visibility.support.valid_until = md_.authoritative_support_valid_until_v2_;
+  visibility.support.valid_until_accepted_ticks =
+      md_.authoritative_support_valid_until_ticks_v2_;
+  visibility.support.support_min = md_.authoritative_support_min_v2_;
+  visibility.support.support_max = md_.authoritative_support_max_v2_;
+  visibility.support.required_halo = md_.authoritative_support_halo_v2_;
+  visibility.support.halo_reconciled =
+      md_.authoritative_support_halo_reconciled_v2_;
+  visibility.valid = visibility.map_instance_id != 0U &&
+      visibility.accepted_state_sequence != 0U &&
+      visibility.accepted_state_notification_sequence >=
+          visibility.accepted_state_sequence &&
+      visibility.accepted_time_ticks != 0U &&
+      visibility.configuration_generation != 0U &&
+      visibility.configuration_key != 0U && !visibility.frame_id.empty();
+  return visibility;
+}
+
+std::shared_ptr<const plan_env::SDFMapCaptureV2>
+SDFMap::captureAuthoritativeSDFMapV2() const {
+  return captureAuthoritativeSDFMapV2(plan_env::SDFMapCaptureRegionV2());
+}
+
+std::shared_ptr<const plan_env::SDFMapCaptureV2>
+SDFMap::captureAuthoritativeSDFMapV2(
+    const plan_env::SDFMapCaptureRegionV2& requested_region) const {
+  if (!plan_env::sdfMapCaptureV2FloatingPointEnvironmentSupported()) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
+  // The default-constructed legacy MappingParameters contains no valid map
+  // geometry.  Check the V2 accepted-state gate first so an uninitialized
+  // legacy buffer is never read merely to answer “unavailable”.
+  if (md_.authoritative_state_sequence_v2_ == 0U ||
+      md_.authoritative_state_identity_exhausted_v2_ ||
+      md_.authoritative_configuration_generation_v2_ == 0U ||
+      md_.authoritative_configuration_identity_exhausted_v2_ ||
+      authoritative_capture_mutex_v2_.instance_id == 0U ||
+      !validCaptureMapGeometry(mp_)) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+
+  const Eigen::Vector3i map_count = mp_.map_voxel_num_;
+  std::size_t expected_size = 0U;
+  if (!validMapVoxelCount(map_count, expected_size)) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  if (md_.occupancy_buffer_inflate_.size() != expected_size) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  Eigen::Vector3d effective_map_min;
+  Eigen::Vector3d effective_map_max;
+  if (!effectiveCaptureDomainV2(mp_, md_, effective_map_min,
+                                effective_map_max)) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  const std::uint64_t current_configuration_key =
+      captureConfigurationKeyV2(
+          mp_, md_.manual_boundary_enabled_, md_.manual_boundary_min_,
+          md_.manual_boundary_max_);
+  if (md_.authoritative_support_valid_v2_ &&
+      md_.authoritative_support_complete_v2_ &&
+      (md_.authoritative_support_map_instance_id_v2_ !=
+           authoritative_capture_mutex_v2_.instance_id ||
+       md_.authoritative_support_configuration_generation_v2_ !=
+           md_.authoritative_configuration_generation_v2_ ||
+       md_.authoritative_support_configuration_key_v2_ !=
+           current_configuration_key ||
+       md_.authoritative_support_frame_id_v2_ != mp_.frame_id_)) {
+    // A const capture cannot rewrite map buffers, but it must latch the
+    // provenance mismatch so restoring an old frame/configuration cannot
+    // resurrect stale support.  Only fresh complete evidence clears it.
+    authoritative_capture_mutex_v2_.support_binding_invalidated = true;
+  }
+
+  Eigen::Vector3d requested_min = effective_map_min;
+  Eigen::Vector3d requested_max = effective_map_max;
+  if (requested_region.valid) {
+    if (!finiteVector(requested_region.min) ||
+        !finiteVector(requested_region.max) ||
+        !std::isfinite(requested_region.halo) ||
+        requested_region.halo < 0.0 ||
+        (requested_region.max.array() < requested_region.min.array()).any()) {
+      return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+    }
+    // Expand and clip in directed intervals.  The source range must enclose
+    // every closed voxel volume that could intersect the mathematical region;
+    // composed long-double expressions followed by an implicit double
+    // conversion are not a sound enclosure at ULP-scale boundaries.
+    for (int axis = 0; axis < 3; ++axis) {
+      DirectedBoundsV2 region_min = scalarBoundsV2(requested_region.min(axis));
+      DirectedBoundsV2 region_max = scalarBoundsV2(requested_region.max(axis));
+      const DirectedBoundsV2 halo = scalarBoundsV2(requested_region.halo);
+      DirectedBoundsV2 expanded_min;
+      DirectedBoundsV2 expanded_max;
+      if (!directedSubV2(region_min, halo, expanded_min) ||
+          !directedAddV2(region_max, halo, expanded_max)) {
+        return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+      }
+
+      expanded_min.lower = std::max(expanded_min.lower,
+                                    effective_map_min(axis));
+      expanded_min.upper = std::max(expanded_min.upper,
+                                    effective_map_min(axis));
+      expanded_max.lower = std::min(expanded_max.lower,
+                                    effective_map_max(axis));
+      expanded_max.upper = std::min(expanded_max.upper,
+                                    effective_map_max(axis));
+      if (!finiteBoundsV2(expanded_min) || !finiteBoundsV2(expanded_max) ||
+          expanded_min.lower > expanded_max.upper) {
+        return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+      }
+      // Keep the directed clipped request as metadata as well as using it to
+      // select source indices.  It remains in native map coordinates.
+      requested_min(axis) = expanded_min.lower;
+      requested_max(axis) = expanded_max.upper;
+    }
+  }
+  if ((requested_max.array() < requested_min.array()).any()) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+
+  Eigen::Vector3i source_min = Eigen::Vector3i::Zero();
+  Eigen::Vector3i source_max = map_count - Eigen::Vector3i::Ones();
+  if (requested_region.valid) {
+    for (int axis = 0; axis < 3; ++axis) {
+      DirectedBoundsV2 lower_offset;
+      DirectedBoundsV2 upper_offset;
+      DirectedBoundsV2 lower_coordinate;
+      DirectedBoundsV2 upper_coordinate;
+      if (!directedSubV2(scalarBoundsV2(requested_min(axis)),
+                         scalarBoundsV2(mp_.map_origin_(axis)),
+                         lower_offset) ||
+          !directedSubV2(scalarBoundsV2(requested_max(axis)),
+                         scalarBoundsV2(mp_.map_origin_(axis)),
+                         upper_offset) ||
+          !directedDivV2(lower_offset, mp_.resolution_, lower_coordinate) ||
+          !directedDivV2(upper_offset, mp_.resolution_, upper_coordinate)) {
+        return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+      }
+      int first = 0;
+      int last = -1;
+      if (!captureIndexRangeForRegion(lower_coordinate, upper_coordinate,
+                                      map_count(axis), first, last)) {
+        return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+      }
+      source_min(axis) = first;
+      source_max(axis) = last;
+    }
+  }
+
+  const Eigen::Vector3i capture_count = source_max - source_min +
+      Eigen::Vector3i::Ones();
+  std::size_t capture_size = 0U;
+  if (!validMapVoxelCount(capture_count, capture_size)) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  if (capture_size == 0U || capture_size > expected_size) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+
+  const std::shared_ptr<plan_env::SDFMapCaptureV2> capture(
+      new plan_env::SDFMapCaptureV2());
+  capture->valid = true;
+  capture->map_instance_id = authoritative_capture_mutex_v2_.instance_id;
+  if (capture->map_instance_id == 0U) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  capture->configuration_generation =
+      md_.authoritative_configuration_generation_v2_ == 0U
+      ? 1U : md_.authoritative_configuration_generation_v2_;
+  capture->configuration_key = captureConfigurationKeyV2(
+      mp_, md_.manual_boundary_enabled_, md_.manual_boundary_min_,
+      md_.manual_boundary_max_);
+  capture->frame_id = mp_.frame_id_;
+  capture->accepted_state_sequence = md_.authoritative_state_sequence_v2_;
+  capture->accepted_state_notification_sequence =
+      md_.authoritative_state_notification_sequence_v2_;
+  capture->accepted_time_ticks = md_.authoritative_state_time_ticks_v2_;
+  capture->observation_stamp = md_.authoritative_state_stamp_v2_;
+  capture->accepted_state_stamp = md_.authoritative_state_stamp_v2_;
+  // map_min/map_max are the effective planner-admissible domain.  The native
+  // grid origin/count remain the full SDFMap geometry; manual boundaries are
+  // therefore represented as a conservative domain restriction, not by
+  // rebasing or rewriting voxel indices.
+  capture->map_min = effective_map_min;
+  capture->map_max = effective_map_max;
+  capture->source_min_index = source_min;
+  capture->source_max_index = source_max;
+  capture->voxel_count = capture_count;
+  capture->resolution = mp_.resolution_;
+  // Retain the native SDFMap grid origin.  A cropped capture is identified by
+  // its integer source offsets, never by rebasing the origin through rounded
+  // floating-point multiplication.
+  capture->grid_origin = mp_.map_origin_;
+  capture->capture_min = requested_min;
+  capture->capture_max = requested_max;
+  capture->included_map_inflation = mp_.obstacles_inflation_;
+  // A present layer with a mismatched backing cannot be safely treated as
+  // absent: its effective planner contribution is unknown at this boundary.
+  if ((!md_.manual_occupancy_buffer_.empty() &&
+       md_.manual_occupancy_buffer_.size() != expected_size) ||
+      (!md_.static_preinflated_buffer_.empty() &&
+       md_.static_preinflated_buffer_.size() != expected_size)) {
+    return std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+  }
+  const bool manual_layer_present =
+      md_.manual_occupancy_buffer_.size() == expected_size &&
+      anyNonzero(md_.manual_occupancy_buffer_);
+  const bool static_layer_present =
+      mp_.static_preinflated_map_enable_ &&
+      md_.static_preinflated_map_ready_ &&
+      md_.static_preinflated_buffer_.size() == expected_size;
+  int ceiling_index = -1;
+  const bool ceiling_configured =
+      std::isfinite(mp_.virtual_ceil_height_) &&
+      mp_.virtual_ceil_height_ > -0.5;
+  if (ceiling_configured) {
+    const double ceiling_coordinate =
+        (mp_.virtual_ceil_height_ - mp_.map_origin_(2)) /
+        mp_.resolution_;
+    if (std::isfinite(ceiling_coordinate) &&
+        ceiling_coordinate >= static_cast<double>(INT_MIN) &&
+        ceiling_coordinate <= static_cast<double>(INT_MAX)) {
+      const double floored = std::floor(ceiling_coordinate);
+      if (floored >= 0.0 &&
+          floored < static_cast<double>(map_count.z())) {
+        ceiling_index = static_cast<int>(floored);
+      }
+    }
+  }
+  if (md_.has_cloud_ || md_.has_first_depth_) {
+    capture->effective_layer_mask |= plan_env::kSDFMapCaptureLayerSensor;
+  }
+  if (manual_layer_present) {
+    capture->effective_layer_mask |= plan_env::kSDFMapCaptureLayerManual;
+  }
+  if (static_layer_present) {
+    capture->effective_layer_mask |= plan_env::kSDFMapCaptureLayerStatic;
+  }
+  capture->occupied.assign(capture_size, 0U);
+  if (md_.authoritative_support_buffer_v2_.size() == expected_size) {
+    capture->support.mask.assign(capture_size, 0U);
+  }
+
+  bool ceiling_backing_present = false;
+  for (int x = source_min.x(); x <= source_max.x(); ++x)
+    for (int y = source_min.y(); y <= source_max.y(); ++y)
+      for (int z = source_min.z(); z <= source_max.z(); ++z) {
+        const Eigen::Vector3i source_index(x, y, z);
+        const Eigen::Vector3i capture_index = source_index - source_min;
+        const std::size_t source_address = mapAddressChecked(
+            source_index, map_count);
+        const std::size_t capture_address = mapAddressChecked(
+            capture_index, capture_count);
+        bool occupied = md_.occupancy_buffer_inflate_[source_address] != 0;
+        // `getInflateOccupancy` treats the manual overlay as authoritative
+        // even if a caller has not yet rerun applyManualLayer().  Preserve
+        // that effective planner semantics at the serialization boundary.
+        if (manual_layer_present &&
+            md_.manual_occupancy_buffer_[source_address] != 0) {
+          occupied = true;
+        }
+        // A ready static/preinflated layer is likewise effective even if its
+        // bits have not yet been re-applied to the mutable inflate buffer.
+        if (static_layer_present &&
+            md_.static_preinflated_buffer_[source_address] != 0) {
+          occupied = true;
+        }
+        // The ceiling layer is effective only when its native planner backing
+        // actually contains the configured ceiling plane.  A cloud-only map
+        // with the parameter set but no clear/inflate application must not
+        // synthesize a phantom occupied plane in this read-only capture.
+        if (ceiling_index >= 0 && source_index.z() == ceiling_index &&
+            md_.occupancy_buffer_inflate_[source_address] != 0) {
+          ceiling_backing_present = true;
+        }
+        capture->occupied[capture_address] = occupied ? 1U : 0U;
+        if (!capture->support.mask.empty()) {
+          capture->support.mask[capture_address] =
+              md_.authoritative_support_buffer_v2_[source_address] != 0 ? 1U : 0U;
+        }
+      }
+
+  if (ceiling_backing_present) {
+    capture->effective_layer_mask |= plan_env::kSDFMapCaptureLayerCeiling;
+  }
+
+  const bool support_binding_matches =
+      md_.authoritative_support_map_instance_id_v2_ ==
+          capture->map_instance_id &&
+      md_.authoritative_support_configuration_generation_v2_ ==
+          capture->configuration_generation &&
+      md_.authoritative_support_configuration_key_v2_ ==
+          capture->configuration_key &&
+      md_.authoritative_support_frame_id_v2_ == capture->frame_id;
+  const bool support_expiry_grounded =
+      md_.authoritative_support_valid_until_v2_.isZero()
+      ? md_.authoritative_support_valid_until_ticks_v2_ == 0U
+      : md_.authoritative_support_valid_until_ticks_v2_ != 0U;
+  const bool support_not_expired =
+      support_expiry_grounded &&
+      (md_.authoritative_support_valid_until_ticks_v2_ == 0U ||
+       steadyTicksV2() <= md_.authoritative_support_valid_until_ticks_v2_);
+  Eigen::Vector3d support_min = md_.authoritative_support_min_v2_;
+  Eigen::Vector3d support_max = md_.authoritative_support_max_v2_;
+  bool support_domain_valid = finiteVector(support_min) &&
+      finiteVector(support_max) &&
+      (support_max.array() >= support_min.array()).all();
+  if (support_domain_valid && md_.manual_boundary_enabled_) {
+    support_min = support_min.cwiseMax(capture->map_min);
+    support_max = support_max.cwiseMin(capture->map_max);
+    support_domain_valid =
+        (support_max.array() >= support_min.array()).all();
+  }
+  if (support_domain_valid) {
+    support_domain_valid =
+        (support_min.array() >= capture->map_min.array()).all() &&
+        (support_max.array() <= capture->map_max.array()).all();
+  }
+  capture->support.valid = md_.authoritative_support_valid_v2_ &&
+      md_.authoritative_support_complete_v2_ &&
+      support_binding_matches && support_not_expired &&
+      !authoritative_capture_mutex_v2_.support_binding_invalidated &&
+      support_domain_valid &&
+      !capture->support.mask.empty();
+  capture->support.complete = capture->support.valid;
+  capture->support.evidence_basis =
+      md_.authoritative_support_evidence_basis_v2_;
+  capture->support.evidence_sequence =
+      md_.authoritative_support_sequence_v2_;
+  capture->support.evidence_accepted_ticks =
+      md_.authoritative_support_accepted_ticks_v2_;
+  capture->support.map_instance_id =
+      md_.authoritative_support_map_instance_id_v2_;
+  capture->support.configuration_generation =
+      md_.authoritative_support_configuration_generation_v2_;
+  capture->support.configuration_key =
+      md_.authoritative_support_configuration_key_v2_;
+  capture->support.frame_id = md_.authoritative_support_frame_id_v2_;
+  capture->support.evidence_stamp = md_.authoritative_support_stamp_v2_;
+  capture->support.valid_until = md_.authoritative_support_valid_until_v2_;
+  capture->support.valid_until_accepted_ticks =
+      md_.authoritative_support_valid_until_ticks_v2_;
+  capture->support.support_min = support_domain_valid
+      ? support_min : Eigen::Vector3d::Zero();
+  capture->support.support_max = support_domain_valid
+      ? support_max : Eigen::Vector3d::Zero();
+  capture->support.required_halo = md_.authoritative_support_halo_v2_;
+  capture->support.halo_reconciled =
+      md_.authoritative_support_halo_reconciled_v2_;
+  return std::shared_ptr<const plan_env::SDFMapCaptureV2>(capture);
+}
+
 double SDFMap::getResolution() { return mp_.resolution_; }
 
 Eigen::Vector3d SDFMap::getOrigin() { return mp_.map_origin_; }
@@ -2246,6 +3433,8 @@ void SDFMap::getSurroundPts(const Eigen::Vector3d& pos, Eigen::Vector3d pts[2][2
 
 void SDFMap::depthOdomCallback(const sensor_msgs::ImageConstPtr& img,
                                const nav_msgs::OdometryConstPtr& odom) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   /* get pose */
   md_.camera_pos_(0) = odom->pose.pose.position.x;
   md_.camera_pos_(1) = odom->pose.pose.position.y;
@@ -2265,10 +3454,14 @@ void SDFMap::depthOdomCallback(const sensor_msgs::ImageConstPtr& img,
 }
 
 void SDFMap::depthCallback(const sensor_msgs::ImageConstPtr& img) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   std::cout << "depth: " << img->header.stamp << std::endl;
 }
 
 void SDFMap::poseCallback(const geometry_msgs::PoseStampedConstPtr& pose) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   std::cout << "pose: " << pose->header.stamp << std::endl;
 
   md_.camera_pos_(0) = pose->pose.position.x;

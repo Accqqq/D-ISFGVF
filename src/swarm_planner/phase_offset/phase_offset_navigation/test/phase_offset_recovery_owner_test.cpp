@@ -702,6 +702,185 @@ TEST(RecoveryOwnerTest, TinyNonzeroTargetResidualIsNotCanonicalizedToTerminal) {
   }
 }
 
+TubeFiniteReserveV2 FiniteReserveFixture() {
+  TubeFiniteReserveV2 reserve;
+  reserve.valid = true;
+  reserve.reserve_id = 901U;
+  reserve.identity.execution_generation = 1U;
+  reserve.identity.path_instance_id = 2U;
+  reserve.identity.path_revision = 3U;
+  reserve.identity.frame_revision = 4U;
+  reserve.identity.frame_convention_id = 5U;
+  reserve.identity.configuration_id = 6U;
+  reserve.identity.map_instance_id = 7U;
+  reserve.identity.map_state_id = 8U;
+  reserve.identity.accepted_sequence = 9U;
+  reserve.identity.profile_id = 10U;
+  reserve.identity.binding_sequence = 11U;
+  reserve.initial.w = 0.0;
+  reserve.initial.delta = 0.1;
+  reserve.initial.previous_u = phase_offset_core::PortCommand();
+  reserve.dt = 0.1;
+  TubeReserveStepV2 brake;
+  brake.ordinal = 0U;
+  brake.segment = TubeReserveSegmentKindV2::BRAKE;
+  brake.before = reserve.initial;
+  brake.command.u_delta = -1.0;
+  brake.base_phase_rate = 0.1;
+  brake.phase_rate_lower = 0.1;
+  brake.phase_rate_upper = 0.2;
+  brake.after = brake.before;
+  brake.after.w = brake.before.w +
+      reserve.dt * (brake.base_phase_rate + brake.command.u_w);
+  brake.after.delta = brake.before.delta +
+      reserve.dt * brake.command.u_delta;
+  brake.after.previous_u = brake.command;
+  brake.valid = true;
+  TubeReserveStepV2 settle;
+  settle.ordinal = 1U;
+  settle.segment = TubeReserveSegmentKindV2::SETTLE;
+  settle.before = brake.after;
+  settle.command = phase_offset_core::PortCommand();
+  settle.base_phase_rate = 0.1;
+  settle.phase_rate_lower = 0.1;
+  settle.phase_rate_upper = 0.2;
+  settle.after = settle.before;
+  settle.after.w = settle.before.w +
+      reserve.dt * (settle.base_phase_rate + settle.command.u_w);
+  settle.after.delta = settle.before.delta +
+      reserve.dt * settle.command.u_delta;
+  settle.after.previous_u = settle.command;
+  settle.valid = true;
+  reserve.steps = {brake, settle};
+  reserve.terminal = settle.after;
+  reserve.w_max = settle.after.w;
+  reserve.common_lower = -1.0;
+  reserve.common_upper = 1.0;
+  reserve.cursor = 0U;
+  reserve.work_count = 2U;
+  reserve.provenance = "T23/finite-reserve-fixture";
+  return reserve;
+}
+
+TEST(RecoveryOwnerTest, TypedFiniteReserveAdvancesOnlyAfterCommit) {
+  PhaseOffsetRecoveryOwner owner;
+  const TubeFiniteReserveV2 reserve = FiniteReserveFixture();
+  ASSERT_TRUE(TubeExecutionGuardV2::validateReserve(reserve));
+  CertifiedReservePrepareInputV2 input;
+  input.recovery_session = 17U;
+  input.reserve = reserve;
+  input.expected_identity = reserve.identity;
+  input.cursor = 0U;
+  input.expected_state = reserve.initial;
+  input.dt = reserve.dt;
+  input.now = 0.0;
+  input.deadline = 1.0;
+  input.deadline_valid = true;
+  input.provenance = "T23/typed-reserve";
+  RecoveryPreparedStep prepared;
+  ASSERT_TRUE(owner.prepareCertifiedReserveV2(input, prepared));
+  EXPECT_EQ(owner.status().reserve_cursor, 0U);
+  EXPECT_EQ(prepared.proof_kind, RecoveryStepProofKind::FINITE_RESERVE_V2);
+  EXPECT_EQ(prepared.reserve_cursor, 0U);
+  ASSERT_TRUE(owner.commit(prepared));
+  EXPECT_EQ(owner.status().reserve_id, reserve.reserve_id);
+  EXPECT_EQ(owner.status().reserve_cursor, 1U);
+  EXPECT_DOUBLE_EQ(owner.status().current_delta, 0.0);
+  EXPECT_TRUE(owner.status().nonzero_authority_retained);
+
+  // The cursor advances only after the first publication/commit.  Prepare
+  // the actual SETTLE step against a reserve copy carrying cursor=1, then
+  // verify that the exact neutral terminality is published with cursor=2.
+  CertifiedReservePrepareInputV2 settle_input = input;
+  settle_input.reserve.cursor = 1U;
+  settle_input.cursor = 1U;
+  settle_input.expected_state = reserve.steps[1].before;
+  RecoveryPreparedStep settle_prepared;
+  ASSERT_TRUE(owner.prepareCertifiedReserveV2(settle_input, settle_prepared));
+  EXPECT_EQ(owner.status().reserve_cursor, 1U);
+  EXPECT_EQ(settle_prepared.reserve_segment, TubeReserveSegmentKindV2::SETTLE);
+  EXPECT_TRUE(settle_prepared.exact_terminal_predicate);
+  ASSERT_TRUE(owner.commit(settle_prepared));
+  EXPECT_EQ(owner.status().reserve_cursor, 2U);
+  EXPECT_TRUE(owner.status().exact_terminal_predicate);
+  EXPECT_FALSE(owner.status().nonzero_authority_retained);
+
+  CertifiedReservePrepareInputV2 stale_session = settle_input;
+  stale_session.recovery_session += 1U;
+  RecoveryPreparedStep stale_output;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(stale_session, stale_output));
+  EXPECT_EQ(stale_output.status, RecoveryStepStatus::STALE);
+  EXPECT_EQ(owner.status().reserve_cursor, 2U);
+
+  RecoveryPreparedStep replay;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(input, replay));
+  EXPECT_EQ(replay.status, RecoveryStepStatus::STALE);
+  EXPECT_EQ(owner.status().reserve_cursor, 2U);
+}
+
+TEST(RecoveryOwnerTest, TypedFiniteReserveRejectsSubstitutionAndExpiredPublish) {
+  PhaseOffsetRecoveryOwner owner;
+  const TubeFiniteReserveV2 reserve = FiniteReserveFixture();
+  CertifiedReservePrepareInputV2 input;
+  input.recovery_session = 18U;
+  input.reserve = reserve;
+  input.expected_identity = reserve.identity;
+  input.cursor = 0U;
+  input.expected_state = reserve.initial;
+  input.dt = reserve.dt;
+  input.now = 0.0;
+  input.deadline = 1.0;
+  input.deadline_valid = true;
+  input.provenance = "T23/failed-publish";
+  RecoveryPreparedStep prepared;
+  ASSERT_TRUE(owner.prepareCertifiedReserveV2(input, prepared));
+  const RecoveryOwnerStatus before = owner.status();
+  prepared.selected_u.u_delta = -0.5;
+  EXPECT_FALSE(owner.validateCommit(prepared));
+  EXPECT_EQ(owner.status().reserve_cursor, before.reserve_cursor);
+
+  // A caller cannot substitute a different expected execution state for the
+  // selected reserve cursor.  Preparation must reject it without advancing
+  // or otherwise mutating the owner status.
+  CertifiedReservePrepareInputV2 mismatched_state = input;
+  mismatched_state.expected_state.delta = 0.2;
+  RecoveryPreparedStep mismatch_output;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(mismatched_state,
+                                               mismatch_output));
+  EXPECT_EQ(mismatch_output.status, RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED);
+  EXPECT_EQ(owner.status().reserve_cursor, before.reserve_cursor);
+
+  CertifiedReservePrepareInputV2 mismatched_identity = input;
+  mismatched_identity.expected_identity.path_revision += 1U;
+  RecoveryPreparedStep identity_output;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(mismatched_identity,
+                                               identity_output));
+  EXPECT_EQ(identity_output.status, RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED);
+  EXPECT_EQ(owner.status().reserve_cursor, before.reserve_cursor);
+
+  CertifiedReservePrepareInputV2 mismatched_dt = input;
+  mismatched_dt.dt = reserve.dt + 0.01;
+  RecoveryPreparedStep dt_output;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(mismatched_dt, dt_output));
+  EXPECT_EQ(dt_output.status, RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED);
+  EXPECT_EQ(owner.status().reserve_cursor, before.reserve_cursor);
+
+  // The typed validator re-derives each after-state recurrence; a forged
+  // reserve endpoint is unavailable even when the cursor/identity match.
+  CertifiedReservePrepareInputV2 forged = input;
+  forged.reserve.steps[0].after.w += 0.001;
+  RecoveryPreparedStep forged_output;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(forged, forged_output));
+  EXPECT_EQ(forged_output.status, RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED);
+  EXPECT_EQ(owner.status().reserve_cursor, before.reserve_cursor);
+
+  prepared = RecoveryPreparedStep();
+  input.now = input.deadline;
+  EXPECT_FALSE(owner.prepareCertifiedReserveV2(input, prepared));
+  EXPECT_EQ(prepared.status, RecoveryStepStatus::DEADLINE_EXPIRED);
+  EXPECT_EQ(owner.status().reserve_cursor, before.reserve_cursor);
+}
+
 }  // namespace
 }  // namespace phase_offset_navigation
 

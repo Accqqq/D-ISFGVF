@@ -2,9 +2,11 @@
 
 #include <cmath>
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "bspline_race/integration/phase_offset_clearance_audit.h"
+#include "bspline_race/integration/phase_offset_cloud_occupancy_query.h"
 #include "bspline_race/integration/phase_offset_matched_adapter.h"
 #include "phase_offset_navigation/tube_builder.h"
 #include "phase_offset_navigation/tube_filter.h"
@@ -38,6 +40,37 @@ ContinuousPhasePath MakeStraightPath(const std::string& label = "mapped_bspline"
   ContinuousPhasePath path;
   path.appendSegment(0.0, 3.0, label, MakeStraightEvaluator());
   return path;
+}
+
+phase_offset_navigation::PathCellBoundQuery
+MakeStraightPathCellBoundQuery() {
+  return [](const double w0, const double w1,
+            phase_offset_core::PathCellGeometryCertificate& certificate) {
+    certificate = phase_offset_core::PathCellGeometryCertificate();
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.segment_w0 = 0.0;
+    certificate.segment_w1 = 3.0;
+    certificate.segment_identity = 1U;
+    certificate.inf_p_w_norm = 1.0;
+    certificate.inf_horizontal_p_w_norm = 1.0;
+    certificate.sup_p_w_norm = 1.0;
+    certificate.sup_p_ww_norm = 0.0;
+    certificate.sup_p_www_norm = 0.0;
+    certificate.sup_horizontal_p_ww_norm = 0.0;
+    certificate.horizontal_acceleration_bound_complete = true;
+    certificate.sup_N_w_norm = 0.0;
+    certificate.sup_abs_curvature = 0.0;
+    certificate.normal_variation_bound = 0.0;
+    certificate.tangent_variation_bound = 0.0;
+    certificate.curvature_variation_bound = 0.0;
+    certificate.midpoint_position_variation_bound = 0.5 * (w1 - w0);
+    certificate.chord_deviation_bound = 0.0;
+    certificate.valid = std::isfinite(w0) && std::isfinite(w1) &&
+        w1 > w0 && w0 >= 0.0 && w1 <= 3.0;
+    certificate.complete = certificate.valid;
+    return certificate.valid;
+  };
 }
 
 ContinuousPhasePath MakeHeightVaryingPath() {
@@ -150,6 +183,47 @@ phase_offset_navigation::ClearanceQuery MakeCertifiedClearance(
     result.clearance_certified = clearance >= required;
     return result;
   };
+}
+
+std::shared_ptr<const plan_env::SDFMapCaptureV2> MakeMetricCapture() {
+  std::shared_ptr<plan_env::SDFMapCaptureV2> capture(
+      new plan_env::SDFMapCaptureV2());
+  capture->valid = true;
+  capture->map_instance_id = 51U;
+  capture->configuration_generation = 2U;
+  capture->configuration_key = 31U;
+  capture->frame_id = "world";
+  capture->accepted_state_sequence = 7U;
+  capture->accepted_time_ticks = 10U;
+  capture->map_min = Eigen::Vector3d::Constant(-1.0);
+  capture->map_max = Eigen::Vector3d::Constant(3.0);
+  capture->grid_origin = capture->map_min;
+  capture->capture_min = capture->map_min;
+  capture->capture_max = capture->map_max;
+  capture->source_min_index = Eigen::Vector3i::Zero();
+  capture->source_max_index = Eigen::Vector3i::Constant(3);
+  capture->voxel_count = Eigen::Vector3i::Constant(4);
+  capture->resolution = 1.0;
+  capture->included_map_inflation = 0.0;
+  capture->occupied.assign(64U, 0U);
+  // Native index (1,1,1) is the closed voxel [0,1]^3.
+  capture->occupied[(1U * 4U + 1U) * 4U + 1U] = 1U;
+  capture->support.valid = true;
+  capture->support.complete = true;
+  capture->support.evidence_basis =
+      plan_env::kSDFMapCaptureSupportEvidenceCompletePreknownDomain;
+  capture->support.evidence_sequence = 7U;
+  capture->support.evidence_accepted_ticks = 10U;
+  capture->support.map_instance_id = 51U;
+  capture->support.configuration_generation = 2U;
+  capture->support.configuration_key = 31U;
+  capture->support.frame_id = "world";
+  capture->support.support_min = capture->map_min;
+  capture->support.support_max = capture->map_max;
+  capture->support.required_halo = 0.0;
+  capture->support.halo_reconciled = true;
+  capture->support.mask.assign(64U, 1U);
+  return capture;
 }
 
 // Two disconnected robust components: nominal delta=0 is safe, while the
@@ -289,16 +363,18 @@ TEST(ClearanceAuditTest, ActualBuilderFilterValidatorBuildFeedsOneAuditRecord) {
         result.clearance_certified = true;
         return result;
       };
+  const auto path_cell_bound_query = MakeStraightPathCellBoundQuery();
   phase_offset_navigation::TubeProfile profile;
   ASSERT_TRUE(phase_offset_navigation::TubeBuilder().buildCloudClearance(
       phase_offset_navigation::TubeSource::ESDF, preview, clearance,
-      path_query, 0.10, 1.0, 7U, 11U, profile));
+      path_query, path_cell_bound_query, 0.10, 1.0, 7U, 11U, profile));
   profile.snapshot_sequence = 19U;
   profile.snapshot_provenance_is_immutable = true;
   ASSERT_TRUE(phase_offset_navigation::TubeFilter().filter(profile, 1.0));
   phase_offset_navigation::TubeSurfaceValidationResult surface;
   ASSERT_TRUE(phase_offset_navigation::TubeSurfaceValidator().validate(
-      profile, 1.0, path_query, clearance, 0.10, 0.40, 0.10, surface));
+      profile, 1.0, path_query, path_cell_bound_query, clearance, 0.10, 0.40,
+      0.10, surface));
 
   auto input = MakeMarginInput(path, profile, clearance);
   input.surface_validation = &surface;
@@ -345,17 +421,18 @@ TEST(ClearanceAuditTest,
         return state.valid;
       };
   const auto split_clearance = MakeSplitRobustClearance();
+  const auto path_cell_bound_query = MakeStraightPathCellBoundQuery();
   phase_offset_navigation::TubeProfile profile;
   ASSERT_TRUE(phase_offset_navigation::TubeBuilder().buildCloudClearance(
       phase_offset_navigation::TubeSource::ESDF, preview, split_clearance,
-      path_query, 0.10, 1.0, 7U, 11U, profile));
+      path_query, path_cell_bound_query, 0.10, 1.0, 7U, 11U, profile));
   profile.snapshot_sequence = 19U;
   profile.snapshot_provenance_is_immutable = true;
   ASSERT_TRUE(phase_offset_navigation::TubeFilter().filter(profile, 1.0));
   phase_offset_navigation::TubeSurfaceValidationResult surface;
   ASSERT_TRUE(phase_offset_navigation::TubeSurfaceValidator().validate(
-      profile, 1.0, path_query, split_clearance, 0.10, 0.40, 0.10,
-      surface));
+      profile, 1.0, path_query, path_cell_bound_query, split_clearance, 0.10,
+      0.40, 0.10, surface));
 
   auto input = MakeMarginInput(path, profile, split_clearance);
   input.planner_distance_query = MakeConstantQuery(0.40);
@@ -654,9 +731,74 @@ TEST(ClearanceAuditTest, PositiveAndNegativeProbesAreNotSwapped) {
   EXPECT_NEAR(Value(result, kAuditMinBaseDistance), 0.4, 1e-12);
 }
 
-TEST(ClearanceAuditTest, SchemaIsStrictSixtyAndExistingManualStaysEightyThree) {
+TEST(ClearanceAuditTest,
+     CenterDistanceAndClosedVolumeRemainDistinctAtUnchangedEpsilon) {
+  // The immutable backing contains one occupied voxel [0,1]^3.  At q=(1.25,
+  // .5,.5), its center is 0.75 m away while its closed volume is 0.25 m away.
+  // Keep the planner epsilon fixed at 0.40 for both metrics.
+  const double epsilon = 0.40;
+  const Eigen::Vector3d witness(1.25, 0.5, 0.5);
+  const std::shared_ptr<const plan_env::SDFMapCaptureV2> capture =
+      MakeMetricCapture();
+  const SDFMapCaptureQueryBridgeV2 bridge =
+      makeSDFMapCaptureQueryV2(capture);
+  ASSERT_TRUE(bridge.usable());
+  EXPECT_TRUE(bridge.descriptor.closed_inflated_voxel_volume_metric);
+  EXPECT_EQ(bridge.descriptor.clearance_metric,
+            "closed_inflated_voxel_volume");
+  EXPECT_DOUBLE_EQ(bridge.descriptor.included_map_inflation, 0.0);
+
+  // Mirror the same occupied backing through the unchanged legacy
+  // planner-ESDF-base center query.  Its requested radius is deliberately
+  // larger only to expose the uncapped 0.75 m center distance; admission
+  // still compares that evidence against the unchanged epsilon above.
+  plan_env::CloudOccupancySnapshot legacy;
+  legacy.valid = true;
+  legacy.observation_sequence = 7U;
+  legacy.map_min = Eigen::Vector3d::Constant(-1.0);
+  legacy.map_max = Eigen::Vector3d::Constant(3.0);
+  legacy.observed_min = legacy.map_min;
+  legacy.observed_max = legacy.map_max;
+  legacy.grid_origin = legacy.map_min;
+  legacy.voxel_count = Eigen::Vector3i::Constant(4);
+  legacy.resolution = 1.0;
+  legacy.included_map_inflation = 0.0;
+  legacy.occupied.assign(64U, 0U);
+  legacy.occupied[(1U * 4U + 1U) * 4U + 1U] = 1U;
+  const auto center_at_epsilon =
+      plan_env::queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+          legacy, witness, epsilon);
+  EXPECT_EQ(center_at_epsilon.status,
+            plan_env::CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_TRUE(center_at_epsilon.clearance_certified);
+  EXPECT_DOUBLE_EQ(
+      center_at_epsilon.nearest_inflated_occupied_voxel_center_distance,
+      epsilon);
+  const auto center = plan_env::queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
+      legacy, witness, 1.0);
+  EXPECT_EQ(center.status, plan_env::CloudOccupancyStatus::KNOWN_FREE);
+  EXPECT_TRUE(center.clearance_certified);
+  EXPECT_NEAR(center.nearest_inflated_occupied_voxel_center_distance,
+              0.75, 1e-12);
+  EXPECT_GT(center.nearest_inflated_occupied_voxel_center_distance, epsilon);
+
+  const auto native = plan_env::certifySDFMapCaptureFreeBallV2(
+      *capture, witness, epsilon);
+  EXPECT_EQ(native.status,
+            plan_env::SDFMapCaptureFreeBallStatusV2::INCONCLUSIVE);
+  const auto volume = bridge.free_ball_query(witness, epsilon);
+  EXPECT_EQ(volume.status,
+            phase_offset_navigation::DistanceStatus::UNAVAILABLE);
+  EXPECT_FALSE(volume.certified);
+  EXPECT_FALSE(volume.exact);
+  EXPECT_NE(volume.provenance.find("closed-inflated-voxel-volume"),
+            std::string::npos);
+  EXPECT_NE(volume.provenance.find("inconclusive"), std::string::npos);
+  EXPECT_DOUBLE_EQ(epsilon, 0.40);
+}
+
+TEST(ClearanceAuditTest, V2AuditSchemaIsStrictSixtyAndFinite) {
   EXPECT_EQ(kAuditCount, 60U);
-  EXPECT_EQ(kManualDiagnosticCount, 83U);
   EXPECT_EQ(kAuditSchemaVersion, 0U);
   EXPECT_EQ(kAuditCount - 1U, kAuditTubeInsufficientClearanceCount);
   const auto path = MakeStraightPath();

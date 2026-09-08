@@ -9,8 +9,15 @@
 namespace FLAG_Race
 {
     namespace {
-    constexpr double kH2HandoffCoverageTolerance = 1e-10;
-    constexpr double kH2LifecycleNonzeroDeltaTolerance = 1e-6;
+    constexpr double kPathReferenceHandoffTolerance = 1e-10;
+    constexpr std::uint64_t kWorldHorizontalFrameConventionIdV2 = 1U;
+
+    double steadyTicksV2AsDouble()
+    {
+        return static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
 
     PhaseOffsetCoordinationBackend parseCoordinationBackend(
         const std::string& value, bool& valid)
@@ -59,73 +66,160 @@ namespace FLAG_Race
         return -1;
     }
 
-    bool c2ConnectorEndForSeam(
+    bool c2ConnectorEndForSeamV2(
         const std::shared_ptr<const ContinuousPhasePath>& path,
-        const double seam_w, double& connector_end_w)
+        const double seam_w,
+        double& connector_end_w)
     {
         connector_end_w = 0.0;
         if (!path || path->empty() || !std::isfinite(seam_w)) return false;
         for (const ContinuousPhasePath::Segment& segment : path->segments()) {
             if (segment.label == "c2_quintic" &&
                 std::abs(segment.w0 - seam_w) <=
-                    kH2HandoffCoverageTolerance &&
+                    kPathReferenceHandoffTolerance &&
                 std::isfinite(segment.w1) &&
-                segment.w1 > seam_w + kH2HandoffCoverageTolerance) {
+                segment.w1 > seam_w + kPathReferenceHandoffTolerance) {
                 connector_end_w = segment.w1;
                 return true;
             }
         }
         return false;
     }
+
     }
 
-    bool gvf_manager::selectStructuralFutureSeam(
-        const std::shared_ptr<const PathTubePair>& old_pair,
-        const double captured_w0,
-        const double min_construction_lead_w,
-        double& seam_w)
-    {
-        seam_w = 0.0;
-        constexpr double kSeamEps = 1e-10;
-        if (!old_pair || !old_pair->path_owner || old_pair->path_owner->empty() ||
-            !old_pair->full_path_samples || !std::isfinite(captured_w0) ||
-            !std::isfinite(min_construction_lead_w) ||
-            min_construction_lead_w < 0.0 ||
-            old_pair->source_revision == 0U) {
-            return false;
-        }
-
-        double previous_w = -std::numeric_limits<double>::infinity();
-        for (const phase_offset_core::PathDifferentialState& sample :
-             *old_pair->full_path_samples) {
-            if (!sample.valid || !std::isfinite(sample.w) ||
-                sample.w <= previous_w + kSeamEps) {
-                return false;
-            }
-            previous_w = sample.w;
-            // This is a geometric/asynchronous construction lead only.  Do
-            // not query the old profile or certificate here: the old Pair is
-            // checked solely at the later live-CAS phase, while the new owner
-            // proves this copied prefix and future connector.
-            if (sample.w < captured_w0 + min_construction_lead_w -
-                    kSeamEps) {
-                continue;
-            }
-            ContinuousPhasePathState owner_state;
-            if (!old_pair->path_owner->evaluate(sample.w, owner_state, false) ||
-                !owner_state.valid || !owner_state.p.allFinite() ||
-                !owner_state.dp_dw.allFinite() ||
-                !owner_state.d2p_dw2.allFinite() ||
-                (owner_state.p - sample.p).norm() > kSeamEps ||
-                (owner_state.dp_dw - sample.p_w).norm() > kSeamEps ||
-                (owner_state.d2p_dw2 - sample.p_ww).norm() > kSeamEps) {
-                return false;
-            }
-            seam_w = sample.w;
-            return true;
-        }
+bool gvf_manager::plannerOnlyFutureSeamV2(
+    const std::shared_ptr<const ContinuousPhasePath>& source_path,
+    const double phase_at_switch,
+    const double construction_lead_w,
+    double& seam_w)
+{
+    seam_w = 0.0;
+    if (!source_path || source_path->empty() ||
+        !std::isfinite(phase_at_switch) ||
+        !std::isfinite(construction_lead_w) ||
+        phase_at_switch < source_path->startW() ||
+        phase_at_switch >= source_path->endW()) {
         return false;
     }
+    const double earliest_seam_w =
+        phase_at_switch + std::max(0.0, construction_lead_w);
+    if (!std::isfinite(earliest_seam_w)) return false;
+
+    // A mapped B-spline is one outer Segment whose represented map owns many
+    // exact internal breakpoints.  Segment::w1 alone sees only the path end
+    // and unnecessarily falls back to a current-w CAS.  Use the complete
+    // structural partition and require a genuinely interior future seam.
+    std::vector<double> breakpoints;
+    if (!source_path->certificateBreakpointsV2(breakpoints)) return false;
+    for (const double candidate : breakpoints) {
+        if (!std::isfinite(candidate) ||
+            candidate <= phase_at_switch +
+                kPathReferenceHandoffTolerance ||
+            candidate + kPathReferenceHandoffTolerance < earliest_seam_w ||
+            candidate >= source_path->endW() -
+                kPathReferenceHandoffTolerance) {
+            continue;
+        }
+        ContinuousPhasePathState seam_state;
+        if (source_path->evaluate(candidate, seam_state, false) &&
+            seam_state.valid) {
+            seam_w = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PathReferenceFrontendMirrorV2::complete() const
+{
+    if (traj.rows() < 2 || traj.cols() != 3 ||
+        vel.rows() != traj.rows() || vel.cols() != 3 ||
+        time.size() != traj.rows() ||
+        w.size() != static_cast<std::size_t>(traj.rows()) ||
+        anchor_idx < 0 || anchor_idx >= traj.rows() ||
+        !traj.allFinite() || !vel.allFinite() || !time.allFinite()) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < w.size(); ++index) {
+        if (!std::isfinite(w[index]) ||
+            (index != 0U && !(w[index] > w[index - 1U]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PathReferenceHandoffV2::requestComplete() const
+{
+    if (expected_execution_generation == 0U ||
+        !source_path_key.complete() || !successor_path_key.complete() ||
+        source_path_key.execution_generation != expected_execution_generation ||
+        successor_path_key.execution_generation != expected_execution_generation ||
+        source_path_key == successor_path_key || !successor_path_owner ||
+        successor_path_owner->empty() || !successor_request ||
+        !successor_request->complete() || !frontend_mirror ||
+        !frontend_mirror->complete() ||
+        !std::isfinite(successor_phase_after_w) ||
+        !std::isfinite(copied_prefix_start_w) ||
+        !std::isfinite(copied_prefix_end_w) ||
+        successor_phase_after_w != copied_prefix_start_w ||
+        !(copied_prefix_end_w > copied_prefix_start_w) ||
+        copied_prefix_start_w < source_path_key.domain_start ||
+        copied_prefix_end_w > source_path_key.domain_end ||
+        copied_prefix_start_w < successor_path_key.domain_start ||
+        copied_prefix_end_w > successor_path_key.domain_end ||
+        source_path_key.phase_orientation !=
+            successor_path_key.phase_orientation ||
+        source_path_key.frame_convention_id !=
+            successor_path_key.frame_convention_id ||
+        source_path_key.frame_convention !=
+            successor_path_key.frame_convention ||
+        successor_path_owner->startW() != successor_path_key.domain_start ||
+        successor_path_owner->endW() != successor_path_key.domain_end ||
+        successor_path_owner->pathRevision() !=
+            successor_path_key.path_revision ||
+        successor_request->path_key != successor_path_key ||
+        successor_request->requested_start != copied_prefix_start_w ||
+        successor_request->anchor_w != successor_phase_after_w ||
+        successor_request->requested_end < copied_prefix_end_w ||
+        successor_request->path_owner.get() != successor_path_owner.get()) {
+        return false;
+    }
+    if (successor_profile &&
+        (successor_profile->path_key != successor_path_key ||
+         successor_profile->configuration_key !=
+             successor_request->configuration_key ||
+         successor_profile->map_capture_key !=
+             successor_request->map_capture_key)) {
+        return false;
+    }
+    if (admission_evidence &&
+        (!admission_evidence->valid ||
+         !admission_evidence->structurally_copied_prefix ||
+         admission_evidence->expected_execution_generation !=
+             expected_execution_generation ||
+         admission_evidence->source_path_key != source_path_key ||
+         admission_evidence->successor_path_key != successor_path_key ||
+         admission_evidence->source_path_owner == nullptr ||
+         admission_evidence->successor_path_owner != successor_path_owner ||
+         admission_evidence->successor_request != successor_request ||
+         admission_evidence->phase_after_w != successor_phase_after_w ||
+         admission_evidence->copied_prefix_start_w !=
+             copied_prefix_start_w ||
+         admission_evidence->copied_prefix_end_w != copied_prefix_end_w)) {
+        return false;
+    }
+    return true;
+}
+
+bool PathReferenceHandoffV2::committedComplete() const
+{
+    return requestComplete() && successor_profile &&
+        successor_profile->complete && successor_profile->valid &&
+        successor_profile->path_owner.get() == successor_path_owner.get() &&
+        successor_profile->request_id == successor_request->request_id;
+}
 
     gvf_manager::AuthoritativePhaseSnapshot
     gvf_manager::captureAuthoritativePhase() const
@@ -137,126 +231,6 @@ namespace FLAG_Race
         snapshot.closed_acquired = closed_phase_acquired_;
         snapshot.generation = authoritative_phase_generation_;
         return snapshot;
-    }
-
-    std::shared_ptr<const gvf_manager::SuccessorHandoffTransaction>
-    gvf_manager::captureSuccessorHandoffTransaction() const
-    {
-        std::lock_guard<std::mutex> lock(successor_handoff_mutex_);
-        return successor_handoff_transaction_;
-    }
-
-    void gvf_manager::clearSuccessorHandoffTransaction()
-    {
-        std::lock_guard<std::mutex> lock(successor_handoff_mutex_);
-        successor_handoff_transaction_.reset();
-    }
-
-    void gvf_manager::publishSuccessorHandoffTransaction(
-        const AuthoritativePhaseCommitToken& phase_token,
-        const std::shared_ptr<const PathTubePair>& command_pair,
-        const std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>&
-            committed_authority,
-        const double runtime_retained_delta_before,
-        const phase_offset_core::PortCommand& runtime_previous_final_port_before,
-        const double runtime_next_delta,
-        const phase_offset_core::PortCommand& runtime_next_previous_final_port)
-    {
-        if (!phase_token.valid || !command_pair || !committed_authority ||
-            !phase_token.expected.initialized ||
-            !phase_token.committed.initialized ||
-            !command_pair->active_profile || !command_pair->path_owner ||
-            !command_pair->frame_owner) {
-            return;
-        }
-        const double epsilon = phase_offset_matched_adapter_
-            ? phase_offset_matched_adapter_->execution_authority_
-                  .config().comparison_epsilon
-            : 1e-12;
-        if (!std::isfinite(epsilon) || epsilon < 0.0 ||
-            !std::isfinite(phase_token.expected.w) ||
-            !std::isfinite(phase_token.committed.w) ||
-            !std::isfinite(committed_authority->w) ||
-            !std::isfinite(committed_authority->proposed_next_w) ||
-            std::abs(committed_authority->w - phase_token.expected.w) >
-                epsilon ||
-            std::abs(committed_authority->proposed_next_w -
-                     phase_token.committed.w) > epsilon ||
-            committed_authority->authority_session == 0U ||
-            committed_authority->sequence == 0U ||
-            command_pair->authority_session !=
-                committed_authority->authority_session ||
-            command_pair->source_revision !=
-                committed_authority->planner_path_revision ||
-            command_pair->path_revision !=
-                committed_authority->executed_path_revision ||
-            command_pair->frame_revision != committed_authority->frame_revision ||
-            command_pair->active_profile->tube_revision !=
-                committed_authority->tube_revision ||
-            command_pair->active_profile->profile_revision !=
-                committed_authority->profile_revision ||
-            command_pair->active_profile->map_revision !=
-                committed_authority->map_revision) {
-            return;
-        }
-        if (!phase_offset_matched_adapter_ ||
-            phase_offset_matched_adapter_->task_generation_.load(
-                std::memory_order_acquire) == 0U ||
-            phase_offset_matched_adapter_->execution_authority_.snapshotPtr() !=
-                committed_authority ||
-            phase_offset_matched_adapter_->capturePathTubePair() !=
-                command_pair) {
-            return;
-        }
-        std::shared_ptr<SuccessorHandoffTransaction> next(
-            new SuccessorHandoffTransaction());
-        next->task_generation = phase_offset_matched_adapter_->task_generation_.load(
-            std::memory_order_acquire);
-        next->authority_session = committed_authority->authority_session;
-        next->authority_sequence = committed_authority->sequence;
-        next->phase_generation_before = phase_token.expected.generation;
-        next->phase_generation_after = phase_token.committed.generation;
-        next->phase_before_w = phase_token.expected.w;
-        next->phase_after_w = phase_token.committed.w;
-        next->authority_w = committed_authority->w;
-        next->authority_proposed_next_w = committed_authority->proposed_next_w;
-        next->runtime_retained_delta_before = runtime_retained_delta_before;
-        next->runtime_previous_final_port_before =
-            runtime_previous_final_port_before;
-        next->runtime_next_delta = runtime_next_delta;
-        next->runtime_next_previous_final_port =
-            runtime_next_previous_final_port;
-        next->active_pair = command_pair;
-        next->active_pair_generation = command_pair->generation;
-        next->source_revision = command_pair->source_revision;
-        next->path_revision = command_pair->path_revision;
-        next->frame_revision = command_pair->frame_revision;
-        next->tube_revision = command_pair->active_profile->tube_revision;
-        next->profile_revision = command_pair->active_profile->profile_revision;
-        next->map_revision = command_pair->active_profile->map_revision;
-        next->obstacle_contract_id =
-            command_pair->active_profile->obstacle_contract_id;
-        next->semantic_path_owner = command_pair->path_owner;
-        next->frame_owner = command_pair->frame_owner;
-        next->committed_authority_snapshot = committed_authority;
-        next->valid = true;
-        if (!next->structurallyValid()) return;
-
-        const auto sequence_after = [](const std::uint64_t newer,
-                                       const std::uint64_t older) {
-            return newer != older &&
-                static_cast<std::int64_t>(newer - older) > 0;
-        };
-        std::lock_guard<std::mutex> lock(successor_handoff_mutex_);
-        if (successor_handoff_transaction_ &&
-            (!sequence_after(next->authority_sequence,
-                             successor_handoff_transaction_->authority_sequence) ||
-             !sequence_after(next->phase_generation_after,
-                             successor_handoff_transaction_->phase_generation_after))) {
-            return;
-        }
-        successor_handoff_transaction_ =
-            std::shared_ptr<const SuccessorHandoffTransaction>(next);
     }
 
     void gvf_manager::publishAuthoritativePhaseLocked(
@@ -720,30 +694,18 @@ namespace FLAG_Race
         {
             phase_offset_matched_adapter_->requestShutdown();
         }
-        // Stop every manager-owned timer before detaching the H2 mailbox.
-        // In particular FSMCallback can acquire a transaction pin and stage
-        // a new pending handoff; leaving that timer live would permit a pin
-        // to appear after the shutdown detach point.
+        // Stop every manager-owned timer before detaching the V2 handoff.
         exec_fsm_timer.stop();
         kino_timer.stop();
         test_cmd_timer.stop();
         exec_timer.stop();
         phase_offset_tube_timer_.stop();
         cmd_timer.stop();
-        shutdownCurrentStateRecoveryMailbox();
-        std::shared_ptr<PendingPathTubeFrontend> cancelled_pending;
-        std::shared_ptr<PendingPathTubeFrontend> cancelled_completed;
         {
-            // Fixed shutdown lock order.  Moving the mailboxes is ownership
-            // bookkeeping only; the pin is released after both locks leave.
             std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-            std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-            cancelled_pending = std::move(pending_path_tube_handoff_);
-            cancelled_completed = std::move(completed_path_tube_handoff_);
+            std::lock_guard<std::mutex> handoff_lock(path_reference_handoff_mutex_);
+            pending_path_reference_handoff_v2_.reset();
         }
-        cancelled_pending.reset();
-        cancelled_completed.reset();
-        clearSuccessorHandoffTransaction();
         if (phase_offset_matched_adapter_)
         {
             phase_offset_matched_adapter_->shutdown();
@@ -1034,20 +996,13 @@ void gvf_manager::resetGovernorState()
 void gvf_manager::clearActiveTrajectory(bool publish_empty_path,
                                         bool clear_gvf_path)
 {
-    std::shared_ptr<PendingPathTubeFrontend> cancelled_pending;
-    std::shared_ptr<PendingPathTubeFrontend> cancelled_completed;
     {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        cancelled_pending = std::move(pending_path_tube_handoff_);
-        cancelled_completed = std::move(completed_path_tube_handoff_);
+        std::lock_guard<std::mutex> lock(path_reference_handoff_mutex_);
+        pending_path_reference_handoff_v2_.reset();
     }
-    // A pending frontend may own the sole adapter pin.  Its last reference
-    // must never be destroyed while a manager ownership lock is held.
-    cancelled_pending.reset();
-    cancelled_completed.reset();
     // In active H2 execution the asynchronous goal/reset callback must not
     // write frontend mirrors concurrently with FSM.  Reset has retired the
-    // pair and emptied the mailbox above; FSM will own the ensuing mirror
+    // handoff above; FSM will own the ensuing mirror
     // application/clear.  Legacy modes retain their original immediate clear.
     if (unifiedPhaseV2Active() && phase_offset_matched_adapter_ &&
         phase_offset_matched_adapter_->requiresAuthoritativeOffsetHandoff()) {
@@ -1587,143 +1542,324 @@ bool gvf_manager::publishGovernorPositionCommand(const Eigen::Vector3d& cmd_pos,
     return true;
 }
 
-const char* gvf_manager::offsetBootstrapAttemptOutcomeName(
-    const OffsetBootstrapAttemptOutcome outcome) {
-    switch (outcome) {
-    case OffsetBootstrapAttemptOutcome::NOT_REQUIRED:
-        return "NOT_REQUIRED";
-    case OffsetBootstrapAttemptOutcome::ENTRY_OR_SLOT_PRECONDITION:
-        return "ENTRY_OR_SLOT_PRECONDITION";
-    case OffsetBootstrapAttemptOutcome::OWNER_OR_SAMPLE:
-        return "OWNER_OR_SAMPLE";
-    case OffsetBootstrapAttemptOutcome::STRUCTURAL_SEAM:
-        return "STRUCTURAL_SEAM";
-    case OffsetBootstrapAttemptOutcome::STAGE_PATH_TUBE_PAIR:
-        return "STAGE_PATH_TUBE_PAIR";
-    case OffsetBootstrapAttemptOutcome::LIVE_PHASE_STATE:
-        return "LIVE_PHASE_STATE";
-    case OffsetBootstrapAttemptOutcome::LIVE_PHASE_WINDOW:
-        return "LIVE_PHASE_WINDOW";
-    case OffsetBootstrapAttemptOutcome::POST_STAGE_OWNER_OR_SESSION:
-        return "POST_STAGE_OWNER_OR_SESSION";
-    case OffsetBootstrapAttemptOutcome::LIVE_PREPARE_OR_LATEST_MAP:
-        return "LIVE_PREPARE_OR_LATEST_MAP";
-    case OffsetBootstrapAttemptOutcome::FINAL_CAS:
-        return "FINAL_CAS";
-    case OffsetBootstrapAttemptOutcome::COMMITTED:
-        return "COMMITTED";
+bool gvf_manager::assignPathIdentityV2(
+    const std::shared_ptr<const ContinuousPhasePath>& candidate,
+    std::shared_ptr<const ContinuousPhasePath>& assigned)
+{
+    assigned.reset();
+    if (!candidate || candidate->empty()) return false;
+    std::uint64_t identity = 0U;
+    {
+        std::lock_guard<std::mutex> lock(path_reference_handoff_mutex_);
+        const std::uint64_t floor = std::max(
+            next_path_identity_v2_, candidate->pathRevision());
+        if (floor == std::numeric_limits<std::uint64_t>::max()) return false;
+        identity = floor + 1U;
+        next_path_identity_v2_ = identity;
     }
-    return "UNKNOWN";
+    std::shared_ptr<ContinuousPhasePath> revised(
+        new ContinuousPhasePath(*candidate));
+    revised->setPathRevision(identity);
+    assigned = std::shared_ptr<const ContinuousPhasePath>(std::move(revised));
+    return assigned && assigned->pathRevision() == identity;
 }
 
-const char* gvf_manager::pathTubePairStageFailureName(
-    const PathTubePairStageFailure failure) {
-    switch (failure) {
-    case PathTubePairStageFailure::NONE:
-        return "NONE";
-    case PathTubePairStageFailure::INPUT_PRECONDITION:
-        return "INPUT_PRECONDITION";
-    case PathTubePairStageFailure::TRANSACTION_PRECONDITION:
-        return "TRANSACTION_PRECONDITION";
-    case PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT:
-        return "PAIR_SESSION_RUNTIME_SNAPSHOT";
-    case PathTubePairStageFailure::OWNER_EVALUATE:
-        return "OWNER_EVALUATE";
-    case PathTubePairStageFailure::TUBE_BUILD_PRECONDITION:
-        return "TUBE_BUILD_PRECONDITION";
-    case PathTubePairStageFailure::TUBE_RAW_BUILD:
-        return "TUBE_RAW_BUILD";
-    case PathTubePairStageFailure::TUBE_FILTER:
-        return "TUBE_FILTER";
-    case PathTubePairStageFailure::TUBE_SURFACE_VALIDATOR:
-        return "TUBE_SURFACE_VALIDATOR";
-    case PathTubePairStageFailure::TUBE_PROFILE_COVERAGE:
-        return "TUBE_PROFILE_COVERAGE";
-    case PathTubePairStageFailure::TUBE_PROFILE_OWNER_MATCH:
-        return "TUBE_PROFILE_OWNER_MATCH";
-    case PathTubePairStageFailure::STAGING_DRY_RUN:
-        return "STAGING_DRY_RUN";
+bool gvf_manager::buildCurrentTubeRequestV2(
+    gvfManager& pm,
+    const AuthoritativePhaseSnapshot& phase,
+    std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>& request)
+{
+    request.reset();
+    if (!phase_offset_matched_adapter_ || !pm.gvf_ || !pm.sdf_map_ ||
+        !phase.initialized || !std::isfinite(phase.w)) {
+        return false;
     }
-    return "UNKNOWN";
+    const std::uint64_t execution_generation =
+        phase_offset_matched_adapter_->executionGenerationV2();
+    const std::shared_ptr<const ContinuousPhasePath> path =
+        pm.gvf_->getContinuousPhasePath();
+    if (execution_generation == 0U || !path || path->empty() ||
+        path->pathRevision() == 0U || phase.w < path->startW() ||
+        phase.w > path->endW()) {
+        return false;
+    }
+
+    const double requested_start = std::max(
+        path->startW(), phase.w - std::max(0.0, matched_config_.tube.back_w));
+    const double refresh_slack =
+        std::max(0.0, matched_config_.tube.min_certified_forward_w);
+    const double normal_horizon =
+        matched_config_.normal_preview_policy.preview_horizon_w;
+    const double requested_forward = std::max(
+        matched_config_.tube.lookahead_w, normal_horizon) + refresh_slack;
+    const double requested_end = std::min(
+        path->endW(), phase.w + requested_forward);
+    const double required_useful_end = phase.w + normal_horizon;
+    if (!std::isfinite(requested_start) || !std::isfinite(requested_end) ||
+        !(requested_end > requested_start) || phase.w < requested_start ||
+        phase.w > requested_end) {
+        return false;
+    }
+
+    // A coherent capture copies the effective occupancy backing, so avoid
+    // doing that work on every 10 Hz timer tick.  The small accepted-state
+    // visibility value is sufficient to prove that the retained immutable
+    // capture still names the exact same authority/support cohort and has
+    // enough suffix for this profile request.
+    const plan_env::SDFMapAcceptedStateVisibilityV2 visibility =
+        pm.sdf_map_->acceptedStateVisibilityV2();
+    if (visibility.valid) {
+        std::lock_guard<std::mutex> lock(current_tube_request_mutex_v2_);
+        const std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
+            retained = current_tube_request_v2_;
+        if (retained && retained->complete() &&
+            retained->path_owner.get() == path.get() &&
+            retained->path_key.execution_generation == execution_generation &&
+            retained->path_key.path_revision == path->pathRevision() &&
+            retained->configuration_key == matched_config_.tube_certificate_v2.key() &&
+            retained->requested_start <= phase.w &&
+            retained->requested_end >= required_useful_end) {
+            const phase_offset_navigation::TubeMapCaptureKey& captured =
+                retained->map_capture_key;
+            const bool timeless_support =
+                visibility.support.valid_until_accepted_ticks == 0U &&
+                visibility.support.valid_until.isZero();
+            const bool same_support_expiry = captured.support_expiry_timeless
+                ? timeless_support
+                : !timeless_support &&
+                    captured.support_expiry_ticks ==
+                        visibility.support.valid_until_accepted_ticks;
+            const bool same_authority =
+                captured.map_instance_id == visibility.map_instance_id &&
+                captured.state_id == visibility.accepted_state_sequence &&
+                captured.accepted_sequence ==
+                    visibility.accepted_state_sequence &&
+                visibility.accepted_state_notification_sequence ==
+                    visibility.accepted_state_sequence &&
+                captured.accepted_time_ticks == visibility.accepted_time_ticks &&
+                captured.configuration_generation ==
+                    visibility.configuration_generation &&
+                captured.configuration_id == visibility.configuration_key &&
+                captured.frame_provenance == visibility.frame_id &&
+                visibility.support.valid && visibility.support.complete &&
+                captured.support_provenance_id ==
+                    visibility.support.evidence_sequence &&
+                captured.support_halo == visibility.support.required_halo &&
+                captured.halo_reconciled ==
+                    visibility.support.halo_reconciled &&
+                visibility.support.map_instance_id ==
+                    visibility.map_instance_id &&
+                visibility.support.configuration_generation ==
+                    visibility.configuration_generation &&
+                visibility.support.configuration_key ==
+                    visibility.configuration_key &&
+                visibility.support.frame_id == visibility.frame_id &&
+                same_support_expiry;
+            if (same_authority) {
+                request = retained;
+                return true;
+            }
+        }
+    }
+
+    std::vector<double> structural_breakpoints;
+    if (!path->certificateBreakpointsV2(structural_breakpoints)) return false;
+    const std::shared_ptr<const plan_env::SDFMapCaptureV2> map_capture =
+        pm.sdf_map_->captureAuthoritativeSDFMapV2();
+    const SDFMapCaptureQueryBridgeV2 map_bridge =
+        makeSDFMapCaptureQueryV2(map_capture);
+    if (!map_bridge.usable() || !map_bridge.descriptor.valid) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(current_tube_request_mutex_v2_);
+        const std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
+            retained = current_tube_request_v2_;
+        if (retained && retained->complete() &&
+            retained->path_owner.get() == path.get() &&
+            retained->path_key.execution_generation == execution_generation &&
+            retained->path_key.path_revision == path->pathRevision() &&
+            retained->map_capture_key == map_bridge.descriptor.map_capture_key &&
+            retained->requested_start <= phase.w &&
+            retained->requested_end >= required_useful_end) {
+            request = retained;
+            return true;
+        }
+    }
+
+    std::uint64_t request_id = 0U;
+    {
+        std::lock_guard<std::mutex> lock(path_reference_handoff_mutex_);
+        if (next_tube_request_id_v2_ ==
+            std::numeric_limits<std::uint64_t>::max()) {
+            return false;
+        }
+        request_id = ++next_tube_request_id_v2_;
+    }
+    std::shared_ptr<phase_offset_navigation::TubeBuildInputV2> staged(
+        new phase_offset_navigation::TubeBuildInputV2());
+    staged->request_id = request_id;
+    staged->path_key.execution_generation = execution_generation;
+    staged->path_key.path_instance_id = path->pathRevision();
+    staged->path_key.path_revision = path->pathRevision();
+    staged->path_key.frame_revision = path->pathRevision();
+    staged->path_key.frame_convention_id =
+        kWorldHorizontalFrameConventionIdV2;
+    staged->path_key.frame_convention =
+        phase_offset_core::kWorldHorizontalCrossProductProvenance;
+    staged->path_key.phase_orientation = 1;
+    staged->path_key.domain_start = path->startW();
+    staged->path_key.domain_end = path->endW();
+    staged->configuration_key = matched_config_.tube_certificate_v2.key();
+    staged->map_capture_key = map_bridge.descriptor.map_capture_key;
+    staged->requested_start = requested_start;
+    staged->requested_end = requested_end;
+    staged->anchor_w = phase.w;
+    staged->producer_breakpoints = structural_breakpoints;
+    staged->producer_breakpoint_query =
+        [path](std::vector<double>& breakpoints) {
+            return path->certificateBreakpointsV2(breakpoints);
+        };
+    staged->path_cell_query =
+        [path](const double w0, const double w1,
+               phase_offset_core::CertifiedPathCellV2& certificate) {
+            return path->tubeCellBoundsV2(w0, w1, certificate);
+        };
+    staged->path_owner = std::static_pointer_cast<const void>(path);
+    staged->query_owner = map_bridge.query_owner;
+    staged->capture_owner = map_bridge.capture_owner;
+    staged->applicability_assumptions =
+        "CURRENT immutable path over authoritative SDFMap capture";
+    staged->applicability_deadline_ticks =
+        staged->map_capture_key.support_expiry_ticks;
+    staged->applicability_deadline_timeless =
+        staged->map_capture_key.support_expiry_timeless;
+    staged->free_ball_query = map_bridge.free_ball_query;
+    if (!staged->complete()) return false;
+    request = std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>(
+        std::move(staged));
+    return true;
+}
+
+bool gvf_manager::captureCurrentTubeCommandEvidenceV2(
+    gvfManager& pm,
+    const std::shared_ptr<const ContinuousPhasePath>& command_path,
+    const double current_w,
+    MatchedAdapterInput& input) const
+{
+    if (!phase_offset_matched_adapter_ || !pm.sdf_map_ || !command_path ||
+        !std::isfinite(current_w)) {
+        return false;
+    }
+    std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2> request;
+    {
+        std::lock_guard<std::mutex> lock(current_tube_request_mutex_v2_);
+        request = current_tube_request_v2_;
+    }
+    if (!request || !request->complete() ||
+        request->path_owner.get() != command_path.get() ||
+        request->path_key.path_revision != command_path->pathRevision() ||
+        request->path_key.execution_generation !=
+            phase_offset_matched_adapter_->executionGenerationV2() ||
+        current_w < request->requested_start ||
+        current_w > request->requested_end) {
+        return false;
+    }
+    const plan_env::SDFMapAcceptedStateVisibilityV2 visibility =
+        pm.sdf_map_->acceptedStateVisibilityV2();
+    if (!visibility.valid) return false;
+
+    input.tube_worker_input_v2 = request;
+    input.tube_worker_purpose_v2 = TubeWorkerPurposeV2::CURRENT;
+    MatchedAdapterInput::TubeV2AdmissionEvidence& evidence =
+        input.tube_v2_admission;
+    const phase_offset_navigation::TubeMapCaptureKey& captured =
+        request->map_capture_key;
+    evidence.valid = true;
+    const std::shared_ptr<const TubeV2ExecutionBinding> binding =
+        phase_offset_matched_adapter_->captureV2ExecutionBinding();
+    evidence.binding_sequence = binding && binding->complete()
+        ? binding->identity.binding_sequence : 1U;
+    evidence.accepted_state_sequence = captured.accepted_sequence;
+    evidence.accepted_state_notification_sequence =
+        captured.accepted_sequence;
+    evidence.accepted_time_ticks = captured.accepted_time_ticks;
+    evidence.support_expiry_ticks = captured.support_expiry_ticks;
+    evidence.support_expiry_timeless = captured.support_expiry_timeless;
+    evidence.map_instance_id = captured.map_instance_id;
+    evidence.configuration_generation = captured.configuration_generation;
+    evidence.configuration_key = captured.configuration_id;
+    evidence.support_provenance_id = captured.support_provenance_id;
+    evidence.frame_provenance = captured.frame_provenance;
+    evidence.latest_accepted_state_sequence =
+        visibility.accepted_state_sequence;
+    evidence.latest_accepted_state_notification_sequence =
+        visibility.accepted_state_notification_sequence;
+    evidence.latest_accepted_time_ticks = visibility.accepted_time_ticks;
+    evidence.latest_map_instance_id = visibility.map_instance_id;
+    evidence.latest_configuration_generation =
+        visibility.configuration_generation;
+    evidence.latest_configuration_key = visibility.configuration_key;
+    evidence.latest_support_provenance_id =
+        visibility.support.evidence_sequence;
+    evidence.latest_frame_provenance = visibility.frame_id;
+    evidence.now = steadyTicksV2AsDouble();
+    evidence.applicability_deadline =
+        static_cast<double>(request->applicability_deadline_ticks);
+    evidence.applicability_deadline_valid =
+        !request->applicability_deadline_timeless;
+    evidence.preview_policy = matched_config_.normal_preview_policy;
+    evidence.upper_u_delta = matched_config_.u_delta_abs_max;
+    evidence.limits.lower_phase_rate =
+        matched_config_.normal_preview_policy.lower_nu;
+    evidence.limits.upper_phase_rate =
+        matched_config_.normal_preview_policy.upper_nu;
+    evidence.limits.upper_nu =
+        matched_config_.normal_preview_policy.upper_nu;
+    evidence.limits.max_u_w = matched_config_.u_w_abs_max;
+    evidence.limits.max_u_delta = matched_config_.u_delta_abs_max;
+    evidence.limits.u_w_slew_rate = matched_config_.u_w_rate_max;
+    evidence.limits.u_delta_slew_rate = matched_config_.u_delta_rate_max;
+    evidence.limits.return_u_delta_max = matched_config_.u_delta_abs_max;
+    evidence.limits.return_u_delta_slew_rate =
+        matched_config_.u_delta_rate_max;
+    evidence.limits.max_schedule_steps =
+        matched_config_.tube_certificate_v2.budgets.max_cells;
+    evidence.limits.max_work =
+        matched_config_.tube_certificate_v2.budgets.max_queries;
+    evidence.limits.valid = true;
+    // P22 computes the exact live error/tangent evidence from the same
+    // geometry used by preview, allocation and MatchedPort.
+    evidence.tracking.valid = false;
+    evidence.tracking.error_bound =
+        matched_config_.tube.cross_section.margins.tracking_error_bound;
+    evidence.tracking.physical_tangent_valid = false;
+    evidence.max_work =
+        matched_config_.tube_certificate_v2.budgets.max_queries;
+    evidence.provenance =
+        "gvf_manager/CURRENT/acceptedStateVisibilityV2";
+    return true;
 }
 
 void gvf_manager::phaseOffsetTubeTimerCallback(const ros::TimerEvent& event)
 {
+    (void)event;
     if (!phase_offset_matched_adapter_ ||
         !phase_offset_matched_adapter_->requiresTubeTimer()) {
         return;
     }
-    // The ROS callback is scheduler-only.  Heavy Tube construction runs on
-    // the adapter's single joined worker; timerTick() remains available only
-    // for unadvertised deterministic test fixtures.
+    if (!swarmParticlesManager.empty()) {
+        gvfManager& pm = swarmParticlesManager[0];
+        std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
+            current_request;
+        if (buildCurrentTubeRequestV2(
+                pm, captureAuthoritativePhase(), current_request)) {
+            std::lock_guard<std::mutex> lock(current_tube_request_mutex_v2_);
+            current_tube_request_v2_ = current_request;
+        }
+    }
+    // The adapter call is scheduler-only.  Heavy certificate construction
+    // remains on its one joined worker.
     phase_offset_matched_adapter_->scheduleTubeBuild();
-
-    // The activation bridge may construct a prepared Tube epoch.  It belongs
-    // to this timer-owned path, never to the 50 Hz command callback.  Capture
-    // the same immutable phase, planner owner inputs and map provenance only
-    // after the timer has refreshed its sidecar epoch.
-    if (!unifiedPhaseV2Active() || swarmParticlesManager.empty()) return;
-    gvfManager& pm = swarmParticlesManager.front();
-    if (!pm.gvf_) return;
-    const AuthoritativePhaseSnapshot timer_phase =
-        captureAuthoritativePhase();
-    if (!timer_phase.initialized) return;
-    const guidance::IsfGains timer_gains(
-        pm.gvf_->gvf_.K1_, pm.gvf_->gvf_.K2_,
-        pm.gvf_->gvf_.convergence_bandwidth_, pm.gvf_->progress_rho0_,
-        pm.gvf_->progress_delta_, pm.gvf_->alpha_min_);
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-        timer_cloud_snapshot = pm.sdf_map_
-            ? pm.sdf_map_->cloudOccupancySnapshot()
-            : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-    BootstrapRendezvousTicket rendezvous_ticket;
-    // Claim is a nonblocking identity handoff.  No activation work is
-    // attempted unless a freshly finalized post-arm epoch was atomically
-    // consumed; the existing activation transaction still performs all
-    // current owner/phase/map/dry-run checks from live immutable evidence.
-    if (!phase_offset_matched_adapter_->claimBootstrapRendezvous(
-            rendezvous_ticket)) {
-        return;
-    }
-    OffsetBootstrapAttemptResult bootstrap_attempt;
-    const bool bootstrap_committed = activatePendingOffsetAuthority(
-        pm, timer_phase, odom_, timer_gains, 0.02, timer_cloud_snapshot,
-        rendezvous_ticket, &bootstrap_attempt);
-    phase_offset_matched_adapter_->completeBootstrapRendezvous(
-        rendezvous_ticket,
-        bootstrap_committed &&
-            bootstrap_attempt.outcome ==
-                OffsetBootstrapAttemptOutcome::COMMITTED);
-    // zero-only/not-certified timer frames are expected before the existing
-    // activation predicate opens.  Do not turn those into bootstrap noise;
-    // emit only when this callback actually required an offset pair attempt.
-    if (bootstrap_attempt.outcome == OffsetBootstrapAttemptOutcome::NOT_REQUIRED) {
-        return;
-    }
-    if (bootstrap_committed &&
-        bootstrap_attempt.outcome == OffsetBootstrapAttemptOutcome::COMMITTED) {
-        ROS_WARN("[GVF][OFFSET_BOOTSTRAP] result=COMMITTED pair_generation=%llu session=%llu owner_w=[%.9f,%.9f] w0=%.9f wc=%.9f seam=%.9f map_seq=%llu",
-                 static_cast<unsigned long long>(bootstrap_attempt.pair_generation),
-                 static_cast<unsigned long long>(bootstrap_attempt.authority_session),
-                 pm.gvf_->getContinuousPhasePath()
-                     ? pm.gvf_->getContinuousPhasePath()->startW() : 0.0,
-                 pm.gvf_->getContinuousPhasePath()
-                     ? pm.gvf_->getContinuousPhasePath()->endW() : 0.0,
-                 bootstrap_attempt.captured_w0, bootstrap_attempt.live_wc,
-                 bootstrap_attempt.future_seam_w,
-                 static_cast<unsigned long long>(
-                     bootstrap_attempt.map_observation_sequence));
-        return;
-    }
-    ROS_WARN_THROTTLE(1.0,
-        "[GVF][OFFSET_BOOTSTRAP] result=%s stage_failure=%s session=%llu w0=%.9f wc=%.9f seam=%.9f map_seq=%llu",
-        offsetBootstrapAttemptOutcomeName(bootstrap_attempt.outcome),
-        pathTubePairStageFailureName(bootstrap_attempt.stage_failure),
-        static_cast<unsigned long long>(bootstrap_attempt.authority_session),
-        bootstrap_attempt.captured_w0, bootstrap_attempt.live_wc,
-        bootstrap_attempt.future_seam_w,
-        static_cast<unsigned long long>(
-            bootstrap_attempt.map_observation_sequence));
 }
 
 void gvf_manager::cmdCallback(const ros::TimerEvent& event)
@@ -1863,18 +1999,6 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         pm.gvf_ ? pm.gvf_->progress_rho0_ : 0.0,
         pm.gvf_ ? pm.gvf_->progress_delta_ : 0.0,
         pm.gvf_ ? pm.gvf_->alpha_min_ : 0.0);
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-        command_cloud_snapshot = pm.sdf_map_
-            ? pm.sdf_map_->cloudOccupancySnapshot()
-            : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-    // A replan only stages an immutable transaction.  Command may atomically
-    // exchange its pair authority, but frontend/GVF mirrors are delivered to
-    // the FSM-owned completed mailbox and never written from this callback.
-    if (phase_offset_matched_adapter_ && unifiedPhaseV2Active() &&
-        command_phase.initialized) {
-        prepareAndCommitPendingPathTubeHandoff(
-            command_phase, pos, command_gains, dt, command_cloud_snapshot);
-    }
     bool have_phase_candidate = false;
     double phase_candidate = phase_before;
     bool legacy_progress_candidate_valid = false;
@@ -1893,14 +2017,10 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     gvf::LiftedGuidanceResult out;
     double governor_reference_delta = 0.0;
     std::uint64_t pending_position_command_identity = 0U;
+    bool pending_v2_binding_transition = false;
+    std::shared_ptr<const TubeV2ExecutionBinding>
+        pending_v2_proposed_binding;
     bool command_published_and_committed = false;
-    std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
-        pending_authority_snapshot;
-    double pending_runtime_retained_delta_before = 0.0;
-    phase_offset_core::PortCommand pending_runtime_previous_final_port_before;
-    double pending_runtime_next_delta = 0.0;
-    phase_offset_core::PortCommand pending_runtime_next_previous_final_port;
-    std::shared_ptr<const PathTubePair> command_pair_for_handoff;
     if (!pm.gvf_)
     {
         deactivate_phase_offset();
@@ -1911,49 +2031,21 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         const double shadow_semantic_w =
             unifiedPhaseV2Active() && command_phase.initialized
                 ? phase_before : activeTrackingPhase();
-        // Capture the sole path owner once for this command.  H2-1 threads
-        // this same immutable owner through guidance, Runtime input and the
-        // governor; the legacy publication slot is only a mirror here.
-        const std::shared_ptr<const PathTubePair> captured_command_pair =
-            phase_offset_matched_adapter_
-                ? phase_offset_matched_adapter_->capturePathTubePair()
-                : std::shared_ptr<const PathTubePair>();
-        command_pair_for_handoff = captured_command_pair;
-        const bool command_offset_authority =
-            phase_offset_matched_adapter_ &&
-            phase_offset_matched_adapter_->requiresAuthoritativeOffsetHandoff();
-        const bool command_pair_arms_activation =
-            phase_offset_matched_adapter_ &&
-            phase_offset_matched_adapter_->hasPendingOffsetActivationPair(
-                captured_command_pair);
-        if (command_pair_arms_activation && captured_command_pair &&
-            pending_activation_command_logged_generation_.exchange(
-                captured_command_pair->generation,
-                std::memory_order_acq_rel) !=
-                captured_command_pair->generation)
-        {
-            ROS_WARN("[GVF][H2][LIFECYCLE] command_capture=pending_activation "
-                     "pair_generation=%llu session=%llu owner_w=[%.9f,%.9f]",
-                     static_cast<unsigned long long>(
-                         captured_command_pair->generation),
-                     static_cast<unsigned long long>(
-                         captured_command_pair->authority_session),
-                     captured_command_pair->path_owner
-                         ? captured_command_pair->path_owner->startW() : 0.0,
-                     captured_command_pair->path_owner
-                         ? captured_command_pair->path_owner->endW() : 0.0);
-        }
+        // Capture the single committed V2 binding once for this command.
+        // Guidance, Runtime input and the governor use its exact path owner.
+        const std::shared_ptr<const TubeV2ExecutionBinding>
+            captured_v2_binding = phase_offset_matched_adapter_
+                ? phase_offset_matched_adapter_->captureV2ExecutionBinding()
+                : std::shared_ptr<const TubeV2ExecutionBinding>();
+        const std::shared_ptr<const ContinuousPhasePath> committed_v2_path =
+            captureCommandPathForV2Binding(pm, captured_v2_binding);
         // Neutral navigation always evaluates the current planner C2 owner.
-        // The pair is supplied to Runtime only at the activation edge; its
-        // owner was just proven to be that same immutable planner path.
+        // An authoritative V2 binding must resolve its exact committed owner;
+        // a failed resolution remains unavailable and fails closed below.
         const std::shared_ptr<const ContinuousPhasePath> command_path =
-            command_offset_authority && captured_command_pair &&
-                    captured_command_pair->path_owner
-                ? captured_command_pair->path_owner
+            captured_v2_binding
+                ? committed_v2_path
                 : pm.gvf_->getContinuousPhasePath();
-        const std::shared_ptr<const PathTubePair> command_pair =
-            (command_offset_authority || command_pair_arms_activation)
-                ? captured_command_pair : std::shared_ptr<const PathTubePair>();
         if (unifiedPhaseV2Active() && command_phase.initialized)
         {
             out = pm.gvf_->calcLiftedGuidanceAtPhase(
@@ -1978,7 +2070,6 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     matched_input.semantic_path_owner = command_path;
                     matched_input.semantic_path_start_w = command_path->startW();
                     matched_input.semantic_path_end_w = command_path->endW();
-                    matched_input.path_tube_pair = command_pair;
                     if (coordination_backend_ ==
                         PhaseOffsetCoordinationBackend::SPH &&
                         phase_offset_sph_ros_bridge_) {
@@ -1999,167 +2090,45 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     } else {
                         matched_input.g_des_valid = false;
                     }
-                    // Preserve the exact staged successor as evidence for a
-                    // recovery/preview tick when the command-boundary CAS
-                    // could not install it yet.  The candidate remains
-                    // uncommitted; the current pair is still the sole owner.
+                    // The timer owns the coherent map copy and immutable
+                    // CURRENT request.  This callback copies only that owner
+                    // and bounded latest accepted-state visibility.
+                    captureCurrentTubeCommandEvidenceV2(
+                        pm, command_path, phase_before, matched_input);
+                    // Preserve the exact V2 successor evidence for this
+                    // command.  It remains uncommitted until publication.
                     if (phase_offset_matched_adapter_) {
                         std::lock_guard<std::mutex> handoff_lock(
-                            path_tube_handoff_mutex_);
-                        const std::uint64_t command_session =
-                            captured_command_pair
-                                ? captured_command_pair->authority_session
-                                : 0U;
-                        if (pending_path_tube_handoff_ &&
-                            pending_path_tube_handoff_->candidate_pair &&
-                            command_session != 0U &&
-                            pending_path_tube_handoff_->authority_session ==
-                                command_session) {
-                            matched_input.successor_path_tube_pair =
-                                pending_path_tube_handoff_->candidate_pair;
+                            path_reference_handoff_mutex_);
+                        const std::shared_ptr<const PathReferenceHandoffV2>&
+                            v2_handoff = pending_path_reference_handoff_v2_;
+                        if (v2_handoff && !v2_handoff->successor_profile &&
+                            v2_handoff->requestComplete() &&
+                            v2_handoff->admission_evidence &&
+                            v2_handoff->source_path_key.execution_generation ==
+                                v2_handoff->expected_execution_generation &&
+                            command_path ==
+                                v2_handoff->admission_evidence->source_path_owner) {
+                            matched_input.tube_v2_successor_handoff =
+                                v2_handoff->admission_evidence;
                         }
                     }
-                    matched_input.cloud_occupancy_snapshot =
-                        command_cloud_snapshot;
                     MatchedAdapterOutput matched_output;
                     const bool adapter_update_success =
                         phase_offset_matched_adapter_->update(
                             matched_input, matched_output);
-                    if (adapter_update_success &&
-                        phase_offset_matched_adapter_) {
-                        std::lock_guard<std::mutex> runtime_lock(
-                            phase_offset_matched_adapter_->runtime_command_mutex_);
-                        if (phase_offset_matched_adapter_->pending_authority_valid_ &&
-                            phase_offset_matched_adapter_->pending_runtime_commit_.valid &&
-                            phase_offset_matched_adapter_->pending_authority_prepared_
-                                .committed_snapshot) {
-                            pending_authority_snapshot =
-                                phase_offset_matched_adapter_->pending_authority_prepared_
-                                    .committed_snapshot;
-                            pending_runtime_retained_delta_before =
-                                phase_offset_matched_adapter_->pending_runtime_commit_
-                                    .expected_delta;
-                            pending_runtime_previous_final_port_before =
-                                phase_offset_matched_adapter_->pending_runtime_commit_
-                                    .expected_previous_final_port;
-                            pending_runtime_next_delta =
-                                phase_offset_matched_adapter_->pending_runtime_commit_
-                                    .next_delta;
-                            pending_runtime_next_previous_final_port =
-                                phase_offset_matched_adapter_->pending_runtime_commit_
-                                    .next_previous_final_port;
-                        }
-                    }
                     publish_sph_beta(
                         &matched_output, true);
                     last_recovery_status_ = matched_output.recovery_status;
-                    // A reset can retire a pair after command captured it but
-                    // before Runtime update acquires its lock.  Do not retain
-                    // legacy guidance from that retired authority; the next
-                    // command will capture the new pair (or fail closed until
-                    // bootstrap succeeds).
-                    const bool command_pair_still_live = command_pair ==
-                        phase_offset_matched_adapter_->capturePathTubePair();
-                    if (!command_pair_still_live)
-                    {
-                        out.valid = false;
-                    }
-                    // An active nonzero authority may not silently fall back
-                    // to the planner/base centerline when its matched or
-                    // recovery step is denied.  Retain the authoritative
-                    // owner and fail closed for this command tick; the FSM
-                    // recovery mailbox remains the only recovery route.
-                    if (command_pair_still_live && command_offset_authority &&
+                    // Once a V2 binding is authoritative, a denied matched
+                    // update may not fall back to neutral planner guidance.
+                    if (captured_v2_binding &&
                         (!adapter_update_success || !matched_output.selected))
                     {
                         out.valid = false;
                     }
-                    if (command_pair_still_live && captured_command_pair &&
-                        phase_offset_matched_adapter_->
-                            requiresAuthoritativeOffsetHandoff() &&
-                        (!adapter_update_success || !matched_output.selected) &&
-                        pending_activation_not_selected_logged_generation_.exchange(
-                            captured_command_pair->generation,
-                            std::memory_order_acq_rel) !=
-                            captured_command_pair->generation)
-                    {
-                        ROS_WARN("[GVF][H2][LIFECYCLE] "
-                                 "command_activation=not_selected_or_invalid "
-                                 "pair_generation=%llu session=%llu "
-                                 "update_success=%d selected=%d valid=%d "
-                                 "projection_valid=%d execution_mode=%d "
-                                 "certificate_denied=%d fatal_control_failure=%d "
-                                 "invalid_reason=%s",
-                                 static_cast<unsigned long long>(
-                                     captured_command_pair->generation),
-                                 static_cast<unsigned long long>(
-                                     captured_command_pair->authority_session),
-                                 adapter_update_success ? 1 : 0,
-                                 matched_output.selected ? 1 : 0,
-                                 matched_output.valid ? 1 : 0,
-                                 matched_output.projection.valid ? 1 : 0,
-                                 static_cast<int>(matched_output.runtime_execution.mode),
-                                 matched_output.runtime_execution.certificate_denied ? 1 : 0,
-                                 matched_output.runtime_execution.fatal_control_failure ? 1 : 0,
-                                 matched_output.invalid_reason.c_str());
-                    }
-                    // This is request-only P2a plumbing.  The absence of an
-                    // authorised P2b physical recovery owner means it must
-                    // not manufacture a HOLD/recovery command or change H2
-                    // authority here.  P2b will attach the FSM consume seam;
-                    // until then the request is deliberately non-publishing.
-                    if (command_pair_still_live) {
-                        stageCurrentStateRecoveryRequest(
-                            matched_output, command_pair);
-                    }
                     if (matched_output.selected)
                     {
-                        // The adapter reports the retained delta captured at
-                        // command entry.  A selected projection commits its
-                        // next_delta in Runtime::complete(), so use that
-                        // post-commit value for lifecycle evidence without
-                        // adding a control predicate or changing Runtime.
-                        if (command_pair_still_live &&
-                            captured_command_pair &&
-                            phase_offset_matched_adapter_->
-                                requiresAuthoritativeOffsetHandoff() &&
-                            matched_output.projection.valid &&
-                            std::abs(matched_output.projection.next_delta) >
-                                kH2LifecycleNonzeroDeltaTolerance &&
-                            pending_activation_nonzero_logged_generation_.exchange(
-                                captured_command_pair->generation,
-                                std::memory_order_acq_rel) !=
-                                captured_command_pair->generation)
-                        {
-                            ROS_WARN("[GVF][H2][LIFECYCLE] "
-                                     "command_activation=selected_nonzero_delta "
-                                     "pair_generation=%llu session=%llu "
-                                     "retained_delta_before=%.9f retained_delta_after=%.9f",
-                                     static_cast<unsigned long long>(
-                                         captured_command_pair->generation),
-                                     static_cast<unsigned long long>(
-                                         captured_command_pair->authority_session),
-                                     matched_output.delta,
-                                     matched_output.projection.next_delta);
-                        }
-                        if (command_pair_arms_activation &&
-                            captured_command_pair &&
-                            phase_offset_matched_adapter_->
-                                requiresAuthoritativeOffsetHandoff() &&
-                            pending_activation_executed_logged_generation_.exchange(
-                                captured_command_pair->generation,
-                                std::memory_order_acq_rel) !=
-                                captured_command_pair->generation)
-                        {
-                            ROS_WARN("[GVF][H2][LIFECYCLE] "
-                                     "command_activation=selected_runtime_executed "
-                                     "pair_generation=%llu session=%llu delta=%.9f",
-                                     static_cast<unsigned long long>(
-                                         captured_command_pair->generation),
-                                     static_cast<unsigned long long>(
-                                         captured_command_pair->authority_session),
-                                     matched_output.delta);
-                        }
                         out.v_cmd = matched_output.guidance.v_cmd;
                         out.w_proj = phase_before;
                         out.w_dot = matched_output.guidance.w_dot;
@@ -2235,6 +2204,11 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     : PendingPositionCommandCapture();
             pending_position_command_identity = pending_capture.pending
                 ? pending_capture.identity : 0U;
+            pending_v2_binding_transition =
+                pending_capture.pending &&
+                pending_capture.v2_binding_transition;
+            pending_v2_proposed_binding =
+                pending_capture.proposed_v2_binding;
             if (unifiedPhaseV2Active() && command_phase.initialized)
             {
                 const double requested_phase = phase_before + out.w_dot * dt;
@@ -2340,6 +2314,8 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
         // PositionCommand has actually published.  The adapter prepares an
         // immutable deactivation token and commits it only on publish success.
         pending_position_command_identity = 0U;
+        pending_v2_binding_transition = false;
+        pending_v2_proposed_binding.reset();
         dbg.final_cmd_overridden = result.command_valid;
         dbg.state_reset_due_to_override = true;
         result.selected_valid_for_state = false;
@@ -2361,13 +2337,56 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
             initial_closed_phase_acquisition_used, phase_before, phase_candidate,
             command_phase.closed_acquired,
             will_acquire_closed_phase);
+    std::shared_ptr<const PathReferenceHandoffV2>
+        expected_v2_handoff;
+    std::shared_ptr<const PathReferenceHandoffV2>
+        enriched_v2_handoff;
+    if (pending_v2_binding_transition) {
+        {
+            std::lock_guard<std::mutex> handoff_lock(
+                path_reference_handoff_mutex_);
+            expected_v2_handoff = pending_path_reference_handoff_v2_;
+        }
+        if (expected_v2_handoff && expected_v2_handoff->requestComplete() &&
+            !expected_v2_handoff->successor_profile &&
+            pending_v2_proposed_binding &&
+            pending_v2_proposed_binding->complete() &&
+            pending_v2_proposed_binding->source_input ==
+                expected_v2_handoff->successor_request &&
+            pending_v2_proposed_binding->profile->path_key ==
+                expected_v2_handoff->successor_path_key) {
+            std::shared_ptr<PathReferenceHandoffV2> enriched(
+                new PathReferenceHandoffV2(*expected_v2_handoff));
+            enriched->successor_profile =
+                pending_v2_proposed_binding->profile;
+            if (enriched->committedComplete()) {
+                enriched_v2_handoff =
+                    std::shared_ptr<const PathReferenceHandoffV2>(enriched);
+            }
+        }
+    }
     // Prepare the phase publication token before any PositionCommand can be
     // emitted.  Holding this existing phase mutex through publication and the
     // no-fail commit serializes the token against reset/goal retirement.
+    std::unique_lock<std::mutex> frontend_transaction_lock;
+    std::unique_lock<std::mutex> handoff_transaction_lock;
     std::unique_lock<std::mutex> phase_transaction_lock;
     AuthoritativePhaseCommitToken phase_commit_token;
     bool phase_commit_ready = true;
-    if (phase_decision.commit) {
+    if (pending_v2_binding_transition) {
+        if (!phase_decision.commit || !enriched_v2_handoff) {
+            phase_commit_ready = false;
+        } else {
+            frontend_transaction_lock = std::unique_lock<std::mutex>(
+                frontend_apply_mutex_);
+            handoff_transaction_lock = std::unique_lock<std::mutex>(
+                path_reference_handoff_mutex_);
+            if (pending_path_reference_handoff_v2_ != expected_v2_handoff) {
+                phase_commit_ready = false;
+            }
+        }
+    }
+    if (phase_decision.commit && phase_commit_ready) {
         phase_transaction_lock = std::unique_lock<std::mutex>(
             authoritative_phase_mutex_);
         phase_commit_ready = prepareAuthoritativePhaseCommitLocked(
@@ -2382,6 +2401,19 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
     // authority/runtime transaction have both committed.
     const bool switch_active = now < cmd_switch_motion_limit_until_;
     logGovernorCommand(result, dbg, result.cmd_pos, real_dis_to_goal, kp_equiv, switch_active);
+    bool phase_committed_in_publication = false;
+    std::function<void()> post_publish_no_fail;
+    if (phase_decision.commit && phase_commit_token.valid) {
+        post_publish_no_fail = [this, &phase_commit_token,
+                                &phase_committed_in_publication,
+                                enriched_v2_handoff]() {
+            commitAuthoritativePhaseNoFailLocked(phase_commit_token);
+            if (enriched_v2_handoff) {
+                pending_path_reference_handoff_v2_ = enriched_v2_handoff;
+            }
+            phase_committed_in_publication = true;
+        };
+    }
     if (phase_commit_ready && phase_offset_matched_adapter_) {
         // The adapter serializes final validation, the actual cmd_pub.publish
         // invocation, and the no-fail authority/token commit against task
@@ -2391,10 +2423,17 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
             [this, &result]() {
                 return publishGovernorPositionCommand(
                     result.cmd_pos, result.yaw_cmd_vec);
-            }, pending_position_command_identity, force_goal_position);
+            }, pending_position_command_identity, force_goal_position,
+            post_publish_no_fail);
     } else if (phase_commit_ready) {
         command_published_and_committed =
             publishGovernorPositionCommand(result.cmd_pos, result.yaw_cmd_vec);
+    }
+    if (handoff_transaction_lock.owns_lock()) {
+        handoff_transaction_lock.unlock();
+    }
+    if (frontend_transaction_lock.owns_lock()) {
+        frontend_transaction_lock.unlock();
     }
     if (command_published_and_committed) {
         if (pending_last_yaw_valid_) {
@@ -2405,14 +2444,9 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
             resetGovernorState();
         }
         if (phase_decision.commit && phase_commit_token.valid) {
-            commitAuthoritativePhaseNoFailLocked(phase_commit_token);
-            publishSuccessorHandoffTransaction(
-                phase_commit_token, command_pair_for_handoff,
-                pending_authority_snapshot,
-                pending_runtime_retained_delta_before,
-                pending_runtime_previous_final_port_before,
-                pending_runtime_next_delta,
-                pending_runtime_next_previous_final_port);
+            if (!phase_committed_in_publication) {
+                commitAuthoritativePhaseNoFailLocked(phase_commit_token);
+            }
             progress_w_ = phase_commit_token.committed.w;
             progress_initialized_ = true;
             if (phase_decision.acquire_closed_phase) {
@@ -2746,86 +2780,27 @@ double gvf_manager::activeTrackingPhase() const
     return unifiedPhaseV2Active() && phase.initialized ? phase.w : progress_w_;
 }
 
-void gvf_manager::resetUnifiedPhaseV2()
-{
-    std::shared_ptr<PendingPathTubeFrontend> cancelled_pending;
-    std::shared_ptr<PendingPathTubeFrontend> cancelled_completed;
-    {
-        // A reset retires the pair/session and invalidates the authoritative
-        // phase tuple as one ownership operation.  In particular, do not
-        // expose a new session with an old initialized phase: an initial
-        // bootstrap could otherwise finalize a pair in that window.
-        // Lock order is frontend-apply -> handoff -> phase -> adapter Runtime.
-        std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
-        cancelled_pending = std::move(pending_path_tube_handoff_);
-        cancelled_completed = std::move(completed_path_tube_handoff_);
-        ++path_tube_authority_session_;
-        nonzero_handoff_recovery_required_reported_ = false;
-        if (phase_offset_matched_adapter_) {
-            path_tube_authority_session_ =
-                phase_offset_matched_adapter_->retirePathTubeAuthority(
-                    path_tube_authority_session_);
-        }
-        pending_frontend_clear_session_ = path_tube_authority_session_;
-        publishAuthoritativePhaseLocked(0.0, false, false);
-    }
-    // retirePathTubeAuthority() invalidated the capture under the documented
-    // manager -> Runtime order.  Destruction of the guard itself is outside
-    // every manager lock, so its registry release cannot invert that order.
-    cancelled_pending.reset();
-    cancelled_completed.reset();
-    clearSuccessorHandoffTransaction();
-    closed_phase_pending_path_end_w_ = 0.0;
-    closed_phase_has_pending_path_end_w_ = false;
-    // In H2 the FSM clear mailbox above is the only frontend/GVF-mirror
-    // writer.  Legacy modes retain their original immediate reset behavior.
-    if (unifiedPhaseV2Active() && phase_offset_matched_adapter_ &&
-        phase_offset_matched_adapter_->requiresAuthoritativeOffsetHandoff()) {
-        return;
-    }
-    for (auto& manager : swarmParticlesManager) {
-        if (manager.gvf_) {
-            manager.gvf_->setAuthoritativePhaseMode(false);
-            manager.gvf_->clearContinuousPhasePath();
-        }
-    }
-}
-
 bool gvf_manager::resetForNewNavigationTask()
 {
-    std::shared_ptr<PendingPathTubeFrontend> cancelled_pending;
-    std::shared_ptr<PendingPathTubeFrontend> cancelled_completed;
     {
-        // A new goal owns a new path coordinate.  Keep the established lock
-        // order while retiring all manager-side handoff artifacts and using
-        // the adapter's distinct task-level neutral reset.  Same-goal H2
-        // replacement continues to use resetUnifiedPhaseV2()/ordinary
-        // retirement and therefore retains its Runtime authority state.
+        // A new goal owns a new path coordinate.  Retire the adapter task and
+        // manager-side V2 handoff under the established publication lock order.
         std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
+        std::lock_guard<std::mutex> handoff_lock(path_reference_handoff_mutex_);
         std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
-        const std::uint64_t expected_session = path_tube_authority_session_;
-        std::uint64_t retired_session = expected_session + 1U;
         if (phase_offset_matched_adapter_ &&
-            !phase_offset_matched_adapter_->resetForNewNavigationTask(
-                expected_session, retired_session)) {
-            ROS_ERROR("[GVF][NEW_TASK_AUTHORITY_RESET] stale adapter session expected=%llu",
-                      static_cast<unsigned long long>(expected_session));
+            !phase_offset_matched_adapter_->resetForNewNavigationTask()) {
+            ROS_ERROR("[GVF][NEW_TASK_AUTHORITY_RESET] adapter task reset failed");
             return false;
         }
-        cancelled_pending = std::move(pending_path_tube_handoff_);
-        cancelled_completed = std::move(completed_path_tube_handoff_);
-        path_tube_authority_session_ = retired_session;
-        nonzero_handoff_recovery_required_reported_ = false;
-        pending_frontend_clear_session_ = path_tube_authority_session_;
+        pending_path_reference_handoff_v2_.reset();
+        {
+            std::lock_guard<std::mutex> request_lock(
+                current_tube_request_mutex_v2_);
+            current_tube_request_v2_.reset();
+        }
         publishAuthoritativePhaseLocked(0.0, false, false);
     }
-    // Pending H2 guards release outside all manager and Runtime locks.
-    cancelled_pending.reset();
-    cancelled_completed.reset();
-    clearSuccessorHandoffTransaction();
     closed_phase_pending_path_end_w_ = 0.0;
     closed_phase_has_pending_path_end_w_ = false;
     return true;
@@ -3488,332 +3463,8 @@ bool gvf_manager::buildPhaseV2C2Frontend(
     return true;
 }
 
-bool gvf_manager::prepareBootstrapPathTubeTransaction(
-    const std::shared_ptr<const ContinuousPhasePath>& path_owner,
-    const std::vector<double>& sample_w,
-    const double current_w,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        frozen_cloud_occupancy_snapshot,
-    const std::uint64_t authority_session,
-    PathTubePairTransaction& transaction,
-    std::shared_ptr<const PathTubePair>& candidate_pair,
-    OffsetBootstrapAttemptResult* const attempt_result,
-    const BootstrapRendezvousTicket* const rendezvous_ticket)
-{
-    transaction = PathTubePairTransaction();
-    candidate_pair.reset();
-    if (attempt_result) {
-        attempt_result->stage_failure = PathTubePairStageFailure::NONE;
-        attempt_result->captured_w0 = current_w;
-        attempt_result->authority_session = authority_session;
-        attempt_result->map_observation_sequence =
-            frozen_cloud_occupancy_snapshot
-                ? frozen_cloud_occupancy_snapshot->observation_sequence : 0U;
-    }
-    if (!phase_offset_matched_adapter_) {
-        return true;
-    }
-    if (rendezvous_ticket) {
-        if (!phase_offset_matched_adapter_->validateBootstrapRendezvousClaim(
-                *rendezvous_ticket)) {
-            if (attempt_result) {
-                attempt_result->outcome =
-                    OffsetBootstrapAttemptOutcome::ENTRY_OR_SLOT_PRECONDITION;
-            }
-            return false;
-        }
-    } else if (!phase_offset_matched_adapter_->requiresPathTubePairBootstrap()) {
-        return true;
-    }
-    if (!path_owner || path_owner->empty() || sample_w.size() < 2U ||
-        !std::isfinite(current_w)) {
-        if (attempt_result) {
-            attempt_result->outcome =
-                OffsetBootstrapAttemptOutcome::OWNER_OR_SAMPLE;
-        }
-        return false;
-    }
-    MatchedAdapterPathSamples samples;
-    samples.reserve(sample_w.size());
-    for (const double w : sample_w) {
-        ContinuousPhasePathState state;
-        if (!path_owner->evaluate(w, state, false)) {
-            if (attempt_result) {
-                attempt_result->outcome =
-                    OffsetBootstrapAttemptOutcome::OWNER_OR_SAMPLE;
-            }
-            return false;
-        }
-        samples.push_back(ConvertContinuousPhasePathStateForActive(state, w));
-    }
-    // Bootstrap has no old Tube authority.  Its seam is therefore selected
-    // exclusively from the current immutable planner owner's structural
-    // samples, with the same construction lead used by an H2 replacement.
-    // Do not bind a commit preparation to this capture point: the timer must
-    // later dry-run and commit at a freshly captured live phase.
-    const double minimum_seam_w = current_w +
-        matched_config_.tube.min_certified_forward_w;
-    double future_seam = 0.0;
-    for (const auto& sample : samples) {
-        if (sample.w >= minimum_seam_w -
-                            kH2HandoffCoverageTolerance) {
-            future_seam = sample.w;
-            break;
-        }
-    }
-    if (!std::isfinite(future_seam) ||
-        future_seam < minimum_seam_w - kH2HandoffCoverageTolerance ||
-        samples.empty() || samples.back().w < future_seam) {
-        if (attempt_result) {
-            attempt_result->outcome =
-                OffsetBootstrapAttemptOutcome::STRUCTURAL_SEAM;
-        }
-        return false;
-    }
-    if (attempt_result) attempt_result->future_seam_w = future_seam;
-    const double required_horizon_end =
-        phase_offset_matched_adapter_->bootstrapPreparedHorizonEnd(
-            current_w, future_seam, samples.back().w);
-    if (!std::isfinite(required_horizon_end)) {
-        if (attempt_result) {
-            attempt_result->outcome =
-                OffsetBootstrapAttemptOutcome::STRUCTURAL_SEAM;
-        }
-        return false;
-    }
-    PathTubePairStageFailure stage_failure = PathTubePairStageFailure::NONE;
-    if (!phase_offset_matched_adapter_->stagePathTubePair(
-            std::shared_ptr<const PathTubePair>(), path_owner, samples,
-            current_w, future_seam, required_horizon_end, position, gains, dt,
-            frozen_cloud_occupancy_snapshot, transaction, authority_session,
-            nullptr, 0U, &stage_failure)) {
-        if (attempt_result) {
-            attempt_result->outcome =
-                OffsetBootstrapAttemptOutcome::STAGE_PATH_TUBE_PAIR;
-            attempt_result->stage_failure = stage_failure;
-        }
-        return false;
-    }
-    candidate_pair = transaction.candidate_pair;
-    if (!candidate_pair && attempt_result) {
-        attempt_result->outcome =
-            OffsetBootstrapAttemptOutcome::STAGE_PATH_TUBE_PAIR;
-        attempt_result->stage_failure = PathTubePairStageFailure::NONE;
-    }
-    return static_cast<bool>(candidate_pair);
-}
-
-bool gvf_manager::activatePendingOffsetAuthority(
-    gvfManager& pm,
-    const AuthoritativePhaseSnapshot& captured_phase,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        frozen_cloud_occupancy_snapshot,
-    OffsetBootstrapAttemptResult* const attempt_result) {
-    return activatePendingOffsetAuthorityImpl(
-        pm, captured_phase, position, gains, dt,
-        frozen_cloud_occupancy_snapshot, nullptr, attempt_result);
-}
-
-bool gvf_manager::activatePendingOffsetAuthority(
-    gvfManager& pm,
-    const AuthoritativePhaseSnapshot& captured_phase,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        frozen_cloud_occupancy_snapshot,
-    const BootstrapRendezvousTicket& rendezvous_ticket,
-    OffsetBootstrapAttemptResult* const attempt_result) {
-    return activatePendingOffsetAuthorityImpl(
-        pm, captured_phase, position, gains, dt,
-        frozen_cloud_occupancy_snapshot, &rendezvous_ticket, attempt_result);
-}
-
-bool gvf_manager::activatePendingOffsetAuthorityImpl(
-    gvfManager& pm,
-    const AuthoritativePhaseSnapshot& captured_phase,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        frozen_cloud_occupancy_snapshot,
-    const BootstrapRendezvousTicket* const rendezvous_ticket,
-    OffsetBootstrapAttemptResult* const attempt_result)
-{
-    OffsetBootstrapAttemptResult local_result;
-    OffsetBootstrapAttemptResult& result = attempt_result
-        ? *attempt_result : local_result;
-    result = OffsetBootstrapAttemptResult();
-    const auto first_false = [&result](const OffsetBootstrapAttemptOutcome outcome) {
-        result.outcome = outcome;
-        return false;
-    };
-    if (!phase_offset_matched_adapter_ || !pm.gvf_ ||
-        !captured_phase.initialized ||
-        (!rendezvous_ticket &&
-         !phase_offset_matched_adapter_->requiresPathTubePairBootstrap())) {
-        return first_false(OffsetBootstrapAttemptOutcome::NOT_REQUIRED);
-    }
-    if (rendezvous_ticket &&
-        !phase_offset_matched_adapter_->validateBootstrapRendezvousClaim(
-            *rendezvous_ticket)) {
-        return first_false(OffsetBootstrapAttemptOutcome::ENTRY_OR_SLOT_PRECONDITION);
-    }
-    result.captured_w0 = captured_phase.w;
-    result.authority_session = 0U;
-    result.map_observation_sequence = frozen_cloud_occupancy_snapshot
-        ? frozen_cloud_occupancy_snapshot->observation_sequence : 0U;
-    // Capture planner owner and authority session as one handoff-coherent
-    // snapshot.  Reading the owner before the session would allow a neutral
-    // planner commit between them and manufacture {old owner, new session}.
-    std::shared_ptr<const ContinuousPhasePath> planner_owner;
-    std::uint64_t authority_session = 0U;
-    {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        if (pending_path_tube_handoff_ || completed_path_tube_handoff_) {
-            return first_false(
-                OffsetBootstrapAttemptOutcome::ENTRY_OR_SLOT_PRECONDITION);
-        }
-        authority_session = path_tube_authority_session_;
-        planner_owner = pm.gvf_->getContinuousPhasePath();
-    }
-    result.authority_session = authority_session;
-
-    // There is deliberately no C2 construction here.  The pending manual
-    // profile is about to leave delta=0, so the existing planner C2 owner is
-    // sampled and proven as-is.  Any replan/reset that changes this owner or
-    // session while the expensive proof runs invalidates the final CAS below.
-    if (!planner_owner || planner_owner->empty()) {
-        return first_false(OffsetBootstrapAttemptOutcome::OWNER_OR_SAMPLE);
-    }
-    std::vector<double> sample_w;
-    std::vector<ContinuousPhasePathState> sample_states;
-    if (!planner_owner->sample(phase_offset_matched_adapter_->sampleStepW(),
-                               sample_w, sample_states) ||
-        sample_w.size() != sample_states.size() || sample_w.size() < 2U ||
-        sample_w.front() > captured_phase.w + kH2HandoffCoverageTolerance ||
-        sample_w.back() <= captured_phase.w +
-            kH2HandoffCoverageTolerance) {
-        return first_false(OffsetBootstrapAttemptOutcome::OWNER_OR_SAMPLE);
-    }
-
-    PathTubePairTransaction transaction;
-    std::shared_ptr<const PathTubePair> candidate_pair;
-    if (!prepareBootstrapPathTubeTransaction(
-            planner_owner, sample_w, captured_phase.w, position, gains, dt,
-            frozen_cloud_occupancy_snapshot, authority_session, transaction,
-            candidate_pair, &result, rendezvous_ticket) || !candidate_pair) {
-        if (result.outcome == OffsetBootstrapAttemptOutcome::NOT_REQUIRED) {
-            result.outcome = OffsetBootstrapAttemptOutcome::
-                ENTRY_OR_SLOT_PRECONDITION;
-        }
-        return false;
-    }
-    if (rendezvous_ticket &&
-        !phase_offset_matched_adapter_->validateBootstrapRendezvousClaim(
-            *rendezvous_ticket)) {
-        return first_false(OffsetBootstrapAttemptOutcome::POST_STAGE_OWNER_OR_SESSION);
-    }
-    if (bootstrap_after_stage_test_hook_) {
-        bootstrap_after_stage_test_hook_();
-    }
-    // Normal command progress between the timer's capture and the completed
-    // Tube build is expected.  Capture the live current phase only after
-    // staging, and use this exact wc for the only commit preparation/dry-run.
-    const AuthoritativePhaseSnapshot live_phase =
-        captureAuthoritativePhase();
-    if (!live_phase.initialized ||
-        live_phase.initialized != captured_phase.initialized ||
-        live_phase.closed_acquired != captured_phase.closed_acquired) {
-        return first_false(OffsetBootstrapAttemptOutcome::LIVE_PHASE_STATE);
-    }
-    result.live_wc = live_phase.w;
-    result.future_seam_w = candidate_pair->future_seam_w;
-    if (live_phase.w < captured_phase.w - kH2HandoffCoverageTolerance ||
-        live_phase.w >= candidate_pair->future_seam_w) {
-        return first_false(OffsetBootstrapAttemptOutcome::LIVE_PHASE_WINDOW);
-    }
-    {
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        if (!pendingOffsetBootstrapMatchesCurrentPlannerLocked(
-                pm, planner_owner, authority_session)) {
-            return first_false(
-                OffsetBootstrapAttemptOutcome::POST_STAGE_OWNER_OR_SESSION);
-        }
-    }
-    // Map/actual-state facts are live commit predicates, unlike the immutable
-    // construction provenance retained by the staged pair.  A timer build
-    // may be lengthy enough for either to change before wc, so never reuse
-    // the entry snapshot/position for this Runtime dry-run.
-    const Eigen::Vector3d live_position = odom_;
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-        latest_cloud_occupancy_snapshot = pm.sdf_map_
-            ? pm.sdf_map_->cloudOccupancySnapshot()
-            : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-
-    PathTubePairCommitPreparation preparation;
-    if (!phase_offset_matched_adapter_->preparePathTubePairCommit(
-            transaction, live_phase.w, live_position, gains, dt,
-            latest_cloud_occupancy_snapshot, preparation)) {
-        return first_false(
-            OffsetBootstrapAttemptOutcome::LIVE_PREPARE_OR_LATEST_MAP);
-    }
-    if (rendezvous_ticket &&
-        !phase_offset_matched_adapter_->validateBootstrapRendezvousClaim(
-            *rendezvous_ticket)) {
-        return first_false(OffsetBootstrapAttemptOutcome::FINAL_CAS);
-    }
-    if (bootstrap_before_final_cas_test_hook_) {
-        bootstrap_before_final_cas_test_hook_();
-    }
-
-    std::shared_ptr<const PathTubePair> committed_pair;
-    {
-        // Lock order matches H2 completion: manager handoff, phase, then the
-        // adapter's short Runtime/CAS lock inside finalize.  No Tube build or
-        // dry-run occurs while these locks are held.
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        if (!pendingOffsetBootstrapMatchesCurrentPlannerLocked(
-                pm, planner_owner, authority_session)) {
-            return first_false(OffsetBootstrapAttemptOutcome::FINAL_CAS);
-        }
-        std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
-        if (authoritative_phase_generation_ != live_phase.generation ||
-            phase_initialized_ != live_phase.initialized ||
-            closed_phase_acquired_ != live_phase.closed_acquired ||
-            phase_w_ != live_phase.w ||
-            !phase_initialized_ || phase_w_ < candidate_pair->captured_w0 -
-                kH2HandoffCoverageTolerance ||
-            phase_w_ >= candidate_pair->future_seam_w) {
-            return first_false(OffsetBootstrapAttemptOutcome::FINAL_CAS);
-        }
-        if (!phase_offset_matched_adapter_->finalizePreparedPathTubePairCommit(
-            preparation, committed_pair, rendezvous_ticket) || !committed_pair ||
-            committed_pair->path_owner != planner_owner) {
-            return first_false(OffsetBootstrapAttemptOutcome::FINAL_CAS);
-        }
-    }
-    result.outcome = OffsetBootstrapAttemptOutcome::COMMITTED;
-    result.stage_failure = PathTubePairStageFailure::NONE;
-    result.pair_generation = committed_pair->generation;
-    result.authority_session = committed_pair->authority_session;
-    result.map_observation_sequence = committed_pair->map_observation_sequence;
-    return true;
-}
-
-bool gvf_manager::stageFutureSeamPathTubeTransaction(
-    double captured_w0,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        frozen_cloud_occupancy_snapshot,
+bool gvf_manager::stageFutureSeamPathReferenceHandoffV2(
+    const AuthoritativePhaseSnapshot& phase_after,
     gvfManager& pm,
     const double path_end_w,
     const int candidate_anchor_idx,
@@ -3826,135 +3477,87 @@ bool gvf_manager::stageFutureSeamPathTubeTransaction(
     Eigen::MatrixXd& staged_vel,
     Eigen::VectorXd& staged_time,
     std::vector<double>& staged_w,
-    std::shared_ptr<const ContinuousPhasePath>& staged_path,
-    PathTubePairStageFailure* const stage_failure,
-    const std::shared_ptr<const SuccessorHandoffTransaction>&
-        successor_handoff)
+    std::shared_ptr<const ContinuousPhasePath>& staged_path)
 {
     staged_traj.resize(0, 0);
     staged_vel.resize(0, 0);
     staged_time.resize(0);
     staged_w.clear();
     staged_path.reset();
-    if (stage_failure) {
-        *stage_failure = PathTubePairStageFailure::NONE;
-    }
-    if (!phase_offset_matched_adapter_) {
+    if (!phase_offset_matched_adapter_ || !phase_after.initialized ||
+        !std::isfinite(phase_after.w)) {
         return false;
     }
-    if (successor_handoff) {
-        // A successor stage is anchored to the phase-after witness produced
-        // by the last fully committed command transaction.  Never substitute
-        // the prior authority.w/current phase origin as this seed.
-        if (!successor_handoff->structurallyValid() ||
-            !std::isfinite(successor_handoff->phase_after_w) ||
-            std::abs(successor_handoff->phase_after_w -
-                     successor_handoff->authority_proposed_next_w) >
-                phase_offset_matched_adapter_->execution_authority_
-                    .config().comparison_epsilon) {
-            return false;
-        }
-        captured_w0 = successor_handoff->phase_after_w;
-    }
-    // This is the transaction's first ownership operation.  It occurs before
-    // any handoff lock, seam enumeration, C2 work, new-tube build or dry-run.
-    std::unique_ptr<PathTubePairPin> transaction_pin =
-        phase_offset_matched_adapter_->captureAndAcquirePathTubePairPin();
-    if (!transaction_pin || !transaction_pin->valid()) {
+
+    phase_offset_navigation::TubePathKey source_path_key;
+    std::uint64_t execution_generation = 0U;
+    std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
+        source_input;
+    if (!phase_offset_matched_adapter_->captureV2SuccessorSource(
+            source_path_key, execution_generation, source_input) ||
+        !source_input || !source_input->complete() ||
+        source_input->path_key != source_path_key ||
+        source_path_key.execution_generation != execution_generation) {
         return false;
     }
-    const PathTubePairPinCapture& capture = transaction_pin->capture();
-    const std::shared_ptr<const PathTubePair>& old_pair = capture.pair;
-    const std::uint64_t authority_session = capture.authority_session;
-    if (!old_pair ||
-        !old_pair->path_owner || !old_pair->full_path_samples ||
-        !old_pair->active_profile ||
-        old_pair->authority_session != authority_session) {
+    const std::shared_ptr<const TubeV2ExecutionBinding> source_binding =
+        phase_offset_matched_adapter_->captureV2ExecutionBinding();
+    if (!source_binding || !source_binding->complete() ||
+        source_binding->source_input != source_input ||
+        source_binding->profile->path_key != source_path_key ||
+        source_binding->profile->path_owner.get() !=
+            source_input->path_owner.get()) {
         return false;
     }
-    if (successor_handoff &&
-        (successor_handoff->active_pair != old_pair ||
-         successor_handoff->active_pair_generation != old_pair->generation ||
-         successor_handoff->authority_session != authority_session ||
-         successor_handoff->source_revision != old_pair->source_revision ||
-         successor_handoff->path_revision != old_pair->path_revision ||
-         successor_handoff->frame_revision != old_pair->frame_revision)) {
+    const std::shared_ptr<const ContinuousPhasePath> source_path =
+        std::static_pointer_cast<const ContinuousPhasePath>(
+            source_input->path_owner);
+    if (!source_path || source_path->empty() ||
+        source_path->pathRevision() != source_path_key.path_revision ||
+        source_path->startW() != source_path_key.domain_start ||
+        source_path->endW() != source_path_key.domain_end ||
+        phase_after.w < source_path->startW() ||
+        phase_after.w >= source_path->endW()) {
         return false;
     }
-    if (successor_handoff) {
-        const AuthoritativePhaseSnapshot live_phase =
-            captureAuthoritativePhase();
-        const std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
-            live_authority = phase_offset_matched_adapter_->execution_authority_
-                .snapshotPtr();
-        std::uint64_t live_session = 0U;
-        {
-            std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-            live_session = path_tube_authority_session_;
-        }
-        const auto& profile = old_pair->active_profile;
-        if (successor_handoff->task_generation !=
-                phase_offset_matched_adapter_->task_generation_.load(
-                    std::memory_order_acquire) ||
-            successor_handoff->authority_session != live_session ||
-            successor_handoff->authority_sequence == 0U ||
-            successor_handoff->phase_generation_after !=
-                live_phase.generation ||
-            successor_handoff->phase_after_w != live_phase.w ||
-            live_authority != successor_handoff->committed_authority_snapshot ||
-            !profile ||
-            successor_handoff->tube_revision != profile->tube_revision ||
-            successor_handoff->profile_revision != profile->profile_revision ||
-            successor_handoff->map_revision != profile->map_revision ||
-            successor_handoff->obstacle_contract_id !=
-                profile->obstacle_contract_id) {
-            return false;
-        }
+
+    const double construction_lead_w =
+        std::max(0.0, matched_config_.tube.min_certified_forward_w);
+    const double earliest_seam_w = phase_after.w + construction_lead_w;
+    std::vector<double> seam_candidates = source_input->sample_grid;
+    for (const ContinuousPhasePath::Segment& segment : source_path->segments()) {
+        seam_candidates.push_back(segment.w1);
     }
-    {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        if (path_tube_authority_session_ != authority_session ||
-            pending_path_tube_handoff_ || completed_path_tube_handoff_) {
-            return false;
-        }
-    }
+    std::sort(seam_candidates.begin(), seam_candidates.end());
+    seam_candidates.erase(
+        std::unique(seam_candidates.begin(), seam_candidates.end()),
+        seam_candidates.end());
     double seam_w = 0.0;
-    if (!selectStructuralFutureSeam(
-            old_pair, captured_w0,
-            matched_config_.tube.min_certified_forward_w, seam_w)) {
-        // A future geometric seam is selected solely from the old immutable
-        // path owner with the existing structural construction lead.  The old
-        // profile/certificate never has to cover a selected seam.  Only true
-        // structural exhaustion of that owner remains terminal.
-        const bool terminal_exhaustion = old_pair->path_owner &&
-            old_pair->path_owner->endW() <= captured_w0 +
-                kH2HandoffCoverageTolerance;
-        bool report_recovery_required = false;
-        if (terminal_exhaustion) {
-            std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-            if (!nonzero_handoff_recovery_required_reported_) {
-                nonzero_handoff_recovery_required_reported_ = true;
-                report_recovery_required = true;
-            }
+    bool have_seam = false;
+    for (const double candidate : seam_candidates) {
+        if (!std::isfinite(candidate) ||
+            candidate <= phase_after.w + kPathReferenceHandoffTolerance ||
+            candidate + kPathReferenceHandoffTolerance < earliest_seam_w ||
+            candidate > source_path->endW()) {
+            continue;
         }
-        if (report_recovery_required) {
-            ROS_ERROR("[GVF][H2] NONZERO_OFFSET_HANDOFF_RECOVERY_REQUIRED "
-                      "current_w=%.6f old_path_end=%.6f; "
-                      "no authorized recenter/recovery owner; retaining fail-closed handoff",
-                      captured_w0, old_pair->path_owner->endW());
+        ContinuousPhasePathState seam_state;
+        if (source_path->evaluate(candidate, seam_state, false) &&
+            seam_state.valid) {
+            seam_w = candidate;
+            have_seam = true;
+            break;
         }
-        return false;
     }
-    // H2-L1 deliberately makes exactly one C2 and Tube-staging attempt per
-    // replan callback.  A retry uses a later callback and fresh live phase,
-    // never a second synchronous seam in this callback.
+    if (!have_seam) return false;
+
     Eigen::MatrixXd trial_traj;
     Eigen::MatrixXd trial_vel;
     Eigen::VectorXd trial_time;
     std::vector<double> trial_w;
     std::shared_ptr<const ContinuousPhasePath> trial_path;
     if (!buildPhaseV2C2Frontend(
-            pm, captured_w0, seam_w, old_pair->path_owner, path_end_w,
+            pm, phase_after.w, seam_w, source_path, path_end_w,
             candidate_anchor_idx, candidate_spline, candidate_traj,
             candidate_vel, candidate_time, candidate_w, trial_traj,
             trial_vel, trial_time, trial_w, trial_path) ||
@@ -3962,541 +3565,402 @@ bool gvf_manager::stageFutureSeamPathTubeTransaction(
         return false;
     }
     double connector_end_w = 0.0;
-    if (!c2ConnectorEndForSeam(trial_path, seam_w, connector_end_w)) {
+    if (!c2ConnectorEndForSeamV2(
+            trial_path, seam_w, connector_end_w)) {
         return false;
     }
-    const double new_owner_required_horizon_end = std::max(
-        connector_end_w, captured_w0 +
-        matched_config_.tube.min_certified_forward_w);
-    if (!std::isfinite(new_owner_required_horizon_end) ||
-        new_owner_required_horizon_end > trial_path->endW() +
-            kH2HandoffCoverageTolerance) {
+    const double requested_end = std::max(
+        connector_end_w, phase_after.w + construction_lead_w);
+    if (!std::isfinite(requested_end) ||
+        requested_end <= phase_after.w ||
+        requested_end > trial_path->endW() +
+            kPathReferenceHandoffTolerance) {
         return false;
     }
-    MatchedAdapterPathSamples trial_samples;
-    trial_samples.reserve(trial_w.size());
-    for (const double w : trial_w) {
-        ContinuousPhasePathState state;
-        if (!trial_path->evaluate(w, state, false)) {
+    if ((source_path_key.phase_orientation != 1 &&
+         source_path_key.phase_orientation != -1) ||
+        source_path_key.frame_convention_id == 0U ||
+        source_path_key.frame_convention !=
+            phase_offset_core::kWorldHorizontalCrossProductProvenance) {
+        return false;
+    }
+
+    std::uint64_t successor_identity = 0U;
+    std::uint64_t successor_request_id = 0U;
+    {
+        std::lock_guard<std::mutex> handoff_lock(
+            path_reference_handoff_mutex_);
+        if (pending_path_reference_handoff_v2_) return false;
+        const std::uint64_t identity_floor = std::max(
+            std::max(next_path_identity_v2_,
+                     source_path_key.path_instance_id),
+            source_path_key.path_revision);
+        const std::uint64_t request_floor = std::max(
+            next_tube_request_id_v2_, source_input->request_id);
+        if (identity_floor == std::numeric_limits<std::uint64_t>::max() ||
+            request_floor == std::numeric_limits<std::uint64_t>::max()) {
             return false;
         }
-        trial_samples.push_back(
-            ConvertContinuousPhasePathStateForActive(state, w));
+        successor_identity = identity_floor + 1U;
+        successor_request_id = request_floor + 1U;
+        next_path_identity_v2_ = successor_identity;
+        next_tube_request_id_v2_ = successor_request_id;
     }
-    PathTubePairTransaction transaction;
-    PathTubePairStageFailure local_stage_failure =
-        PathTubePairStageFailure::NONE;
-    const bool tube_stage_ready = phase_offset_matched_adapter_->stagePathTubePair(
-            old_pair, trial_path, trial_samples, captured_w0, seam_w,
-            new_owner_required_horizon_end, position, gains, dt,
-            frozen_cloud_occupancy_snapshot, transaction,
-            authority_session, &capture, transaction_pin->leaseId(),
-            &local_stage_failure);
-    if (stage_failure) {
-        *stage_failure = local_stage_failure;
+
+    std::shared_ptr<ContinuousPhasePath> revised_path(
+        new ContinuousPhasePath(*trial_path));
+    revised_path->setPathRevision(successor_identity);
+    const std::shared_ptr<const ContinuousPhasePath> successor_path =
+        revised_path;
+    std::vector<double> structural_breakpoints;
+    if (!successor_path->certificateBreakpointsV2(
+            structural_breakpoints)) {
+        return false;
     }
-    if (!tube_stage_ready) {
-        ROS_WARN("[GVF][H2][STAGE] pair_generation=%llu session=%llu "
-                 "captured_w=%.9f seam_w=%.9f owner_end_w=%.9f "
-                 "stage_success=0 stage_failure=%s",
-                 static_cast<unsigned long long>(old_pair->generation),
-                 static_cast<unsigned long long>(authority_session),
-                 captured_w0, seam_w, trial_path->endW(),
-                 pathTubePairStageFailureName(local_stage_failure));
+
+    const std::shared_ptr<const plan_env::SDFMapCaptureV2> map_capture =
+        pm.sdf_map_ ? pm.sdf_map_->captureAuthoritativeSDFMapV2()
+                    : std::shared_ptr<const plan_env::SDFMapCaptureV2>();
+    const SDFMapCaptureQueryBridgeV2 map_bridge =
+        makeSDFMapCaptureQueryV2(map_capture);
+    if (!map_bridge.usable() || !map_bridge.descriptor.valid) return false;
+
+    std::shared_ptr<phase_offset_navigation::TubeBuildInputV2> successor_input(
+        new phase_offset_navigation::TubeBuildInputV2());
+    successor_input->request_id = successor_request_id;
+    successor_input->path_key.execution_generation = execution_generation;
+    successor_input->path_key.path_instance_id = successor_identity;
+    successor_input->path_key.path_revision = successor_identity;
+    successor_input->path_key.frame_revision = successor_identity;
+    successor_input->path_key.frame_convention_id =
+        source_path_key.frame_convention_id;
+    successor_input->path_key.frame_convention =
+        source_path_key.frame_convention;
+    successor_input->path_key.phase_orientation =
+        source_path_key.phase_orientation;
+    successor_input->path_key.domain_start = successor_path->startW();
+    successor_input->path_key.domain_end = successor_path->endW();
+    successor_input->configuration_key =
+        matched_config_.tube_certificate_v2.key();
+    successor_input->map_capture_key = map_bridge.descriptor.map_capture_key;
+    successor_input->requested_start = phase_after.w;
+    successor_input->requested_end = requested_end;
+    successor_input->anchor_w = phase_after.w;
+    successor_input->producer_breakpoints = structural_breakpoints;
+    successor_input->producer_breakpoint_query =
+        [successor_path](std::vector<double>& breakpoints) {
+            return successor_path->certificateBreakpointsV2(breakpoints);
+        };
+    successor_input->path_cell_query =
+        [successor_path](
+            const double w0, const double w1,
+            phase_offset_core::CertifiedPathCellV2& certificate) {
+            return successor_path->tubeCellBoundsV2(w0, w1, certificate);
+        };
+    successor_input->path_owner =
+        std::static_pointer_cast<const void>(successor_path);
+    successor_input->query_owner = map_bridge.query_owner;
+    successor_input->capture_owner = map_bridge.capture_owner;
+    successor_input->applicability_assumptions =
+        "copied-prefix successor over immutable authoritative SDFMap capture";
+    successor_input->applicability_deadline_ticks =
+        successor_input->map_capture_key.support_expiry_ticks;
+    successor_input->applicability_deadline_timeless =
+        successor_input->map_capture_key.support_expiry_timeless;
+    successor_input->free_ball_query = map_bridge.free_ball_query;
+    for (const double w : trial_w) {
+        if (w >= successor_input->requested_start &&
+            w <= successor_input->requested_end) {
+            successor_input->sample_grid.push_back(w);
+        }
     }
-    // The accepted planner frontend belongs to this callback even when Tube
-    // staging fails.  Preserve it in the caller's local output so the
-    // existing neutral commit path may install it only if its own live
-    // neutral-retirement predicate succeeds; no retry or cached mailbox is
-    // introduced here.
+    if (!successor_input->complete()) return false;
+
+    std::shared_ptr<PathReferenceFrontendMirrorV2> mirror(
+        new PathReferenceFrontendMirrorV2());
+    mirror->traj = trial_traj;
+    mirror->vel = trial_vel;
+    mirror->time = trial_time;
+    mirror->w = trial_w;
+    mirror->anchor_idx = static_cast<int>(std::distance(
+        trial_w.begin(),
+        std::lower_bound(trial_w.begin(), trial_w.end(), phase_after.w)));
+    mirror->anchor_idx = std::max(
+        0, std::min(mirror->anchor_idx,
+                    static_cast<int>(trial_w.size()) - 1));
+
+    std::shared_ptr<PathReferenceHandoffV2> handoff(
+        new PathReferenceHandoffV2());
+    handoff->expected_execution_generation = execution_generation;
+    handoff->source_path_key = source_path_key;
+    handoff->successor_path_owner = successor_path;
+    handoff->successor_path_key = successor_input->path_key;
+    handoff->successor_phase_after_w = phase_after.w;
+    handoff->copied_prefix_start_w = phase_after.w;
+    handoff->copied_prefix_end_w = seam_w;
+    handoff->successor_request =
+        std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>(
+            successor_input);
+    std::shared_ptr<TubeV2SuccessorHandoffEvidence> admission_evidence(
+        new TubeV2SuccessorHandoffEvidence());
+    admission_evidence->valid = true;
+    admission_evidence->structurally_copied_prefix = true;
+    admission_evidence->expected_execution_generation = execution_generation;
+    admission_evidence->source_path_key = source_path_key;
+    admission_evidence->source_path_owner = source_path;
+    admission_evidence->successor_path_key = successor_input->path_key;
+    admission_evidence->successor_path_owner = successor_path;
+    admission_evidence->phase_after_w = phase_after.w;
+    admission_evidence->copied_prefix_start_w = phase_after.w;
+    admission_evidence->copied_prefix_end_w = seam_w;
+    admission_evidence->successor_request = handoff->successor_request;
+    admission_evidence->provenance =
+        "gvf_manager/buildPhaseV2C2Frontend/appendSlice";
+    handoff->admission_evidence =
+        std::shared_ptr<const TubeV2SuccessorHandoffEvidence>(
+            admission_evidence);
+    handoff->frontend_mirror =
+        std::shared_ptr<const PathReferenceFrontendMirrorV2>(mirror);
+    if (!handoff->requestComplete()) return false;
+
+    {
+        std::lock_guard<std::mutex> handoff_lock(
+            path_reference_handoff_mutex_);
+        if (pending_path_reference_handoff_v2_) return false;
+        pending_path_reference_handoff_v2_ = handoff;
+    }
+    if (!phase_offset_matched_adapter_->enqueueV2SuccessorRequest(
+            handoff->source_path_key, *handoff->successor_request)) {
+        std::lock_guard<std::mutex> handoff_lock(
+            path_reference_handoff_mutex_);
+        if (pending_path_reference_handoff_v2_ == handoff) {
+            pending_path_reference_handoff_v2_.reset();
+        }
+        return false;
+    }
+
     staged_traj = trial_traj;
     staged_vel = trial_vel;
     staged_time = trial_time;
     staged_w = trial_w;
-    staged_path = trial_path;
-    if (!tube_stage_ready) return false;
-    std::shared_ptr<PendingPathTubeFrontend> frontend(
-        new PendingPathTubeFrontend());
-    frontend->candidate_pair = transaction.candidate_pair;
-    frontend->transaction = transaction;
-    frontend->traj = trial_traj;
-    frontend->vel = trial_vel;
-    frontend->time = trial_time;
-    frontend->w = trial_w;
-    frontend->anchor_idx = static_cast<int>(std::distance(
-        trial_w.begin(), std::lower_bound(trial_w.begin(),
-                                           trial_w.end(), captured_w0)));
-    frontend->anchor_idx = std::max(0, std::min(
-        frontend->anchor_idx, static_cast<int>(trial_w.size()) - 1));
-    frontend->authority_session = authority_session;
-    if (!transaction.candidate_pair ||
-        transaction.authority_session != authority_session) {
-        return false;
-    }
-    {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        // A manager transaction slot is deliberately single-entry.  Never let
-        // a later replan overwrite a fully prepared older handoff that may
-        // still be safely committed before its seam.
-        if (path_tube_authority_session_ != authority_session ||
-            pending_path_tube_handoff_ || completed_path_tube_handoff_) {
-            return false;
-        }
-        frontend->transaction_pin = std::move(transaction_pin);
-        pending_path_tube_handoff_ = frontend;
-    }
-    // A later valid H2 handoff proves that the prior terminal classification
-    // is no longer the live authority condition.
-    {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        nonzero_handoff_recovery_required_reported_ = false;
-    }
+    staged_path = successor_path;
     return true;
 }
 
-bool gvf_manager::prepareAndCommitPendingPathTubeHandoff(
-    const AuthoritativePhaseSnapshot& captured_phase,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        latest_cloud_occupancy_snapshot)
-{
-    if (!phase_offset_matched_adapter_) {
-        return false;
-    }
-    std::shared_ptr<PendingPathTubeFrontend> handoff;
-    // A discarded pending entry may own the transaction pin.  Its release
-    // must remain outside manager/Runtime locks.
-    std::unique_ptr<PathTubePairPin> released_pin;
-    {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        if (!captured_phase.initialized) {
-            return false;
-        }
-        // Copy mailbox identity only.  Retryable prepare/final failures must
-        // leave this slot intact for the next command callback.
-        handoff = pending_path_tube_handoff_;
-        if (!handoff) {
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::NONE;
-            return false;
-        }
-        if (!handoff || !handoff->candidate_pair ||
-            !handoff->transaction_pin ||
-            !handoff->transaction_pin->valid() ||
-            handoff->authority_session != path_tube_authority_session_ ||
-            handoff->transaction.authority_session !=
-                path_tube_authority_session_) {
-            if (pending_path_tube_handoff_ == handoff) {
-                released_pin = std::move(handoff->transaction_pin);
-                pending_path_tube_handoff_.reset();
-            }
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::DROPPED_STALE;
-            return false;
-        }
-        if (!std::isfinite(handoff->candidate_pair->future_seam_w) ||
-            captured_phase.w >= handoff->candidate_pair->future_seam_w) {
-            if (pending_path_tube_handoff_ == handoff) {
-                released_pin = std::move(handoff->transaction_pin);
-                pending_path_tube_handoff_.reset();
-            }
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::DROPPED_EXPIRED;
-            return false;
-        }
-    }
-
-    // The expensive exact port/map validation is deliberately outside both
-    // manager locks.  It uses the captured command phase only as a value;
-    // final serialization re-reads the phase tuple below.
-    PathTubePairCommitPreparation preparation;
-    if (!phase_offset_matched_adapter_->preparePathTubePairCommit(
-            handoff->transaction, captured_phase.w, position, gains, dt,
-            latest_cloud_occupancy_snapshot, preparation)) {
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        if (pending_path_tube_handoff_ == handoff) {
-            if (handoff->authority_session != path_tube_authority_session_ ||
-                handoff->transaction.authority_session !=
-                    path_tube_authority_session_ ||
-                !handoff->transaction_pin ||
-                !handoff->transaction_pin->valid()) {
-                released_pin = std::move(handoff->transaction_pin);
-                pending_path_tube_handoff_.reset();
-                last_path_tube_handoff_lifecycle_result_ =
-                    PathTubeHandoffLifecycleResult::DROPPED_STALE;
-            } else {
-                std::lock_guard<std::mutex> phase_lock(
-                    authoritative_phase_mutex_);
-                if (!phase_initialized_ ||
-                    phase_w_ >= handoff->candidate_pair->future_seam_w) {
-                    released_pin = std::move(handoff->transaction_pin);
-                    pending_path_tube_handoff_.reset();
-                    last_path_tube_handoff_lifecycle_result_ =
-                        PathTubeHandoffLifecycleResult::DROPPED_EXPIRED;
-                } else {
-                    last_path_tube_handoff_lifecycle_result_ =
-                        PathTubeHandoffLifecycleResult::RETRY_PENDING;
-                }
-            }
-        }
-        return false;
-    }
-
-    std::shared_ptr<const PathTubePair> committed_pair;
-    std::unique_ptr<PathTubePairPin> committed_pin;
-    {
-        // Lock ordering is fixed: handoff first, phase second, then the
-        // adapter's short Runtime/CAS lock.  No planning, map scan or dry-run
-        // occurs while either manager lock is held.
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        if (pending_path_tube_handoff_ != handoff) {
-            return false;
-        }
-        if (handoff->authority_session != path_tube_authority_session_ ||
-            handoff->transaction.authority_session !=
-                path_tube_authority_session_ ||
-            !handoff->transaction_pin ||
-            !handoff->transaction_pin->valid()) {
-            released_pin = std::move(handoff->transaction_pin);
-            pending_path_tube_handoff_.reset();
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::DROPPED_STALE;
-            return false;
-        }
-        if (completed_path_tube_handoff_) {
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::RETRY_PENDING;
-            return false;
-        }
-        std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
-        // This compares the command capture, not the staging capture.  Normal
-        // phase progress is allowed between replan staging and this command,
-        // but a reset/initialization or another command completion during this
-        // command's lock-free port trial must invalidate the trial.
-        if (authoritative_phase_generation_ != captured_phase.generation ||
-            phase_initialized_ != captured_phase.initialized ||
-            closed_phase_acquired_ != captured_phase.closed_acquired ||
-            phase_w_ != captured_phase.w) {
-            if (!phase_initialized_ ||
-                phase_w_ >= handoff->candidate_pair->future_seam_w) {
-                released_pin = std::move(handoff->transaction_pin);
-                pending_path_tube_handoff_.reset();
-                last_path_tube_handoff_lifecycle_result_ =
-                    PathTubeHandoffLifecycleResult::DROPPED_EXPIRED;
-            } else {
-                last_path_tube_handoff_lifecycle_result_ =
-                    PathTubeHandoffLifecycleResult::RETRY_PENDING;
-            }
-            return false;
-        }
-        const double live_w = phase_w_;
-        if (!phase_initialized_ ||
-            live_w < handoff->candidate_pair->captured_w0 -
-                kH2HandoffCoverageTolerance ||
-            live_w >= handoff->candidate_pair->future_seam_w) {
-            if (!phase_initialized_ ||
-                live_w >= handoff->candidate_pair->future_seam_w) {
-                released_pin = std::move(handoff->transaction_pin);
-                pending_path_tube_handoff_.reset();
-                last_path_tube_handoff_lifecycle_result_ =
-                    PathTubeHandoffLifecycleResult::DROPPED_EXPIRED;
-            } else {
-                last_path_tube_handoff_lifecycle_result_ =
-                    PathTubeHandoffLifecycleResult::RETRY_PENDING;
-            }
-            return false;
-        }
-        // The prepare result was evaluated at the same captured phase.  A
-        // command phase advance means it must be rebuilt/retried, never
-        // silently reused under a different exact port.
-        const bool final_cas_succeeded = live_w == preparation.current_w &&
-            phase_offset_matched_adapter_->finalizePreparedPathTubePairCommit(
-                preparation, committed_pair) && committed_pair;
-        if (!final_cas_succeeded) {
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::RETRY_PENDING;
-            return false;
-        }
-        // Publish the pin-free completed mailbox in the same manager critical
-        // section that serialized the pair CAS.  Moving the guard to a local
-        // owner keeps its eventual registry release outside all manager locks,
-        // while preventing another replan from occupying the now-empty slot in
-        // the CAS-to-mailbox gap.
-        handoff->candidate_pair = committed_pair;
-        committed_pin = std::move(handoff->transaction_pin);
-        pending_path_tube_handoff_.reset();
-        completed_path_tube_handoff_ = handoff;
-        last_path_tube_handoff_lifecycle_result_ =
-            PathTubeHandoffLifecycleResult::COMMITTED;
-    }
-    // The exact old pair remained pinned through final CAS and completed
-    // mailbox publication.  Registry release occurs only after handoff, phase
-    // and adapter Runtime locks have all left scope.
-    // RAII release is null-safe and remains outside every manager/Runtime
-    // lock; avoid a separate explicit call that would make this path rely on
-    // a non-null local after future ownership refactors.
-    committed_pin.reset();
-    return true;
-}
-
-bool gvf_manager::retireOffsetAuthorityForPlannerOwnerLocked()
-{
-    if (!phase_offset_matched_adapter_) return true;
-    // The planner owner is about to become visible to the command callback.
-    // Retire the old offset pair first, so no command can observe a new
-    // planner mirror together with an old PathTubePair.  Keep the manager and
-    // adapter sessions aligned for any subsequent authoritative bootstrap.
-    // The adapter owns the sole atomic safe-neutral proof under its Runtime
-    // lock; pending activation is not an unconditional manager veto.
-    const std::uint64_t requested_session = path_tube_authority_session_ + 1U;
-    std::uint64_t retired_session = 0U;
-    if (!phase_offset_matched_adapter_->retirePathTubeAuthorityIfNeutral(
-            requested_session, retired_session)) {
-        return false;
-    }
-    pending_path_tube_handoff_.reset();
-    completed_path_tube_handoff_.reset();
-    nonzero_handoff_recovery_required_reported_ = false;
-    path_tube_authority_session_ = retired_session;
-    clearSuccessorHandoffTransaction();
-    return true;
-}
-
-gvf_manager::PathTubeReplanHandoffRequirement
-gvf_manager::capturePathTubeReplanHandoffRequirement() const
-{
-    PathTubeReplanHandoffRequirement requirement;
-    if (!phase_offset_matched_adapter_) return requirement;
-
-    // The exact Pair identity is captured once at the replan boundary.  The
-    // adapter verifies that same immutable identity is still live while it
-    // evaluates the pending-activation predicate.
-    requirement.captured_pair =
-        phase_offset_matched_adapter_->capturePathTubePair();
-    requirement.successor_handoff = captureSuccessorHandoffTransaction();
-    requirement.executed_authority =
-        phase_offset_matched_adapter_->requiresAuthoritativeOffsetHandoff();
-    requirement.pending_activation =
-        phase_offset_matched_adapter_->hasPendingOffsetActivationPair(
-            requirement.captured_pair);
-    return requirement;
-}
-
-bool gvf_manager::commitNeutralPlannerFrontend(
+bool gvf_manager::installPlannerOnlyFrontendV2(
     gvfManager& pm,
     const Eigen::MatrixXd& traj,
     const Eigen::MatrixXd& vel,
     const Eigen::VectorXd& time,
     const std::vector<double>& w,
     const std::shared_ptr<const ContinuousPhasePath>& path_owner,
-    const int anchor_idx,
     const ros::Time& now,
+    const AuthoritativePhaseSnapshot& expected_phase,
+    const std::shared_ptr<const ContinuousPhasePath>& copied_prefix_source,
+    const double copied_prefix_end_w,
+    const std::uint64_t expected_execution_generation,
     nav_msgs::Path& path_msg)
 {
     path_msg = nav_msgs::Path();
     if (!pm.gvf_ || !path_owner || path_owner->empty() || traj.rows() <= 0 ||
         vel.rows() != traj.rows() || time.size() != traj.rows() ||
-        w.size() != static_cast<size_t>(traj.rows())) {
+        w.size() != static_cast<std::size_t>(traj.rows()) ||
+        !traj.allFinite() || !vel.allFinite() || !time.allFinite() ||
+        !std::isfinite(expected_phase.w) ||
+        !std::isfinite(copied_prefix_end_w)) {
+        ROS_WARN("[GVF][H2][PLANNER_ONLY_INSTALL] rejected reason=invalid_frontend_or_phase_evidence");
+        return false;
+    }
+    for (std::size_t index = 0U; index < w.size(); ++index) {
+        if (!std::isfinite(w[index]) ||
+            (index != 0U && !(w[index] > w[index - 1U]))) {
+            ROS_WARN("[GVF][H2][PLANNER_ONLY_INSTALL] rejected reason=invalid_phase_samples");
+            return false;
+        }
+    }
+
+    const bool has_copied_prefix =
+        static_cast<bool>(copied_prefix_source);
+    if ((has_copied_prefix &&
+         (!expected_phase.initialized ||
+          expected_execution_generation == 0U ||
+          !(copied_prefix_end_w > expected_phase.w) ||
+          copied_prefix_source->empty() ||
+          expected_phase.w < copied_prefix_source->startW() ||
+          copied_prefix_end_w > copied_prefix_source->endW() ||
+          expected_phase.w < path_owner->startW() ||
+          copied_prefix_end_w > path_owner->endW())) ||
+        (!has_copied_prefix &&
+         (copied_prefix_end_w != expected_phase.w ||
+          expected_execution_generation != 0U))) {
+        ROS_WARN("[GVF][H2][PLANNER_ONLY_INSTALL] rejected reason=invalid_copied_prefix_evidence expected_w=%.17g prefix_end_w=%.17g expected_execution_generation=%llu",
+                 expected_phase.w, copied_prefix_end_w,
+                 static_cast<unsigned long long>(
+                     expected_execution_generation));
         return false;
     }
 
-    PendingPathTubeFrontend frontend;
-    frontend.planner_path_owner = path_owner;
-    frontend.traj = traj;
-    frontend.vel = vel;
-    frontend.time = time;
-    frontend.w = w;
-    frontend.anchor_idx = std::max(
-        0, std::min(anchor_idx, static_cast<int>(w.size()) - 1));
-    frontend.is_first_goal = false;
-
-    // Neutral direct-install linearization point.  Do not release the handoff
-    // barrier between retiring the old Pair and publishing the new in-memory
-    // planner owner.  A concurrent activation CAS therefore either completes
-    // first and makes the neutral check fail, or observes the retired session
-    // only after the new owner is installed.
+    std::shared_ptr<const ContinuousPhasePath> identified_path;
+    if (!assignPathIdentityV2(path_owner, identified_path)) {
+        ROS_WARN("[GVF][H2][PLANNER_ONLY_INSTALL] rejected reason=path_identity_unavailable");
+        return false;
+    }
     std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-    std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-    if (pending_path_tube_handoff_ || completed_path_tube_handoff_) {
+    std::lock_guard<std::mutex> handoff_lock(path_reference_handoff_mutex_);
+    std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
+    const std::uint64_t live_execution_generation =
+        phase_offset_matched_adapter_
+            ? phase_offset_matched_adapter_->executionGenerationV2()
+            : 0U;
+    const auto reject_locked = [&](const char* reason) {
+        ROS_WARN("[GVF][H2][PLANNER_ONLY_INSTALL] rejected reason=%s expected_w=%.17g live_w=%.17g prefix_end_w=%.17g expected_phase_generation=%llu live_phase_generation=%llu expected_execution_generation=%llu live_execution_generation=%llu",
+                 reason, expected_phase.w, phase_w_, copied_prefix_end_w,
+                 static_cast<unsigned long long>(expected_phase.generation),
+                 static_cast<unsigned long long>(
+                     authoritative_phase_generation_),
+                 static_cast<unsigned long long>(
+                     expected_execution_generation),
+                 static_cast<unsigned long long>(live_execution_generation));
         return false;
+    };
+    if (pending_path_reference_handoff_v2_) {
+        return reject_locked("pending_v2_handoff");
     }
-    if (!retireOffsetAuthorityForPlannerOwnerLocked()) {
-        return false;
+    if (phase_offset_matched_adapter_ &&
+        phase_offset_matched_adapter_->captureV2ExecutionBinding()) {
+        return reject_locked("v2_binding_active");
     }
-    applyPathTubeFrontendMirrorLocked(pm, frontend, now);
+    if (phase_initialized_ != expected_phase.initialized ||
+        closed_phase_acquired_ != expected_phase.closed_acquired) {
+        return reject_locked("phase_mode_changed");
+    }
+    if (has_copied_prefix) {
+        if (!phase_offset_matched_adapter_ ||
+            live_execution_generation != expected_execution_generation) {
+            return reject_locked("task_generation_changed");
+        }
+        if (pm.gvf_->getContinuousPhasePath() != copied_prefix_source) {
+            return reject_locked("source_path_generation_changed");
+        }
+        if (authoritative_phase_generation_ < expected_phase.generation) {
+            return reject_locked("phase_generation_regressed");
+        }
+        if (!std::isfinite(phase_w_) || phase_w_ < expected_phase.w) {
+            return reject_locked("phase_regressed_before_copied_prefix");
+        }
+        if (phase_w_ > copied_prefix_end_w) {
+            return reject_locked("copied_prefix_expired");
+        }
+    } else if (authoritative_phase_generation_ != expected_phase.generation ||
+               phase_w_ != expected_phase.w) {
+        return reject_locked("exact_phase_cas_changed");
+    }
+    if (phase_w_ < identified_path->startW() ||
+        phase_w_ > identified_path->endW() ||
+        phase_w_ < w.front() || phase_w_ > w.back()) {
+        return reject_locked("live_phase_outside_frontend");
+    }
+
+    const int live_anchor_idx = static_cast<int>(std::distance(
+        w.begin(), std::lower_bound(w.begin(), w.end(), phase_w_)));
+    pm.last_traj = traj;
+    pm.last_vel = vel;
+    pm.last_traj_time_ = time;
+    pm.is_first_goal = false;
+    current_traj_index_ = std::max(
+        0, std::min(live_anchor_idx, static_cast<int>(w.size()) - 1));
+    last_switch_time_ = now;
+    cmd_switch_motion_limit_until_ = now + ros::Duration(
+        std::max(0.0, cmd_switch_motion_limit_time_));
+    pm.gvf_->setAuthoritativePhaseMode(true);
+    pm.gvf_->setContinuousPhasePath(identified_path);
+    pm.gvf_->setNextPathWSamples(w);
+    {
+        std::lock_guard<std::mutex> request_lock(
+            current_tube_request_mutex_v2_);
+        current_tube_request_v2_.reset();
+    }
+    resetGovernorState();
     return installAuthoritativePathMirrorLocked(traj, vel, w, path_msg);
 }
 
-bool gvf_manager::pendingOffsetBootstrapMatchesCurrentPlannerLocked(
-    const gvfManager& pm,
-    const std::shared_ptr<const ContinuousPhasePath>& planner_owner,
-    const std::uint64_t authority_session) const
-{
-    return pm.gvf_ && planner_owner &&
-        path_tube_authority_session_ == authority_session &&
-        !pending_path_tube_handoff_ && !completed_path_tube_handoff_ &&
-        pm.gvf_->getContinuousPhasePath() == planner_owner;
-}
-
-bool gvf_manager::consumeCompletedPathTubeHandoff(
+bool gvf_manager::consumeCommittedPathReferenceHandoffV2(
     gvfManager& pm, const ros::Time& now)
 {
     if (!phase_offset_matched_adapter_ || !pm.gvf_) return false;
     nav_msgs::Path path_msg;
-    // Keep an identity copy until the FSM-side mirror application has
-    // succeeded.  A completed frontend is not consumed merely because this
-    // callback looked at it.
-    std::shared_ptr<PendingPathTubeFrontend> completed;
-    std::unique_ptr<PathTubePairPin> released_pin;
+    std::shared_ptr<const PathReferenceHandoffV2> handoff;
     {
         std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-        // Keep this serialization boundary through prevalidation, mirror
-        // application and mailbox retirement.  A reset/session retirement
-        // therefore cannot make a previously valid completed frontend stale
-        // after validation but before the FSM mirror is installed.
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        completed = completed_path_tube_handoff_;
-        if (!completed) {
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::NONE;
+        std::lock_guard<std::mutex> handoff_lock(
+            path_reference_handoff_mutex_);
+        handoff = pending_path_reference_handoff_v2_;
+        if (!handoff || !handoff->committedComplete()) return false;
+        const std::shared_ptr<const TubeV2ExecutionBinding> binding =
+            phase_offset_matched_adapter_->captureV2ExecutionBinding();
+        if (!binding || !binding->complete() ||
+            binding->profile != handoff->successor_profile ||
+            binding->source_input != handoff->successor_request) {
+            pending_path_reference_handoff_v2_.reset();
             return false;
         }
-        if (!completed->candidate_pair || completed->transaction_pin ||
-            completed->authority_session != path_tube_authority_session_ ||
-            !validatePathTubeFrontendForMirror(pm, *completed)) {
-            if (completed_path_tube_handoff_ == completed) {
-                released_pin = std::move(completed->transaction_pin);
-                completed_path_tube_handoff_.reset();
-            }
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::DROPPED_STALE;
+        const std::shared_ptr<const PathReferenceFrontendMirrorV2>& mirror =
+            handoff->frontend_mirror;
+        if (!mirror || !mirror->complete() ||
+            !installAuthoritativePathMirrorLocked(
+                mirror->traj, mirror->vel, mirror->w, path_msg)) {
             return false;
         }
-        const std::shared_ptr<const PathTubePair> live =
-            phase_offset_matched_adapter_->capturePathTubePair();
-        // A timer refresh may legitimately replace the pair object/profile
-        // for the same owner+revision before FSM reaches this mailbox.  The
-        // frontend belongs to that immutable path owner, not a profile ptr.
-        if (!samePathTubeAuthority(live, completed->candidate_pair)) {
-            if (completed_path_tube_handoff_ == completed) {
-                completed_path_tube_handoff_.reset();
-            }
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::DROPPED_STALE;
-            return false;
+        pm.last_traj = mirror->traj;
+        pm.last_vel = mirror->vel;
+        pm.last_traj_time_ = mirror->time;
+        pm.is_first_goal = false;
+        current_traj_index_ = mirror->anchor_idx;
+        last_switch_time_ = now;
+        cmd_switch_motion_limit_until_ = now + ros::Duration(
+            std::max(0.0, cmd_switch_motion_limit_time_));
+        pm.gvf_->setAuthoritativePhaseMode(true);
+        pm.gvf_->setContinuousPhasePath(handoff->successor_path_owner);
+        pm.gvf_->setNextPathWSamples(mirror->w);
+        {
+            std::lock_guard<std::mutex> request_lock(
+                current_tube_request_mutex_v2_);
+            current_tube_request_v2_.reset();
         }
-
-        // All fallible payload checks precede mirror mutation.  From this
-        // point the validated frontend can be installed atomically from the
-        // FSM's point of view; only a successful install consumes its slot.
-        applyPathTubeFrontendMirrorLocked(pm, *completed, now);
-        if (!installAuthoritativePathMirrorLocked(
-                completed->traj, completed->vel, completed->w, path_msg)) {
-            last_path_tube_handoff_lifecycle_result_ =
-                PathTubeHandoffLifecycleResult::RETRY_PENDING;
-            return false;
-        }
-        if (completed_path_tube_handoff_ != completed) {
-            return false;
-        }
-        completed_path_tube_handoff_.reset();
-        last_path_tube_handoff_lifecycle_result_ =
-            PathTubeHandoffLifecycleResult::CONSUMED;
+        resetGovernorState();
+        if (pending_path_reference_handoff_v2_ != handoff) return false;
+        pending_path_reference_handoff_v2_.reset();
     }
-    released_pin.reset();
-    // ROS publication may synchronously dispatch callbacks.  All H2
-    // ownership locks are released before publication; the cache was already
-    // installed and topic callbacks are ignored while authoritative.
     path_pub.publish(path_msg);
     return true;
 }
 
-bool gvf_manager::samePathTubeAuthority(
-    const std::shared_ptr<const PathTubePair>& lhs,
-    const std::shared_ptr<const PathTubePair>& rhs)
-{
-    // A same-path timer refresh may replace the immutable pair/profile object
-    // before FSM consumes its completed mailbox.  The frontend is still safe
-    // exactly when session, source revision and semantic owner agree.
-    return lhs && rhs && lhs->authority_session == rhs->authority_session &&
-        lhs->source_revision == rhs->source_revision && lhs->path_owner &&
-        rhs->path_owner && lhs->path_owner.get() == rhs->path_owner.get();
-}
-
 std::shared_ptr<const ContinuousPhasePath>
-gvf_manager::plannerPathOwnerForFrontend(
-    const PendingPathTubeFrontend& frontend)
+gvf_manager::captureCommandPathForV2Binding(
+    const gvfManager& pm,
+    const std::shared_ptr<const TubeV2ExecutionBinding>& binding)
 {
-    if (frontend.candidate_pair) {
-        const std::shared_ptr<const ContinuousPhasePath>& pair_owner =
-            frontend.candidate_pair->path_owner;
-        if (!pair_owner ||
-            (frontend.planner_path_owner &&
-             frontend.planner_path_owner != pair_owner)) {
-            return std::shared_ptr<const ContinuousPhasePath>();
-        }
-        return pair_owner;
+    if (!binding || !binding->complete()) {
+        return std::shared_ptr<const ContinuousPhasePath>();
     }
-    return frontend.planner_path_owner;
-}
-
-bool gvf_manager::validatePathTubeFrontendForMirror(
-    const gvfManager& pm, const PendingPathTubeFrontend& frontend)
-{
-    const std::shared_ptr<const ContinuousPhasePath> planner_path_owner =
-        plannerPathOwnerForFrontend(frontend);
-    if (!pm.gvf_ || !planner_path_owner || planner_path_owner->empty() ||
-        frontend.traj.rows() <= 0 || frontend.traj.cols() < 3 ||
-        frontend.vel.rows() != frontend.traj.rows() ||
-        frontend.vel.cols() < 3 ||
-        frontend.time.size() != frontend.traj.rows() ||
-        frontend.w.size() != static_cast<size_t>(frontend.traj.rows()) ||
-        frontend.anchor_idx < 0 ||
-        frontend.anchor_idx >= frontend.traj.rows()) {
-        return false;
-    }
-    for (int i = 0; i < frontend.traj.rows(); ++i) {
-        if (!frontend.traj.row(i).allFinite() ||
-            !frontend.vel.row(i).allFinite() ||
-            !std::isfinite(frontend.time(i)) ||
-            !std::isfinite(frontend.w[static_cast<size_t>(i)]) ||
-            (i > 0 && frontend.w[static_cast<size_t>(i)] <=
-                frontend.w[static_cast<size_t>(i - 1)])) {
-            return false;
+    {
+        std::lock_guard<std::mutex> handoff_lock(
+            path_reference_handoff_mutex_);
+        const std::shared_ptr<const PathReferenceHandoffV2>& handoff =
+            pending_path_reference_handoff_v2_;
+        if (handoff && handoff->committedComplete() &&
+            handoff->successor_profile == binding->profile &&
+            handoff->successor_request == binding->source_input) {
+            return handoff->successor_path_owner;
         }
     }
-    return frontend.w.front() >= planner_path_owner->startW() -
-               kH2HandoffCoverageTolerance &&
-        frontend.w.back() <= planner_path_owner->endW() +
-               kH2HandoffCoverageTolerance;
-}
-
-void gvf_manager::applyPathTubeFrontendMirrorLocked(
-    gvfManager& pm, const PendingPathTubeFrontend& frontend,
-    const ros::Time& now)
-{
-    // Caller owns frontend_apply_mutex_.  This function has no authority
-    // effect: the pair was already committed; it updates only FSM-owned
-    // legacy/display mirrors from the same immutable frontend payload.
-    pm.last_traj = frontend.traj;
-    pm.last_vel = frontend.vel;
-    pm.last_traj_time_ = frontend.time;
-    pm.is_first_goal = frontend.is_first_goal;
-    if (frontend.replace_goal) pm.goal_pt = frontend.goal;
-    current_traj_index_ = frontend.anchor_idx;
-    last_switch_time_ = now;
-    cmd_switch_motion_limit_until_ = now + ros::Duration(
-        std::max(0.0, cmd_switch_motion_limit_time_));
-    const std::shared_ptr<const ContinuousPhasePath> planner_path_owner =
-        plannerPathOwnerForFrontend(frontend);
-    if (pm.gvf_ && planner_path_owner) {
-        pm.gvf_->setAuthoritativePhaseMode(true);
-        pm.gvf_->setContinuousPhasePath(planner_path_owner);
-        pm.gvf_->setNextPathWSamples(frontend.w);
-    }
-    resetGovernorState();
+    const std::shared_ptr<const ContinuousPhasePath> frontend_path =
+        pm.gvf_ ? pm.gvf_->getContinuousPhasePath()
+                : std::shared_ptr<const ContinuousPhasePath>();
+    return frontend_path && binding->source_input->path_owner.get() ==
+            frontend_path.get()
+        ? frontend_path
+        : std::shared_ptr<const ContinuousPhasePath>();
 }
 
 bool gvf_manager::installAuthoritativePathMirrorLocked(
@@ -4534,136 +3998,6 @@ bool gvf_manager::installAuthoritativePathMirrorLocked(
     return true;
 }
 
-bool gvf_manager::consumeFrontendClearMailbox(gvfManager& pm)
-{
-    std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-    bool clear = false;
-    {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        if (pending_frontend_clear_session_ >
-            consumed_frontend_clear_session_) {
-            consumed_frontend_clear_session_ =
-                pending_frontend_clear_session_;
-            clear = true;
-        }
-    }
-    if (!clear) return false;
-    pm.last_traj.resize(0, 3);
-    pm.last_vel.resize(0, 3);
-    pm.last_traj_time_.resize(0);
-    if (pm.gvf_) {
-        pm.gvf_->clearPathReparamState();
-        pm.gvf_->clearContinuousPhasePath();
-    }
-    current_traj_index_ = 0;
-    test_traj_index_ = 0;
-    resetGovernorState();
-    nav_msgs::Path empty_path;
-    empty_path.header.frame_id = "world";
-    empty_path.header.stamp = ros::Time::now();
-    path_pub.publish(empty_path);
-    kino_path_pub.publish(empty_path);
-    return true;
-}
-
-bool gvf_manager::requiresCurrentStateRecovery(
-    const MatchedAdapterOutput& output)
-{
-    // RECOVERY_REPLAN_REQUIRED is an evidence-renewal request, not a
-    // planner/HOLD result.  Route it through the existing owner/session-bound
-    // FSM mailbox so requestRecenter() can drive the established
-    // Preview/Handoff/RecoveryOwner flow on the next tick.
-    if (output.recovery_replan_required ||
-        output.recovery_status ==
-            phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED) {
-        return true;
-    }
-    // P2a consumes only existing, explicit current-state denial facts.  A
-    // Runtime witness denial can follow a valid current executable port, so
-    // CERTIFICATE_DENIED deliberately does not require executable=false.
-    // In contrast, CURRENT_OFFSET_OUTSIDE remains an invalid-current-state
-    // rejection and therefore must not be staged if an executable port is
-    // reported at the same time.
-    const bool non_selected_invalid = !output.selected && !output.valid;
-    if (!non_selected_invalid) return false;
-
-    const bool certificate_denied =
-        output.runtime_execution.mode ==
-            phase_offset_navigation::RuntimeExecutionMode::CERTIFICATE_DENIED ||
-        output.runtime_execution.certificate_denied ||
-        output.tube_epoch_status.certificate_denied;
-    if (certificate_denied) return true;
-
-    return !output.runtime_execution.executable &&
-        output.tube_epoch_status.reason ==
-            phase_offset_navigation::TubeEpochReason::CURRENT_OFFSET_OUTSIDE;
-}
-
-bool gvf_manager::stageCurrentStateRecoveryRequest(
-    const MatchedAdapterOutput& output,
-    const std::shared_ptr<const PathTubePair>& owner_pair)
-{
-    if (!requiresCurrentStateRecovery(output) || !owner_pair) return false;
-
-    std::lock_guard<std::mutex> lock(current_state_recovery_mutex_);
-    if (current_state_recovery_shutdown_) return false;
-
-    if (pending_current_state_recovery_request_) {
-        const PendingCurrentStateRecoveryRequest& pending =
-            *pending_current_state_recovery_request_;
-        // Repeated command callbacks for the exact immutable authority are
-        // idempotent: they retain, rather than duplicate, its ticket.
-        return pending.owner_pair == owner_pair &&
-            pending.source_revision == owner_pair->source_revision &&
-            pending.generation == owner_pair->generation &&
-            pending.authority_session == owner_pair->authority_session;
-    }
-
-    std::shared_ptr<PendingCurrentStateRecoveryRequest> request(
-        new PendingCurrentStateRecoveryRequest());
-    request->owner_pair = owner_pair;
-    request->source_revision = owner_pair->source_revision;
-    request->generation = owner_pair->generation;
-    request->authority_session = owner_pair->authority_session;
-    request->ticket = ++next_current_state_recovery_ticket_;
-    pending_current_state_recovery_request_ = request;
-    return true;
-}
-
-bool gvf_manager::consumeCurrentStateRecoveryRequestForFsm(
-    const std::shared_ptr<const PathTubePair>& active_pair,
-    PendingCurrentStateRecoveryRequest& request)
-{
-    std::lock_guard<std::mutex> lock(current_state_recovery_mutex_);
-    if (current_state_recovery_shutdown_ ||
-        !pending_current_state_recovery_request_) {
-        return false;
-    }
-
-    const std::shared_ptr<PendingCurrentStateRecoveryRequest> pending =
-        pending_current_state_recovery_request_;
-    const bool exact_live_authority = active_pair &&
-        pending->owner_pair == active_pair &&
-        pending->source_revision == active_pair->source_revision &&
-        pending->generation == active_pair->generation &&
-        pending->authority_session == active_pair->authority_session;
-    // A replacement/reset may retire this identity while a command producer
-    // is queued.  Drop it without consuming or remapping it to the new owner.
-    pending_current_state_recovery_request_.reset();
-    if (!exact_live_authority) return false;
-
-    consumed_current_state_recovery_ticket_ = pending->ticket;
-    request = *pending;
-    return true;
-}
-
-void gvf_manager::shutdownCurrentStateRecoveryMailbox()
-{
-    std::lock_guard<std::mutex> lock(current_state_recovery_mutex_);
-    current_state_recovery_shutdown_ = true;
-    pending_current_state_recovery_request_.reset();
-}
-
 bool gvf_manager::installInitialClosedPhaseFrontend(
     gvfManager& pm,
     const Eigen::Vector3d& current_pos,
@@ -4671,21 +4005,13 @@ bool gvf_manager::installInitialClosedPhaseFrontend(
 {
     if (!closedPhaseV2Active() || !pm.gvf_) return false;
 
-    // Capture reset-retirement evidence before any path sampling, C2 work or
-    // prepared tube construction.  A later reset changes this session, so an
-    // old bootstrap can only discard; it cannot attach itself to the new
-    // goal's session after heavyweight work completes.
+    // Capture reset-retirement evidence before path sampling and C2 work.  A
+    // later reset changes this session, so stale planner work can only discard.
     const AuthoritativePhaseSnapshot bootstrap_phase =
         captureAuthoritativePhase();
-    const std::uint64_t bootstrap_session = [&]() {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        return path_tube_authority_session_;
-    }();
-
     const double initial_phase_w = findInitialClosedPhaseV2(current_pos);
-    // Publish only after the complete bootstrap pair below succeeds.  The
-    // local value is used for all heavyweight initialization work so no
-    // callback observes a partially initialized H2 phase tuple.
+    // Keep the phase local until the complete planner frontend is ready so no
+    // callback observes a partially initialized authoritative phase tuple.
 
     Eigen::MatrixXd traj;
     Eigen::MatrixXd vel;
@@ -4699,8 +4025,13 @@ bool gvf_manager::installInitialClosedPhaseFrontend(
     if (!buildNominalContinuousPhasePath(
             initial_phase_w - closed_phase_back_margin_w_,
             initial_phase_w + frontend_length,
-            continuous_path) ||
-        !sampleContinuousPhasePath(
+            continuous_path)) {
+        return false;
+    }
+    std::shared_ptr<const ContinuousPhasePath> identified_path;
+    if (!assignPathIdentityV2(continuous_path, identified_path)) return false;
+    continuous_path = identified_path;
+    if (!sampleContinuousPhasePath(
             continuous_path, traj, vel, time, global_w)) {
         return false;
     }
@@ -4712,45 +4043,11 @@ bool gvf_manager::installInitialClosedPhaseFrontend(
         return false;
     }
 
-    const guidance::IsfGains gains(
-        pm.gvf_->gvf_.K1_, pm.gvf_->gvf_.K2_,
-        pm.gvf_->gvf_.convergence_bandwidth_, pm.gvf_->progress_rho0_,
-        pm.gvf_->progress_delta_, pm.gvf_->alpha_min_);
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot> snapshot =
-        pm.sdf_map_ ? pm.sdf_map_->cloudOccupancySnapshot()
-                    : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-    PathTubePairTransaction bootstrap_transaction;
-    std::shared_ptr<const PathTubePair> bootstrap_pair;
-    if (!prepareBootstrapPathTubeTransaction(
-            continuous_path, global_w, initial_phase_w, current_pos, gains,
-            0.02, snapshot, bootstrap_session, bootstrap_transaction,
-            bootstrap_pair)) {
-        return false;
-    }
-    PathTubePairCommitPreparation bootstrap_preparation;
-    if (bootstrap_pair && !phase_offset_matched_adapter_->
-            preparePathTubePairCommit(
-                bootstrap_transaction, initial_phase_w, current_pos, gains,
-                0.02, snapshot, bootstrap_preparation)) {
-        return false;
-    }
-
-    std::shared_ptr<PendingPathTubeFrontend> bootstrap_frontend(
-        new PendingPathTubeFrontend());
-    bootstrap_frontend->candidate_pair = bootstrap_pair;
-    bootstrap_frontend->planner_path_owner = continuous_path;
-    bootstrap_frontend->traj = traj;
-    bootstrap_frontend->vel = vel;
-    bootstrap_frontend->time = time;
-    bootstrap_frontend->w = global_w;
-    bootstrap_frontend->is_first_goal = true;
-    bootstrap_frontend->replace_goal = true;
-    bootstrap_frontend->goal = end_state.p;
-    bootstrap_frontend->anchor_idx = static_cast<int>(std::distance(
+    int bootstrap_anchor_idx = static_cast<int>(std::distance(
         global_w.begin(), std::lower_bound(global_w.begin(), global_w.end(),
                                            initial_phase_w)));
-    bootstrap_frontend->anchor_idx = std::max(
-        0, std::min(bootstrap_frontend->anchor_idx,
+    bootstrap_anchor_idx = std::max(
+        0, std::min(bootstrap_anchor_idx,
                     static_cast<int>(global_w.size()) - 1));
     const bool closed_phase_acquired =
         (current_pos - phase_state.p).norm() <= closed_phase_acquire_distance_;
@@ -4758,49 +4055,44 @@ bool gvf_manager::installInitialClosedPhaseFrontend(
     nav_msgs::Path bootstrap_path_msg;
     {
         std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        const bool requires_authoritative_handoff =
-            phase_offset_matched_adapter_ &&
-            phase_offset_matched_adapter_->requiresAuthoritativeOffsetHandoff();
-        const bool requires_tube_pair = phase_offset_matched_adapter_ &&
-            phase_offset_matched_adapter_->requiresPathTubePairBootstrap();
-        if (canInstallBootstrapPlannerOwner(
-                requires_authoritative_handoff, requires_tube_pair,
-                static_cast<bool>(bootstrap_pair)) &&
-            bootstrap_session == path_tube_authority_session_ &&
-            !pending_path_tube_handoff_ && !completed_path_tube_handoff_ &&
-            pending_frontend_clear_session_ == consumed_frontend_clear_session_) {
+        std::lock_guard<std::mutex> handoff_lock(path_reference_handoff_mutex_);
+        if (!pending_path_reference_handoff_v2_) {
             std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
             if (authoritative_phase_generation_ == bootstrap_phase.generation &&
                 phase_w_ == bootstrap_phase.w &&
                 phase_initialized_ == bootstrap_phase.initialized &&
                 closed_phase_acquired_ == bootstrap_phase.closed_acquired) {
-                std::shared_ptr<const PathTubePair> committed = bootstrap_pair;
-                const bool committed_pair = !requires_tube_pair ||
-                    (phase_offset_matched_adapter_->
-                         finalizePreparedPathTubePairCommit(
-                             bootstrap_preparation, committed) && committed &&
-                     committed->authority_session == bootstrap_session);
-                if (committed_pair) {
-                    if (requires_tube_pair) {
-                        bootstrap_frontend->candidate_pair = committed;
-                    }
-                    applyPathTubeFrontendMirrorLocked(pm, *bootstrap_frontend,
-                                                       current_time);
-                    if (!installAuthoritativePathMirrorLocked(
-                            pm.last_traj, pm.last_vel, global_w,
-                            bootstrap_path_msg)) {
-                        return false;
-                    }
-                    closed_phase_pending_path_end_w_ = global_w.back();
-                    closed_phase_has_pending_path_end_w_ = true;
-                    publishAuthoritativePhaseLocked(
-                        initial_phase_w, true, closed_phase_acquired);
-                    progress_w_ = initial_phase_w;
-                    progress_initialized_ = true;
-                    pm.gvf_->setVisualizationProgressW(initial_phase_w);
-                    bootstrap_applied = true;
+                pm.last_traj = traj;
+                pm.last_vel = vel;
+                pm.last_traj_time_ = time;
+                pm.is_first_goal = true;
+                pm.goal_pt = end_state.p;
+                current_traj_index_ = bootstrap_anchor_idx;
+                last_switch_time_ = current_time;
+                cmd_switch_motion_limit_until_ = current_time + ros::Duration(
+                    std::max(0.0, cmd_switch_motion_limit_time_));
+                pm.gvf_->setAuthoritativePhaseMode(true);
+                pm.gvf_->setContinuousPhasePath(continuous_path);
+                pm.gvf_->setNextPathWSamples(global_w);
+                {
+                    std::lock_guard<std::mutex> request_lock(
+                        current_tube_request_mutex_v2_);
+                    current_tube_request_v2_.reset();
                 }
+                resetGovernorState();
+                if (!installAuthoritativePathMirrorLocked(
+                        pm.last_traj, pm.last_vel, global_w,
+                        bootstrap_path_msg)) {
+                    return false;
+                }
+                closed_phase_pending_path_end_w_ = global_w.back();
+                closed_phase_has_pending_path_end_w_ = true;
+                publishAuthoritativePhaseLocked(
+                    initial_phase_w, true, closed_phase_acquired);
+                progress_w_ = initial_phase_w;
+                progress_initialized_ = true;
+                pm.gvf_->setVisualizationProgressW(initial_phase_w);
+                bootstrap_applied = true;
             }
         }
     }
@@ -4837,11 +4129,6 @@ bool gvf_manager::installInitialPointPhaseFrontend(
     // edge for this otherwise lock-free preparation.
     const AuthoritativePhaseSnapshot bootstrap_phase =
         captureAuthoritativePhase();
-    const std::uint64_t bootstrap_session = [&]() {
-        std::lock_guard<std::mutex> lock(path_tube_handoff_mutex_);
-        return path_tube_authority_session_;
-    }();
-
     candidate_anchor_idx = std::max(
         0, std::min(candidate_anchor_idx, static_cast<int>(candidate_traj.rows()) - 2));
     const double raw_t_anchor = candidate_time(candidate_anchor_idx);
@@ -4874,98 +4161,58 @@ bool gvf_manager::installInitialPointPhaseFrontend(
             "[GVF][POINT_PHASE_V2][MAPPED_CONTINUOUS_PATH] frontend mapping failed");
         return false;
     }
+    std::shared_ptr<const ContinuousPhasePath> identified_path;
+    if (!assignPathIdentityV2(continuous_path, identified_path)) return false;
+    continuous_path = identified_path;
 
     const double initial_phase_w = continuous_path->startW();
 
-    const guidance::IsfGains gains(
-        pm.gvf_->gvf_.K1_, pm.gvf_->gvf_.K2_,
-        pm.gvf_->gvf_.convergence_bandwidth_, pm.gvf_->progress_rho0_,
-        pm.gvf_->progress_delta_, pm.gvf_->alpha_min_);
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot> snapshot =
-        pm.sdf_map_ ? pm.sdf_map_->cloudOccupancySnapshot()
-                    : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-    PathTubePairTransaction bootstrap_transaction;
-    std::shared_ptr<const PathTubePair> bootstrap_pair;
-    if (!prepareBootstrapPathTubeTransaction(
-            continuous_path, install_w, initial_phase_w, current_pos, gains,
-            0.02, snapshot, bootstrap_session, bootstrap_transaction,
-            bootstrap_pair)) {
-        ROS_WARN_THROTTLE(1.0,
-            "[GVF][POINT_PHASE_V2][OPTIONAL_TUBE_PAIR_BOOTSTRAP] preparation failed");
-        return false;
-    }
-    PathTubePairCommitPreparation bootstrap_preparation;
-    if (bootstrap_pair && !phase_offset_matched_adapter_->
-            preparePathTubePairCommit(
-                bootstrap_transaction, initial_phase_w, current_pos, gains,
-                0.02, snapshot, bootstrap_preparation)) {
-        ROS_WARN_THROTTLE(1.0,
-            "[GVF][POINT_PHASE_V2][OPTIONAL_TUBE_PAIR_BOOTSTRAP] live preparation failed");
-        return false;
-    }
-
-    std::shared_ptr<PendingPathTubeFrontend> bootstrap_frontend(
-        new PendingPathTubeFrontend());
-    bootstrap_frontend->candidate_pair = bootstrap_pair;
-    bootstrap_frontend->planner_path_owner = continuous_path;
-    bootstrap_frontend->traj = install_traj;
-    bootstrap_frontend->vel = install_vel;
-    bootstrap_frontend->time = install_time;
-    bootstrap_frontend->w = install_w;
-    bootstrap_frontend->is_first_goal = false;
-    bootstrap_frontend->anchor_idx = static_cast<int>(std::distance(
+    int bootstrap_anchor_idx = static_cast<int>(std::distance(
         install_w.begin(),
         std::lower_bound(install_w.begin(), install_w.end(), initial_phase_w)));
-    bootstrap_frontend->anchor_idx = std::max(
-        0, std::min(bootstrap_frontend->anchor_idx,
+    bootstrap_anchor_idx = std::max(
+        0, std::min(bootstrap_anchor_idx,
                     static_cast<int>(install_w.size()) - 1));
-    bootstrap_frontend->authority_session = bootstrap_session;
 
     bool bootstrap_applied = false;
     nav_msgs::Path bootstrap_path_msg;
     {
         std::lock_guard<std::mutex> apply_lock(frontend_apply_mutex_);
-        std::lock_guard<std::mutex> handoff_lock(path_tube_handoff_mutex_);
-        const bool requires_authoritative_handoff =
-            phase_offset_matched_adapter_ &&
-            phase_offset_matched_adapter_->requiresAuthoritativeOffsetHandoff();
-        const bool requires_tube_pair = phase_offset_matched_adapter_ &&
-            phase_offset_matched_adapter_->requiresPathTubePairBootstrap();
-        if (canInstallBootstrapPlannerOwner(
-                requires_authoritative_handoff, requires_tube_pair,
-                static_cast<bool>(bootstrap_pair)) &&
-            bootstrap_session == path_tube_authority_session_ &&
-            !pending_path_tube_handoff_ && !completed_path_tube_handoff_ &&
-            pending_frontend_clear_session_ == consumed_frontend_clear_session_) {
+        std::lock_guard<std::mutex> handoff_lock(path_reference_handoff_mutex_);
+        if (!pending_path_reference_handoff_v2_) {
             std::lock_guard<std::mutex> phase_lock(authoritative_phase_mutex_);
             if (authoritative_phase_generation_ == bootstrap_phase.generation &&
                 phase_w_ == bootstrap_phase.w &&
                 phase_initialized_ == bootstrap_phase.initialized &&
                 closed_phase_acquired_ == bootstrap_phase.closed_acquired &&
                 !phase_initialized_) {
-                std::shared_ptr<const PathTubePair> committed = bootstrap_pair;
-                const bool committed_pair = !requires_tube_pair ||
-                    (phase_offset_matched_adapter_->
-                         finalizePreparedPathTubePairCommit(
-                             bootstrap_preparation, committed) && committed &&
-                     committed->authority_session == bootstrap_session);
-                if (committed_pair) {
-                    if (requires_tube_pair) {
-                        bootstrap_frontend->candidate_pair = committed;
-                    }
-                    applyPathTubeFrontendMirrorLocked(pm, *bootstrap_frontend,
-                                                       current_time);
-                    if (!installAuthoritativePathMirrorLocked(
-                            pm.last_traj, pm.last_vel, install_w,
-                            bootstrap_path_msg)) {
-                        return false;
-                    }
-                    publishAuthoritativePhaseLocked(initial_phase_w, true, true);
-                    progress_w_ = initial_phase_w;
-                    progress_initialized_ = true;
-                    pm.gvf_->setVisualizationProgressW(initial_phase_w);
-                    bootstrap_applied = true;
+                pm.last_traj = install_traj;
+                pm.last_vel = install_vel;
+                pm.last_traj_time_ = install_time;
+                pm.is_first_goal = false;
+                current_traj_index_ = bootstrap_anchor_idx;
+                last_switch_time_ = current_time;
+                cmd_switch_motion_limit_until_ = current_time + ros::Duration(
+                    std::max(0.0, cmd_switch_motion_limit_time_));
+                pm.gvf_->setAuthoritativePhaseMode(true);
+                pm.gvf_->setContinuousPhasePath(continuous_path);
+                pm.gvf_->setNextPathWSamples(install_w);
+                {
+                    std::lock_guard<std::mutex> request_lock(
+                        current_tube_request_mutex_v2_);
+                    current_tube_request_v2_.reset();
                 }
+                resetGovernorState();
+                if (!installAuthoritativePathMirrorLocked(
+                        pm.last_traj, pm.last_vel, install_w,
+                        bootstrap_path_msg)) {
+                    return false;
+                }
+                publishAuthoritativePhaseLocked(initial_phase_w, true, true);
+                progress_w_ = initial_phase_w;
+                progress_initialized_ = true;
+                pm.gvf_->setVisualizationProgressW(initial_phase_w);
+                bootstrap_applied = true;
             }
         }
     }
@@ -7884,44 +7131,11 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
     auto& pm = swarmParticlesManager[0];
     Eigen::Vector3d current_pos(odom_.x(), odom_.y(), odom_.z());
     ros::Time current_time = ros::Time::now();
-    // Command only publishes a completed immutable handoff.  FSM is the
-    // single writer for pm.last_* and the legacy GVF mirror, so consume it
-    // before doing any planning/switch decision in this tick.
-    consumeFrontendClearMailbox(pm);
-    consumeCompletedPathTubeHandoff(pm, current_time);
-    // P2a's sole production consumer is FSM.  There is intentionally no
-    // generic HOLD dispatch.  Route a valid request into the existing
-    // adapter-owned Preview/Handoff/RecoveryOwner chain; the request remains
-    // owner/session-bound and does not create a second FSM or authority.
-    if (phase_offset_matched_adapter_) {
-        PendingCurrentStateRecoveryRequest recovery_request;
-        if (consumeCurrentStateRecoveryRequestForFsm(
-                phase_offset_matched_adapter_->capturePathTubePair(),
-                recovery_request)) {
-            // The command-side recovery_replan_required flag is consumed at
-            // this owner/session-bound FSM handoff; it is not a storage-only
-            // latch.  The mailbox ticket prevents duplicate routing.
-            const bool recenter_routed =
-                phase_offset_matched_adapter_->requestRecenter();
-            if (!recenter_routed) {
-                ROS_WARN_THROTTLE(
-                    1.0,
-                    "[GVF][PHASE_OFFSET][RECOVERY] owner-bound request could not be routed");
-            } else if (exec_state_ == EXEC_TRAJ) {
-                // A recovery replan request must renew successor/planner
-                // evidence; merely setting the inward lifecycle bit would
-                // retry the same failed continuation on the same pair.
-                // Reuse the existing FSM REPLAN_TRAJ path, with the mailbox
-                // ticket providing single-consumption/idempotence.
-                changeFSMExecState(
-                    REPLAN_TRAJ,
-                    "phase-offset recovery evidence renewal");
-            }
-        }
-    }
-    // A replan intentionally retains this captured w0 through its expensive
-    // work.  The command-boundary pair commit revalidates the live phase
-    // against the future seam, so no FSM lock is held across planning/tubes.
+    // FSM is the single writer for pm.last_* and the GVF display mirror, so
+    // consume a publish-committed immutable V2 handoff before planning.
+    consumeCommittedPathReferenceHandoffV2(pm, current_time);
+    // A replan intentionally retains this publish-committed phase-after
+    // witness through its expensive planner and request preparation work.
     const AuthoritativePhaseSnapshot fsm_phase =
         captureAuthoritativePhase();
 
@@ -8117,139 +7331,103 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                         Eigen::VectorXd install_time = cand_time;
                         std::vector<double> install_w = global_w;
                         std::shared_ptr<const ContinuousPhasePath> install_continuous_path;
-                        int install_i0 = std::max(
-                            0, std::min(new_i0, static_cast<int>(cand_traj.rows()) - 1));
                         bool connector_ready = true;
+                        std::shared_ptr<const ContinuousPhasePath>
+                            planner_only_prefix_source;
+                        double planner_only_prefix_end_w = phase_at_switch;
+                        std::uint64_t planner_only_execution_generation = 0U;
 
-                        const PathTubeReplanHandoffRequirement
-                            replan_handoff = closed_phase_c2_enabled_
-                                ? capturePathTubeReplanHandoffRequirement()
-                                : PathTubeReplanHandoffRequirement();
-                        const bool path_tube_handoff_required =
-                            closed_phase_c2_enabled_ && replan_handoff.required();
-                        if (path_tube_handoff_required) {
-                            PathTubePairStageFailure h2_stage_failure =
-                                PathTubePairStageFailure::NONE;
-                            const guidance::IsfGains gains(
-                                pm.gvf_->gvf_.K1_, pm.gvf_->gvf_.K2_,
-                                pm.gvf_->gvf_.convergence_bandwidth_,
-                                pm.gvf_->progress_rho0_, pm.gvf_->progress_delta_,
-                                pm.gvf_->alpha_min_);
-                            const std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-                                snapshot = pm.sdf_map_
-                                    ? pm.sdf_map_->cloudOccupancySnapshot()
-                                    : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-                            if (replan_handoff.executed_authority &&
-                                !replan_handoff.successor_handoff) {
-                                connector_ready = false;
-                                h2_stage_failure =
-                                    PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-                            } else {
-                                connector_ready = stageFutureSeamPathTubeTransaction(
-                                    phase_at_switch, current_pos, gains,
-                                    0.02, snapshot, pm, path_end_w, new_i0,
+                        const std::shared_ptr<const TubeV2ExecutionBinding>
+                            active_v2_binding =
+                                closed_phase_c2_enabled_ &&
+                                        phase_offset_matched_adapter_
+                                    ? phase_offset_matched_adapter_->
+                                          captureV2ExecutionBinding()
+                                    : std::shared_ptr<const
+                                          TubeV2ExecutionBinding>();
+                        const bool v2_handoff_required =
+                            static_cast<bool>(active_v2_binding);
+                        if (v2_handoff_required) {
+                            connector_ready =
+                                stageFutureSeamPathReferenceHandoffV2(
+                                    fsm_phase, pm, path_end_w, new_i0,
                                     cand_spline, cand_traj, cand_vel, cand_time,
-                                    global_w, install_traj, install_vel, install_time,
-                                    install_w, install_continuous_path,
-                                    &h2_stage_failure,
-                                    replan_handoff.successor_handoff);
-                            }
-                            if (replan_handoff.captured_pair &&
-                                path_tube_replan_logged_generation_.exchange(
-                                    replan_handoff.captured_pair->generation,
-                                    std::memory_order_acq_rel) !=
-                                    replan_handoff.captured_pair->generation)
-                            {
-                                ROS_WARN("[GVF][H2][LIFECYCLE] "
-                                         "replan_branch=H2 mode=closed reason=%s "
-                                         "pair_generation=%llu session=%llu "
-                                         "captured_w=%.9f stage_success=%d "
-                                         "stage_failure=%s",
-                                         replan_handoff.pending_activation
-                                             ? "pending_activation"
-                                             : "executed_authority",
-                                         static_cast<unsigned long long>(
-                                             replan_handoff.captured_pair->generation),
-                                         static_cast<unsigned long long>(
-                                             replan_handoff.captured_pair->authority_session),
-                                         phase_at_switch,
-                                         connector_ready ? 1 : 0,
-                                         pathTubePairStageFailureName(
-                                             h2_stage_failure));
-                            }
+                                    global_w, install_traj, install_vel,
+                                    install_time, install_w,
+                                    install_continuous_path);
                         } else if (closed_phase_c2_enabled_) {
-                            // H2 pair ownership applies only to the timer
-                            // backed mode.  Preserve the legacy direct C2
-                            // frontend installation for non-timer adapters.
+                            // Build against a future structural seam so command
+                            // progress during A*/C2 construction remains on an
+                            // exactly copied old-path prefix.  If insufficient
+                            // old-path horizon remains, retain the original
+                            // current-seam construction and its exact CAS.
                             const std::shared_ptr<const ContinuousPhasePath>
                                 old_path = pm.gvf_->getContinuousPhasePath();
-                            connector_ready = buildPhaseV2C2Frontend(
-                                pm, phase_at_switch, phase_at_switch, old_path,
-                                path_end_w, new_i0, cand_spline, cand_traj,
-                                cand_vel, cand_time, global_w, install_traj,
-                                install_vel, install_time, install_w,
-                                install_continuous_path);
-                        }
-                        if (connector_ready && closed_phase_c2_enabled_) {
+                            const std::uint64_t captured_execution_generation =
+                                phase_offset_matched_adapter_
+                                    ? phase_offset_matched_adapter_->
+                                          executionGenerationV2()
+                                    : 0U;
+                            double future_seam_w = 0.0;
+                            const bool future_seam_available =
+                                captured_execution_generation != 0U &&
+                                plannerOnlyFutureSeamV2(
+                                    old_path, phase_at_switch,
+                                    matched_config_.tube.min_certified_forward_w,
+                                    future_seam_w);
+                            connector_ready = future_seam_available &&
+                                buildPhaseV2C2Frontend(
+                                    pm, phase_at_switch, future_seam_w, old_path,
+                                    path_end_w, new_i0, cand_spline, cand_traj,
+                                    cand_vel, cand_time, global_w, install_traj,
+                                    install_vel, install_time, install_w,
+                                    install_continuous_path);
                             if (connector_ready) {
-                                install_i0 = static_cast<int>(std::distance(
-                                    install_w.begin(),
-                                    std::lower_bound(
-                                        install_w.begin(), install_w.end(), phase_at_switch)));
-                                install_i0 = std::max(
-                                    0, std::min(install_i0,
-                                        static_cast<int>(install_w.size()) - 1));
+                                planner_only_prefix_source = old_path;
+                                planner_only_prefix_end_w = future_seam_w;
+                                planner_only_execution_generation =
+                                    captured_execution_generation;
+                            } else {
+                                planner_only_prefix_source.reset();
+                                planner_only_prefix_end_w = phase_at_switch;
+                                planner_only_execution_generation = 0U;
+                                connector_ready = buildPhaseV2C2Frontend(
+                                    pm, phase_at_switch, phase_at_switch,
+                                    old_path, path_end_w, new_i0, cand_spline,
+                                    cand_traj, cand_vel, cand_time, global_w,
+                                    install_traj, install_vel, install_time,
+                                    install_w, install_continuous_path);
                             }
                         }
 
                         if (!connector_ready) {
-                            // A future exact-port/Tube denial is preview or
-                            // handoff evidence, not planner invalidity.  Keep
-                            // the old immutable owner and ask Runtime to
-                            // recenter continuously; neutral CAS remains the
-                            // only path to planner-only installation.
-                            if (path_tube_handoff_required &&
-                                replan_handoff.executed_authority &&
+                            // A denied successor retains the committed source
+                            // binding and requests its certified recenter path.
+                            if (v2_handoff_required &&
                                 phase_offset_matched_adapter_->requestRecenter()) {
                                 ROS_WARN_THROTTLE(
                                     1.0,
                                     "[GVF][H2][RECOVERY] successor denied; continuous recenter requested");
                             }
-                            // A failed Tube stage may still have produced the
-                            // accepted planner frontend in this callback.  Let
-                            // the existing neutral commit path decide whether
-                            // retirement is currently safe; it refuses any
-                            // live nonzero authority atomically.
-                            if (!install_w.empty() && install_continuous_path) {
-                                nav_msgs::Path committed_path_msg;
-                                if (commitNeutralPlannerFrontend(
-                                        pm, install_traj, install_vel,
-                                        install_time, install_w,
-                                        install_continuous_path, install_i0,
-                                        current_time, committed_path_msg)) {
-                                    path_pub.publish(committed_path_msg);
-                                    installed = true;
-                                    ROS_WARN(
-                                        "[GVF][CLOSED_PHASE_V2] tube_stage_failed=1 neutral_frontend_installed=1");
-                                }
-                            }
-                            if (!installed) {
-                                ROS_WARN("[GVF][CLOSED_PHASE_V2] C2 connector unavailable; keep old frontend");
-                            }
-                        } else if (path_tube_handoff_required) {
-                            // The immutable transaction is now pending.  The
-                            // command boundary applies this frontend only
-                            // after the same pair CAS succeeds.
+                            ROS_WARN("[GVF][CLOSED_PHASE_V2] C2 connector unavailable; keep old frontend");
+                        } else if (v2_handoff_required) {
+                            // The immutable successor request is pending; its
+                            // frontend mirror is applied only after publication
+                            // commits the matching V2 binding.
                             installed = true;
                         } else {
                             // 规划成功后只替换当前有限前端，phase_w_ 本身不赋新值。
                             nav_msgs::Path committed_path_msg;
-                            if (!commitNeutralPlannerFrontend(
+                            if (!installPlannerOnlyFrontendV2(
                                     pm, install_traj, install_vel, install_time,
-                                    install_w, install_continuous_path, install_i0,
-                                    current_time, committed_path_msg)) {
-                                ROS_ERROR("[GVF][H2] planner-only switch denied: "
-                                          "offset authority became active before final install");
+                                    install_w, install_continuous_path,
+                                    current_time, fsm_phase,
+                                    planner_only_prefix_source,
+                                    planner_only_prefix_end_w,
+                                    planner_only_execution_generation,
+                                    committed_path_msg)) {
+                                ROS_ERROR("[GVF][H2] planner-only switch denied; "
+                                          "see PLANNER_ONLY_INSTALL reason");
                             } else {
                                 path_pub.publish(committed_path_msg);
                                 installed = true;
@@ -8263,7 +7441,8 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
 
                                 ROS_WARN("[GVF][CLOSED_PHASE_V2][SWITCH] accepted_new=1 phase_before=%.6f phase_after=%.6f path_start_w=%.3f path_end_w=%.3f anchor_idx=%d points=%d c2=%d exact_path=%d segments=%zu",
                                          phase_at_switch, fsm_phase.w, install_w.front(), install_w.back(),
-                                         install_i0, static_cast<int>(install_traj.rows()),
+                                         current_traj_index_,
+                                         static_cast<int>(install_traj.rows()),
                                          closed_phase_c2_enabled_ ? 1 : 0,
                                          install_continuous_path ? 1 : 0,
                                          install_continuous_path
@@ -8299,21 +7478,28 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
 
                 if (astaropt(current_pos, cand_traj, cand_vel, new_i0,
                              cand_time, &cand_spline)) {
-                    const PathTubeReplanHandoffRequirement replan_handoff =
-                        point_phase_c2_enabled_
-                            ? capturePathTubeReplanHandoffRequirement()
-                            : PathTubeReplanHandoffRequirement();
+                    const std::shared_ptr<const TubeV2ExecutionBinding>
+                        active_v2_binding =
+                            point_phase_c2_enabled_ &&
+                                    phase_offset_matched_adapter_
+                                ? phase_offset_matched_adapter_->
+                                      captureV2ExecutionBinding()
+                                : std::shared_ptr<const
+                                      TubeV2ExecutionBinding>();
                     bool accept_new = true;
                     std::string reason = "accept_default";
                     if (old_traj.rows() > 0 && old_vel.rows() == old_traj.rows()) {
                         double accepted_path_w_end =
                             std::numeric_limits<double>::quiet_NaN();
-                        const std::shared_ptr<const PathTubePair>& old_pair =
-                            replan_handoff.captured_pair;
-                        const auto old_path = old_pair && old_pair->path_owner
-                            ? old_pair->path_owner
-                            : (pm.gvf_ ? pm.gvf_->getContinuousPhasePath()
-                                       : std::shared_ptr<const ContinuousPhasePath>());
+                        const std::shared_ptr<const ContinuousPhasePath>
+                            old_path = active_v2_binding
+                                ? std::static_pointer_cast<
+                                      const ContinuousPhasePath>(
+                                      active_v2_binding->source_input->path_owner)
+                                : (pm.gvf_
+                                    ? pm.gvf_->getContinuousPhasePath()
+                                    : std::shared_ptr<const
+                                          ContinuousPhasePath>());
                         if (old_path && !old_path->empty()) {
                             accepted_path_w_end = old_path->endW();
                         }
@@ -8354,79 +7540,72 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                             std::shared_ptr<const ContinuousPhasePath>
                                 install_continuous_path;
                             bool frontend_ready = false;
+                            std::shared_ptr<const ContinuousPhasePath>
+                                planner_only_prefix_source;
+                            double planner_only_prefix_end_w = phase_at_switch;
+                            std::uint64_t planner_only_execution_generation = 0U;
 
-                            const bool path_tube_handoff_required =
-                                point_phase_c2_enabled_ &&
-                                replan_handoff.required();
-                            if (path_tube_handoff_required) {
-                                PathTubePairStageFailure h2_stage_failure =
-                                    PathTubePairStageFailure::NONE;
-                                const guidance::IsfGains gains(
-                                    pm.gvf_->gvf_.K1_, pm.gvf_->gvf_.K2_,
-                                    pm.gvf_->gvf_.convergence_bandwidth_,
-                                    pm.gvf_->progress_rho0_, pm.gvf_->progress_delta_,
-                                    pm.gvf_->alpha_min_);
-                                const std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-                                    snapshot = pm.sdf_map_
-                                        ? pm.sdf_map_->cloudOccupancySnapshot()
-                                        : std::shared_ptr<const plan_env::CloudOccupancySnapshot>();
-                                if (replan_handoff.executed_authority &&
-                                    !replan_handoff.successor_handoff) {
-                                    frontend_ready = false;
-                                    h2_stage_failure =
-                                        PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-                                } else {
-                                    frontend_ready = stageFutureSeamPathTubeTransaction(
-                                        phase_at_switch, current_pos, gains,
-                                        0.02, snapshot, pm, path_end_w, new_i0,
-                                        cand_spline, cand_traj, cand_vel, cand_time,
-                                        candidate_w, install_traj, install_vel,
-                                        install_time, install_w,
-                                        install_continuous_path,
-                                        &h2_stage_failure,
-                                        replan_handoff.successor_handoff);
-                                }
+                            const bool v2_handoff_required =
+                                static_cast<bool>(active_v2_binding);
+                            if (v2_handoff_required) {
+                                frontend_ready =
+                                    stageFutureSeamPathReferenceHandoffV2(
+                                        fsm_phase, pm, path_end_w, new_i0,
+                                        cand_spline, cand_traj, cand_vel,
+                                        cand_time, candidate_w, install_traj,
+                                        install_vel, install_time, install_w,
+                                        install_continuous_path);
                                 if (!frontend_ready &&
-                                    replan_handoff.executed_authority &&
                                     phase_offset_matched_adapter_->requestRecenter()) {
                                     ROS_WARN_THROTTLE(
                                         1.0,
                                         "[GVF][H2][RECOVERY] point successor stage denied; continuous recenter requested");
                                 }
-                                if (replan_handoff.captured_pair &&
-                                    path_tube_replan_logged_generation_.exchange(
-                                        replan_handoff.captured_pair->generation,
-                                        std::memory_order_acq_rel) !=
-                                        replan_handoff.captured_pair->generation)
-                                {
-                                    ROS_WARN("[GVF][H2][LIFECYCLE] "
-                                             "replan_branch=H2 mode=point reason=%s "
-                                             "pair_generation=%llu session=%llu "
-                                             "captured_w=%.9f stage_success=%d "
-                                             "stage_failure=%s",
-                                             replan_handoff.pending_activation
-                                                 ? "pending_activation"
-                                                 : "executed_authority",
-                                             static_cast<unsigned long long>(
-                                                 replan_handoff.captured_pair->generation),
-                                             static_cast<unsigned long long>(
-                                                 replan_handoff.captured_pair->authority_session),
-                                             phase_at_switch,
-                                             frontend_ready ? 1 : 0,
-                                             pathTubePairStageFailureName(
-                                                 h2_stage_failure));
-                                }
                             } else if (point_phase_c2_enabled_) {
-                                // Non-timer modes retain the original direct
-                                // current-seam C2 install path.
+                                // No installed V2 binding: copy enough of the
+                                // current frontend to tolerate phase progress
+                                // while C2 is built.  Near the source endpoint,
+                                // keep the exact current-seam fallback.
                                 const std::shared_ptr<const ContinuousPhasePath>
                                     old_path = pm.gvf_->getContinuousPhasePath();
-                                frontend_ready = buildPhaseV2C2Frontend(
-                                    pm, phase_at_switch, phase_at_switch,
-                                    old_path, path_end_w, new_i0, cand_spline,
-                                    cand_traj, cand_vel, cand_time, candidate_w,
-                                    install_traj, install_vel, install_time,
-                                    install_w, install_continuous_path);
+                                const std::uint64_t captured_execution_generation =
+                                    phase_offset_matched_adapter_
+                                        ? phase_offset_matched_adapter_->
+                                              executionGenerationV2()
+                                        : 0U;
+                                double future_seam_w = 0.0;
+                                const bool future_seam_available =
+                                    captured_execution_generation != 0U &&
+                                    plannerOnlyFutureSeamV2(
+                                        old_path, phase_at_switch,
+                                        matched_config_.tube.
+                                            min_certified_forward_w,
+                                        future_seam_w);
+                                frontend_ready = future_seam_available &&
+                                    buildPhaseV2C2Frontend(
+                                        pm, phase_at_switch, future_seam_w,
+                                        old_path, path_end_w, new_i0,
+                                        cand_spline, cand_traj, cand_vel,
+                                        cand_time, candidate_w, install_traj,
+                                        install_vel, install_time, install_w,
+                                        install_continuous_path);
+                                if (frontend_ready) {
+                                    planner_only_prefix_source = old_path;
+                                    planner_only_prefix_end_w = future_seam_w;
+                                    planner_only_execution_generation =
+                                        captured_execution_generation;
+                                } else {
+                                    planner_only_prefix_source.reset();
+                                    planner_only_prefix_end_w = phase_at_switch;
+                                    planner_only_execution_generation = 0U;
+                                    frontend_ready = buildPhaseV2C2Frontend(
+                                        pm, phase_at_switch, phase_at_switch,
+                                        old_path, path_end_w, new_i0,
+                                        cand_spline, cand_traj, cand_vel,
+                                        cand_time, candidate_w, install_traj,
+                                        install_vel, install_time, install_w,
+                                        install_continuous_path);
+                                }
                             } else {
                                 frontend_ready = buildMappedPhaseFrontend(
                                     phase_at_switch, path_end_w, false, new_i0,
@@ -8436,23 +7615,20 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                             }
 
                             if (frontend_ready && !install_w.empty() &&
-                                path_tube_handoff_required) {
+                                v2_handoff_required) {
                                 installed = true;
                             } else if (frontend_ready && !install_w.empty()) {
-                                const int install_anchor_idx = static_cast<int>(
-                                    std::distance(
-                                        install_w.begin(),
-                                        std::lower_bound(
-                                            install_w.begin(), install_w.end(),
-                                            phase_at_switch)));
                                 nav_msgs::Path committed_path_msg;
-                                if (!commitNeutralPlannerFrontend(
+                                if (!installPlannerOnlyFrontendV2(
                                         pm, install_traj, install_vel, install_time,
                                         install_w, install_continuous_path,
-                                        install_anchor_idx, current_time,
+                                        current_time, fsm_phase,
+                                        planner_only_prefix_source,
+                                        planner_only_prefix_end_w,
+                                        planner_only_execution_generation,
                                         committed_path_msg)) {
-                                    ROS_ERROR("[GVF][H2] planner-only switch denied: "
-                                              "offset authority became active before final install");
+                                    ROS_ERROR("[GVF][H2] planner-only switch denied; "
+                                              "see PLANNER_ONLY_INSTALL reason");
                                 } else {
                                     path_pub.publish(committed_path_msg);
                                     installed = true;
@@ -8462,38 +7638,6 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                              install_w.back(),
                                              static_cast<int>(install_traj.rows()),
                                              point_phase_c2_enabled_ ? 1 : 0);
-                                }
-                            } else if (!frontend_ready &&
-                                       !install_w.empty() &&
-                                       install_continuous_path) {
-                                if (path_tube_handoff_required &&
-                                    replan_handoff.executed_authority &&
-                                    phase_offset_matched_adapter_->requestRecenter()) {
-                                    ROS_WARN_THROTTLE(
-                                        1.0,
-                                        "[GVF][H2][RECOVERY] point successor denied; continuous recenter requested");
-                                }
-                                // Preserve the accepted planner payload from
-                                // this callback.  The existing neutral commit
-                                // predicate is the sole authority for whether
-                                // a failed Tube may retire offset ownership.
-                                const int install_anchor_idx = static_cast<int>(
-                                    std::distance(
-                                        install_w.begin(),
-                                        std::lower_bound(
-                                            install_w.begin(), install_w.end(),
-                                            phase_at_switch)));
-                                nav_msgs::Path committed_path_msg;
-                                if (commitNeutralPlannerFrontend(
-                                        pm, install_traj, install_vel,
-                                        install_time, install_w,
-                                        install_continuous_path,
-                                        install_anchor_idx, current_time,
-                                        committed_path_msg)) {
-                                    path_pub.publish(committed_path_msg);
-                                    installed = true;
-                                    ROS_WARN(
-                                        "[GVF][POINT_PHASE_V2] tube_stage_failed=1 neutral_frontend_installed=1");
                                 }
                             }
                             }

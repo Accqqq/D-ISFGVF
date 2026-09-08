@@ -26,6 +26,224 @@ double asDouble(const bool value) {
   return value ? 1.0 : 0.0;
 }
 
+constexpr std::uint32_t kKnownCaptureLayerMask =
+    plan_env::kSDFMapCaptureLayerSensor |
+    plan_env::kSDFMapCaptureLayerManual |
+    plan_env::kSDFMapCaptureLayerStatic |
+    plan_env::kSDFMapCaptureLayerCeiling;
+constexpr std::uint32_t kKnownSupportEvidenceMask =
+    plan_env::kSDFMapCaptureSupportEvidenceDepthRaycast |
+    plan_env::kSDFMapCaptureSupportEvidenceCompletePreknownDomain;
+
+bool validPositiveCount(const Eigen::Vector3i& count) {
+  return (count.array() > 0).all();
+}
+
+bool captureGeometryValid(const plan_env::SDFMapCaptureV2& capture) {
+  return finite(capture.map_min) && finite(capture.map_max) &&
+      finite(capture.capture_min) && finite(capture.capture_max) &&
+      finite(capture.grid_origin) && finite(capture.resolution) &&
+      capture.resolution > 0.0 && validPositiveCount(capture.voxel_count) &&
+      (capture.map_max.array() > capture.map_min.array()).all() &&
+      (capture.capture_max.array() >= capture.capture_min.array()).all() &&
+      (capture.effective_layer_mask & ~kKnownCaptureLayerMask) == 0U;
+}
+
+bool supportExpiryMetadataValid(
+    const plan_env::SDFMapCaptureV2& capture) {
+  const plan_env::SDFMapCaptureSupportV2& support = capture.support;
+  if (!std::isfinite(support.valid_until.toSec())) return false;
+  if (support.valid_until_accepted_ticks == 0U) {
+    return support.valid_until.isZero();
+  }
+  return !support.valid_until.isZero() &&
+      support.valid_until_accepted_ticks >=
+          support.evidence_accepted_ticks &&
+      support.valid_until_accepted_ticks >= capture.accepted_time_ticks;
+}
+
+bool supportMetadataValid(const plan_env::SDFMapCaptureV2& capture) {
+  const plan_env::SDFMapCaptureSupportV2& support = capture.support;
+  if (!support.valid || !support.complete ||
+      support.evidence_sequence == 0U ||
+      support.evidence_accepted_ticks == 0U ||
+      support.evidence_accepted_ticks > capture.accepted_time_ticks ||
+      support.evidence_sequence > capture.accepted_state_sequence ||
+      support.map_instance_id != capture.map_instance_id ||
+      support.configuration_generation != capture.configuration_generation ||
+      support.configuration_key != capture.configuration_key ||
+      support.frame_id != capture.frame_id ||
+      (support.evidence_basis & ~kKnownSupportEvidenceMask) != 0U ||
+      (support.evidence_basis &
+           plan_env::kSDFMapCaptureSupportEvidenceCompletePreknownDomain) ==
+          0U ||
+      !finite(support.support_min) || !finite(support.support_max) ||
+      (support.support_max.array() < support.support_min.array()).any() ||
+      !finite(support.required_halo) || support.required_halo < 0.0 ||
+      !support.halo_reconciled ||
+      support.mask.size() != capture.occupied.size()) {
+    return false;
+  }
+  return supportExpiryMetadataValid(capture);
+}
+
+void fillMapCaptureKey(
+    const plan_env::SDFMapCaptureV2& capture,
+    const SDFMapCaptureQueryStatusV2& status,
+    phase_offset_navigation::TubeMapCaptureKey& key) {
+  key = phase_offset_navigation::TubeMapCaptureKey();
+  key.map_instance_id = capture.map_instance_id;
+  key.state_id = capture.accepted_state_sequence;
+  key.accepted_sequence = capture.accepted_state_sequence;
+  key.configuration_generation = capture.configuration_generation;
+  key.configuration_id = capture.configuration_key;
+  // TubeMapCaptureKey carries the exact map frame string.  Its numeric frame
+  // attribution reuses the captured configuration identity; it is not a
+  // registry handle and cannot outlive/rebind to another frame.
+  key.frame_provenance_id = capture.configuration_key;
+  key.frame_provenance = capture.frame_id;
+  // The accepted support evidence sequence is the producer-owned support
+  // cohort identity.  Keep it direct so cropped/full views agree.
+  key.support_provenance_id = capture.support.evidence_sequence;
+  key.accepted_time_ticks = capture.accepted_time_ticks;
+  key.support_expiry_timeless =
+      capture.support.valid_until_accepted_ticks == 0U &&
+      capture.support.valid_until.isZero();
+  key.support_expiry_ticks =
+      key.support_expiry_timeless ? 0U
+                                  : capture.support.valid_until_accepted_ticks;
+  key.support_halo = finite(capture.support.required_halo)
+      ? capture.support.required_halo : 0.0;
+  key.halo_reconciled = capture.support.halo_reconciled;
+  key.grid_min_index_x = 0;
+  key.grid_min_index_y = 0;
+  key.grid_min_index_z = 0;
+  key.grid_max_index_x =
+      capture.voxel_count.x() > 0
+      ? static_cast<std::int64_t>(capture.voxel_count.x()) - 1 : -1;
+  key.grid_max_index_y =
+      capture.voxel_count.y() > 0
+      ? static_cast<std::int64_t>(capture.voxel_count.y()) - 1 : -1;
+  key.grid_max_index_z =
+      capture.voxel_count.z() > 0
+      ? static_cast<std::int64_t>(capture.voxel_count.z()) - 1 : -1;
+  key.grid_native_origin = capture.grid_origin;
+  key.grid_voxel_resolution =
+      Eigen::Vector3d::Constant(capture.resolution);
+  key.grid_source_offset_x = capture.source_min_index.x();
+  key.grid_source_offset_y = capture.source_min_index.y();
+  key.grid_source_offset_z = capture.source_min_index.z();
+  // Predicate ranges are capture-local.  The native grid origin and integer
+  // source offsets are retained separately, so no rebasing is needed.
+  key.grid_native_index = false;
+  key.complete_support = status.usable;
+}
+
+void fillCommonResultMetadata(
+    const SDFMapCaptureQueryDescriptorV2& descriptor,
+    phase_offset_navigation::TubeFreeBallQueryResult& result) {
+  const phase_offset_navigation::TubeMapCaptureKey& key =
+      descriptor.map_capture_key;
+  result.map_instance_id = key.map_instance_id;
+  result.map_state_id = key.state_id;
+  result.configuration_id = key.configuration_id;
+  result.frame_provenance_id = key.frame_provenance_id;
+  result.frame_provenance = key.frame_provenance;
+  result.accepted_sequence = key.accepted_sequence;
+  result.configuration_generation = key.configuration_generation;
+  result.support_provenance_id = key.support_provenance_id;
+  result.accepted_time_ticks = key.accepted_time_ticks;
+  result.support_expiry_ticks = key.support_expiry_ticks;
+  result.support_expiry_timeless = key.support_expiry_timeless;
+  result.halo_reconciled = key.halo_reconciled;
+  result.provenance = std::string("SDFMapCaptureV2/closed-inflated-voxel-volume/") +
+      descriptor.frame_id;
+}
+
+phase_offset_navigation::DistanceStatus translateFreeBallStatus(
+    const plan_env::SDFMapCaptureFreeBallStatusV2 status) {
+  using phase_offset_navigation::DistanceStatus;
+  switch (status) {
+    case plan_env::SDFMapCaptureFreeBallStatusV2::OUT_OF_MAP:
+      return DistanceStatus::OUT_OF_MAP;
+    case plan_env::SDFMapCaptureFreeBallStatusV2::OCCUPIED:
+      return DistanceStatus::OCCUPIED;
+    case plan_env::SDFMapCaptureFreeBallStatusV2::UNKNOWN:
+      // Navigation has no INCONCLUSIVE category.  Preserve the fail-closed
+      // meaning instead of claiming free, occupied, or an exact distance.
+      return DistanceStatus::UNKNOWN;
+    case plan_env::SDFMapCaptureFreeBallStatusV2::INCONCLUSIVE:
+      // INCONCLUSIVE denotes an unresolved numerical/coverage predicate, not
+      // an observed unknown voxel.  Keep that attribution as UNAVAILABLE.
+      return DistanceStatus::UNAVAILABLE;
+    case plan_env::SDFMapCaptureFreeBallStatusV2::CERTIFIED_FREE:
+      return DistanceStatus::KNOWN_FREE;
+    case plan_env::SDFMapCaptureFreeBallStatusV2::UNAVAILABLE:
+      return DistanceStatus::UNAVAILABLE;
+  }
+  return DistanceStatus::UNAVAILABLE;
+}
+
+bool validCertifiedFootprint(
+    const plan_env::SDFMapCaptureV2& capture,
+    const plan_env::SDFMapCaptureFreeBallResultV2& native) {
+  const Eigen::Vector3i lower = native.enumerated_min_index;
+  const Eigen::Vector3i upper = native.enumerated_max_index;
+  return (lower.array() >= 0).all() &&
+      (upper.array() >= lower.array()).all() &&
+      (upper.array() < capture.voxel_count.array()).all();
+}
+
+void fillCertifiedSupport(
+    const plan_env::SDFMapCaptureV2& capture,
+    const SDFMapCaptureQueryDescriptorV2& descriptor,
+    const Eigen::Vector3d& witness,
+    const double radius,
+    const plan_env::SDFMapCaptureFreeBallResultV2& native,
+    phase_offset_navigation::TubeFreeBallQueryResult& result) {
+  result.certified_radius = native.certified_radius;
+  result.certified = true;
+  // The predicate certifies the requested lower-bound radius.  It does not
+  // compute an exact nearest occupied-voxel distance.
+  result.exact = false;
+  result.complete_support = true;
+  result.support.lower = native.support_min;
+  result.support.upper = native.support_max;
+  result.support.witness = witness;
+  result.support.radius = radius;
+  result.support.map_instance_id = descriptor.map_capture_key.map_instance_id;
+  result.support.map_state_id = descriptor.map_capture_key.state_id;
+  result.support.support_provenance_id =
+      descriptor.map_capture_key.support_provenance_id;
+  result.support.accepted_time_ticks =
+      descriptor.map_capture_key.accepted_time_ticks;
+  result.support.support_expiry_ticks =
+      descriptor.map_capture_key.support_expiry_ticks;
+  result.support.support_expiry_timeless =
+      descriptor.map_capture_key.support_expiry_timeless;
+  result.support.valid = true;
+
+  phase_offset_navigation::TubeVoxelFootprintV2 footprint;
+  footprint.min_index_x = native.enumerated_min_index.x();
+  footprint.min_index_y = native.enumerated_min_index.y();
+  footprint.min_index_z = native.enumerated_min_index.z();
+  footprint.max_index_x = native.enumerated_max_index.x();
+  footprint.max_index_y = native.enumerated_max_index.y();
+  footprint.max_index_z = native.enumerated_max_index.z();
+  footprint.native_origin = capture.grid_origin;
+  footprint.voxel_resolution =
+      Eigen::Vector3d::Constant(capture.resolution);
+  footprint.source_offset_x = capture.source_min_index.x();
+  footprint.source_offset_y = capture.source_min_index.y();
+  footprint.source_offset_z = capture.source_min_index.z();
+  // The predicate's enumerated range is indexed from the crop's local
+  // source_min_index.  Preserve that offset instead of pretending it is a
+  // native index range.
+  footprint.native_index = false;
+  footprint.valid = true;
+  result.support.voxel_footprint.push_back(footprint);
+}
+
 phase_offset_navigation::DistanceStatus translate(
     const plan_env::CloudOccupancyStatus status) {
   using phase_offset_navigation::DistanceStatus;
@@ -138,6 +356,147 @@ phase_offset_navigation::ClearanceQuery makeCloudOccupancyClearanceQuery(
         result.clearance_certified && result.clearance < required_radius;
     return result;
   };
+}
+
+SDFMapCaptureQueryStatusV2 inspectSDFMapCaptureQueryV2(
+    const std::shared_ptr<const plan_env::SDFMapCaptureV2>& capture) {
+  SDFMapCaptureQueryStatusV2 status;
+  status.closed_inflated_voxel_volume_metric = true;
+  status.floating_point_environment_supported =
+      plan_env::sdfMapCaptureV2FloatingPointEnvironmentSupported();
+  status.capture_available = static_cast<bool>(capture);
+  if (!capture) return status;
+
+  status.map_instance_id = capture->map_instance_id;
+  status.map_state_id = capture->accepted_state_sequence;
+  status.accepted_sequence = capture->accepted_state_sequence;
+  status.accepted_state_notification_sequence =
+      capture->accepted_state_notification_sequence;
+  status.configuration_generation = capture->configuration_generation;
+  status.configuration_key = capture->configuration_key;
+  status.support_sequence = capture->support.evidence_sequence;
+  status.support_evidence_accepted_ticks =
+      capture->support.evidence_accepted_ticks;
+  status.accepted_time_ticks = capture->accepted_time_ticks;
+  status.support_expiry_ticks =
+      capture->support.valid_until_accepted_ticks;
+  status.support_expiry_timeless =
+      capture->support.valid_until_accepted_ticks == 0U &&
+      capture->support.valid_until.isZero();
+  status.frame_id = capture->frame_id;
+
+  status.identity_valid = capture->map_instance_id != 0U &&
+      capture->accepted_state_sequence != 0U &&
+      capture->accepted_time_ticks != 0U;
+  status.configuration_valid = capture->configuration_generation != 0U &&
+      capture->configuration_key != 0U;
+  status.frame_valid = !capture->frame_id.empty() &&
+      capture->support.frame_id == capture->frame_id;
+  status.geometry_valid = captureGeometryValid(*capture);
+  status.support_valid = capture->support.valid;
+  status.support_complete = capture->support.complete;
+  status.support_metadata_valid = supportMetadataValid(*capture);
+  status.expiry_metadata_valid = supportExpiryMetadataValid(*capture);
+  status.capture_consistent = plan_env::sdfMapCaptureV2Consistent(*capture);
+  status.usable = status.floating_point_environment_supported &&
+      status.capture_available && status.capture_consistent &&
+      status.identity_valid && status.configuration_valid &&
+      status.frame_valid && status.geometry_valid && status.support_valid &&
+      status.support_complete && status.support_metadata_valid &&
+      status.expiry_metadata_valid;
+  return status;
+}
+
+SDFMapCaptureQueryBridgeV2 makeSDFMapCaptureQueryV2(
+    const std::shared_ptr<const plan_env::SDFMapCaptureV2>& capture) {
+  SDFMapCaptureQueryBridgeV2 bridge;
+  bridge.status = inspectSDFMapCaptureQueryV2(capture);
+  if (capture) {
+    bridge.descriptor.capture = capture;
+    bridge.descriptor.frame_id = capture->frame_id;
+    bridge.descriptor.observation_stamp = capture->observation_stamp;
+    bridge.descriptor.accepted_state_stamp = capture->accepted_state_stamp;
+    bridge.descriptor.accepted_state_notification_sequence =
+        capture->accepted_state_notification_sequence;
+    bridge.descriptor.support_sequence = capture->support.evidence_sequence;
+    bridge.descriptor.support_evidence_accepted_ticks =
+        capture->support.evidence_accepted_ticks;
+    bridge.descriptor.support_evidence_stamp =
+        capture->support.evidence_stamp;
+    bridge.descriptor.support_valid_until = capture->support.valid_until;
+    bridge.descriptor.support_valid_until_ticks =
+        capture->support.valid_until_accepted_ticks;
+    bridge.descriptor.support_expiry_timeless =
+        bridge.status.support_expiry_timeless;
+    bridge.descriptor.support_evidence_basis =
+        capture->support.evidence_basis;
+    bridge.descriptor.support_complete = capture->support.complete;
+    bridge.descriptor.map_min = capture->map_min;
+    bridge.descriptor.map_max = capture->map_max;
+    bridge.descriptor.support_min = capture->support.support_min;
+    bridge.descriptor.support_max = capture->support.support_max;
+    bridge.descriptor.required_halo = capture->support.required_halo;
+    bridge.descriptor.halo_reconciled = capture->support.halo_reconciled;
+    bridge.descriptor.grid_origin = capture->grid_origin;
+    bridge.descriptor.resolution = capture->resolution;
+    bridge.descriptor.source_min_index = capture->source_min_index;
+    bridge.descriptor.source_max_index = capture->source_max_index;
+    bridge.descriptor.capture_min = capture->capture_min;
+    bridge.descriptor.capture_max = capture->capture_max;
+    bridge.descriptor.effective_layer_mask = capture->effective_layer_mask;
+    bridge.descriptor.included_map_inflation = capture->included_map_inflation;
+    bridge.descriptor.closed_inflated_voxel_volume_metric = true;
+    bridge.descriptor.clearance_metric = "closed_inflated_voxel_volume";
+    fillMapCaptureKey(*capture, bridge.status,
+                      bridge.descriptor.map_capture_key);
+    bridge.capture_owner = capture;
+    // There is no second query object or mutable map.  Both owner slots keep
+    // the exact immutable capture alive for the worker/build DTO contract.
+    bridge.query_owner = capture;
+    bridge.descriptor.valid = bridge.status.usable;
+  }
+
+  const SDFMapCaptureQueryStatusV2 status = bridge.status;
+  const SDFMapCaptureQueryDescriptorV2 descriptor = bridge.descriptor;
+  bridge.free_ball_query = [capture, status, descriptor](
+      const Eigen::Vector3d& witness,
+      const double requested_radius) {
+    phase_offset_navigation::TubeFreeBallQueryResult result;
+    if (!status.usable || !capture || !finite(witness) ||
+        !finite(requested_radius) || requested_radius < 0.0) {
+      return result;
+    }
+    fillCommonResultMetadata(descriptor, result);
+
+    const plan_env::SDFMapCaptureFreeBallResultV2 native =
+        plan_env::certifySDFMapCaptureFreeBallV2(
+            *capture, witness, requested_radius);
+    result.status = translateFreeBallStatus(native.status);
+    if (native.status ==
+        plan_env::SDFMapCaptureFreeBallStatusV2::INCONCLUSIVE) {
+      result.provenance += "/inconclusive";
+    }
+    if (native.status != plan_env::SDFMapCaptureFreeBallStatusV2::CERTIFIED_FREE ||
+        !native.clearance_certified ||
+        native.certified_radius != requested_radius ||
+        !finite(native.certified_radius) ||
+        !finite(native.support_min) || !finite(native.support_max) ||
+        !validCertifiedFootprint(*capture, native)) {
+      // INCONCLUSIVE and malformed producer answers remain uncertified.  In
+      // particular, never turn a failed exact comparison into KNOWN_FREE or
+      // expose a fabricated nearest-distance value.
+      if (native.status ==
+          plan_env::SDFMapCaptureFreeBallStatusV2::CERTIFIED_FREE) {
+        result.status = phase_offset_navigation::DistanceStatus::UNAVAILABLE;
+        result.provenance += "/malformed";
+      }
+      return result;
+    }
+    fillCertifiedSupport(*capture, descriptor, witness, requested_radius,
+                         native, result);
+    return result;
+  };
+  return bridge;
 }
 
 const std::array<const char*, kCloudSnapshotDiagnosticCount>&

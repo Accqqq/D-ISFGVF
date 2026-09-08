@@ -5,6 +5,7 @@
 #include <phase_offset_core/port_projector.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -138,8 +139,33 @@ struct RecoveryOwnerStatus {
   // infer terminality from a tolerance check on a forged snapshot alone.
   bool terminal_predicate = false;
   bool exact_terminal_predicate = false;
+  RecoveryStepProofKind proof_kind = RecoveryStepProofKind::LEGACY;
+  std::uint64_t reserve_id = 0U;
+  std::size_t reserve_cursor = 0U;
+  std::size_t reserve_size = 0U;
+  TubeReserveSegmentKindV2 reserve_segment = TubeReserveSegmentKindV2::BRAKE;
   std::string reason;
 };
+
+// A typed V2 cursor transaction.  The reserve is copied into this value before
+// publication; owner state changes only when the prepared step is committed
+// after the command publication succeeds.
+struct CertifiedReservePrepareInputV2 {
+  std::uint64_t recovery_session = 0U;
+  TubeFiniteReserveV2 reserve;
+  // The caller's immutable execution binding must match every field captured
+  // by the reserve.  A reserve ID alone is not sufficient identity evidence.
+  TubeExecutionIdentityV2 expected_identity;
+  std::size_t cursor = 0U;
+  TubeExecutionStateV2 expected_state;
+  double dt = 0.0;
+  double now = 0.0;
+  double deadline = std::numeric_limits<double>::quiet_NaN();
+  bool deadline_valid = false;
+  std::string provenance;
+};
+
+using RecoveryReservePrepareInputV2 = CertifiedReservePrepareInputV2;
 
 class PhaseOffsetRecoveryOwner {
  public:
@@ -154,6 +180,13 @@ class PhaseOffsetRecoveryOwner {
   // Pure preparation: no selected command or owner state is committed.
   bool prepare(const RecoveryPrepareInput& input,
                RecoveryPreparedStep& output) const;
+
+  // V2 preparation consumes one immutable finite reserve step.  It does not
+  // apply the legacy distance-progress criterion and does not mutate owner
+  // state; commit() or commitNoFail() advances the typed cursor later.
+  bool prepareCertifiedReserveV2(
+      const CertifiedReservePrepareInputV2& input,
+      RecoveryPreparedStep& output) const;
 
   // Commit accepts exactly the selected-u contained in the prepared step.  It
   // never projects, ranks, clamps, or substitutes the command.

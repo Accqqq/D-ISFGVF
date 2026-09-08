@@ -4,11 +4,123 @@
 
 #include <cmath>
 #include <cstdint>
+#include <array>
 #include <string>
 
 #include "phase_offset_core/normal_frame.h"
 
 namespace phase_offset_core {
+
+// A closed binary64 interval used only by the proof-facing path DTOs.  The
+// endpoints are values of the represented real operation, not sampled
+// observations.  Producers must set valid only after every elementary
+// operation has been rounded outward and all domains have been checked.
+struct Binary64Interval {
+  double lower = 0.0;
+  double upper = 0.0;
+  bool valid = false;
+};
+
+struct Binary64VectorInterval {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  std::array<Binary64Interval, 3U> component;
+  bool valid = false;
+};
+
+// Proof-only value DTO for one closed structural path cell.  It deliberately
+// contains no callback, map, ROS, or mutable owner.  The legacy
+// PathCellGeometryCertificate below remains unchanged for existing callers;
+// V2 producers use this stronger interval evidence and fail closed when any
+// required field is unavailable.
+struct CertifiedPathCellV2 {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  double w0 = 0.0;
+  double w1 = 0.0;
+  double anchor_w = 0.0;
+  std::uint64_t path_revision = 0U;
+  std::uint64_t frame_revision = 0U;
+  std::uint64_t segment_identity = 0U;
+  std::uint64_t proof_identity = 0U;
+
+  Binary64VectorInterval anchor_position;
+  Binary64VectorInterval anchor_p_w;
+  Binary64VectorInterval anchor_p_ww;
+
+  // Complete-cell derivative extrema.  The speed floors are strict lower
+  // bounds; all upper bounds are finite closed-cell bounds.
+  Binary64Interval inf_p_w_norm;
+  Binary64Interval sup_p_w_norm;
+  Binary64Interval inf_horizontal_p_w_norm;
+  Binary64Interval sup_p_ww_norm;
+  Binary64Interval sup_horizontal_p_ww_norm;
+  Binary64Interval sup_p_www_norm;
+  Binary64Interval sup_normal_derivative;
+  Binary64Interval normal_variation;
+  Binary64Interval tangent_variation;
+  Binary64Interval curvature_variation;
+  Binary64Interval midpoint_position_variation;
+  Binary64Interval chord_deviation;
+
+  bool horizontal_acceleration_bound_complete = false;
+  bool normal_frame_proof_complete = false;
+  bool phase_map_proof_complete = false;
+  bool complete = false;
+  bool valid = false;
+  std::string provenance;
+};
+
+inline bool binary64IntervalIsComplete(const Binary64Interval& interval,
+                                       const bool nonnegative = false) {
+  return interval.valid && std::isfinite(interval.lower) &&
+      std::isfinite(interval.upper) && interval.lower <= interval.upper &&
+      (!nonnegative || interval.lower >= 0.0);
+}
+
+inline bool binary64VectorIntervalIsComplete(
+    const Binary64VectorInterval& interval) {
+  if (!interval.valid) return false;
+  for (const Binary64Interval& component : interval.component) {
+    if (!binary64IntervalIsComplete(component)) return false;
+  }
+  return true;
+}
+
+inline bool certifiedPathCellV2IsComplete(
+    const CertifiedPathCellV2& cell) {
+  if (!cell.valid || !cell.complete || !std::isfinite(cell.w0) ||
+      !std::isfinite(cell.w1) || !(cell.w1 > cell.w0) ||
+      !std::isfinite(cell.anchor_w) || cell.anchor_w < cell.w0 ||
+      cell.anchor_w > cell.w1 || cell.segment_identity == 0U ||
+      cell.proof_identity == 0U || !binary64VectorIntervalIsComplete(
+          cell.anchor_position) || !binary64VectorIntervalIsComplete(
+          cell.anchor_p_w) || !binary64VectorIntervalIsComplete(
+          cell.anchor_p_ww) || !binary64IntervalIsComplete(cell.inf_p_w_norm,
+                                                            true) ||
+      !binary64IntervalIsComplete(cell.sup_p_w_norm, true) ||
+      !binary64IntervalIsComplete(cell.inf_horizontal_p_w_norm, true) ||
+      !binary64IntervalIsComplete(cell.sup_p_ww_norm, true) ||
+      !binary64IntervalIsComplete(cell.sup_horizontal_p_ww_norm, true) ||
+      !binary64IntervalIsComplete(cell.sup_p_www_norm, true) ||
+      !binary64IntervalIsComplete(cell.sup_normal_derivative, true) ||
+      !binary64IntervalIsComplete(cell.normal_variation, true) ||
+      !binary64IntervalIsComplete(cell.tangent_variation, true) ||
+      !binary64IntervalIsComplete(cell.curvature_variation, true) ||
+      !binary64IntervalIsComplete(cell.midpoint_position_variation, true) ||
+      !binary64IntervalIsComplete(cell.chord_deviation, true) ||
+      !cell.horizontal_acceleration_bound_complete ||
+      !cell.normal_frame_proof_complete || !cell.phase_map_proof_complete) {
+    return false;
+  }
+  if ((cell.path_revision == 0U) != (cell.frame_revision == 0U) ||
+      !isWorldHorizontalCrossProductProvenance(cell.provenance)) {
+    return false;
+  }
+  return cell.inf_p_w_norm.upper <= cell.sup_p_w_norm.upper &&
+      cell.inf_horizontal_p_w_norm.lower >
+          kHorizontalNormalSpeedEpsilon;
+}
 
 struct PathDifferentialState {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW

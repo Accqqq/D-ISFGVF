@@ -4,6 +4,7 @@
 #include <limits>
 #include <cmath>
 
+#include <bspline_race/continuous_phase_path.h>
 #include <bspline_race/continuous_phase_normal_frame.h>
 
 namespace {
@@ -215,6 +216,18 @@ TEST(ContinuousPhaseNormalFrameTest, HorizontalNormalThresholdIsStrict) {
     FLAG_Race::ContinuousPhaseNormalFrame frame(path, 41U, 43U);
     phase_offset_core::NormalFrameQuery query;
     EXPECT_EQ(frame.query(1.0, query), q > epsilon);
+    phase_offset_core::CertifiedPathCellV2 v2_certificate;
+    const bool v2_ok = path->tubeCellBoundsV2(0.25, 1.75, v2_certificate);
+    EXPECT_EQ(v2_ok, q > epsilon);
+    if (v2_ok) {
+      EXPECT_GT(v2_certificate.inf_horizontal_p_w_norm.lower, epsilon);
+      EXPECT_TRUE(phase_offset_core::certifiedPathCellV2IsComplete(
+          v2_certificate));
+      FLAG_Race::ContinuousPhasePathState state;
+      ASSERT_TRUE(path->evaluate(1.0, state, false));
+      EXPECT_LE(v2_certificate.inf_horizontal_p_w_norm.lower,
+                std::hypot(state.dp_dw.x(), state.dp_dw.y()));
+    }
   }
 }
 

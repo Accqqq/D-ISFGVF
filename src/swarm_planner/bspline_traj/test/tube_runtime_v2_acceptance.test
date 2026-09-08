@@ -1,0 +1,9 @@
+<launch>
+  <group ns="tube_runtime_v2_acceptance">
+    <test test-name="offline_replay_self_test"
+          pkg="bspline_race"
+          type="tube_runtime_v2_acceptance.py"
+          args="--self-test"
+          time-limit="30.0"/>
+  </group>
+</launch>

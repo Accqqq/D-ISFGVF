@@ -251,6 +251,253 @@ PhaseOffsetRuntimeConfig MakeConfig(TubeSource source) {
   return config;
 }
 
+// Small immutable V2 admission fixture.  It mirrors the production value
+// contract (complete path/config/map keys and certified PWL cells) without
+// constructing any manager, map, or adapter authority.
+phase_offset_core::Binary64Interval V2Interval(const double lower,
+                                               const double upper) {
+  phase_offset_core::Binary64Interval result;
+  result.lower = lower;
+  result.upper = upper;
+  result.valid = true;
+  return result;
+}
+
+phase_offset_core::Binary64VectorInterval V2VectorInterval() {
+  phase_offset_core::Binary64VectorInterval result;
+  result.valid = true;
+  for (phase_offset_core::Binary64Interval& component : result.component) {
+    component = V2Interval(0.0, 0.0);
+  }
+  return result;
+}
+
+phase_offset_core::CertifiedPathCellV2 V2PathCell(
+    const double w0, const double w1, const std::uint64_t segment) {
+  phase_offset_core::CertifiedPathCellV2 cell;
+  cell.w0 = w0;
+  cell.w1 = w1;
+  cell.anchor_w = 0.5 * (w0 + w1);
+  cell.path_revision = 11U;
+  cell.frame_revision = 12U;
+  cell.segment_identity = segment;
+  cell.proof_identity = 100U + segment;
+  cell.anchor_position = V2VectorInterval();
+  cell.anchor_p_w = V2VectorInterval();
+  cell.anchor_p_ww = V2VectorInterval();
+  cell.inf_p_w_norm = V2Interval(1.0, 1.0);
+  cell.sup_p_w_norm = V2Interval(1.0, 1.0);
+  cell.inf_horizontal_p_w_norm = V2Interval(1.0, 1.0);
+  cell.sup_p_ww_norm = V2Interval(0.0, 0.0);
+  cell.sup_horizontal_p_ww_norm = V2Interval(0.0, 0.0);
+  cell.sup_p_www_norm = V2Interval(0.0, 0.0);
+  cell.sup_normal_derivative = V2Interval(0.0, 0.0);
+  cell.normal_variation = V2Interval(0.0, 0.0);
+  cell.tangent_variation = V2Interval(0.0, 0.0);
+  cell.curvature_variation = V2Interval(0.0, 0.0);
+  cell.midpoint_position_variation = V2Interval(0.0, 0.0);
+  cell.chord_deviation = V2Interval(0.0, 0.0);
+  cell.horizontal_acceleration_bound_complete = true;
+  cell.normal_frame_proof_complete = true;
+  cell.phase_map_proof_complete = true;
+  cell.provenance = phase_offset_core::kWorldHorizontalCrossProductProvenance;
+  cell.complete = true;
+  cell.valid = true;
+  return cell;
+}
+
+TubePathKey V2PathKey() {
+  TubePathKey key;
+  key.execution_generation = 21U;
+  key.path_instance_id = 22U;
+  key.path_revision = 11U;
+  key.frame_revision = 12U;
+  key.frame_convention_id = 13U;
+  key.frame_convention =
+      phase_offset_core::kWorldHorizontalCrossProductProvenance;
+  key.phase_orientation = 1;
+  key.domain_start = 0.0;
+  key.domain_end = 2.0;
+  return key;
+}
+
+TubeConfigurationKey V2ConfigurationKey() {
+  TubeConfigurationKey key;
+  key.configuration_id = 31U;
+  key.epsilon = 0.1;
+  key.nominal_half_width = 0.5;
+  key.ray_step = 0.05;
+  key.snapshot_resolution = 0.05;
+  key.minimum_reference_speed = 1e-8;
+  return key;
+}
+
+TubeMapCaptureKey V2MapKey() {
+  TubeMapCaptureKey key;
+  key.map_instance_id = 41U;
+  key.state_id = 42U;
+  key.accepted_sequence = 43U;
+  key.configuration_generation = 44U;
+  key.configuration_id = 31U;
+  key.frame_provenance_id = 45U;
+  key.frame_provenance = "test-authoritative-sdfmap";
+  key.support_provenance_id = 46U;
+  key.accepted_time_ticks = 100U;
+  key.support_expiry_ticks = 10000U;
+  key.support_halo = 0.1;
+  key.halo_reconciled = true;
+  key.grid_min_index_x = -10;
+  key.grid_min_index_y = -10;
+  key.grid_min_index_z = -10;
+  key.grid_max_index_x = 10;
+  key.grid_max_index_y = 10;
+  key.grid_max_index_z = 10;
+  key.grid_native_origin = Eigen::Vector3d::Zero();
+  key.grid_voxel_resolution = Eigen::Vector3d::Constant(0.05);
+  key.complete_support = true;
+  return key;
+}
+
+std::shared_ptr<TubeProfileV2> MakeRuntimeV2Profile() {
+  auto profile = std::make_shared<TubeProfileV2>();
+  profile->path_key = V2PathKey();
+  profile->configuration_key = V2ConfigurationKey();
+  profile->map_capture_key = V2MapKey();
+  profile->profile_id = 51U;
+  profile->request_id = 52U;
+  profile->requested_start = 0.0;
+  profile->requested_end = 2.0;
+  profile->anchor_w = 0.0;
+  profile->certified_start = 0.0;
+  profile->certified_end = 2.0;
+  profile->valid = true;
+  profile->complete = true;
+  profile->contains_anchor = true;
+  profile->contains_zero_everywhere = true;
+  profile->nonzero_capacity = true;
+  profile->capability = TubeProfileV2Capability::OFFSET_CERTIFIED;
+  profile->path_owner = std::shared_ptr<const void>(new int(1));
+  profile->capture_owner = std::shared_ptr<const void>(new int(2));
+  profile->query_owner = std::shared_ptr<const void>(new int(3));
+  profile->applicability_assumptions = "runtime-test-complete-support";
+  profile->applicability_deadline_ticks = 10000U;
+  profile->applicability_deadline_timeless = false;
+  TubePwlKnotV2 first;
+  first.w = 0.0;
+  first.lower = -0.5;
+  first.upper = 0.5;
+  first.right_cell_id = 61U;
+  first.right_lower_slope_interval = TubeDirectedRatioV2{0.0, 0.0, true};
+  first.right_upper_slope_interval = TubeDirectedRatioV2{0.0, 0.0, true};
+  first.valid = true;
+  TubePwlKnotV2 middle = first;
+  middle.w = 1.0;
+  middle.left_cell_id = 61U;
+  middle.right_cell_id = 62U;
+  middle.left_lower_slope_interval = TubeDirectedRatioV2{0.0, 0.0, true};
+  middle.left_upper_slope_interval = TubeDirectedRatioV2{0.0, 0.0, true};
+  middle.right_lower_slope_interval = TubeDirectedRatioV2{0.0, 0.0, true};
+  middle.right_upper_slope_interval = TubeDirectedRatioV2{0.0, 0.0, true};
+  TubePwlKnotV2 last = middle;
+  last.w = 2.0;
+  last.left_cell_id = 62U;
+  last.right_cell_id = 0U;
+  last.right_lower_slope_interval = TubeDirectedRatioV2();
+  last.right_upper_slope_interval = TubeDirectedRatioV2();
+  profile->knots = {first, middle, last};
+  TubeProofCellV2 cell0;
+  cell0.w0 = 0.0;
+  cell0.w1 = 1.0;
+  cell0.lower = -0.5;
+  cell0.upper = 0.5;
+  cell0.cell_id = 61U;
+  cell0.valid = true;
+  cell0.complete = true;
+  cell0.path_cell = V2PathCell(0.0, 1.0, 71U);
+  TubeProofCellV2 cell1 = cell0;
+  cell1.w0 = 1.0;
+  cell1.w1 = 2.0;
+  cell1.cell_id = 62U;
+  cell1.path_cell = V2PathCell(1.0, 2.0, 72U);
+  profile->cells = {cell0, cell1};
+  return profile;
+}
+
+TubeExecutionIdentityV2 RuntimeV2Identity(const TubeProfileV2& profile) {
+  TubeExecutionIdentityV2 identity;
+  identity.execution_generation = profile.path_key.execution_generation;
+  identity.path_instance_id = profile.path_key.path_instance_id;
+  identity.path_revision = profile.path_key.path_revision;
+  identity.frame_revision = profile.path_key.frame_revision;
+  identity.frame_convention_id = profile.path_key.frame_convention_id;
+  identity.configuration_id = profile.configuration_key.configuration_id;
+  identity.map_instance_id = profile.map_capture_key.map_instance_id;
+  identity.map_state_id = profile.map_capture_key.state_id;
+  identity.accepted_sequence = profile.map_capture_key.accepted_sequence;
+  identity.profile_id = profile.profile_id;
+  identity.binding_sequence = 81U;
+  return identity;
+}
+
+TubeExecutionLimitsV2 RuntimeV2Limits() {
+  TubeExecutionLimitsV2 limits;
+  limits.lower_phase_rate = 0.05;
+  limits.upper_phase_rate = 0.5;
+  limits.upper_nu = 0.5;
+  limits.max_u_w = 0.5;
+  limits.max_u_delta = 1.0;
+  limits.u_w_slew_rate = 1.0;
+  limits.u_delta_slew_rate = 1.0;
+  limits.return_u_delta_max = 0.5;
+  limits.return_u_delta_slew_rate = 0.5;
+  limits.max_schedule_steps = 200U;
+  limits.max_work = 1000U;
+  limits.valid = true;
+  return limits;
+}
+
+NormalPreviewProductionPolicy RuntimeV2Policy() {
+  NormalPreviewProductionPolicy policy;
+  policy.preview_horizon_w = 1.0;
+  policy.sample_spacing_w = 0.25;
+  policy.lower_nu = 0.05;
+  policy.upper_nu = 0.5;
+  policy.b_tight = 0.1;
+  policy.b_open = 0.5;
+  policy.policy_revision = 1U;
+  policy.configuration_identity = V2ConfigurationKey().configuration_id;
+  policy.configuration_id = "runtime-test-preview-policy";
+  return policy;
+}
+
+RuntimeV2PrepareInput MakeRuntimeV2Input(
+    const std::shared_ptr<const TubeProfileV2>& profile) {
+  RuntimeV2PrepareInput input;
+  input.profile = profile;
+  input.identity = RuntimeV2Identity(*profile);
+  input.current.w = 0.25;
+  input.current.delta = 0.0;
+  input.current.previous_u = phase_offset_core::PortCommand();
+  input.preview_policy = RuntimeV2Policy();
+  input.limits = RuntimeV2Limits();
+  input.selected_u = phase_offset_core::PortCommand();
+  input.selected_u.u_delta = 0.05;
+  input.base_phase_rate = 0.1;
+  input.phase_rate_lower = 0.05;
+  input.phase_rate_upper = 0.5;
+  input.horizon_w = 1.25;
+  input.sample_spacing_w = 0.25;
+  input.upper_u_delta = 0.2;
+  input.dt = 0.1;
+  input.now = 1.0;
+  input.applicability_deadline = 100.0;
+  input.applicability_deadline_valid = true;
+  input.tracking = TubeExecutionTrackingEvidenceV2();
+  input.max_work = 1000U;
+  input.provenance = "runtime-test/v2-admission";
+  return input;
+}
+
 RuntimeInstalledTubeView MakeView(TubeEpochState state = TubeEpochState::ROLLING,
                                   std::shared_ptr<const TubeProfile> profile = MakeActiveProfile()) {
   RuntimeInstalledTubeView view;
@@ -310,6 +557,7 @@ RuntimeDryRunInput MakeDryRunInput(const RuntimePathSamples& path,
   return input;
 }
 
+#ifndef PHASE_OFFSET_RUNTIME_V2_TEST_ONLY
 TEST(PhaseOffsetRuntimeTest, NoneKeepsA4FinalPortDeltaIntegration) {
   const RuntimePathSamples path = MakePath();
   PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
@@ -1192,6 +1440,207 @@ TEST(PhaseOffsetRuntimeTest, RecenterIsContinuousAndDoesNotResetBeforeCommit) {
   EXPECT_FALSE(runtime.recenterRequested());
   EXPECT_FALSE(runtime.hasExecutedOffsetAuthority());
 }
+#endif
+
+#ifndef PHASE_OFFSET_RUNTIME_LEGACY_TEST_ONLY
+TEST(PhaseOffsetRuntimeTest, V2PrepareIsPureAndOwnsImmutableProfileAndReserve) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::FIXED));
+  std::shared_ptr<TubeProfileV2> owned_profile = MakeRuntimeV2Profile();
+  RuntimeV2PrepareInput input = MakeRuntimeV2Input(owned_profile);
+  const double delta_before = runtime.retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      runtime.previousFinalPort();
+  RuntimeV2PreparedStep prepared;
+  ASSERT_TRUE(runtime.prepareV2(input, prepared)) << prepared.invalid_reason;
+  ASSERT_TRUE(prepared.valid);
+  ASSERT_TRUE(prepared.admission.valid);
+  ASSERT_TRUE(prepared.admission.successor_reserve.terminalExact());
+  EXPECT_DOUBLE_EQ(prepared.successor.w,
+                   input.current.w + input.dt * input.base_phase_rate);
+  EXPECT_DOUBLE_EQ(prepared.successor.delta,
+                   input.current.delta + input.dt * input.selected_u.u_delta);
+  EXPECT_EQ(prepared.profile.get(), owned_profile.get());
+  ASSERT_TRUE(prepared.reserve_owner);
+  EXPECT_TRUE(prepared.reserve_owner->terminalExact());
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w, previous_before.u_w);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, previous_before.u_delta);
+  // The preparation owner keeps the immutable profile alive independently of
+  // the caller's input wrapper.
+  input.profile.reset();
+  owned_profile.reset();
+  EXPECT_TRUE(prepared.profile);
+  EXPECT_TRUE(prepared.profile->structurallyValid());
+}
+
+TEST(PhaseOffsetRuntimeTest, V2CommitTokenBindsExactCommandAndSuccessor) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::FIXED));
+  const std::shared_ptr<const TubeProfileV2> profile =
+      MakeRuntimeV2Profile();
+  const RuntimeV2PrepareInput input = MakeRuntimeV2Input(profile);
+  RuntimeV2PreparedStep prepared;
+  ASSERT_TRUE(runtime.prepareV2(input, prepared)) << prepared.invalid_reason;
+  RuntimeV2CommitToken token;
+  ASSERT_TRUE(runtime.makeCommitTokenV2(prepared, token));
+  const double delta_before = runtime.retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      runtime.previousFinalPort();
+  RuntimeV2CommitToken substituted = token;
+  substituted.prepared.selected_u.u_delta = 0.01;
+  EXPECT_FALSE(runtime.commitV2(substituted));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w, previous_before.u_w);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, previous_before.u_delta);
+  ASSERT_TRUE(runtime.commitV2(token));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), prepared.successor.delta);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w,
+                   prepared.successor.previous_u.u_w);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta,
+                   prepared.successor.previous_u.u_delta);
+  ASSERT_NE(runtime.committedV2Reserve(), nullptr);
+  EXPECT_TRUE(runtime.committedV2Reserve()->terminalExact());
+
+  // A failed PositionCommand publication leaves the token uncommitted.  A
+  // retry from the same immutable input must prepare again without observing
+  // any partially installed Runtime state.
+  PhaseOffsetRuntime retry_runtime(MakeConfig(TubeSource::FIXED));
+  RuntimeV2PreparedStep first_retry;
+  ASSERT_TRUE(retry_runtime.prepareV2(input, first_retry));
+  RuntimeV2CommitToken retry_token;
+  ASSERT_TRUE(retry_runtime.makeCommitTokenV2(first_retry, retry_token));
+  EXPECT_EQ(retry_runtime.committedV2Reserve(), nullptr);
+  RuntimeV2PreparedStep second_retry;
+  ASSERT_TRUE(retry_runtime.prepareV2(input, second_retry));
+  EXPECT_EQ(retry_runtime.committedV2Reserve(), nullptr);
+  EXPECT_DOUBLE_EQ(retry_runtime.retainedDelta(), 0.0);
+
+  ASSERT_TRUE(retry_runtime.commitV2(retry_token));
+  const double committed_delta = retry_runtime.retainedDelta();
+  const phase_offset_core::PortCommand committed_previous =
+      retry_runtime.previousFinalPort();
+  const TubeFiniteReserveV2* committed_reserve =
+      retry_runtime.committedV2Reserve();
+  RuntimeV2PrepareInput stale = input;
+  stale.current = first_retry.successor;
+  stale.identity.binding_sequence += 1U;
+  EXPECT_FALSE(retry_runtime.prepareV2(stale, second_retry));
+  EXPECT_DOUBLE_EQ(retry_runtime.retainedDelta(), committed_delta);
+  EXPECT_DOUBLE_EQ(retry_runtime.previousFinalPort().u_w,
+                   committed_previous.u_w);
+  EXPECT_DOUBLE_EQ(retry_runtime.previousFinalPort().u_delta,
+                   committed_previous.u_delta);
+  EXPECT_EQ(retry_runtime.committedV2Reserve(), committed_reserve);
+}
+
+TEST(PhaseOffsetRuntimeTest,
+     V2CopiedPrefixBindingTransitionSealsExpectedAndProposedIdentity) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::FIXED));
+  const std::shared_ptr<const TubeProfileV2> source_profile =
+      MakeRuntimeV2Profile();
+  const RuntimeV2PrepareInput source_input =
+      MakeRuntimeV2Input(source_profile);
+  RuntimeV2PreparedStep source_prepared;
+  ASSERT_TRUE(runtime.prepareV2(source_input, source_prepared))
+      << source_prepared.invalid_reason;
+  RuntimeV2CommitToken source_token;
+  ASSERT_TRUE(runtime.makeCommitTokenV2(source_prepared, source_token));
+  ASSERT_TRUE(runtime.commitV2(source_token));
+
+  std::shared_ptr<TubeProfileV2> successor_profile(
+      new TubeProfileV2(*source_profile));
+  ++successor_profile->path_key.path_instance_id;
+  ++successor_profile->profile_id;
+  ++successor_profile->request_id;
+  ASSERT_TRUE(successor_profile->structurallyValid());
+  RuntimeV2PrepareInput successor_input =
+      MakeRuntimeV2Input(successor_profile);
+  successor_input.current = source_prepared.successor;
+  successor_input.binding_transition = true;
+  successor_input.expected_identity = source_prepared.identity;
+  successor_input.identity.binding_sequence =
+      successor_input.expected_identity.binding_sequence + 1U;
+
+  const double delta_before = runtime.retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      runtime.previousFinalPort();
+  const TubeFiniteReserveV2* reserve_before = runtime.committedV2Reserve();
+  RuntimeV2PreparedStep successor_prepared;
+  ASSERT_TRUE(runtime.prepareV2(successor_input, successor_prepared))
+      << successor_prepared.invalid_reason;
+  EXPECT_TRUE(successor_prepared.binding_transition);
+  EXPECT_EQ(successor_prepared.expected_identity.path_instance_id,
+            source_profile->path_key.path_instance_id);
+  EXPECT_EQ(successor_prepared.identity.path_instance_id,
+            successor_profile->path_key.path_instance_id);
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta,
+                   previous_before.u_delta);
+  EXPECT_EQ(runtime.committedV2Reserve(), reserve_before);
+
+  RuntimeV2CommitToken successor_token;
+  ASSERT_TRUE(runtime.makeCommitTokenV2(successor_prepared,
+                                        successor_token));
+  RuntimeV2CommitToken substituted = successor_token;
+  ++substituted.prepared.expected_identity.binding_sequence;
+  EXPECT_FALSE(runtime.commitV2(substituted));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  EXPECT_EQ(runtime.committedV2Reserve(), reserve_before);
+
+  RuntimeV2PrepareInput stale_expected = successor_input;
+  ++stale_expected.expected_identity.profile_id;
+  EXPECT_FALSE(runtime.prepareV2(stale_expected, successor_prepared));
+  RuntimeV2PrepareInput invalid_transition = successor_input;
+  invalid_transition.identity.path_instance_id =
+      invalid_transition.expected_identity.path_instance_id;
+  EXPECT_FALSE(runtime.prepareV2(invalid_transition, successor_prepared));
+
+  ASSERT_TRUE(runtime.commitV2(successor_token));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(),
+                   successor_token.prepared.successor.delta);
+  EXPECT_EQ(runtime.committedV2Reserve(),
+            successor_token.prepared.reserve_owner.get());
+  EXPECT_FALSE(runtime.commitV2(successor_token));
+}
+
+TEST(PhaseOffsetRuntimeTest,
+     V2FailedRetryAndStaleEvidenceLeaveSoleRuntimeStateUnchanged) {
+  const std::shared_ptr<const TubeProfileV2> profile =
+      MakeRuntimeV2Profile();
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::FIXED));
+  const double delta_before = runtime.retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      runtime.previousFinalPort();
+  RuntimeV2PrepareInput input = MakeRuntimeV2Input(profile);
+  RuntimeV2PreparedStep prepared;
+  input.identity.path_revision += 1U;
+  EXPECT_FALSE(runtime.prepareV2(input, prepared));
+  input = MakeRuntimeV2Input(profile);
+  input.now = input.applicability_deadline;
+  EXPECT_FALSE(runtime.prepareV2(input, prepared));
+  input = MakeRuntimeV2Input(profile);
+  input.dt = 0.0;
+  EXPECT_FALSE(runtime.prepareV2(input, prepared));
+  input = MakeRuntimeV2Input(profile);
+  input.tracking.error_norm = input.tracking.error_bound + 1e-3;
+  EXPECT_FALSE(runtime.prepareV2(input, prepared));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w, previous_before.u_w);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, previous_before.u_delta);
+}
+
+TEST(PhaseOffsetRuntimeTest, V2DryRunDoesNotInstallReserveOrLifecycleState) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::FIXED));
+  RuntimeV2PrepareInput input = MakeRuntimeV2Input(MakeRuntimeV2Profile());
+  RuntimeV2PreparedStep dry;
+  ASSERT_TRUE(runtime.dryRunV2(input, dry)) << dry.invalid_reason;
+  EXPECT_TRUE(dry.valid);
+  EXPECT_TRUE(dry.reserve_owner);
+  EXPECT_EQ(runtime.committedV2Reserve(), nullptr);
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), 0.0);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w, 0.0);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, 0.0);
+}
+#endif
 
 }  // namespace
 }  // namespace phase_offset_navigation

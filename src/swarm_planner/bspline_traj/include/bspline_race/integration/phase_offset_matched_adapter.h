@@ -1,11 +1,11 @@
 #pragma once
+#include <visualization_msgs/MarkerArray.h>
 
 #include <Eigen/Core>
 #include <Eigen/StdVector>
 
 #include <atomic>
 #include <array>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
@@ -14,21 +14,16 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <ros/ros.h>
 #include <std_msgs/Float64MultiArray.h>
-#include <visualization_msgs/Marker.h>
-#include <visualization_msgs/MarkerArray.h>
 
 #include <bspline_race/continuous_phase_path.h>
 #include <bspline_race/continuous_phase_normal_frame.h>
 #include <bspline_race/integration/phase_offset_active_adapter.h>
-#include <bspline_race/integration/phase_offset_cloud_occupancy_query.h>
-#include <bspline_race/integration/phase_offset_raw_candidate_diagnostics.h>
 #include <bspline_race/integration/phase_offset_sph_ros_bridge.h>
-#include <plan_env/cloud_occupancy_snapshot.h>
+#include <bspline_race/integration/phase_offset_tube_runtime_v2.h>
 #include <phase_offset_navigation/phase_offset_runtime.h>
 #include <phase_offset_navigation/phase_offset_allocator.h>
 #include <phase_offset_navigation/immutable_executed_reference_query.h>
@@ -36,14 +31,10 @@
 #include <phase_offset_navigation/active_reference_authority.h>
 #include <phase_offset_navigation/phase_offset_recovery_owner.h>
 #include <phase_offset_navigation/preview_feasibility.h>
-#include <phase_offset_navigation/handoff_state_machine.h>
-#include <phase_offset_navigation/tube_epoch_manager.h>
 
 namespace FLAG_Race {
 
 class gvf_manager;
-struct TubeEpochSnapshot;
-struct TubeBuildRequest;
 
 enum class PhaseOffsetMatchedMode { ACTIVE = 0, MANUAL = 1 };
 
@@ -62,12 +53,6 @@ enum class PhaseOffsetCoordinationBackend {
 
 const char* phaseOffsetCoordinationBackendName(
     PhaseOffsetCoordinationBackend backend);
-
-// This is deliberately an owning value type.  A command cycle may hand it to
-// the tube timer, but neither side may retain a mutable path/vector owned by
-// the other callback.
-using MatchedAdapterPathSamples =
-    phase_offset_navigation::RuntimePathSamples;
 
 struct PhaseOffsetMatchedAdapterConfig {
   PhaseOffsetMatchedMode mode = PhaseOffsetMatchedMode::ACTIVE;
@@ -98,6 +83,9 @@ struct PhaseOffsetMatchedAdapterConfig {
   phase_offset_navigation::TubeSource tube_source =
       phase_offset_navigation::TubeSource::NONE;
   phase_offset_navigation::TubeBuilderConfig tube;
+  // Explicit V2 certificate configuration.  A shadow adapter never derives
+  // or fabricates this value from the legacy TubeBuilderConfig.
+  phase_offset_navigation::TubeCertificateConfigV2 tube_certificate_v2;
   phase_offset_navigation::TubeFilterConfig filter;
   double tube_update_period = 0.10;
   // ESDF-selected tube construction accepts the local occupycloud snapshot
@@ -123,245 +111,89 @@ struct PhaseOffsetMatchedAdapterConfig {
   }
 };
 
-// Immutable control authority for an H2 path/tube handoff.  This is an
-// ownership value only: it adds no ROS-facing state, gate, diagnostic field,
-// or execution mode.  A command captures one shared_ptr and must take its
-// path, Runtime profile/status, and map provenance from that one object.
-struct PathTubePair {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  std::uint64_t source_revision = 0U;
-  std::uint64_t path_revision = 0U;
-  std::uint64_t frame_revision = 0U;
-  std::uint64_t generation = 0U;
-  // Private H2 retirement domain.  It is neither a Runtime state nor a
-  // diagnostic: a goal/reset increments it so a command that captured an old
-  // shared_ptr cannot continue to execute or install that retired authority.
-  std::uint64_t authority_session = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  std::shared_ptr<const ContinuousPhasePath> path_owner;
-  // One immutable WorldHorizontalCrossProduct frame is shared by all
-  // path-state, cell-proof, and executed-reference queries for this handoff.
-  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
-  std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-      frozen_cloud_occupancy_snapshot;
-  std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
-  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
-      executed_reference_query;
-  // Exact predecessor authority used to seed a staged successor frame.  It
-  // is immutable provenance only; governor/reference consumers never read the
-  // stored executed_N as a control input.
-  std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
-      successor_seed_authority;
-  phase_offset_navigation::TubeEpochStatus epoch_status;
-  // The precommit facts are retained verbatim so a later command can reject
-  // a stale stage before it exchanges authority.
-  double captured_w0 = 0.0;
-  double future_seam_w = 0.0;
-  double existing_future_horizon_end_w = 0.0;
-  double captured_retained_delta = 0.0;
-  phase_offset_core::PortCommand captured_previous_final_port;
-  std::shared_ptr<const TubeEpochSnapshot> epoch_snapshot;
-};
-
-// Immutable evidence captured atomically with a transaction-scoped pin.  It
-// deliberately copies identities/provenance and Runtime history rather than
-// exposing an adapter lock to seam/C2/tube work.
-struct PathTubePairPinCapture {
-  std::shared_ptr<const PathTubePair> pair;
-  std::uint64_t source_revision = 0U;
-  std::uint64_t generation = 0U;
-  std::uint64_t authority_session = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  std::shared_ptr<const ContinuousPhasePath> path_owner;
-  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
-  std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-      frozen_cloud_occupancy_snapshot;
-  std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
-  std::shared_ptr<const TubeEpochSnapshot> epoch_snapshot;
-  double retained_delta = 0.0;
-  phase_offset_core::PortCommand previous_final_port;
-
-  bool valid() const {
-    return pair && source_revision == pair->source_revision &&
-        generation == pair->generation &&
-        authority_session == pair->authority_session &&
-        map_observation_sequence == pair->map_observation_sequence &&
-        map_observation_is_snapshot == pair->map_observation_is_snapshot &&
-        path_owner == pair->path_owner &&
-        frame_owner == pair->frame_owner &&
-        frozen_cloud_occupancy_snapshot ==
-            pair->frozen_cloud_occupancy_snapshot &&
-        full_path_samples == pair->full_path_samples &&
-        active_profile == pair->active_profile &&
-        epoch_snapshot == pair->epoch_snapshot;
-  }
-};
-
-struct PathTubePairPinRegistry;
-
-// One exclusive, transaction-owned H2 lease.  It has no control/runtime
-// semantics: holding it only prevents timer pair-authority replacement while
-// a manager builds and validates a successor from the exact captured pair.
-// The registry outlives the adapter so a late guard destruction after
-// shutdown is harmless.  Release is idempotent and ABA-safe by lease id plus
-// exact pair/generation/session identity.
-class PathTubePairPin {
- public:
-  PathTubePairPin() = default;
-  ~PathTubePairPin();
-  PathTubePairPin(const PathTubePairPin&) = delete;
-  PathTubePairPin& operator=(const PathTubePairPin&) = delete;
-  PathTubePairPin(PathTubePairPin&& other) noexcept;
-  PathTubePairPin& operator=(PathTubePairPin&& other) noexcept;
-
-  bool valid() const { return lease_id_ != 0U && capture_.valid(); }
-  std::uint64_t leaseId() const { return lease_id_; }
-  const PathTubePairPinCapture& capture() const { return capture_; }
-  void release();
-
- private:
-  friend class PhaseOffsetMatchedAdapter;
-  PathTubePairPin(const std::shared_ptr<PathTubePairPinRegistry>& registry,
-                  const PathTubePairPinCapture& capture,
-                  std::uint64_t lease_id);
-
-  std::shared_ptr<PathTubePairPinRegistry> registry_;
-  PathTubePairPinCapture capture_;
-  std::uint64_t lease_id_ = 0U;
-};
-
-// A staged pair is never an authority.  It keeps the old authority alive for
-// identity revalidation and is consumed only by the command boundary.
-struct PathTubePairTransaction {
-  std::shared_ptr<const PathTubePair> expected_pair;
-  std::shared_ptr<const PathTubePair> candidate_pair;
-  // Stage 2 copies capture evidence and its lease identity only.  Ownership
-  // remains with the manager's pending frontend guard, never with a staging
-  // value that could be copied or outlive a cancelled transaction.
-  PathTubePairPinCapture expected_capture;
-  std::uint64_t pin_lease_id = 0U;
-  std::uint64_t authority_session = 0U;
-  double captured_retained_delta = 0.0;
-  phase_offset_core::PortCommand captured_previous_final_port;
-};
-
-// Nonblocking neutral-to-offset bootstrap rendezvous.  The ticket is an
-// immutable identity/sequence token only: it deliberately carries no Tube
-// profile, cloud snapshot, Runtime state, or other heavy transaction value.
-// A manager may claim one READY ticket and perform the existing fresh
-// Path+Tube transaction outside the adapter command lock, then release the
-// claim with the result of its final Pair CAS.
-enum class BootstrapRendezvousState {
-  DISARMED,
-  ARMED,
-  READY,
-};
-
-struct BootstrapRendezvousTicket {
-  std::uint64_t claim_id = 0U;
-  std::uint64_t task_generation = 0U;
-  std::uint64_t authority_session = 0U;
-  std::uint64_t source_revision = 0U;
-  std::uint64_t path_revision = 0U;
-  std::uint64_t frame_revision = 0U;
-  std::uint64_t build_sequence = 0U;
-  const ContinuousPhasePath* semantic_path_owner = nullptr;
-  const ContinuousPhaseNormalFrame* frame_owner = nullptr;
-
-  bool valid() const {
-    return claim_id != 0U && task_generation != 0U &&
-        source_revision != 0U && build_sequence != 0U &&
-        semantic_path_owner != nullptr;
-  }
-};
-
-// Result of the lock-free half of an H2 handoff commit.  It contains no live
-// Runtime reference: all expensive owner evaluation, map checking and exact
-// port dry-run have already completed against a local Runtime copy.  The
-// manager serializes the short final Runtime/pair CAS with its phase tuple.
-struct PathTubePairCommitPreparation {
-  PathTubePairTransaction transaction;
-  double current_w = 0.0;
-  // Private-to-the-adapter commit predicate.  These are captured at the
-  // command-boundary prepare step, never copied from the older transaction
-  // pin capture, and are not Runtime state to be installed by pair CAS.
-  double expected_retained_delta = 0.0;
-  phase_offset_core::PortCommand expected_previous_final_port;
+// Immutable command-side view of the manager-owned copied-prefix handoff.
+// The manager remains the sole owner of the canonical handoff and frontend
+// mirror; this value carries only the facts needed for side-effect-free live
+// admission of the already completed SUCCESSOR profile.
+struct TubeV2SuccessorHandoffEvidence {
   bool valid = false;
-};
-
-// Temporary A6/H2 first-false attribution only.  This records no authority,
-// runtime, or ROS-facing state; it lets the manager distinguish a transaction
-// precondition from raw Tube, filter, validator, coverage, or dry-run denial.
-// Remove after the live bootstrap first-false is attributed.
-enum class PathTubePairStageFailure {
-  NONE,
-  INPUT_PRECONDITION,
-  TRANSACTION_PRECONDITION,
-  PAIR_SESSION_RUNTIME_SNAPSHOT,
-  OWNER_EVALUATE,
-  TUBE_BUILD_PRECONDITION,
-  TUBE_RAW_BUILD,
-  TUBE_FILTER,
-  TUBE_SURFACE_VALIDATOR,
-  TUBE_PROFILE_COVERAGE,
-  TUBE_PROFILE_OWNER_MATCH,
-  STAGING_DRY_RUN,
-};
-
-// Private timer-refresh prepare/finalize value.  It is not a control state or
-// an authority: it merely preserves the exact candidate and latest command /
-// Runtime predicate that the short final pair CAS must revalidate.
-struct TimerPairRefreshPreparation {
-  std::shared_ptr<const TubeBuildRequest> build_request;
-  std::shared_ptr<const TubeBuildRequest> latest_request;
-  std::shared_ptr<const TubeEpochSnapshot> epoch;
-  std::shared_ptr<const PathTubePair> expected_pair;
-  std::uint64_t authority_session = 0U;
-  double expected_retained_delta = 0.0;
-  phase_offset_core::PortCommand expected_previous_final_port;
-  bool valid = false;
+  bool structurally_copied_prefix = false;
+  std::uint64_t expected_execution_generation = 0U;
+  phase_offset_navigation::TubePathKey source_path_key;
+  std::shared_ptr<const ContinuousPhasePath> source_path_owner;
+  phase_offset_navigation::TubePathKey successor_path_key;
+  std::shared_ptr<const ContinuousPhasePath> successor_path_owner;
+  double phase_after_w = std::numeric_limits<double>::quiet_NaN();
+  double copied_prefix_start_w = std::numeric_limits<double>::quiet_NaN();
+  double copied_prefix_end_w = std::numeric_limits<double>::quiet_NaN();
+  std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
+      successor_request;
+  std::string provenance;
 };
 
 struct MatchedAdapterInput {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  // Optional value-only V2 admission evidence.  It is captured with the
+  // command input for NORMAL admission and incumbent finite-reserve
+  // applicability.  It never carries authority, publication permission, or
+  // a mutable Runtime reference.
+  struct TubeV2AdmissionEvidence {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    bool valid = false;
+    std::uint64_t binding_sequence = 0U;
+    std::uint64_t accepted_state_sequence = 0U;
+    std::uint64_t accepted_state_notification_sequence = 0U;
+    std::uint64_t accepted_time_ticks = 0U;
+    std::uint64_t support_expiry_ticks = 0U;
+    bool support_expiry_timeless = false;
+    std::uint64_t map_instance_id = 0U;
+    std::uint64_t configuration_generation = 0U;
+    std::uint64_t configuration_key = 0U;
+    std::uint64_t support_provenance_id = 0U;
+    std::string frame_provenance;
+    std::uint64_t latest_accepted_state_sequence = 0U;
+    std::uint64_t latest_accepted_state_notification_sequence = 0U;
+    std::uint64_t latest_accepted_time_ticks = 0U;
+    std::uint64_t latest_map_instance_id = 0U;
+    std::uint64_t latest_configuration_generation = 0U;
+    std::uint64_t latest_configuration_key = 0U;
+    std::uint64_t latest_support_provenance_id = 0U;
+    std::string latest_frame_provenance;
+    phase_offset_core::PortCommand selected_u;
+    std::string selected_u_owner = "PhaseOffsetAllocator";
+    double base_phase_rate = std::numeric_limits<double>::quiet_NaN();
+    double phase_rate_lower = std::numeric_limits<double>::quiet_NaN();
+    double phase_rate_upper = std::numeric_limits<double>::quiet_NaN();
+    double upper_u_delta = std::numeric_limits<double>::quiet_NaN();
+    double now = std::numeric_limits<double>::quiet_NaN();
+    double applicability_deadline = std::numeric_limits<double>::quiet_NaN();
+    bool applicability_deadline_valid = false;
+    phase_offset_navigation::NormalPreviewProductionPolicy preview_policy;
+    phase_offset_navigation::TubeExecutionLimitsV2 limits;
+    phase_offset_navigation::TubeExecutionTrackingEvidenceV2 tracking;
+    std::size_t max_work = 0U;
+    std::string provenance;
+  } tube_v2_admission;
+
   phase_offset_core::PathDifferentialState path;
-  std::vector<phase_offset_core::PathDifferentialState,
-              Eigen::aligned_allocator<phase_offset_core::PathDifferentialState>>
-      sampled_path;
-  std::function<bool(double, std::vector<double>&,
-                     std::vector<ContinuousPhasePathState>&)> sample_path;
-  // Optional exact pure-C++ evaluator for a synthetic/test or adapter-owned
-  // semantic path.  Production normally binds semantic_path below.
-  phase_offset_navigation::PathStateQuery path_state_query;
-  // Command-thread-only compatibility inputs.  They are never retained in a
-  // TubeBuildRequest: the timer receives semantic_path_owner and/or immutable
-  // sampled_path values instead.
-  const ContinuousPhasePath* semantic_path = nullptr;
-  const void* semantic_path_identity = nullptr;
   double semantic_path_start_w = 0.0;
   double semantic_path_end_w = 0.0;
   // Production ownership handoff.  The manager captures these immutable
   // owners in the command callback before storing a build request.
   std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
-  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
-  // When H2 authority is installed this is the sole path/tube source for the
-  // control step.  It is intentionally immutable and never synthesized from
-  // independent path/epoch slots inside update().
-  std::shared_ptr<const PathTubePair> path_tube_pair;
-  // A manager-staged successor is transaction evidence only.  It is supplied
-  // from the exact pending PathTubePair handoff and is never installed or
-  // treated as authority by the adapter.  Recovery/Preview may validate it
-  // while the current pair remains the safe executed owner.
-  std::shared_ptr<const PathTubePair> successor_path_tube_pair;
-  std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-      cloud_occupancy_snapshot;
+  // Optional immutable V2 worker transport captured by the command owner.
+  // The adapter copies this one coherent builder input into the selected
+  // worker; absent input leaves V2 execution unavailable without
+  // fabricating map/path authority from legacy fields.
+  std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
+      tube_worker_input_v2;
+  TubeWorkerPurposeV2 tube_worker_purpose_v2 = TubeWorkerPurposeV2::CURRENT;
+  // Optional exact manager handoff captured under its existing mailbox lock.
+  // It is not a READY flag and cannot install the successor or its mirror.
+  std::shared_ptr<const TubeV2SuccessorHandoffEvidence>
+      tube_v2_successor_handoff;
   // SPH is a value-semantic ROS boundary.  The manager captures one immutable
   // bridge sample before calling update(); evaluateNormalAllocator resolves
   // its source/receipt freshness only after successful NORMAL Preview.
@@ -381,98 +213,75 @@ struct MatchedAdapterInput {
   ros::Time stamp;
 };
 
-using ManualPreflightResult = phase_offset_navigation::ManualPreflightResult;
+// The single committed V2 execution binding.  Profile, exact immutable
+// builder input and Runtime identity are prepared together and exchanged only
+// after a successful PositionCommand publication.
+struct TubeV2ExecutionBinding {
+  std::shared_ptr<const phase_offset_navigation::TubeProfileV2> profile;
+  std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2> source_input;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
+  phase_offset_navigation::TubeExecutionIdentityV2 identity;
+  bool valid = false;
 
-enum ManualDiagnosticIndex : std::size_t {
-  kModeManual = 0U,
-  kZeroGateOpen,
-  kZeroGateConsecutiveCount,
-  kFailureLatched,
-  kProfileActive,
-  kPreflightComplete,
-  kConfiguredAmplitude,
-  kAcceptedAmplitude,
-  kDeltaRef,
-  kDelta,
-  kDeltaTrackingError,
-  kUWRaw,
-  kUDeltaRaw,
-  kUWFinal,
-  kUDeltaFinal,
-  kUWLimited,
-  kUDeltaLimited,
-  kBaseWDot,
-  kFinalWDot,
-  kBaseTangentSpeed,
-  kFinalTangentSpeed,
-  kCurrentRegularity,
-  kNextRegularity,
-  kMatchedResidualNorm,
-  kPhysicalPortNorm,
-  kRMinusPNorm,
-  kRZMinusPZ,
-  kSelectedManual,
-  kManualValid,
-  kPreflightSampleCount,
-  kPreflightInvalidSampleCount,
-  kPreflightMinRegularity,
-  kManualInvalidCount,
-  kManualFallbackCount,
-  kManualLegacyDiagnosticCount,
-  kTubeSource = kManualLegacyDiagnosticCount,
-  kTubeSourceReady,
-  kTubeRawComplete,
-  kTubeFilteredComplete,
-  kTubeProfileComplete,
-  kTubeObstacleCertified,
-  kTubeSourceRevision,
-  kTubeRevision,
-  kTubeSampleCount,
-  kTubeInvalidCount,
-  kTubeUnavailableCount,
-  kTubeOutOfMapCount,
-  kTubeUnknownCount,
-  kTubeOccupiedCount,
-  kTubePreviewStart,
-  kTubePreviewEnd,
-  kTubeCertifiedForward,
-  kTubeLower,
-  kTubeUpper,
-  kTubeLowerW,
-  kTubeUpperW,
-  kTubeNextLower,
-  kTubeNextUpper,
-  kTubeCurrentInside,
-  kTubeNextInside,
-  kTubeUpperH,
-  kTubeLowerH,
-  kTubeUpperInvariant,
-  kTubeLowerInvariant,
-  kTubeRequiredReferenceClearance,
-  kTubeRequiredActualClearance,
-  kTubeReferenceDistance,
-  kTubeActualDistance,
-  kTubeTrackingNorm,
-  kTubeTrackingBound,
-  kTubeViolation,
-  kTubeRebuildCount,
-  kTubeRejectCount,
-  kTubeViolationCount,
-  kTubeReadinessEvaluated,
-  kTubeDisplayCertified,
-  kPreflightFirstInvalidW,
-  kPreflightFirstInvalidSide,
-  kTubeFirstInvalidW,
-  kTubeFirstInvalidSide,
-  kTubeFirstStopReason,
-  kTubeInsufficientClearanceCount,
-  kTubeMinWidth,
-  kTubeMinSafetyMargin,
-  kManualDiagnosticCount,
+  bool complete() const;
 };
 
-static_assert(kManualDiagnosticCount == 83U,
-              "manual diagnostics must remain exactly 83 fields");
+// Immutable result of preparing V2 Runtime work against one already-built
+// CURRENT profile.  NORMAL admission becomes selectable only through the
+// publish-first transaction; when an incumbent NORMAL command is denied, the
+// same value may instead carry one
+// exact finite-reserve step and its publish-gated Runtime successor token.
+// Neither form is authority before successful PositionCommand publication.
+struct TubeV2ShadowAdmissionCandidate {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  bool applicable = false;
+  bool prepared = false;
+  bool nonselecting = true;
+  phase_offset_navigation::TubeExecutionStatusV2 status =
+      phase_offset_navigation::TubeExecutionStatusV2::UNAVAILABLE;
+  std::uint64_t request_id = 0U;
+  std::uint64_t binding_sequence = 0U;
+  std::uint64_t execution_generation = 0U;
+  std::uint64_t accepted_state_demand = 0U;
+  TubeWorkerPurposeV2 purpose = TubeWorkerPurposeV2::CURRENT;
+  phase_offset_navigation::TubePathKey source_path_key;
+  double copied_prefix_start_w = std::numeric_limits<double>::quiet_NaN();
+  double copied_prefix_end_w = std::numeric_limits<double>::quiet_NaN();
+  bool copied_prefix_continuity_valid = false;
+  double path_position_residual = std::numeric_limits<double>::quiet_NaN();
+  double path_derivative_residual = std::numeric_limits<double>::quiet_NaN();
+  double reference_position_residual = std::numeric_limits<double>::quiet_NaN();
+  double reference_derivative_residual = std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t latest_accepted_state_sequence = 0U;
+  std::uint64_t latest_accepted_state_notification_sequence = 0U;
+  std::uint64_t latest_accepted_time_ticks = 0U;
+  std::uint64_t latest_map_instance_id = 0U;
+  std::uint64_t latest_configuration_generation = 0U;
+  std::uint64_t latest_configuration_key = 0U;
+  std::uint64_t latest_support_provenance_id = 0U;
+  std::string latest_frame_provenance;
+  bool accepted_update_visible = false;
+  bool accepted_update_compatible = false;
+  phase_offset_navigation::TubePathKey path_key;
+  phase_offset_navigation::TubeConfigurationKey configuration_key;
+  phase_offset_navigation::TubeMapCaptureKey map_capture_key;
+  std::shared_ptr<const phase_offset_navigation::TubeProfileV2> profile;
+  std::shared_ptr<const TubeV2ExecutionBinding> proposed_binding;
+  Eigen::Vector3d g_des = Eigen::Vector3d::Zero();
+  bool g_des_valid = false;
+  phase_offset_navigation::NormalPreviewResult normal_preview;
+  phase_offset_navigation::PhaseOffsetAllocatorResult allocator;
+  bool allocator_evaluated = false;
+  phase_offset_navigation::RuntimeV2PreparedStep prepared_step;
+  phase_offset_navigation::RuntimeV2CommitToken commit_token;
+  phase_offset_navigation::AuthorityPreparedStep authority_prepared;
+  // A failed refresh may prepare the next step of the already committed V2
+  // finite reserve.  Cursor and Runtime state advance only through the
+  // existing publish-first PositionCommand seam.
+  phase_offset_navigation::RecoveryPreparedStep recovery_step;
+  std::string reason;
+};
 
 struct MatchedAdapterOutput {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
@@ -485,16 +294,14 @@ struct MatchedAdapterOutput {
   phase_offset_core::MatchedPortOutput matched;
   ActiveAdapterOutput zero_port;
   ActiveEquivalenceResult zero_comparison;
-  ManualPreflightResult preflight;
-  // Candidate and installed active ownership are intentionally distinct.
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> candidate_profile;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
-  // Compatibility view: legacy 83-field tube entries always read active.
-  phase_offset_navigation::TubeProfile tube_profile;
-  phase_offset_navigation::TubeBounds tube_current_bounds;
-  phase_offset_navigation::TubeBounds tube_next_bounds;
-  phase_offset_navigation::TubeRuntimeStatus tube_status;
-  phase_offset_navigation::TubeEpochStatus tube_epoch_status;
+  // V2 NORMAL admission is exposed as immutable evidence only.  An incumbent
+  // finite-reserve candidate may also describe the exact recovery command
+  // selected through the existing publish-first transaction; neither form
+  // populates legacy Candidate/Active ownership.
+  std::shared_ptr<const TubeV2ShadowAdmissionCandidate>
+      v2_shadow_admission_candidate;
+  // Value-only execution classification consumed by the existing manager
+  // beta/publication seam.  It is not a legacy Pair/Epoch authority.
   phase_offset_navigation::RuntimeExecutionStatus runtime_execution;
   // NORMAL value-core evidence.  These are immutable copies for diagnostics
   // and tests; they do not add a second owner or execution authority.
@@ -515,185 +322,24 @@ struct MatchedAdapterOutput {
   phase_offset_navigation::ControlFailureReason control_failure_reason =
       phase_offset_navigation::ControlFailureReason::NONE;
   bool profile_active = false;
-  bool tube_update_due_this_cycle = false;
-  // Independent raw-candidate diagnostics are available only for the due
-  // MANUAL+ESDF attempt that generated them; they are not an 83/49 extension.
-  bool raw_candidate_diagnostics_generated = false;
-  std::array<double, kRawCandidateDiagnosticCount> raw_candidate_diagnostics = {{0.0}};
-  bool cloud_snapshot_diagnostics_generated = false;
-  std::array<double, kCloudSnapshotDiagnosticCount>
-      cloud_snapshot_diagnostics = {{0.0}};
   bool selected = false;
   bool valid = false;
   phase_offset_navigation::RecoveryStepStatus recovery_status =
       phase_offset_navigation::RecoveryStepStatus::NONE;
   bool recovery_replan_required = false;
   std::string invalid_reason;
-  std::array<double, kManualDiagnosticCount> diagnostics = {{0.0}};
 };
 
-// Immutable command -> timer handoff.  In particular it intentionally has no
-// SDFMap pointer, raw ContinuousPhasePath pointer, callback, or query object.
-// The timer may create local query adapters from the owned semantic path and
-// immutable cloud snapshot while it is building one epoch.
-struct TubeBuildRequest {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  bool active = false;
-  // New navigation tasks are distinct timer-owned evidence domains even when
-  // a planner happens to restart its local source revision at the same value.
-  // This token is private to the adapter and is never a ROS-facing field.
-  std::uint64_t task_generation = 0U;
-  std::uint64_t control_sequence = 0U;
-  std::uint64_t source_revision = 0U;
-  // Explicit frame/path provenance is carried beside the semantic source
-  // revision.  A frame-owner replacement is therefore observable even when
-  // the planner keeps the same numeric source revision.
-  std::uint64_t path_revision = 0U;
-  std::uint64_t frame_revision = 0U;
-  std::uint64_t authority_session = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  ros::Time stamp;
-  std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
-  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
-  // H2 same-path refresh is anchored to this immutable authority.  The timer
-  // may only replace its tube/profile if this exact pair is still live.
-  std::shared_ptr<const PathTubePair> base_path_tube_pair;
-  std::uint64_t base_path_tube_pair_generation = 0U;
-  double base_retained_delta = 0.0;
-  phase_offset_core::PortCommand base_previous_final_port;
-  double semantic_path_start_w = 0.0;
-  double semantic_path_end_w = 0.0;
-  std::shared_ptr<const MatchedAdapterPathSamples> supplied_path_samples;
-  phase_offset_core::PathDifferentialState current_path;
-  Eigen::Vector3d position = Eigen::Vector3d::Zero();
-  guidance::IsfGains gains;
-  double dt = 0.0;
-  double retained_delta = 0.0;
-  phase_offset_navigation::TubeBounds authority_request;
-  std::shared_ptr<const plan_env::CloudOccupancySnapshot> cloud_snapshot;
-};
-
-// Immutable timer -> command handoff.  It records the exact source/map facts
-// used for the build, as well as the diagnostic payloads that are pending a
-// timer-only publication after a command cycle has consumed this snapshot.
-struct TubeEpochSnapshot {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  bool active = false;
-  std::uint64_t task_generation = 0U;
-  std::uint64_t request_control_sequence = 0U;
-  std::uint64_t build_sequence = 0U;
-  std::uint64_t source_revision = 0U;
-  std::uint64_t path_revision = 0U;
-  std::uint64_t frame_revision = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  ros::Time request_stamp;
-  ros::Time completion_stamp;
-  std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
-  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
-  // Exact finite phase copied from TubeBuildRequest::current_path.w.  This is
-  // Candidate marker provenance for this immutable build and is independent
-  // of any later command-cycle ControlPublishSnapshot::current_w value.
-  double candidate_build_w = 0.0;
-  std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> candidate_profile;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
-  phase_offset_navigation::TubeEpochStatus epoch_status;
-  CloudOccupancyQueryStatus cloud_status;
-  bool raw_candidate_diagnostics_generated = false;
-  std::array<double, kRawCandidateDiagnosticCount>
-      raw_candidate_diagnostics = {{0.0}};
-  bool cloud_snapshot_diagnostics_generated = false;
-  std::array<double, kCloudSnapshotDiagnosticCount>
-      cloud_snapshot_diagnostics = {{0.0}};
-};
-
-// Private staging value for a future-seam handoff.  It is deliberately not a
-// published epoch: all profiles are newly built from its supplied new-owner
-// samples and it carries no Candidate/Active authority.
-struct PreparedTubeBuildResult {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  bool complete = false;
-  std::uint64_t source_revision = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  // Keep the semantic owner and immutable map evidence that were used for
-  // this uncommitted build.  A PreparedTubeBuildResult must never rely on a
-  // stack-local query closure surviving the staging manager.
-  std::shared_ptr<const ContinuousPhasePath> semantic_path_owner;
-  std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner;
-  std::shared_ptr<const plan_env::CloudOccupancySnapshot>
-      frozen_cloud_occupancy_snapshot;
-  // These are facts verified from the actual prepared samples/profile, not
-  // caller assertions.  H2-3 uses them to revalidate a future-seam commit.
-  double prepared_start_w = 0.0;
-  double prepared_end_w = 0.0;
-  double captured_w0 = 0.0;
-  double future_seam_w = 0.0;
-  double existing_future_horizon_end_w = 0.0;
-  std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile> active_profile;
-  phase_offset_navigation::TubeEpochStatus epoch_status;
-};
-
-// Transaction-local owner proof used only to avoid re-evaluating an exact
-// captured knot while H2 stages one immutable replacement.  It is never stored
-// in Runtime, Pair, or any cross-callback cache.
-struct CanonicalOwnerStateReuse {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  std::shared_ptr<const ContinuousPhasePath> owner;
-  phase_offset_core::PathDifferentialState state;
-  const MatchedAdapterPathSamples* verified_samples = nullptr;
-  std::uint64_t task_generation = 0U;
-  std::uint64_t source_revision = 0U;
-  std::uint64_t authority_session = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  bool valid = false;
-};
-
-// Immutable command -> timer publication handoff.  `epoch_snapshot` is the
-// exact epoch that Runtime consumed for this control step; the remaining
-// fields are value copies so marker/83/50 publication never reads Runtime.
-struct ControlPublishSnapshot {
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  // These are the command-cycle facts which created this publication
-  // snapshot.  The candidate epoch below retains its own immutable map
-  // provenance: a newer observation does not invalidate a completed,
-  // same-source profile by itself.
+// Lean command-to-worker transport. It carries no legacy Candidate/Active/
+// Epoch state and grants no publication authority.
+struct TubeBuildRequestV2 {
   bool active = false;
   std::uint64_t task_generation = 0U;
   std::uint64_t control_sequence = 0U;
-  std::uint64_t source_revision = 0U;
-  std::uint64_t map_observation_sequence = 0U;
-  bool map_observation_is_snapshot = false;
-  std::uint64_t candidate_epoch_source_revision = 0U;
-  std::uint64_t candidate_epoch_map_observation_sequence = 0U;
-  bool candidate_epoch_map_observation_is_snapshot = false;
-  // True means the current request cannot use the epoch as Runtime input
-  // under the existing cloud-observation contract.  It is publishable
-  // Candidate evidence, never a Runtime or Certified input.
-  bool candidate_only = false;
-  std::uint64_t epoch_build_sequence = 0U;
-  ros::Time stamp;
-  // Exact command-cycle phase retained for command/diagnostic evidence.  It
-  // must not substitute for the selected Candidate epoch's build provenance.
-  double current_w = 0.0;
-  Eigen::Vector3d position = Eigen::Vector3d::Zero();
-  std::shared_ptr<const TubeEpochSnapshot> epoch_snapshot;
-  std::shared_ptr<const MatchedAdapterPathSamples> full_path_samples;
-  // Command/diagnostic publication is tied to one immutable execution
-  // authority snapshot.  The timer consumes this value-only handoff and
-  // cannot observe a different selected-u transaction.
-  std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
-      authority_snapshot;
-  MatchedAdapterOutput output;
+  double current_w = std::numeric_limits<double>::quiet_NaN();
+  std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
+      tube_worker_input_v2;
+  TubeWorkerPurposeV2 tube_worker_purpose_v2 = TubeWorkerPurposeV2::CURRENT;
 };
 
 struct DeactivationCommitToken {
@@ -703,10 +349,7 @@ struct DeactivationCommitToken {
   std::uint64_t next_control_sequence = 0U;
   bool command_active_before = false;
   bool valid = false;
-  std::shared_ptr<const TubeBuildRequest> inactive_request;
-  std::shared_ptr<const TubeEpochSnapshot> inactive_candidate_snapshot;
-  std::shared_ptr<const TubeEpochSnapshot> inactive_epoch_snapshot;
-  std::shared_ptr<const ControlPublishSnapshot> inactive_control;
+  std::shared_ptr<const TubeBuildRequestV2> inactive_request;
 };
 
 // Immutable command-side capture used to bind the governor's reference query
@@ -719,15 +362,8 @@ struct PendingPositionCommandCapture {
   bool valid = false;
   std::uint64_t identity = 0U;
   phase_offset_navigation::ImmutableExecutedReferenceQueryPtr reference_query;
-};
-
-struct MatchedAdapterMarkerBundle {
-  visualization_msgs::Marker base_path;
-  visualization_msgs::Marker active_path;
-  visualization_msgs::MarkerArray frame;
-  visualization_msgs::MarkerArray tube;
-  visualization_msgs::MarkerArray tube_candidate;
-  visualization_msgs::MarkerArray tube_certified_geometry;
+  bool v2_binding_transition = false;
+  std::shared_ptr<const TubeV2ExecutionBinding> proposed_v2_binding;
 };
 
 class PhaseOffsetMatchedAdapter {
@@ -745,56 +381,14 @@ class PhaseOffsetMatchedAdapter {
   // true after an offset profile has executed (or a nonzero retained delta is
   // live); pending configuration alone must not force terminal H2 denial.
   bool requiresAuthoritativeOffsetHandoff() const;
-  // The activation edge is the only time a neutral Runtime may request its
-  // first PathTubePair.  Before this edge, configured manual amplitude is
-  // observation/intent only and the planner remains the command owner.
-  // A true result means the zero-port gate is open, Runtime is still neutral,
-  // no pair is installed, and the pending profile must be proven atomically
-  // before it can issue its first nonzero port.  Runtime bootstrap is
-  // permitted only for an unadvertised test fixture while the existing
-  // execution-authority test-only owner capability is enabled; advertise()
-  // clears that capability for passive production NORMAL.
-  bool requiresPathTubePairBootstrap() const;
-  // A committed pair may be passed to Runtime for the one activation command
-  // even though Runtime has not yet committed its first nonzero port.  The
-  // command guidance remains on the planner owner until that commit occurs.
-  // An advertised production adapter never reports a Runtime pair as pending
-  // activation because Runtime is not the production NORMAL owner.
-  bool hasPendingOffsetActivationPair(
-      const std::shared_ptr<const PathTubePair>& pair) const;
   // Begin bounded in-owner recentering after a successor denial.  This does
   // not clear the pair, delta, or planner authority; Runtime retires the
   // profile only after an exact accepted step reaches neutral.
   bool requestRecenter();
   bool recenterRequested() const;
-  // A bootstrap has no old pair whose certified end can be retained.  Reuse
-  // the existing manager installation horizon and cap it by the immutable
-  // path; this is not a new handoff threshold.
-  double bootstrapPreparedHorizonEnd(double current_w,
-                                     double future_seam_w,
-                                     double path_end_w) const;
-  // Captures the single H2 control authority.  A non-null return value is
-  // immutable for the caller's entire command; consumers must not combine it
-  // with the legacy GVF path mirror or the timer's evidence slots.
-  std::shared_ptr<const PathTubePair> capturePathTubePair() const;
-  // Atomically captures the exact authoritative pair and Runtime history,
-  // then acquires the sole H2 transaction lease before returning.  It is the
-  // required entry point before any future seam enumeration or connector
-  // work; null means no exact pair or another transaction already owns it.
-  std::unique_ptr<PathTubePairPin> captureAndAcquirePathTubePairPin();
-  // Retires only H2 ownership/timer evidence.  Runtime's retained delta and
-  // previous final port deliberately survive.  If executed offset authority
-  // survives, it remains unpaired/fail-closed until an authorized recovery;
-  // only pending neutral intent may use a following bootstrap.
-  // `authority_session` is manager-owned and monotonically changes on each
-  // goal/reset.
-  std::uint64_t retirePathTubeAuthority(std::uint64_t authority_session);
-  // A user-issued navigation goal is a new path-coordinate task, not an H2
-  // replacement.  Under the command boundary it retires all old authority
-  // and neutralizes only Runtime task history.  The exact expected session
-  // prevents a stale goal callback from clearing a newer task.
-  bool resetForNewNavigationTask(std::uint64_t expected_authority_session,
-                                 std::uint64_t& retired_authority_session);
+  // A user-issued navigation goal starts a new V2 execution generation and
+  // retires every request, completion, binding and pending publication token.
+  bool resetForNewNavigationTask();
   void advertise(ros::NodeHandle& private_nh);
   bool update(const MatchedAdapterInput& input, MatchedAdapterOutput& output);
   // Discard only a staged production transaction.  Authority/Runtime commit
@@ -816,29 +410,36 @@ class PhaseOffsetMatchedAdapter {
   bool publishPendingPositionCommand(
       const std::function<bool()>& local_publish,
       std::uint64_t expected_identity = 0U,
-      bool cancel_pending_for_goal_override = false);
-  // Called only by the manager's 10 Hz MANUAL timer (or deterministically by
-  // an owning test).  It is non-reentrant and owns all TubeEpochManager work.
+      bool cancel_pending_for_goal_override = false,
+      const std::function<void()>& post_publish_no_fail =
+          std::function<void()>());
+  // Compatibility entry point for the manager timer; it is scheduler-only.
   bool timerTick();
   // Scheduler-only production entry point.  One call represents one ROS Tube
   // timer event and creates at most one pending worker permit.  It never
   // performs heavy Tube construction on the caller thread.
   bool scheduleTubeBuild();
-  // Nonblocking neutral-to-offset bootstrap rendezvous.  The command side
-  // arms this state after publishing a complete no-Pair TubeBuildRequest;
-  // the timer claims at most one freshly finalized READY epoch and performs
-  // the existing handoff transaction outside this adapter.  No call waits.
-  BootstrapRendezvousState bootstrapRendezvousState() const;
-  bool claimBootstrapRendezvous(BootstrapRendezvousTicket& ticket);
-  bool validateBootstrapRendezvousClaim(
-      const BootstrapRendezvousTicket& ticket) const;
-  // `bootstrap_succeeded` is the result of the caller's final Pair CAS.  A
-  // failed transaction releases only the matching claim and leaves ARMED (or
-  // a newer READY) so a later fresh epoch can retry.  A successful CAS clears
-  // the rendezvous completely.  Late/mismatched completions are harmless.
-  bool completeBootstrapRendezvous(
-      const BootstrapRendezvousTicket& ticket,
-      bool bootstrap_succeeded);
+  // Current task generation used to bind immutable manager-built requests.
+  // The value is monotonic and grants no execution or publication authority.
+  std::uint64_t executionGenerationV2() const;
+  // Capture the exact installed V2 source identity for a copied-prefix
+  // successor request.  This is immutable transport evidence only; it does
+  // not expose or mutate Runtime delta/port state.
+  bool captureV2SuccessorSource(
+      phase_offset_navigation::TubePathKey& source_path_key,
+      std::uint64_t& execution_generation,
+      std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
+          source_input) const;
+  // Captures the one committed immutable V2 binding.  It is value/owner
+  // evidence only and never grants a second commit path.
+  std::shared_ptr<const TubeV2ExecutionBinding>
+  captureV2ExecutionBinding() const;
+  // Queue one immutable successor proof on the adapter-owned V2 worker.
+  // The source key must still name the installed incumbent.  Submission is
+  // nonblocking and never invokes TubeCertificateBuilderV2 on the caller.
+  bool enqueueV2SuccessorRequest(
+      const phase_offset_navigation::TubePathKey& source_path_key,
+      const phase_offset_navigation::TubeBuildInputV2& successor_input);
   // Command-thread transition used when no goal/path is active.  It clears
   // only async request/tube exposure and queues one timer-side DELETE; Runtime
   // execution state (delta, previous port, profile lifecycle) is preserved.
@@ -846,58 +447,9 @@ class PhaseOffsetMatchedAdapter {
   // Manager shutdown order is: set this flag, stop the ROS timer, wait for an
   // in-flight tick, clear the atomic snapshots, then destroy this adapter.
   void requestShutdown();
-  void shutdown();
-  bool buildMarkers(const MatchedAdapterInput& input,
-                    const MatchedAdapterOutput& output,
-                    MatchedAdapterMarkerBundle& markers) const;
-
+ void shutdown();
  private:
-  using PathSamples = MatchedAdapterPathSamples;
-  struct TubeDueTimingSample {
-    std::uint64_t sequence = 0U;
-    std::uint64_t steady_duration_ns = 0U;
-    std::uint64_t ros_stamp_ns = 0U;
-    bool source_current_finalized = false;
-    bool raw_cloud_publish_attempted = false;
-    // P1 bounded construction/proof accounting captured from the immutable
-    // Candidate profile produced by this due build.  These fields are
-    // measurement-only and do not participate in Stage-1A scheduling or
-    // lifecycle semantics.
-    std::size_t cross_section_directional_query_count = 0U;
-    std::size_t adaptive_refinement_centerline_query_count = 0U;
-    std::size_t adaptive_sample_base_clearance_query_count = 0U;
-    std::size_t builder_certified_cell_bound_query_count = 0U;
-    std::size_t validator_certified_cell_bound_query_count = 0U;
-    std::size_t certified_cell_bound_query_count = 0U;
-    std::size_t validator_surface_query_count = 0U;
-    std::size_t total_tube_construction_clearance_query_count = 0U;
-    std::size_t total_tube_construction_query_count = 0U;
-    std::size_t surface_validator_invocation_count = 0U;
-    std::size_t inward_search_attempt_count = 0U;
-    double max_bounded_construction_abs_delta = 0.0;
-    double effective_nominal_half_width_m = 0.0;
-    int nominal_width_source = 0;
-    bool nominal_width_legacy_conflict = false;
-  };
-
-  bool collectSamples(const TubeBuildRequest& request,
-                      PathSamples& full_path) const;
-  bool makePreview(const PathSamples& full_path,
-                   const phase_offset_core::PathDifferentialState& current,
-                   PathSamples& preview) const;
-  std::uint64_t sourceRevision(const MatchedAdapterInput& input);
   bool requiresAuthoritativeOffsetHandoffLocked() const;
-  // These two predicates intentionally share the authority configuration's
-  // existing test-only Runtime-owner capability.  They must not arm or retain
-  // passive production Runtime intent after advertise() clears that fact.
-  bool requiresPathTubePairBootstrapLocked() const;
-  bool hasPendingOffsetActivationPairLocked(
-      const std::shared_ptr<const PathTubePair>& pair) const;
-  std::uint64_t retirePathTubeAuthorityLocked(
-      std::uint64_t authority_session);
-  bool retirePathTubeAuthorityIfNeutral(
-      std::uint64_t authority_session,
-      std::uint64_t& retired_session);
   void deactivateLocked(const ros::Time& stamp,
                         std::uint64_t expected_task_generation);
   bool prepareDeactivationLocked(
@@ -905,535 +457,193 @@ class PhaseOffsetMatchedAdapter {
       DeactivationCommitToken& token) const;
   void commitDeactivationNoFailLocked(
       const DeactivationCommitToken& token) noexcept;
-  bool buildTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
-                      TubeEpochSnapshot& snapshot);
-  bool buildPreparedTubeEpoch(const TubeBuildRequest& request,
-                              const MatchedAdapterPathSamples& prepared_path,
-                              double prepared_start_w,
-                              double prepared_end_w,
-                              double future_seam_w,
-                              double existing_future_horizon_end_w,
-                              PreparedTubeBuildResult& result,
-                              phase_offset_navigation::TubeEpochUpdateResult*
-                                  temporary_epoch_result = nullptr,
-                              std::string* temporary_failure_layer = nullptr,
-                              const CanonicalOwnerStateReuse*
-                                  canonical_owner_state = nullptr) const;
-  // Attribution only: classify a failed staged update without changing Tube
-  // acceptance, Runtime, or the builder/validator pipeline.
-  static PathTubePairStageFailure classifyTubeUpdateStatusStageFailure(
-      const phase_offset_navigation::TubeEpochUpdateResult& staged);
-  bool dryRunPreparedRuntime(
-      const PreparedTubeBuildResult& prepared_tube,
-      const phase_offset_core::PathDifferentialState& current_path,
-      const Eigen::Vector3d& position,
-      const guidance::IsfGains& gains,
-      double dt,
-      phase_offset_navigation::RuntimeDryRunResult& result) const;
-  bool dryRunPreparedRuntime(
-      phase_offset_navigation::PhaseOffsetRuntime& runtime_snapshot,
-      const PreparedTubeBuildResult& prepared_tube,
-      const phase_offset_core::PathDifferentialState& current_path,
-      const Eigen::Vector3d& position,
-      const guidance::IsfGains& gains,
-      double dt,
-      phase_offset_navigation::RuntimeDryRunResult& result) const;
-  bool stagePathTubePair(
-      const std::shared_ptr<const PathTubePair>& expected_pair,
-      const std::shared_ptr<const ContinuousPhasePath>& new_path_owner,
-      const MatchedAdapterPathSamples& new_path_samples,
-      double captured_w0,
-      double future_seam_w,
-      double existing_future_horizon_end_w,
-      const Eigen::Vector3d& position,
-      const guidance::IsfGains& gains,
-      double dt,
-      const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-          frozen_cloud_occupancy_snapshot,
-      PathTubePairTransaction& transaction,
-      std::uint64_t authority_session = 0U,
-      const PathTubePairPinCapture* expected_capture = nullptr,
-      std::uint64_t pin_lease_id = 0U,
-      PathTubePairStageFailure* temporary_failure = nullptr);
-  bool preparePathTubePairCommit(
-      const PathTubePairTransaction& transaction,
-      double current_w,
-      const Eigen::Vector3d& position,
-      const guidance::IsfGains& gains,
-      double dt,
-      const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-          latest_cloud_occupancy_snapshot,
-      PathTubePairCommitPreparation& preparation);
-  bool finalizePreparedPathTubePairCommit(
-      const PathTubePairCommitPreparation& preparation,
-      std::shared_ptr<const PathTubePair>& committed_pair,
-      const BootstrapRendezvousTicket* rendezvous_ticket = nullptr);
-  // Timer-only completion protocol.  It accepts a completed epoch when its
-  // immutable path source is still current; its frozen map snapshot remains
-  // the epoch's provenance rather than an equality key for later commands.
-  bool finalizeTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
-                         const TubeEpochSnapshot& snapshot);
-  struct BootstrapRendezvousIdentity {
-    std::uint64_t task_generation = 0U;
-    std::uint64_t authority_session = 0U;
-    std::uint64_t source_revision = 0U;
-    std::uint64_t path_revision = 0U;
-    std::uint64_t frame_revision = 0U;
-    const ContinuousPhasePath* semantic_path_owner = nullptr;
-    const ContinuousPhaseNormalFrame* frame_owner = nullptr;
+  std::shared_ptr<const TubeBuildRequestV2> makeBuildRequestV2(
+      const MatchedAdapterInput& input);
+  bool updateGate(const MatchedAdapterInput& input, MatchedAdapterOutput& output);
+  void clearPendingPositionCommandLocked();
+  bool validatePendingPositionCommandLocked(std::string* reason) const;
+  void latchFailure(phase_offset_navigation::ControlFailureReason reason);
 
-    bool valid() const {
-      return task_generation != 0U && source_revision != 0U &&
-          semantic_path_owner != nullptr;
+  // V2 worker deduplication is value based.  In particular this identity
+  // must not retain TubeBuildRequestV2 (or its immutable input owner)
+  // after an in-flight submit/completion no longer needs that object.  The
+  // complete immutable keys are retained so allocator ABA/reused addresses
+  // cannot make an unrelated request look like a duplicate.
+  struct V2ShadowRequestIdentity {
+    TubeWorkerPurposeV2 purpose = TubeWorkerPurposeV2::CURRENT;
+    std::uint64_t request_id = 0U;
+    std::uint64_t execution_generation = 0U;
+    std::uint64_t accepted_state_demand = 0U;
+    double useful_start = 0.0;
+    double useful_end = 0.0;
+    phase_offset_navigation::TubePathKey path_key;
+    phase_offset_navigation::TubeConfigurationKey configuration_key;
+    phase_offset_navigation::TubeMapCaptureKey map_capture_key;
+
+    bool valid() const { return request_id != 0U; }
+    bool operator==(const V2ShadowRequestIdentity& other) const {
+      return purpose == other.purpose && request_id == other.request_id &&
+          execution_generation == other.execution_generation &&
+          accepted_state_demand == other.accepted_state_demand &&
+          useful_start == other.useful_start && useful_end == other.useful_end &&
+          path_key == other.path_key &&
+          configuration_key == other.configuration_key &&
+          map_capture_key == other.map_capture_key;
     }
-    bool operator==(const BootstrapRendezvousIdentity& other) const {
-      return task_generation == other.task_generation &&
-          authority_session == other.authority_session &&
-          source_revision == other.source_revision &&
-          path_revision == other.path_revision &&
-          frame_revision == other.frame_revision &&
-          semantic_path_owner == other.semantic_path_owner &&
-          frame_owner == other.frame_owner;
-    }
-    bool operator!=(const BootstrapRendezvousIdentity& other) const {
+    bool operator!=(const V2ShadowRequestIdentity& other) const {
       return !(*this == other);
     }
   };
 
-  void clearBootstrapRendezvousLocked();
-  bool armBootstrapRendezvousLocked(
-      const std::shared_ptr<const TubeBuildRequest>& request);
-  bool candidateBootstrapRendezvousEligibleLocked(
-      const TubeBuildRequest& request,
-      const TubeEpochSnapshot& snapshot);
-  bool claimMatchesBootstrapRendezvousLocked(
-      const BootstrapRendezvousTicket& ticket) const;
-  bool bootstrapReadyEpochMatchesLocked(
-      const BootstrapRendezvousIdentity& identity,
-      std::uint64_t build_sequence) const;
-  void demoteBootstrapReadyLocked();
-  void recordBootstrapReadyLocked(const TubeBuildRequest& request,
-                                  const TubeEpochSnapshot& snapshot);
-  bool requestSourceStillCurrent(const TubeBuildRequest& request) const;
-  bool requestCloudSnapshotUsable(const TubeBuildRequest& request) const;
-  bool epochMatchesRequest(const TubeEpochSnapshot& epoch,
-                           const TubeBuildRequest& request) const;
-  // Timer-only task-boundary consumption.  The command callback publishes a
-  // new generation but never mutates these timer-owned objects directly.
-  void consumeTimerTaskGeneration(std::uint64_t task_generation);
-  bool refreshPairFromTimerEpoch(
-      const std::shared_ptr<const TubeBuildRequest>& request,
-      const std::shared_ptr<const TubeEpochSnapshot>& epoch);
-  bool prepareTimerPairRefresh(
-      const std::shared_ptr<const TubeBuildRequest>& request,
-      const std::shared_ptr<const TubeEpochSnapshot>& epoch,
-      TimerPairRefreshPreparation& preparation);
-  bool finalizePreparedTimerPairRefresh(
-      const TimerPairRefreshPreparation& preparation,
-      std::shared_ptr<const PathTubePair>& refreshed_pair);
-  std::shared_ptr<const TubeEpochSnapshot> makeCandidateOnlyEpoch(
-      const TubeEpochSnapshot& epoch) const;
-  bool makeAuthorityRequest(
-      double retained_delta,
-      phase_offset_navigation::TubeBounds& authority_request) const;
-  std::shared_ptr<const TubeBuildRequest> makeBuildRequest(
+  V2ShadowRequestIdentity makeV2ShadowRequestIdentity(
+      const TubeWorkerPurposeV2 purpose,
+      const phase_offset_navigation::TubeBuildInputV2& input) const;
+  void retainV2ShadowCompletionLocked(
+      const TubeWorkerCompletionV2& completion);
+  static bool candidateMarkerApplicableV2(
+      const TubeWorkerCompletionV2& completion, const TubeBuildRequestV2& request,
+      std::uint64_t generation, std::uint64_t now_ticks);
+  bool prepareV2ShadowAdmission(
       const MatchedAdapterInput& input,
-      std::uint64_t source_revision,
-      double retained_delta = 0.0);
-  std::shared_ptr<const TubeEpochSnapshot> matchingEpochForRequest(
-      const std::shared_ptr<const TubeBuildRequest>& request) const;
-  void makeControlPublishSnapshot(
+      const std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
+          source,
+      const std::shared_ptr<const TubeWorkerCompletionV2>& completion,
+      std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate,
+      TubeWorkerPurposeV2 purpose = TubeWorkerPurposeV2::CURRENT);
+  bool prepareV2ShadowSuccessorAdmission(
       const MatchedAdapterInput& input,
-      const std::shared_ptr<const TubeBuildRequest>& request,
-      const std::shared_ptr<const TubeEpochSnapshot>& epoch,
-      bool candidate_only,
-      const MatchedAdapterOutput& output);
-  bool updateGate(const MatchedAdapterInput& input, MatchedAdapterOutput& output);
-  void fillLegacyTubeStatus(MatchedAdapterOutput& output) const;
-  bool tubeDisplayCertified(const MatchedAdapterOutput& output) const;
-  void fillManualDiagnostics(MatchedAdapterOutput& output) const;
-  // Runtime::complete is evaluated only on a local value copy.  The exact
-  // selected port and resulting state cross the serialized execution
-  // authority before the live Runtime is replaced; a rejected authority
-  // transaction therefore cannot mutate command state.
-  bool completeThroughExecutionAuthority(
+      const TubeV2SuccessorHandoffEvidence& handoff,
+      const std::shared_ptr<const TubeWorkerCompletionV2>& completion,
+      std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate);
+  bool prepareV2ShadowIncumbentApplicability(
       const MatchedAdapterInput& input,
-      const std::shared_ptr<const PathTubePair>& pair,
-      const std::shared_ptr<const TubeBuildRequest>& request,
-      const std::shared_ptr<const TubeEpochSnapshot>& epoch,
-      const phase_offset_navigation::RuntimePreparedStep& prepared,
-      const Eigen::Vector3d& base_v_cmd,
-      double base_w_dot,
-      bool base_guidance_valid,
-      phase_offset_navigation::RuntimeStepOutput& output,
-      const phase_offset_navigation::PhaseOffsetAllocatorResult*
-          allocator_result = nullptr);
-  bool evaluateNormalAllocator(
+      const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>&
+          incumbent,
+      std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate,
+      phase_offset_navigation::RecoveryPreparedStep* recovery_step = nullptr,
+      bool force_reserve = false);
+  bool evaluateV2NormalAllocator(
       const MatchedAdapterInput& input,
-      const phase_offset_navigation::RuntimePreparedStep& prepared,
-      double base_w_dot,
+      const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>&
+          profile,
+      phase_offset_core::PhaseOffsetGeometryState& geometry,
+      guidance::IsfGuidance& base,
       phase_offset_navigation::NormalPreviewResult& preview,
       phase_offset_navigation::PhaseOffsetAllocatorResult& allocator,
       Eigen::Vector3d& g_des,
-      std::string& failure_reason) const;
-  bool completeThroughRecoveryOwner(
+      std::string& reason) const;
+  bool stageV2ShadowBootstrapLocked(
       const MatchedAdapterInput& input,
-      const std::shared_ptr<const PathTubePair>& pair,
-      const std::shared_ptr<const PathTubePair>& successor_pair,
-      const phase_offset_navigation::RuntimePreparedStep& prepared,
-      const Eigen::Vector3d& base_v_cmd,
-      double base_w_dot,
-      bool base_guidance_valid,
-      phase_offset_navigation::RuntimeStepOutput& output);
-  bool completeAtomicNeutralHandoff(
+      const phase_offset_navigation::TubeBuildInputV2& source,
+      const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate);
+  bool stageV2ShadowRecoveryLocked(
       const MatchedAdapterInput& input,
-      const std::shared_ptr<const PathTubePair>& pair,
-      const phase_offset_navigation::RuntimePreparedStep& prepared,
-      const Eigen::Vector3d& base_v_cmd,
-      double base_w_dot,
-      bool base_guidance_valid,
-      phase_offset_navigation::RuntimeStepOutput& output);
-  void clearPendingPositionCommandLocked();
-  bool validatePendingPositionCommandLocked(std::string* reason) const;
-  static bool exactLivePairPublicationControl(
-      const ControlPublishSnapshot& control,
-      const TubeBuildRequest& request,
-      const std::shared_ptr<const PathTubePair>& live_pair,
-      std::uint64_t current_task_generation,
-      std::uint64_t current_authority_session);
-  static std::shared_ptr<const TubeEpochSnapshot>
-  selectCandidateEpochForPublication(
-      bool exact_live_pair_control,
-      const std::shared_ptr<const TubeEpochSnapshot>& authoritative_candidate,
-      const std::shared_ptr<const TubeEpochSnapshot>& control_epoch);
-  // Stateless R3 predicate.  It validates only immutable ESDF Candidate
-  // geometry/provenance and never consults Runtime, Pair, Active ownership,
-  // selected-u or execution state.
-  static bool certifiedGeometryCandidateEligible(
-      const TubeBuildRequest& request,
-      const TubeEpochSnapshot& candidate,
-      std::uint64_t current_task_generation);
-  bool buildMarkers(const ControlPublishSnapshot& control,
-                    MatchedAdapterMarkerBundle& markers) const;
-  bool buildMarkers(
-      const ControlPublishSnapshot& control,
-      const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
-          candidate_marker_profile,
-      MatchedAdapterMarkerBundle& markers) const;
-  bool buildMarkers(
-      const ControlPublishSnapshot& control,
-      const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
-          candidate_marker_profile,
-      double candidate_anchor_w,
-      MatchedAdapterMarkerBundle& markers) const;
-  bool buildMarkers(
-      const ControlPublishSnapshot& control,
-      const std::shared_ptr<const TubeEpochSnapshot>& candidate_epoch,
-      MatchedAdapterMarkerBundle& markers) const;
-  bool markEpochBuildPublished(std::uint64_t build_sequence);
-  void publishBuildDiagnostics(const TubeEpochSnapshot& epoch);
-  // Timer-owned R3 marker decision.  The request/Candidate/request loads and
-  // final request identity reread form the publication linearization point;
-  // the caller publishes this already-linearized three-marker bundle.
-  visualization_msgs::MarkerArray certifiedGeometryMarkers(
-      const ros::Time& stamp) const;
-  void publishManual(const ControlPublishSnapshot& control);
-  void publishManualDelete(const ControlPublishSnapshot& control);
-  void latchFailure(phase_offset_navigation::ControlFailureReason reason);
-  void recordTubeDueTiming(std::uint64_t steady_duration_ns,
-                           std::uint64_t ros_stamp_ns,
-                           bool source_current_finalized,
-                           bool raw_cloud_publish_attempted,
-                           const phase_offset_navigation::TubeBuildDiagnostics*
-                               diagnostics = nullptr);
-  void flushTubeDueTiming();
-
-  // Immutable request identity used by the one-slot scheduler.  Pointer
-  // identity plus task generation prevents a repeated timer permit from
-  // rebuilding the exact same immutable request after completion.
-  struct RequestInstanceIdentity {
-    // Keep the immutable object alive while its identity is retained in the
-    // scheduler bookkeeping; otherwise a later allocation could reuse the
-    // same raw address and look like a duplicate request.
-    std::shared_ptr<const TubeBuildRequest> request_owner;
-    const TubeBuildRequest* request = nullptr;
-    std::uint64_t task_generation = 0U;
-
-    bool valid() const { return request != nullptr; }
-    bool operator==(const RequestInstanceIdentity& other) const {
-      return request == other.request &&
-          task_generation == other.task_generation;
-    }
-    bool operator!=(const RequestInstanceIdentity& other) const {
-      return !(*this == other);
-    }
-  };
-
-  // Semantic Tube work identity.  It is intentionally richer than a request
-  // sequence so stale owner/frame/pair replacements cannot publish an old
-  // result when a planner reuses a numeric source revision.
-  struct TubeWorkIdentity {
-    std::uint64_t task_generation = 0U;
-    bool active = false;
-    std::uint64_t source_revision = 0U;
-    std::uint64_t path_revision = 0U;
-    std::uint64_t frame_revision = 0U;
-    std::uint64_t authority_session = 0U;
-    bool shutdown_invalidated = false;
-    const ContinuousPhasePath* semantic_path_owner = nullptr;
-    const ContinuousPhaseNormalFrame* frame_owner = nullptr;
-    const PathTubePair* base_path_tube_pair = nullptr;
-    std::uint64_t base_path_tube_pair_generation = 0U;
-
-    bool operator==(const TubeWorkIdentity& other) const {
-      return task_generation == other.task_generation &&
-          active == other.active && source_revision == other.source_revision &&
-          path_revision == other.path_revision &&
-          frame_revision == other.frame_revision &&
-          authority_session == other.authority_session &&
-          shutdown_invalidated == other.shutdown_invalidated &&
-          semantic_path_owner == other.semantic_path_owner &&
-          frame_owner == other.frame_owner &&
-          base_path_tube_pair == other.base_path_tube_pair &&
-          base_path_tube_pair_generation ==
-              other.base_path_tube_pair_generation;
-    }
-    bool operator!=(const TubeWorkIdentity& other) const {
-      return !(*this == other);
-    }
-  };
-
-  struct SchedulePermit {
-    std::uint64_t permit_id = 0U;
-    std::shared_ptr<const TubeBuildRequest> request;
-    RequestInstanceIdentity request_identity;
-    TubeWorkIdentity work_identity;
-  };
-
-  // Worker-local transactional copy.  Heavy construction mutates only this
-  // value; its ordinary state is committed after the currentness gate passes.
-  struct TubeJobLocalState {
-    bool pair_refresh = false;
-    std::unique_ptr<phase_offset_navigation::TubeEpochManager>
-        tube_epoch_manager;
-    PathSamples cached_full_path_samples;
-    std::uint64_t cached_path_source_revision = 0U;
-    bool have_cached_path = false;
-    std::shared_ptr<const phase_offset_navigation::TubeProfile>
-        timer_active_profile;
-    std::uint64_t timer_installed_active_epoch = 0U;
-    CloudOccupancyQueryStatus latest_cloud_occupancy_query_status;
-    std::uint64_t timer_task_generation = 0U;
-    std::uint64_t timer_build_sequence = 0U;
-  };
-
-  TubeWorkIdentity makeTubeWorkIdentity(
-      const std::shared_ptr<const TubeBuildRequest>& request) const;
-  RequestInstanceIdentity makeRequestInstanceIdentity(
-      const std::shared_ptr<const TubeBuildRequest>& request) const;
-  bool runTubeBuildJob(const SchedulePermit& permit);
-  void tubeWorkerMain();
+      const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate);
+  bool stageV2ShadowSuccessorLocked(
+      const MatchedAdapterInput& input,
+      const TubeV2SuccessorHandoffEvidence& handoff,
+      const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate);
+  bool prepareV2ExecutionAuthorityLocked(
+      const MatchedAdapterInput& input,
+      const MatchedAdapterOutput& output,
+      phase_offset_navigation::ActiveReferenceOwnerMode owner_mode,
+      const std::shared_ptr<const TubeV2ExecutionBinding>& binding,
+      TubeV2ShadowAdmissionCandidate& candidate,
+      std::string* reason);
+  bool validatePendingV2ShadowBootstrapLocked(std::string* reason) const;
+  bool scheduleV2ShadowBuild();
+  void consumeV2ShadowCompletions();
+  void publishV2TubeMarkers(const ros::Time& stamp);
   void joinTubeWorker();
-  void prepareTubeJobLocalState(const SchedulePermit& permit,
-                                TubeJobLocalState& state);
-  void commitTubeJobLocalState(TubeJobLocalState& state);
-  bool buildTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
-                      TubeEpochSnapshot& snapshot,
-                      TubeJobLocalState* job_state);
-  bool processInactiveTubeRequest(
-      const std::shared_ptr<const TubeBuildRequest>& request);
-  bool finalizeTubeEpoch(const std::shared_ptr<const TubeBuildRequest>& request,
-                         const TubeEpochSnapshot& snapshot,
-                         TubeJobLocalState* job_state);
+
+  struct TubeMarkerIdentityV2 {
+    std::uint64_t execution_generation = 0U;
+    std::uint64_t path_instance_id = 0U;
+    std::uint64_t profile_id = 0U;
+    std::uint64_t request_id = 0U;
+    std::uint64_t map_state_id = 0U;
+    bool valid = false;
+
+    bool operator==(const TubeMarkerIdentityV2& other) const {
+      return execution_generation == other.execution_generation &&
+          path_instance_id == other.path_instance_id &&
+          profile_id == other.profile_id && request_id == other.request_id &&
+          map_state_id == other.map_state_id && valid == other.valid;
+    }
+    bool operator!=(const TubeMarkerIdentityV2& other) const {
+      return !(*this == other);
+    }
+  };
 
   friend class gvf_manager;
   friend class GvfManagerS4AnchorTestAccess;
 
   PhaseOffsetMatchedAdapterConfig config_;
   bool configuration_valid_ = false;
-  // Command callback ownership: Runtime, gate/latch, source revision, and
-  // control-publication snapshot construction never run on the tube timer.
   PhaseOffsetActiveAdapter zero_port_adapter_;
   std::unique_ptr<phase_offset_navigation::PhaseOffsetRuntime> runtime_;
-  // Sole mutable execution-state authority for selected-u/runtime commits.
-  // H2 pair ownership remains a separate immutable handoff contract.
+  // Runtime/recovery own V2 execution state; this retained authority publishes
+  // the task-level execution identity at the existing command boundary.
   phase_offset_navigation::PhaseOffsetExecutionAuthority execution_authority_;
   phase_offset_navigation::PhaseOffsetRecoveryOwner recovery_owner_;
-  phase_offset_navigation::HandoffStateMachine handoff_state_machine_;
-  // Deferred production transaction.  The token is a bounded value DTO,
-  // never a copied Runtime/path/profile, and remains staging only until a
-  // successful local PositionCommand publication is reported.
-  phase_offset_navigation::RuntimeCommitToken pending_runtime_commit_;
-  phase_offset_navigation::AuthorityPreparedStep pending_authority_prepared_;
-  phase_offset_navigation::RecoveryPreparedStep pending_recovery_step_;
-  bool pending_recovery_step_valid_ = false;
-  phase_offset_navigation::HandoffStateInput pending_handoff_input_;
-  phase_offset_navigation::HandoffDecision pending_handoff_decision_;
-  bool pending_handoff_valid_ = false;
-  // A production NORMAL transaction is bound to the exact immutable Pair
-  // used for its C1/C2 preparation.  Final publication must reject any
-  // timer replacement that wins the live Pair CAS before this command is
-  // published; revisions alone are not sufficient identity.
-  std::shared_ptr<const PathTubePair> pending_normal_source_pair_;
-  // A RECOVERY snapshot may intentionally execute against a staged successor
-  // before the manager can install that pair.  Keep both immutable pair
-  // identities bound to the pending PositionCommand: the source is the exact
-  // live predecessor captured for this tick, while execution is the exact
-  // source/target pair whose geometry/query produced the candidate.  Final
-  // publication accepts only these shared_ptr identities, never a same-
-  // revision clone assembled from independent slots.
-  std::shared_ptr<const PathTubePair> pending_recovery_source_pair_;
-  std::shared_ptr<const PathTubePair> pending_recovery_execution_pair_;
-  std::shared_ptr<const PathTubePair> pending_recovery_target_pair_;
-  double recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
-  std::uint64_t recovery_deadline_session_ = 0U;
-  std::uint64_t recovery_deadline_target_revision_ = 0U;
-  std::uint64_t pending_authority_session_ = 0U;
-  bool pending_authority_valid_ = false;
-  // Runtime is command-owned.  Staging takes only a short snapshot/dry-run
-  // lock; it never holds this lock while constructing a path or tube.
   mutable std::mutex runtime_command_mutex_;
   int zero_gate_consecutive_count_ = 0;
   bool zero_gate_open_ = false;
   bool failure_latched_ = false;
   phase_offset_navigation::ControlFailureReason control_failure_reason_ =
       phase_offset_navigation::ControlFailureReason::NONE;
-  int manual_invalid_count_ = 0;
-  int manual_fallback_count_ = 0;
-  const void* source_identity_ = nullptr;
-  double source_start_w_ = 0.0;
-  double source_end_w_ = 0.0;
-  bool have_source_identity_ = false;
-  std::uint64_t source_revision_ = 0U;
-  std::uint64_t last_preflight_revision_ = 0U;
-  bool have_preflight_revision_ = false;
   std::uint64_t control_sequence_ = 0U;
-  std::uint64_t last_consumed_epoch_build_sequence_ = 0U;
   bool command_active_ = false;
-
-  // Neutral-to-offset bootstrap rendezvous.  All fields below are protected
-  // by runtime_command_mutex_; the ticket never carries profile/cloud data.
-  BootstrapRendezvousState bootstrap_rendezvous_state_ =
-      BootstrapRendezvousState::DISARMED;
-  BootstrapRendezvousIdentity bootstrap_rendezvous_arm_;
-  BootstrapRendezvousIdentity bootstrap_rendezvous_ready_;
-  std::uint64_t bootstrap_rendezvous_ready_build_sequence_ = 0U;
-  std::uint64_t bootstrap_rendezvous_watermark_ = 0U;
-  BootstrapRendezvousTicket bootstrap_rendezvous_claim_;
-  bool bootstrap_rendezvous_claim_active_ = false;
-  std::uint64_t bootstrap_rendezvous_next_claim_id_ = 0U;
-  bool bootstrap_rendezvous_armed_logged_ = false;
-  bool bootstrap_rendezvous_ready_logged_ = false;
-
-  // Cross-thread slots.  Every access uses std::atomic_load/store on the
-  // shared_ptr; no raw pointer or mutable object is shared between callbacks.
-  std::shared_ptr<const TubeBuildRequest> latest_build_request_;
-  // Latest completed Candidate evidence, including its immutable map
-  // provenance.  A later observation alone does not erase same-source
-  // Candidate evidence.
-  std::shared_ptr<const TubeEpochSnapshot> latest_candidate_epoch_snapshot_;
-  // Runtime-eligible epoch only: it is stored only when the path source still
-  // matches and the current request satisfies the existing cloud contract.
-  std::shared_ptr<const TubeEpochSnapshot> latest_epoch_snapshot_;
-  std::shared_ptr<const ControlPublishSnapshot> latest_control_snapshot_;
-  // The sole H2 control authority.  Candidate/epoch evidence above remains
-  // timer/display state only and is never consulted when an input carries a
-  // PathTubePair.
-  std::shared_ptr<const PathTubePair> authoritative_path_tube_pair_;
-  std::uint64_t next_path_tube_pair_generation_ = 0U;
-  // This registry represents transaction ownership rather than a Runtime
-  // mode/gate.  Guards retain it independently so late teardown cannot touch
-  // a destroyed adapter instance.
-  std::shared_ptr<PathTubePairPinRegistry> path_tube_pin_registry_;
-  // Lock-free reads from timer/build requests use this only as a retirement
-  // generation.  Runtime/pair mutation remains serialized by
-  // runtime_command_mutex_.
-  std::atomic<std::uint64_t> authority_session_ {0U};
-  // Linearizes new-task retirement against timer completion publication.
-  // Both paths take this before runtime_command_mutex_; expensive tube build
-  // remains outside both locks.
+  std::shared_ptr<const TubeBuildRequestV2> latest_build_request_;
+  // worker_state_mutex_: one CURRENT proof cohort, not a queue of demands.
+  std::shared_ptr<const TubeBuildRequestV2> pinned_current_cohort_;
+  void releaseCurrentCohort(std::uint64_t request_id);
   mutable std::mutex task_publication_mutex_;
-  std::function<void()> finalize_publication_test_hook_;
-  // Bounded passive test-only interleaving hook.  It is invoked after the
-  // currentness gate has passed but before immutable Candidate/Epoch stores,
-  // while runtime_command_mutex_ remains held.  Production leaves it empty.
-  std::function<void()> finalize_before_epoch_store_test_hook_;
-  std::function<void()> inactive_publication_test_hook_;
-  std::function<void()> deactivate_test_hook_;
-  // Bounded passive test-only interleaving hook.  It is absent in production
-  // and exists solely to force the R3 final request-identity race boundary.
-  std::function<void()> certified_geometry_linearization_test_hook_;
-  // Published by the command-owned new-task reset.  A timer tick consumes it
-  // before observing a request, so no TubeEpochManager/profile/cache state is
-  // carried across navigation tasks.
   std::atomic<std::uint64_t> task_generation_ {1U};
-
-  // Timer callback ownership: candidate construction, sampling/cache,
-  // TubeEpochManager, cloud status, and pending diagnostics are timer-only.
-  std::unique_ptr<phase_offset_navigation::TubeEpochManager> tube_epoch_manager_;
-  PathSamples cached_full_path_samples_;
-  std::uint64_t cached_path_source_revision_ = 0U;
-  bool have_cached_path_ = false;
-  std::shared_ptr<const phase_offset_navigation::TubeProfile>
-      timer_active_profile_;
-  std::uint64_t timer_installed_active_epoch_ = 0U;
-  std::uint64_t timer_build_sequence_ = 0U;
-  std::uint64_t timer_last_deactivate_sequence_ = 0U;
-  std::uint64_t timer_last_publish_delete_source_revision_ = 0U;
-  std::uint64_t timer_last_publish_delete_map_observation_sequence_ = 0U;
-  std::uint64_t timer_last_published_epoch_build_sequence_ = 0U;
-  // Last build sequence which crossed finalizeTubeEpoch's currentness gate.
-  // It is a rendezvous watermark only; marker publication has its own
-  // timer_last_published_epoch_build_sequence_ bookkeeping.
-  // Finalization is performed by the timer worker while arming is observed
-  // by the command thread.  Keep this watermark atomic; it is deliberately
-  // separate from marker-publication bookkeeping.
-  std::atomic<std::uint64_t> timer_last_finalized_build_sequence_ {0U};
-  std::uint64_t timer_last_raw_diagnostic_build_sequence_ = 0U;
-  std::uint64_t timer_last_cloud_diagnostic_build_sequence_ = 0U;
-  std::uint64_t timer_task_generation_ = 1U;
-  std::atomic<bool> timer_inflight_ {false};
   std::atomic<bool> shutdown_requested_ {false};
 
-  // One joined production worker and one latest-only pending request slot.
-  // The mutex protects only this lifecycle/bookkeeping state; it is never
-  // held while Tube construction or finalization runs.
+  // The mutex protects the single V2 worker lifecycle and completion slots.
   mutable std::mutex worker_state_mutex_;
-  std::condition_variable worker_condition_;
-  std::thread tube_worker_;
-  std::uint64_t schedule_permit_id_ = 0U;
-  std::shared_ptr<const TubeBuildRequest> pending_request_;
-  std::uint64_t pending_permit_id_ = 0U;
-  RequestInstanceIdentity pending_request_identity_;
-  TubeWorkIdentity pending_work_identity_;
-  std::shared_ptr<const TubeBuildRequest> running_request_;
-  std::uint64_t running_permit_id_ = 0U;
-  RequestInstanceIdentity running_request_identity_;
-  TubeWorkIdentity running_work_identity_;
-  RequestInstanceIdentity last_started_request_identity_;
-  RequestInstanceIdentity last_completed_request_identity_;
-  TubeWorkIdentity last_started_work_identity_;
-  TubeWorkIdentity last_completed_work_identity_;
+  std::unique_ptr<PhaseOffsetTubeWorkerV2> v2_shadow_worker_;
+  std::shared_ptr<const TubeWorkerCompletionV2>
+      latest_v2_shadow_current_completion_;
+  std::shared_ptr<const TubeWorkerCompletionV2>
+      latest_v2_shadow_successor_completion_;
+  std::shared_ptr<const TubeV2ShadowAdmissionCandidate>
+      latest_v2_shadow_admission_candidate_;
+  // Retain only the last successful binding identity for the exact immutable
+  // completion cohort.  A failed retry still replaces the diagnostic
+  // candidate above, but it must not erase the binding against which a later
+  // substitution is checked.
+  std::shared_ptr<const TubeV2ShadowAdmissionCandidate>
+      retained_v2_shadow_admission_candidate_;
+  // One pending publish-first V2 transaction: bootstrap, successor, or one
+  // exact finite-reserve step.
+  std::shared_ptr<const TubeV2ShadowAdmissionCandidate>
+      pending_v2_shadow_bootstrap_candidate_;
+  std::shared_ptr<const TubeV2ExecutionBinding> v2_execution_binding_;
+  V2ShadowRequestIdentity v2_shadow_last_current_identity_;
+  V2ShadowRequestIdentity v2_shadow_last_successor_identity_;
+  phase_offset_navigation::TubePathKey v2_shadow_last_current_path_key_;
+  phase_offset_navigation::TubePathKey v2_shadow_last_successor_path_key_;
+  bool v2_shadow_have_current_path_key_ = false;
+  bool v2_shadow_have_successor_path_key_ = false;
   bool worker_started_ = false;
   bool worker_stop_requested_ = false;
   ros::Publisher active_diagnostics_pub_;
-  ros::Publisher manual_base_path_pub_;
-  ros::Publisher manual_active_path_pub_;
-  ros::Publisher manual_frame_pub_;
+  // Visualization is a latched, timer-side observer of immutable V2 values.
+  // It neither owns nor admits a profile and never runs on the 50 Hz command
+  // path.  Identity caching avoids repeatedly serializing unchanged geometry.
+  mutable std::mutex marker_publication_mutex_;
   ros::Publisher manual_tube_pub_;
   ros::Publisher manual_tube_candidate_pub_;
-  ros::Publisher manual_tube_certified_geometry_pub_;
-  ros::Publisher manual_diagnostics_pub_;
-  ros::Publisher manual_tube_epoch_diagnostics_pub_;
-  ros::Publisher manual_raw_candidate_diagnostics_pub_;
-  ros::Publisher manual_cloud_snapshot_diagnostics_pub_;
-  CloudOccupancyQueryConfig cloud_occupancy_query_config_;
-  CloudOccupancyQueryStatus latest_cloud_occupancy_query_status_;
-  bool measurement_tube_due_enabled_ = false;
-  std::mutex measurement_tube_due_mutex_;
-  std::vector<TubeDueTimingSample> measurement_tube_due_samples_;
-  std::uint64_t measurement_tube_due_sequence_ = 0U;
-  bool advertised_ = false;
+  TubeMarkerIdentityV2 published_active_marker_identity_;
+  TubeMarkerIdentityV2 published_candidate_marker_identity_;
+  bool marker_snapshot_published_ = false;
+  visualization_msgs::MarkerArray cached_active_markers_v2_;
+  visualization_msgs::MarkerArray cached_candidate_markers_v2_;
+  std::size_t cached_active_first_knot_v2_ = 0U;
+  std::size_t cached_candidate_first_knot_v2_ = 0U;
 };
 
 }  // namespace FLAG_Race

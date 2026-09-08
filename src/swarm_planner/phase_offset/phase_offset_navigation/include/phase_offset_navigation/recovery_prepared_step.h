@@ -1,9 +1,11 @@
 #pragma once
 
 #include "phase_offset_navigation/recovery_reference.h"
+#include "phase_offset_navigation/tube_execution_v2.h"
 
 #include <phase_offset_core/port_types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cmath>
 #include <memory>
@@ -22,6 +24,14 @@ enum class RecoveryStepStatus {
   CURRENT_STATE_UNSAFE,
   REFERENCE_MISMATCH,
   INVALID,
+};
+
+// Legacy distance-progress preparation and the finite V2 reserve are
+// deliberately distinct proof kinds.  A V2 braking/settling step must not be
+// forced through the legacy per-tick distance-progress law.
+enum class RecoveryStepProofKind {
+  LEGACY = 0,
+  FINITE_RESERVE_V2,
 };
 
 const char* recoveryStepStatusName(RecoveryStepStatus status);
@@ -69,6 +79,11 @@ struct RecoveryPreparedStep {
   bool proof_valid = false;
   bool valid = false;
   bool owner_committed = false;
+  RecoveryStepProofKind proof_kind = RecoveryStepProofKind::LEGACY;
+  std::uint64_t reserve_id = 0U;
+  std::size_t reserve_cursor = 0U;
+  std::size_t reserve_size = 0U;
+  TubeReserveSegmentKindV2 reserve_segment = TubeReserveSegmentKindV2::BRAKE;
   RecoveryStepStatus status = RecoveryStepStatus::NONE;
   std::string proof;
   std::string provenance;
@@ -81,8 +96,13 @@ struct RecoveryPreparedStep {
         std::abs(selected_u.u_delta - selected_u_delta) <= tolerance;
   }
 
+  bool selectedUExact() const {
+    return selected_u.u_w == selected_u_w &&
+        selected_u.u_delta == selected_u_delta;
+  }
+
   bool finite() const {
-    return std::isfinite(selected_u.u_w) &&
+    const bool common = std::isfinite(selected_u.u_w) &&
         std::isfinite(selected_u.u_delta) &&
         std::isfinite(selected_u_w) && std::isfinite(selected_u_delta) &&
         std::isfinite(current_w) && std::isfinite(current_delta) &&
@@ -94,8 +114,9 @@ struct RecoveryPreparedStep {
         std::isfinite(remaining_domain_duration) &&
         std::isfinite(u_w_lower) && std::isfinite(u_w_upper) &&
         std::isfinite(u_delta_lower) && std::isfinite(u_delta_upper) &&
-        u_w_lower <= u_w_upper && u_delta_lower <= u_delta_upper &&
-        reference_jet.valid;
+        u_w_lower <= u_w_upper && u_delta_lower <= u_delta_upper;
+    return common && (proof_kind == RecoveryStepProofKind::FINITE_RESERVE_V2 ||
+                      reference_jet.valid);
   }
 };
 

@@ -208,12 +208,21 @@ ClearanceQuery Open() {
 // lets the deterministic reproduction preserve a nonzero raw ribbon but make
 // the full-width continuous surface observe UNKNOWN at its outer side.
 ClearanceQuery FullWidthOuterUnknown() {
-  return [](const Eigen::Vector3d&, const double required) {
+  return [validator_phase_started = false](const Eigen::Vector3d&,
+                                            const double required) mutable {
     ClearanceQueryResult result;
     // Raw Builder probes request exactly 0.40 m.  Every larger centre-ball
     // request is deliberately unknown, so the Validator fails at its first
     // witness without permitting a sampled or inward repair path.
     if (required > 0.4000001) {
+      validator_phase_started = true;
+      result.status = DistanceStatus::UNKNOWN;
+      return result;
+    }
+    // Once the Validator has observed the proof-cell UNKNOWN, the matching
+    // 0.40 m base probe is also unresolved.  Raw Builder construction still
+    // receives its original 0.40 m certified evidence before this phase.
+    if (validator_phase_started) {
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }
@@ -241,13 +250,14 @@ struct OutsideAuthorityObservations {
   double first_non_degenerate_inside_clearance = 0.0;
   bool remote_witness_reached = false;
   bool remote_witness_unknown = false;
+  bool validator_phase_started = false;
 };
 
 ClearanceQuery OutsideNarrowAuthorityUnknown(
     OutsideAuthorityObservations* observations) {
   return [observations](const Eigen::Vector3d& point, const double required) {
     ClearanceQueryResult result;
-    if (required <= 0.4000001) {
+    if (required <= 0.4000001 && !observations->validator_phase_started) {
       ++observations->raw_calls;
       result.status = DistanceStatus::KNOWN_FREE;
       result.clearance = required;
@@ -260,7 +270,16 @@ ClearanceQuery OutsideNarrowAuthorityUnknown(
       return result;
     }
 
+    // The first larger-radius query marks the continuous Validator phase.
+    // Its same-witness base probe must represent the unresolved environment
+    // that the legacy test intended; it is not raw Builder evidence.
+    if (required <= 0.4000001 && observations->validator_phase_started) {
+      result.status = DistanceStatus::UNKNOWN;
+      return result;
+    }
+
     ++observations->validator_calls;
+    observations->validator_phase_started = true;
     const std::size_t event = observations->next_validator_event++;
     const bool exact_current_anchor =
         std::abs(point.x()) <= 1e-12 && std::abs(point.y()) <= 1e-12 &&
@@ -304,6 +323,7 @@ struct NegativeSideObservations {
   bool raw_lower_bound_is_physical_lower_bound = true;
   std::size_t raw_calls = 0U;
   std::size_t validator_calls = 0U;
+  bool validator_phase_started = false;
   bool exact_current_anchor_reached = false;
   bool exact_current_anchor_known_free = false;
   double exact_current_anchor_clearance = 0.0;
@@ -324,6 +344,22 @@ struct NegativeSideObservations {
 ClearanceQuery NegativeSideUnknown(NegativeSideObservations* observations) {
   return [observations](const Eigen::Vector3d& point, const double required) {
     ClearanceQueryResult result;
+    if (required <= 0.4000001 && observations->validator_phase_started) {
+      // Preserve the parent/positive-side refinement evidence, but keep the
+      // negative-side witness genuinely unresolved at its 0.40 m base probe.
+      if (point.y() < -1e-12) {
+        observations->negative_child_reached = true;
+        observations->negative_child_unknown = true;
+        observations->negative_child_required_radius = required;
+        result.status = DistanceStatus::UNKNOWN;
+        return result;
+      }
+      result.status = DistanceStatus::KNOWN_FREE;
+      result.clearance = required;
+      result.clearance_certified = true;
+      result.clearance_is_exact = false;
+      return result;
+    }
     if (required <= 0.4000001) {
       ++observations->raw_calls;
       result.status = DistanceStatus::KNOWN_FREE;
@@ -344,6 +380,7 @@ ClearanceQuery NegativeSideUnknown(NegativeSideObservations* observations) {
     }
 
     ++observations->validator_calls;
+    observations->validator_phase_started = true;
     const bool exact_current_anchor =
         std::abs(point.x()) <= 1e-12 && std::abs(point.y()) <= 1e-12 &&
         std::abs(point.z() - 1.0) <= 1e-12;
@@ -411,9 +448,16 @@ ClearanceQuery NegativeSideUnknown(NegativeSideObservations* observations) {
 }
 
 ClearanceQuery CenterlineUnknownAfterBase() {
-  return [](const Eigen::Vector3d& point, const double required) {
+  return [validator_phase_started = false](const Eigen::Vector3d& point,
+                                            const double required) mutable {
     ClearanceQueryResult result;
     if (required > 0.4000001 && std::abs(point.y()) <= 1e-12) {
+      validator_phase_started = true;
+      result.status = DistanceStatus::UNKNOWN;
+      return result;
+    }
+    if (required <= 0.4000001 && validator_phase_started &&
+        std::abs(point.y()) <= 1e-12) {
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }
@@ -453,10 +497,17 @@ ClearanceQuery AnyNonzeroOffsetUnknown() {
 }
 
 ClearanceQuery CountingCenterlineUnknown(std::size_t* calls) {
-  return [calls](const Eigen::Vector3d& point, const double required) {
+  return [calls, validator_phase_started = false](
+             const Eigen::Vector3d& point, const double required) mutable {
     ++(*calls);
     ClearanceQueryResult result;
     if (required > 0.4000001 && std::abs(point.y()) <= 1e-12) {
+      validator_phase_started = true;
+      result.status = DistanceStatus::UNKNOWN;
+      return result;
+    }
+    if (required <= 0.4000001 && validator_phase_started &&
+        std::abs(point.y()) <= 1e-12) {
       result.status = DistanceStatus::UNKNOWN;
       return result;
     }

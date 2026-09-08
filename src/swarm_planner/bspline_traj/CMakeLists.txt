@@ -115,6 +115,28 @@ target_link_libraries(phase_offset_clearance_audit
   ${catkin_LIBRARIES}
 )
 
+# Standalone V2 tube worker.  It owns one joined worker thread and consumes
+# only immutable navigation/core certificate DTOs; adapters and map objects
+# remain outside this target's dependency direction.
+find_package(Threads REQUIRED)
+add_library(phase_offset_tube_runtime_v2
+  src/integration/phase_offset_tube_runtime_v2.cpp
+)
+target_link_libraries(phase_offset_tube_runtime_v2
+  phase_offset_navigation
+  phase_offset_core
+  Threads::Threads
+)
+
+add_library(phase_offset_tube_v2_diagnostics
+  src/integration/phase_offset_tube_v2_diagnostics.cpp
+)
+target_link_libraries(phase_offset_tube_v2_diagnostics
+  phase_offset_tube_runtime_v2
+  phase_offset_navigation
+  phase_offset_core
+)
+
 add_library(phase_offset_matched_adapter
   src/integration/phase_offset_cloud_occupancy_query.cpp
   src/integration/phase_offset_matched_adapter.cpp
@@ -131,6 +153,7 @@ target_link_libraries(phase_offset_matched_adapter
   plan_env
   isf_reference_kernel
   phase_offset_active_adapter
+  phase_offset_tube_runtime_v2
   phase_offset_sph_ros_bridge
   ${catkin_LIBRARIES}
 )
@@ -161,6 +184,7 @@ bspline_gvf
 )
 
 if(CATKIN_ENABLE_TESTING)
+  find_package(rostest REQUIRED)
   catkin_add_gtest(reference_join_test test/reference_join_test.cpp)
   catkin_add_gtest(gvf_switch_policy_test test/gvf_switch_policy_test.cpp)
   catkin_add_gtest(gvf_lifted_visualization_test test/gvf_lifted_visualization_test.cpp)
@@ -191,6 +215,10 @@ if(CATKIN_ENABLE_TESTING)
     test/phase_offset_environment_evidence_query_test.cpp)
   catkin_add_gtest(phase_offset_clearance_audit_test
     test/phase_offset_clearance_audit_test.cpp)
+  catkin_add_gtest(phase_offset_tube_runtime_v2_test
+    test/phase_offset_tube_runtime_v2_test.cpp)
+  catkin_add_gtest(phase_offset_tube_v2_diagnostics_test
+    test/phase_offset_tube_v2_diagnostics_test.cpp)
   catkin_add_gtest(phase_offset_raw_candidate_diagnostics_test
     test/phase_offset_raw_candidate_diagnostics_test.cpp)
   catkin_add_gtest(phase_offset_tube_markers_test
@@ -201,6 +229,8 @@ if(CATKIN_ENABLE_TESTING)
     test/phase_offset_tube_epoch_integration_test.cpp)
   catkin_add_gtest(phase_offset_recovery_continuation_provider_test
     test/phase_offset_recovery_continuation_provider_test.cpp)
+  catkin_add_nosetests(test/tube_runtime_v2_acceptance.py)
+  add_rostest(test/tube_runtime_v2_acceptance.test)
   # G2d removes this raw-log-odds bridge from all production targets.  Keep a
   # test-only target so the deprecated reference remains independently
   # exercisable without a path from formation_planning to raw occupancy.
@@ -277,10 +307,29 @@ if(CATKIN_ENABLE_TESTING)
   if(TARGET phase_offset_clearance_audit_test)
     target_link_libraries(phase_offset_clearance_audit_test
       phase_offset_clearance_audit
+      phase_offset_matched_adapter
       continuous_phase_path
+      phase_offset_navigation_legacy_tube
       phase_offset_core
       phase_offset_navigation
       ${catkin_LIBRARIES}
+    )
+  endif()
+  if(TARGET phase_offset_tube_runtime_v2_test)
+    target_link_libraries(phase_offset_tube_runtime_v2_test
+      phase_offset_tube_runtime_v2
+      phase_offset_navigation
+      phase_offset_core
+      Threads::Threads
+    )
+  endif()
+  if(TARGET phase_offset_tube_v2_diagnostics_test)
+    target_link_libraries(phase_offset_tube_v2_diagnostics_test
+      phase_offset_tube_v2_diagnostics
+      phase_offset_tube_runtime_v2
+      phase_offset_navigation
+      phase_offset_core
+      Threads::Threads
     )
   endif()
   if(TARGET phase_offset_raw_candidate_diagnostics_test)

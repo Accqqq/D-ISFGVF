@@ -44,6 +44,10 @@ public:
     using PointEvaluator = std::function<bool(double, ContinuousPhasePathState&)>;
     using CellBoundEvaluator = std::function<bool(
         double, double, phase_offset_core::PathCellGeometryCertificate&)>;
+    using TubeCellBoundsV2Evaluator = std::function<bool(
+        double, double, phase_offset_core::CertifiedPathCellV2&)>;
+    using CertificateBreakpointsV2Evaluator = std::function<bool(
+        std::vector<double>&)>;
 
     // A path evaluator and its optional interval proof travel as one value.
     // The callback is optional so legacy/synthetic evaluators remain
@@ -55,9 +59,15 @@ public:
         Evaluator() = default;
         Evaluator(const PointEvaluator& point_evaluator,
                   const CellBoundEvaluator& cell_bound_evaluator =
-                      CellBoundEvaluator())
+                      CellBoundEvaluator(),
+                  const TubeCellBoundsV2Evaluator& tube_cell_bounds_v2 =
+                      TubeCellBoundsV2Evaluator(),
+                  const CertificateBreakpointsV2Evaluator& breakpoints_v2 =
+                      CertificateBreakpointsV2Evaluator())
             : point_evaluator_(point_evaluator),
-              cell_bound_evaluator_(cell_bound_evaluator) {}
+              cell_bound_evaluator_(cell_bound_evaluator),
+              tube_cell_bounds_v2_(tube_cell_bounds_v2),
+              breakpoints_v2_(breakpoints_v2) {}
 
         template <typename Callable,
                   typename std::enable_if<!std::is_same<
@@ -82,9 +92,28 @@ public:
             return static_cast<bool>(cell_bound_evaluator_);
         }
 
+        bool tubeCellBoundsV2(
+            double w0, double w1,
+            phase_offset_core::CertifiedPathCellV2& certificate) const {
+            return tube_cell_bounds_v2_ &&
+                tube_cell_bounds_v2_(w0, w1, certificate);
+        }
+        bool hasTubeCellBoundsV2() const {
+            return static_cast<bool>(tube_cell_bounds_v2_);
+        }
+        bool certificateBreakpointsV2(std::vector<double>& breakpoints) const {
+            breakpoints.clear();
+            return breakpoints_v2_ && breakpoints_v2_(breakpoints);
+        }
+        bool hasCertificateBreakpointsV2() const {
+            return static_cast<bool>(breakpoints_v2_);
+        }
+
     private:
         PointEvaluator point_evaluator_;
         CellBoundEvaluator cell_bound_evaluator_;
+        TubeCellBoundsV2Evaluator tube_cell_bounds_v2_;
+        CertificateBreakpointsV2Evaluator breakpoints_v2_;
     };
 
     struct Segment
@@ -111,6 +140,11 @@ public:
     // segment.  Crossing or unsupported cells intentionally return false.
     bool cellBounds(double w0, double w1,
                     phase_offset_core::PathCellGeometryCertificate& certificate) const;
+    bool tubeCellBoundsV2(
+        double w0, double w1,
+        phase_offset_core::CertifiedPathCellV2& certificate) const;
+    bool certificateBreakpointsV2(std::vector<double>& breakpoints) const;
+    std::vector<double> certificateBreakpointsV2() const;
     bool sample(double step_w,
                 std::vector<double>& w,
                 std::vector<ContinuousPhasePathState>& states) const;

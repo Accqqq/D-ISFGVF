@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -10,6 +11,10 @@
 #include <vector>
 
 #include <boost/multiprecision/cpp_int.hpp>
+
+#if defined(__i386__) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace FLAG_Race
 {
@@ -61,6 +66,503 @@ struct DifferentialBounds
     bool valid = false;
 };
 
+// V2 proof arithmetic.  Every elementary operation returns an interval for
+// the exact real operation on its binary64 operands.  The old certificate
+// helpers below intentionally remain for legacy callers; V2 producers never
+// call those fixed-margin helpers.
+struct ProofInterval {
+    double lower = 0.0;
+    double upper = 0.0;
+    bool valid = false;
+};
+
+// The V2 producers rely on IEEE-754 binary64 operations rounded to nearest,
+// gradual underflow, and separate multiply/add operations.  These properties
+// are environmental inputs to the proof just like the stored coefficients;
+// they cannot be repaired by widening an interval after the fact.  Read the
+// environment only and fail closed when the compiler or execution mode does
+// not provide the contract.  In particular, do not change MXCSR or the
+// process rounding mode on behalf of a caller.
+bool ProofFloatingPointEnvironmentSupported()
+{
+#if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && \
+                               __FINITE_MATH_ONLY__)
+    return false;
+#endif
+#if defined(__FMA__) || defined(__FP_FAST_FMA) || defined(__FP_FAST_FMAF)
+    // The proof arithmetic is deliberately written as separate operations;
+    // a translation unit that permits unaccounted contraction is unsupported.
+    return false;
+#endif
+#if defined(__FLT_EVAL_METHOD__) && __FLT_EVAL_METHOD__ != 0
+    // Extended x87 evaluation would make the binary64 endpoint-underflow and
+    // one-ULP reasoning below dependent on an unaccounted intermediate format.
+    return false;
+#endif
+    if (!std::numeric_limits<double>::is_iec559 ||
+        std::numeric_limits<double>::radix != 2 ||
+        std::numeric_limits<double>::digits != 53 ||
+        std::numeric_limits<double>::has_denorm !=
+            std::denorm_present ||
+        std::fegetround() != FE_TONEAREST) {
+        return false;
+    }
+#if defined(__i386__) || defined(__x86_64__)
+    const unsigned int csr = _mm_getcsr();
+#ifdef _MM_FLUSH_ZERO_ON
+    if ((csr & _MM_FLUSH_ZERO_ON) != 0U) return false;
+#endif
+#ifdef _MM_DENORMALS_ZERO_ON
+    if ((csr & _MM_DENORMALS_ZERO_ON) != 0U) return false;
+#endif
+    return true;
+#else
+    // No portable C++ query proves that a non-x86 runtime has not enabled a
+    // flush-to-zero mode (for example through an ARM FP control register).
+    // The proof therefore remains unavailable instead of assuming gradual
+    // underflow from the type traits alone.
+    return false;
+#endif
+}
+
+ProofInterval InvalidProofInterval()
+{
+    return ProofInterval();
+}
+
+ProofInterval PointProofInterval(const double value)
+{
+    if (!std::isfinite(value)) return InvalidProofInterval();
+    ProofInterval result;
+    result.lower = value;
+    result.upper = value;
+    result.valid = true;
+    return result;
+}
+
+bool ProofFinite(const ProofInterval& value)
+{
+    return value.valid && std::isfinite(value.lower) &&
+        std::isfinite(value.upper) && value.lower <= value.upper;
+}
+
+double ProofLower(const double value)
+{
+    if (!std::isfinite(value)) return std::numeric_limits<double>::quiet_NaN();
+    if (value == 0.0) return 0.0;
+    return std::nextafter(value, -std::numeric_limits<double>::infinity());
+}
+
+double ProofUpper(const double value)
+{
+    if (!std::isfinite(value)) return std::numeric_limits<double>::quiet_NaN();
+    if (value == 0.0) return 0.0;
+    return std::nextafter(value, std::numeric_limits<double>::infinity());
+}
+
+ProofInterval ProofIntervalFromBounds(const double lower, const double upper)
+{
+    if (!std::isfinite(lower) || !std::isfinite(upper) || lower > upper) {
+        return InvalidProofInterval();
+    }
+    ProofInterval result;
+    result.lower = lower;
+    result.upper = upper;
+    result.valid = true;
+    return result;
+}
+
+bool ProofSumEndpoint(const double lhs, const double rhs,
+                      double& lower, double& upper)
+{
+    const double value = lhs + rhs;
+    if (!std::isfinite(value)) return false;
+    if (value == 0.0 && lhs != 0.0 && rhs != 0.0) {
+        // Gradual-underflow addition can round a nonzero exact sum to zero.
+        // Same-sign operands determine the sign; cancellation leaves the
+        // sign unknown, so use the complete one-denorm hull.
+        const double denorm = std::numeric_limits<double>::denorm_min();
+        if (!(denorm > 0.0)) return false;
+        if (std::signbit(lhs) == std::signbit(rhs)) {
+            if (std::signbit(lhs)) {
+                lower = -denorm;
+                upper = 0.0;
+            } else {
+                lower = 0.0;
+                upper = denorm;
+            }
+        } else {
+            lower = -denorm;
+            upper = denorm;
+        }
+        return true;
+    }
+    lower = ProofLower(value);
+    upper = ProofUpper(value);
+    return std::isfinite(lower) && std::isfinite(upper);
+}
+
+ProofInterval ProofAdd(const ProofInterval& lhs, const ProofInterval& rhs)
+{
+    if (!ProofFinite(lhs) || !ProofFinite(rhs)) return InvalidProofInterval();
+    double lower_endpoint_lower = 0.0;
+    double lower_endpoint_upper = 0.0;
+    double upper_endpoint_lower = 0.0;
+    double upper_endpoint_upper = 0.0;
+    if (!ProofSumEndpoint(lhs.lower, rhs.lower,
+                          lower_endpoint_lower, lower_endpoint_upper) ||
+        !ProofSumEndpoint(lhs.upper, rhs.upper,
+                          upper_endpoint_lower, upper_endpoint_upper)) {
+        return InvalidProofInterval();
+    }
+    return ProofIntervalFromBounds(
+        lower_endpoint_lower, upper_endpoint_upper);
+}
+
+// Return an outward enclosure for one endpoint product.  A rounded binary64
+// product can underflow to zero even when the represented real product is
+// nonzero (notably for subnormal inputs).  Treat that case explicitly rather
+// than allowing a zero upper endpoint to become an under-approximation.
+bool ProofProductEndpoint(const double lhs, const double rhs,
+                          double& lower, double& upper)
+{
+    const double value = lhs * rhs;
+    if (!std::isfinite(value)) return false;
+    if (value == 0.0 && lhs != 0.0 && rhs != 0.0) {
+        const double denorm = std::numeric_limits<double>::denorm_min();
+        if (!(denorm > 0.0)) return false;
+        const bool negative = std::signbit(lhs) != std::signbit(rhs);
+        if (negative) {
+            lower = -denorm;
+            upper = 0.0;
+        } else {
+            lower = 0.0;
+            upper = denorm;
+        }
+        return true;
+    }
+    lower = ProofLower(value);
+    upper = ProofUpper(value);
+    return std::isfinite(lower) && std::isfinite(upper);
+}
+
+bool ProofQuotientEndpoint(const double numerator, const double denominator,
+                           double& lower, double& upper)
+{
+    if (denominator == 0.0) return false;
+    const double value = numerator / denominator;
+    if (!std::isfinite(value)) return false;
+    if (value == 0.0 && numerator != 0.0) {
+        const double denorm = std::numeric_limits<double>::denorm_min();
+        if (!(denorm > 0.0)) return false;
+        const bool negative = std::signbit(numerator) !=
+            std::signbit(denominator);
+        if (negative) {
+            lower = -denorm;
+            upper = 0.0;
+        } else {
+            lower = 0.0;
+            upper = denorm;
+        }
+        return true;
+    }
+    lower = ProofLower(value);
+    upper = ProofUpper(value);
+    return std::isfinite(lower) && std::isfinite(upper);
+}
+
+ProofInterval ProofSub(const ProofInterval& lhs, const ProofInterval& rhs)
+{
+    if (!ProofFinite(lhs) || !ProofFinite(rhs)) return InvalidProofInterval();
+    double lower_endpoint_lower = 0.0;
+    double lower_endpoint_upper = 0.0;
+    double upper_endpoint_lower = 0.0;
+    double upper_endpoint_upper = 0.0;
+    if (!ProofSumEndpoint(lhs.lower, -rhs.upper,
+                          lower_endpoint_lower, lower_endpoint_upper) ||
+        !ProofSumEndpoint(lhs.upper, -rhs.lower,
+                          upper_endpoint_lower, upper_endpoint_upper)) {
+        return InvalidProofInterval();
+    }
+    return ProofIntervalFromBounds(
+        lower_endpoint_lower, upper_endpoint_upper);
+}
+
+ProofInterval ProofMul(const ProofInterval& lhs, const ProofInterval& rhs)
+{
+    if (!ProofFinite(lhs) || !ProofFinite(rhs)) return InvalidProofInterval();
+    double lower = std::numeric_limits<double>::infinity();
+    double upper = -std::numeric_limits<double>::infinity();
+    const double lhs_values[] = {lhs.lower, lhs.upper};
+    const double rhs_values[] = {rhs.lower, rhs.upper};
+    for (const double lhs_value : lhs_values) {
+        for (const double rhs_value : rhs_values) {
+            double endpoint_lower = 0.0;
+            double endpoint_upper = 0.0;
+            if (!ProofProductEndpoint(lhs_value, rhs_value,
+                                      endpoint_lower, endpoint_upper)) {
+                return InvalidProofInterval();
+            }
+            lower = std::min(lower, endpoint_lower);
+            upper = std::max(upper, endpoint_upper);
+        }
+    }
+    return ProofIntervalFromBounds(lower, upper);
+}
+
+ProofInterval ProofDiv(const ProofInterval& lhs, const ProofInterval& rhs)
+{
+    if (!ProofFinite(lhs) || !ProofFinite(rhs) ||
+        (rhs.lower <= 0.0 && rhs.upper >= 0.0)) {
+        return InvalidProofInterval();
+    }
+    double lower = std::numeric_limits<double>::infinity();
+    double upper = -std::numeric_limits<double>::infinity();
+    const double lhs_values[] = {lhs.lower, lhs.upper};
+    const double rhs_values[] = {rhs.lower, rhs.upper};
+    for (const double lhs_value : lhs_values) {
+        for (const double rhs_value : rhs_values) {
+            double endpoint_lower = 0.0;
+            double endpoint_upper = 0.0;
+            if (!ProofQuotientEndpoint(lhs_value, rhs_value,
+                                       endpoint_lower, endpoint_upper)) {
+                return InvalidProofInterval();
+            }
+            lower = std::min(lower, endpoint_lower);
+            upper = std::max(upper, endpoint_upper);
+        }
+    }
+    return ProofIntervalFromBounds(lower, upper);
+}
+
+ProofInterval ProofSqrt(const ProofInterval& value)
+{
+    if (!ProofFinite(value) || value.lower < 0.0) {
+        return InvalidProofInterval();
+    }
+    const double lower = std::sqrt(value.lower);
+    const double upper = std::sqrt(value.upper);
+    if (!std::isfinite(lower) || !std::isfinite(upper)) {
+        return InvalidProofInterval();
+    }
+    return ProofIntervalFromBounds(ProofLower(lower), ProofUpper(upper));
+}
+
+ProofInterval ProofNorm(const std::array<ProofInterval, 3U>& components)
+{
+    ProofInterval lower_squared = PointProofInterval(0.0);
+    ProofInterval upper_squared = PointProofInterval(0.0);
+    for (const ProofInterval& component : components) {
+        if (!ProofFinite(component)) return InvalidProofInterval();
+        const double near_zero = component.lower <= 0.0 &&
+            component.upper >= 0.0 ? 0.0 : std::min(
+                std::abs(component.lower), std::abs(component.upper));
+        const double farthest = std::max(std::abs(component.lower),
+                                         std::abs(component.upper));
+        const ProofInterval low_component = PointProofInterval(near_zero);
+        const ProofInterval high_component = PointProofInterval(farthest);
+        const ProofInterval low_square = ProofMul(low_component, low_component);
+        const ProofInterval high_square = ProofMul(high_component, high_component);
+        lower_squared = ProofAdd(lower_squared, low_square);
+        upper_squared = ProofAdd(upper_squared, high_square);
+        if (!ProofFinite(lower_squared) || !ProofFinite(upper_squared)) {
+            return InvalidProofInterval();
+        }
+    }
+    const ProofInterval lower = ProofSqrt(lower_squared);
+    const ProofInterval upper = ProofSqrt(upper_squared);
+    if (!ProofFinite(lower) || !ProofFinite(upper)) return InvalidProofInterval();
+    return ProofIntervalFromBounds(lower.lower, upper.upper);
+}
+
+ProofInterval ProofHorner(const std::vector<ProofInterval>& coefficients,
+                          const ProofInterval& x)
+{
+    if (coefficients.empty() || !ProofFinite(x)) return InvalidProofInterval();
+    ProofInterval value = coefficients.back();
+    for (std::size_t index = coefficients.size() - 1U; index > 0U; --index) {
+        value = ProofAdd(ProofMul(value, x), coefficients[index - 1U]);
+        if (!ProofFinite(value)) return InvalidProofInterval();
+    }
+    return value;
+}
+
+std::uint64_t ProofBinomialInteger(const int n, int k)
+{
+    if (k < 0 || k > n) return 0U;
+    k = std::min(k, n - k);
+    std::uint64_t result = 1U;
+    for (int index = 1; index <= k; ++index) {
+        const std::uint64_t numerator = static_cast<std::uint64_t>(
+            n - k + index);
+        const std::uint64_t denominator = static_cast<std::uint64_t>(index);
+        // The proof producers only use degrees <= 5 here.  Keep the helper
+        // fail-closed if a future caller exceeds exact uint64 arithmetic.
+        if (result > std::numeric_limits<std::uint64_t>::max() /
+            numerator) return 0U;
+        result = result * numerator / denominator;
+    }
+    return result;
+}
+
+ProofInterval ProofRationalInterval(const std::uint64_t numerator,
+                                    const std::uint64_t denominator)
+{
+    if (denominator == 0U) return InvalidProofInterval();
+    if (numerator == 0U) return PointProofInterval(0.0);
+    const double value = static_cast<double>(numerator) /
+        static_cast<double>(denominator);
+    if (!std::isfinite(value)) return InvalidProofInterval();
+    return ProofIntervalFromBounds(ProofLower(value), ProofUpper(value));
+}
+
+// Enclose a power-basis polynomial over [0,1] by forming its Bernstein
+// controls with interval arithmetic and taking their hull.  This is used for
+// the stored phase-map quintic derivative: unlike interval Horner over the
+// entire cell, the Bernstein hull preserves the map's positive derivative
+// witness without introducing dependency-induced sign loss.
+ProofInterval ProofPowerToBernsteinRange(
+    const std::vector<ProofInterval>& coefficients)
+{
+    if (coefficients.empty()) return InvalidProofInterval();
+    const int degree = static_cast<int>(coefficients.size()) - 1;
+    ProofInterval result = InvalidProofInterval();
+    for (int control = 0; control <= degree; ++control) {
+        ProofInterval value = PointProofInterval(0.0);
+        for (int order = 0; order <= control; ++order) {
+            const std::uint64_t numerator = ProofBinomialInteger(control,
+                                                                  order);
+            const std::uint64_t denominator = ProofBinomialInteger(degree,
+                                                                    order);
+            const ProofInterval ratio = ProofRationalInterval(numerator,
+                                                               denominator);
+            value = ProofAdd(value, ProofMul(
+                coefficients[static_cast<std::size_t>(order)], ratio));
+            if (!ProofFinite(value)) return InvalidProofInterval();
+        }
+        if (!ProofFinite(value)) return InvalidProofInterval();
+        if (!result.valid) {
+            result = value;
+        } else {
+            result.lower = std::min(result.lower, value.lower);
+            result.upper = std::max(result.upper, value.upper);
+        }
+    }
+    return ProofFinite(result) ? result : InvalidProofInterval();
+}
+
+phase_offset_core::Binary64Interval ToPublicInterval(
+    const ProofInterval& value)
+{
+    phase_offset_core::Binary64Interval result;
+    result.lower = value.lower;
+    result.upper = value.upper;
+    result.valid = ProofFinite(value);
+    return result;
+}
+
+void SetPublicVectorInterval(
+    const std::array<ProofInterval, 3U>& source,
+    phase_offset_core::Binary64VectorInterval& destination)
+{
+    destination = phase_offset_core::Binary64VectorInterval();
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        destination.component[index] = ToPublicInterval(source[index]);
+        if (!ProofFinite(source[index])) return;
+    }
+    destination.valid = true;
+}
+
+std::array<ProofInterval, 3U> ProofVectorConstant(const Eigen::Vector3d& value)
+{
+    return {{PointProofInterval(value.x()), PointProofInterval(value.y()),
+             PointProofInterval(value.z())}};
+}
+
+using ProofVectorPolynomial =
+    std::vector<std::array<ProofInterval, 3U>>;
+
+ProofVectorPolynomial ProofPolynomialFromEigen(
+    const std::vector<Eigen::Vector3d>& coefficients)
+{
+    ProofVectorPolynomial result;
+    result.reserve(coefficients.size());
+    for (const Eigen::Vector3d& coefficient : coefficients) {
+        result.push_back(ProofVectorConstant(coefficient));
+    }
+    return result;
+}
+
+ProofVectorPolynomial ProofDifferentiatePolynomial(
+    const ProofVectorPolynomial& coefficients)
+{
+    if (coefficients.size() <= 1U) {
+        return ProofVectorPolynomial(1U, {{PointProofInterval(0.0),
+                                          PointProofInterval(0.0),
+                                          PointProofInterval(0.0)}});
+    }
+    ProofVectorPolynomial result(coefficients.size() - 1U);
+    for (std::size_t order = 1U; order < coefficients.size(); ++order) {
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            result[order - 1U][component] = ProofMul(
+                coefficients[order][component],
+                PointProofInterval(static_cast<double>(order)));
+        }
+    }
+    return result;
+}
+
+std::array<ProofInterval, 3U> ProofVectorPolynomialEvaluate(
+    const ProofVectorPolynomial& coefficients, const ProofInterval& x)
+{
+    std::array<ProofInterval, 3U> result;
+    if (coefficients.empty()) {
+        result = {{InvalidProofInterval(), InvalidProofInterval(),
+                   InvalidProofInterval()}};
+        return result;
+    }
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        ProofInterval value = coefficients.back()[component];
+        for (std::size_t index = coefficients.size() - 1U; index > 0U;
+             --index) {
+            value = ProofAdd(ProofMul(value, x),
+                             coefficients[index - 1U][component]);
+        }
+        result[component] = value;
+    }
+    return result;
+}
+
+std::array<ProofInterval, 3U> ProofVectorScale(
+    const std::array<ProofInterval, 3U>& vector,
+    const ProofInterval& scale)
+{
+    std::array<ProofInterval, 3U> result;
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        result[index] = ProofMul(vector[index], scale);
+    }
+    return result;
+}
+
+std::array<ProofInterval, 3U> ProofVectorAdd(
+    const std::array<ProofInterval, 3U>& lhs,
+    const std::array<ProofInterval, 3U>& rhs)
+{
+    std::array<ProofInterval, 3U> result;
+    for (std::size_t index = 0U; index < 3U; ++index) {
+        result[index] = ProofAdd(lhs[index], rhs[index]);
+    }
+    return result;
+}
+
+bool ProofVectorFinite(const std::array<ProofInterval, 3U>& vector)
+{
+    for (const ProofInterval& component : vector) {
+        if (!ProofFinite(component)) return false;
+    }
+    return true;
+}
+
 double UpperBound(const double value)
 {
     if (!std::isfinite(value) || value < 0.0) {
@@ -106,6 +608,48 @@ Binary64Parts DecomposeBinary64(const double value)
         parts.exponent = static_cast<int>(exponent_bits) - 1023 - 52;
     }
     return parts;
+}
+
+// Compare two finite binary64 values in exact dyadic arithmetic.  A rounded
+// subtraction can report `1.0` even when the represented real difference is
+// slightly larger; the supported UniformBspline contract needs the latter
+// exact fact because getDerivative() omits a non-unit knot denominator.
+bool ExactBinary64DifferenceEqualsOne(const double upper, const double lower)
+{
+    if (!std::isfinite(upper) || !std::isfinite(lower)) return false;
+    const Binary64Parts upper_parts = DecomposeBinary64(upper);
+    const Binary64Parts lower_parts = DecomposeBinary64(lower);
+    int base_exponent = 0;
+    bool have_nonzero = false;
+    if (upper_parts.significand != 0U) {
+        base_exponent = upper_parts.exponent;
+        have_nonzero = true;
+    }
+    if (lower_parts.significand != 0U) {
+        base_exponent = have_nonzero
+            ? std::min(base_exponent, lower_parts.exponent)
+            : lower_parts.exponent;
+        have_nonzero = true;
+    }
+    if (!have_nonzero) return false;
+    base_exponent = std::min(base_exponent, 0);
+    boost::multiprecision::cpp_int upper_integer = 0;
+    boost::multiprecision::cpp_int lower_integer = 0;
+    if (upper_parts.significand != 0U) {
+        upper_integer = upper_parts.significand;
+        upper_integer <<= upper_parts.exponent - base_exponent;
+        if (std::signbit(upper)) upper_integer = -upper_integer;
+    }
+    if (lower_parts.significand != 0U) {
+        lower_integer = lower_parts.significand;
+        lower_integer <<= lower_parts.exponent - base_exponent;
+        if (std::signbit(lower)) lower_integer = -lower_integer;
+    }
+    const boost::multiprecision::cpp_int difference =
+        upper_integer - lower_integer;
+    const boost::multiprecision::cpp_int one =
+        boost::multiprecision::cpp_int(1) << (-base_exponent);
+    return difference == one;
 }
 
 struct ExactSquaredMagnitude
@@ -650,6 +1194,296 @@ bool MakeQuinticCertificate(
     return MakeCertificate(w0, w1, aggregate, certificate);
 }
 
+bool MakeV2Certificate(
+    const double w0, const double w1, const double anchor_w,
+    const std::array<ProofInterval, 3U>& anchor_position,
+    const std::array<ProofInterval, 3U>& anchor_p_w,
+    const std::array<ProofInterval, 3U>& anchor_p_ww,
+    const ProofInterval& inf_speed, const ProofInterval& sup_speed,
+    const ProofInterval& inf_horizontal_speed,
+    const ProofInterval& sup_acceleration,
+    const ProofInterval& sup_horizontal_acceleration,
+    const ProofInterval& sup_jerk,
+    const bool phase_map_complete,
+    phase_offset_core::CertifiedPathCellV2& certificate)
+{
+    certificate = phase_offset_core::CertifiedPathCellV2();
+    if (!ProofFloatingPointEnvironmentSupported() ||
+        !std::isfinite(w0) || !std::isfinite(w1) || !(w1 > w0) ||
+        !std::isfinite(anchor_w) || anchor_w < w0 || anchor_w > w1 ||
+        !phase_map_complete || !ProofVectorFinite(anchor_position) ||
+        !ProofVectorFinite(anchor_p_w) || !ProofVectorFinite(anchor_p_ww) ||
+        !ProofFinite(inf_speed) || !ProofFinite(sup_speed) ||
+        !ProofFinite(inf_horizontal_speed) || !ProofFinite(sup_acceleration) ||
+        !ProofFinite(sup_horizontal_acceleration) || !ProofFinite(sup_jerk)) {
+        return false;
+    }
+    const ProofInterval span = ProofSub(PointProofInterval(w1),
+                                        PointProofInterval(w0));
+    const ProofInterval half = ProofIntervalFromBounds(0.5, 0.5);
+    const ProofInterval normal_rate = ProofDiv(
+        sup_horizontal_acceleration, inf_horizontal_speed);
+    const ProofInterval tangent_rate = ProofDiv(sup_acceleration, inf_speed);
+    const ProofInterval curvature = ProofDiv(
+        sup_acceleration, ProofMul(inf_speed, inf_speed));
+    const ProofInterval curvature_rate = ProofAdd(
+        ProofDiv(sup_jerk, ProofMul(inf_speed, inf_speed)),
+        ProofMul(ProofIntervalFromBounds(3.0, 3.0),
+                 ProofDiv(ProofMul(sup_acceleration, sup_acceleration),
+                          ProofMul(ProofMul(inf_speed, inf_speed), inf_speed))));
+    const ProofInterval normal_variation = ProofMul(normal_rate, span);
+    const ProofInterval tangent_variation = ProofMul(tangent_rate, span);
+    const ProofInterval curvature_variation = ProofMul(curvature_rate, span);
+    const ProofInterval midpoint_variation = ProofMul(
+        ProofMul(sup_speed, span), half);
+    const ProofInterval chord_deviation = ProofDiv(
+        ProofMul(ProofMul(sup_acceleration, ProofMul(span, span)), half),
+        ProofIntervalFromBounds(4.0, 4.0));
+    if (!ProofFinite(normal_rate) || !ProofFinite(tangent_rate) ||
+        !ProofFinite(curvature) || !ProofFinite(curvature_rate) ||
+        !ProofFinite(normal_variation) || !ProofFinite(tangent_variation) ||
+        !ProofFinite(curvature_variation) || !ProofFinite(midpoint_variation) ||
+        !ProofFinite(chord_deviation) || inf_speed.lower <= 0.0 ||
+        inf_horizontal_speed.lower <=
+            phase_offset_core::kHorizontalNormalSpeedEpsilon ||
+        sup_speed.upper < inf_speed.lower) {
+        return false;
+    }
+
+    SetPublicVectorInterval(anchor_position, certificate.anchor_position);
+    SetPublicVectorInterval(anchor_p_w, certificate.anchor_p_w);
+    SetPublicVectorInterval(anchor_p_ww, certificate.anchor_p_ww);
+    if (!certificate.anchor_position.valid || !certificate.anchor_p_w.valid ||
+        !certificate.anchor_p_ww.valid) {
+        return false;
+    }
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.anchor_w = anchor_w;
+    certificate.inf_p_w_norm = ToPublicInterval(inf_speed);
+    certificate.sup_p_w_norm = ToPublicInterval(sup_speed);
+    certificate.inf_horizontal_p_w_norm = ToPublicInterval(
+        inf_horizontal_speed);
+    certificate.sup_p_ww_norm = ToPublicInterval(sup_acceleration);
+    certificate.sup_horizontal_p_ww_norm = ToPublicInterval(
+        sup_horizontal_acceleration);
+    certificate.sup_p_www_norm = ToPublicInterval(sup_jerk);
+    certificate.sup_normal_derivative = ToPublicInterval(normal_rate);
+    certificate.normal_variation = ToPublicInterval(normal_variation);
+    certificate.tangent_variation = ToPublicInterval(tangent_variation);
+    certificate.curvature_variation = ToPublicInterval(curvature_variation);
+    certificate.midpoint_position_variation = ToPublicInterval(
+        midpoint_variation);
+    certificate.chord_deviation = ToPublicInterval(chord_deviation);
+    certificate.horizontal_acceleration_bound_complete = true;
+    certificate.normal_frame_proof_complete = true;
+    certificate.phase_map_proof_complete = phase_map_complete;
+    certificate.provenance =
+        phase_offset_core::kWorldHorizontalCrossProductProvenance;
+    // The producer has not yet been bound to a ContinuousPhasePath segment;
+    // the owner wrapper stamps the actual identity/revision after this
+    // callback returns.  Use a nonzero local identity so the value checker can
+    // validate all numerical fields before that binding step.
+    certificate.segment_identity = 1U;
+    certificate.proof_identity = 1U;
+    certificate.valid = true;
+    certificate.complete = true;
+    certificate.complete = phase_offset_core::certifiedPathCellV2IsComplete(
+        certificate);
+    return certificate.complete;
+}
+
+bool MakeQuinticV2Certificate(
+    const std::array<Eigen::Vector3d, 6U>& coefficients,
+    const double segment_w0, const double segment_w1,
+    const double w0, const double w1,
+    const Eigen::Vector3d* constant_horizontal_dp_dw,
+    phase_offset_core::CertifiedPathCellV2& certificate)
+{
+    certificate = phase_offset_core::CertifiedPathCellV2();
+    if (!ProofFloatingPointEnvironmentSupported() ||
+        !std::isfinite(segment_w0) || !std::isfinite(segment_w1) ||
+        !std::isfinite(w0) || !std::isfinite(w1) || !(segment_w1 > segment_w0) ||
+        w0 < segment_w0 || w1 > segment_w1 || !(w1 > w0)) {
+        return false;
+    }
+    const ProofInterval segment_span = ProofSub(
+        PointProofInterval(segment_w1), PointProofInterval(segment_w0));
+    const ProofInterval inverse_span = ProofDiv(
+        PointProofInterval(1.0), segment_span);
+    const ProofInterval first = ProofMul(
+        ProofSub(PointProofInterval(w0), PointProofInterval(segment_w0)),
+        inverse_span);
+    const ProofInterval last = ProofMul(
+        ProofSub(PointProofInterval(w1), PointProofInterval(segment_w0)),
+        inverse_span);
+    if (!ProofFinite(first) || !ProofFinite(last)) return false;
+    const std::vector<Eigen::Vector3d> position(coefficients.begin(),
+                                                coefficients.end());
+    const ProofVectorPolynomial position_poly =
+        ProofPolynomialFromEigen(position);
+    const ProofVectorPolynomial p_w_poly =
+        ProofDifferentiatePolynomial(position_poly);
+    const ProofVectorPolynomial p_ww_poly =
+        ProofDifferentiatePolynomial(p_w_poly);
+    const ProofVectorPolynomial p_www_poly =
+        ProofDifferentiatePolynomial(p_ww_poly);
+    // The proof contract anchors at the mathematical midpoint of the closed
+    // cell.  Keep that midpoint as an outward interval even when the phase
+    // coordinate itself is too large for the midpoint to be represented (the
+    // owner exposes a rounded diagnostic double below).  Also hull the phase
+    // obtained from that diagnostic value so existing consumers querying
+    // certificate.anchor_w remain enclosed by the same evidence.
+    const double anchor_w_value = w0 + 0.5 * (w1 - w0);
+    const ProofInterval mathematical_anchor_s = ProofMul(
+        PointProofInterval(0.5), ProofAdd(first, last));
+    const ProofInterval rounded_anchor_s = ProofDiv(
+        ProofSub(PointProofInterval(anchor_w_value),
+                 PointProofInterval(segment_w0)),
+        segment_span);
+    if (!ProofFinite(mathematical_anchor_s) ||
+        !ProofFinite(rounded_anchor_s)) return false;
+    const ProofInterval anchor_s = ProofIntervalFromBounds(
+        std::min(mathematical_anchor_s.lower, rounded_anchor_s.lower),
+        std::max(mathematical_anchor_s.upper, rounded_anchor_s.upper));
+    if (!ProofFinite(anchor_s)) return false;
+    std::array<ProofInterval, 3U> anchor_position =
+        ProofVectorPolynomialEvaluate(position_poly, anchor_s);
+    std::array<ProofInterval, 3U> anchor_p_w =
+        ProofVectorPolynomialEvaluate(p_w_poly, anchor_s);
+    std::array<ProofInterval, 3U> anchor_p_ww =
+        ProofVectorPolynomialEvaluate(p_ww_poly, anchor_s);
+    anchor_p_w = ProofVectorScale(anchor_p_w, inverse_span);
+    const ProofInterval inverse_span_squared = ProofMul(inverse_span,
+                                                         inverse_span);
+    anchor_p_ww = ProofVectorScale(anchor_p_ww, inverse_span_squared);
+
+    // Restricting a power polynomial to [first,last] and evaluating it with
+    // interval Horner is a complete closed-cell enclosure.  The subdivision
+    // is proof-only and does not alter the nominal evaluator.
+    const int subdivisions = 32;
+    ProofInterval inf_speed = ProofIntervalFromBounds(
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity());
+    ProofInterval inf_horizontal = inf_speed;
+    ProofInterval sup_speed = PointProofInterval(0.0);
+    ProofInterval sup_acceleration = PointProofInterval(0.0);
+    ProofInterval sup_horizontal_acceleration = PointProofInterval(0.0);
+    ProofInterval sup_jerk = PointProofInterval(0.0);
+    bool first_bound = true;
+    for (int index = 0; index < subdivisions; ++index) {
+        const ProofInterval fraction0 = ProofDiv(
+            PointProofInterval(static_cast<double>(index)),
+            PointProofInterval(static_cast<double>(subdivisions)));
+        const ProofInterval fraction1 = ProofDiv(
+            PointProofInterval(static_cast<double>(index + 1)),
+            PointProofInterval(static_cast<double>(subdivisions)));
+        const ProofInterval x = ProofAdd(first,
+            ProofMul(ProofSub(last, first), fraction0));
+        const ProofInterval x_end = ProofAdd(first,
+            ProofMul(ProofSub(last, first), fraction1));
+        if (!ProofFinite(x) || !ProofFinite(x_end)) return false;
+        const ProofInterval x_cell = ProofIntervalFromBounds(x.lower,
+                                                              x_end.upper);
+        std::array<ProofInterval, 3U> v = ProofVectorScale(
+            ProofVectorPolynomialEvaluate(p_w_poly, x_cell), inverse_span);
+        std::array<ProofInterval, 3U> a = ProofVectorScale(
+            ProofVectorPolynomialEvaluate(p_ww_poly, x_cell), inverse_span_squared);
+        const ProofInterval inverse_span_cubed = ProofMul(
+            inverse_span_squared, inverse_span);
+        std::array<ProofInterval, 3U> j = ProofVectorScale(
+            ProofVectorPolynomialEvaluate(p_www_poly, x_cell), inverse_span_cubed);
+        if (constant_horizontal_dp_dw != nullptr) {
+            // The nominal evaluator replaces the generic quintic horizontal
+            // branch with these exact stored components at every phase.  Do
+            // the same substitution before *all* norm extrema (not only the
+            // horizontal floor), so full speed/acceleration/jerk evidence
+            // covers the executed branch rather than depending on algebraic
+            // equivalence plus incidental rounding.
+            v[0] = PointProofInterval(constant_horizontal_dp_dw->x());
+            v[1] = PointProofInterval(constant_horizontal_dp_dw->y());
+            a[0] = PointProofInterval(0.0);
+            a[1] = PointProofInterval(0.0);
+            j[0] = PointProofInterval(0.0);
+            j[1] = PointProofInterval(0.0);
+        }
+        std::array<ProofInterval, 3U> vh = v;
+        std::array<ProofInterval, 3U> ah = a;
+        vh[2] = PointProofInterval(0.0);
+        ah[2] = PointProofInterval(0.0);
+        const ProofInterval speed = ProofNorm(v);
+        const ProofInterval horizontal_speed = ProofNorm(vh);
+        const ProofInterval acceleration = ProofNorm(a);
+        const ProofInterval horizontal_acceleration = ProofNorm(ah);
+        const ProofInterval jerk = ProofNorm(j);
+        if (!ProofFinite(speed) || !ProofFinite(horizontal_speed) ||
+            !ProofFinite(acceleration) || !ProofFinite(horizontal_acceleration) ||
+            !ProofFinite(jerk)) return false;
+        if (first_bound) {
+            inf_speed = speed;
+            inf_horizontal = horizontal_speed;
+            first_bound = false;
+        } else {
+            inf_speed.lower = std::min(inf_speed.lower, speed.lower);
+            inf_horizontal.lower = std::min(inf_horizontal.lower,
+                                             horizontal_speed.lower);
+        }
+        sup_speed.upper = std::max(sup_speed.upper, speed.upper);
+        sup_acceleration.upper = std::max(sup_acceleration.upper,
+                                          acceleration.upper);
+        sup_horizontal_acceleration.upper = std::max(
+            sup_horizontal_acceleration.upper, horizontal_acceleration.upper);
+        sup_jerk.upper = std::max(sup_jerk.upper, jerk.upper);
+    }
+    if (first_bound) return false;
+    inf_speed.valid = true;
+    inf_horizontal.valid = true;
+    sup_speed.valid = true;
+    sup_acceleration.valid = true;
+    sup_horizontal_acceleration.valid = true;
+    sup_jerk.valid = true;
+    if (constant_horizontal_dp_dw != nullptr) {
+        const Eigen::Vector3d horizontal(constant_horizontal_dp_dw->x(),
+                                         constant_horizontal_dp_dw->y(), 0.0);
+        // Preserve the exact direct-branch floor at the strict capability
+        // threshold.  DirectedLowerNorm is an exact binary64-squared oracle
+        // (not a guessed epsilon); its greatest representable value below
+        // the mathematical norm is paired with the next representable upper
+        // endpoint, so a one-ULP-above-threshold constant remains certifiable.
+        const double exact_horizontal_lower = DirectedLowerNorm(horizontal, true);
+        if (!std::isfinite(exact_horizontal_lower) ||
+            exact_horizontal_lower < 0.0) return false;
+        const double exact_horizontal_upper = exact_horizontal_lower == 0.0
+            ? 0.0
+            : std::nextafter(exact_horizontal_lower,
+                             std::numeric_limits<double>::infinity());
+        const ProofInterval exact_horizontal = ProofIntervalFromBounds(
+            exact_horizontal_lower, exact_horizontal_upper);
+        if (!ProofFinite(exact_horizontal)) return false;
+        inf_horizontal = exact_horizontal;
+        // The nominal point evaluator has an explicit horizontal derivative
+        // override.  Its proof must use the same value for anchor and every
+        // horizontal acceleration bound, rather than the generic quintic
+        // coefficients that are algebraically equivalent only in exact real
+        // arithmetic.
+        anchor_position[0] = ProofAdd(PointProofInterval(coefficients[0].x()),
+            ProofMul(PointProofInterval(constant_horizontal_dp_dw->x()),
+                     ProofMul(segment_span, anchor_s)));
+        anchor_position[1] = ProofAdd(PointProofInterval(coefficients[0].y()),
+            ProofMul(PointProofInterval(constant_horizontal_dp_dw->y()),
+                     ProofMul(segment_span, anchor_s)));
+        anchor_p_w[0] = PointProofInterval(constant_horizontal_dp_dw->x());
+        anchor_p_w[1] = PointProofInterval(constant_horizontal_dp_dw->y());
+        anchor_p_ww[0] = PointProofInterval(0.0);
+        anchor_p_ww[1] = PointProofInterval(0.0);
+        sup_horizontal_acceleration = PointProofInterval(0.0);
+    }
+    return MakeV2Certificate(w0, w1, anchor_w_value, anchor_position,
+        anchor_p_w, anchor_p_ww,
+        inf_speed, sup_speed, inf_horizontal, sup_acceleration,
+        sup_horizontal_acceleration, sup_jerk, true, certificate);
+}
+
 bool MakeMappedBsplineCertificate(
     const UniformBspline& p, const UniformBspline& dp_dt,
     const UniformBspline& d2p_dt2, const UniformBspline& d3p_dt3,
@@ -885,6 +1719,680 @@ bool MakeLinearMappedBsplineCertificate(
     return MakeCertificate(w0, w1, differential, certificate);
 }
 
+// UniformBspline::getDerivative() in the unchanged source stores
+// beta*(P[i+1]-P[i]) and therefore assumes unit-spaced source knots.  The V2
+// de Boor proof supports exactly that production representation; mutated,
+// non-unit, duplicated, or metadata-inconsistent knot vectors are rejected
+// rather than silently proving a different derivative than the nominal
+// evaluator executes.
+bool SupportedUniformSplineRepresentation(const UniformBspline& spline)
+{
+    if (spline.p_ < 0 || spline.n_ < 0 ||
+        spline.m_ != spline.p_ + spline.n_ + 1 ||
+        spline.control_points_.rows() != spline.n_ + 1 ||
+        spline.control_points_.cols() != 3 ||
+        spline.u_.size() != spline.m_ + 1) {
+        return false;
+    }
+    for (int index = 0; index <= spline.m_; ++index) {
+        const double knot = spline.u_(index);
+        if (!std::isfinite(knot)) return false;
+        if (index > 0 && !ExactBinary64DifferenceEqualsOne(
+                spline.u_(index), spline.u_(index - 1))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SupportedSplineTimeDomain(const UniformBspline& spline,
+                               const double t0, const double t1)
+{
+    if (!SupportedUniformSplineRepresentation(spline) ||
+        !std::isfinite(spline.beta_) || spline.beta_ <= 0.0 ||
+        !std::isfinite(t0) || !std::isfinite(t1) || t1 <= t0 || t0 < 0.0) {
+        return false;
+    }
+    const int span_count = spline.m_ - 2 * spline.p_;
+    const double span = static_cast<double>(span_count);
+    return span_count > 0 && std::isfinite(span) &&
+        phase_offset_core::binary64ProductLeq(t1, spline.beta_, span);
+}
+
+// Call-local preparation only: neither the path nor a shared evaluator is
+// mutated. Derivatives still use the original binary64 controls and exactly
+// the same outward operations, not the rounded nominal derivative splines.
+struct OriginalSplineProofControls {
+    const UniformBspline& spline;
+    const bool representation_supported;
+    std::vector<ProofVectorPolynomial> derivatives;
+
+    explicit OriginalSplineProofControls(const UniformBspline& source)
+        : spline(source),
+          representation_supported(SupportedUniformSplineRepresentation(source)) {}
+
+    bool prepare(const int derivative_order) {
+        if (derivatives.empty()) {
+            ProofVectorPolynomial controls;
+            controls.reserve(static_cast<std::size_t>(spline.control_points_.rows()));
+            for (Eigen::Index row = 0; row < spline.control_points_.rows(); ++row) {
+                const Eigen::Vector3d value = spline.control_points_.row(row);
+                if (!value.allFinite()) return false;
+                controls.push_back(ProofVectorConstant(value));
+            }
+            derivatives.push_back(std::move(controls));
+        }
+        while (derivatives.size() <= static_cast<std::size_t>(derivative_order)) {
+            const int order = static_cast<int>(derivatives.size()) - 1;
+            const int degree = spline.p_ - order;
+            const ProofVectorPolynomial& controls = derivatives.back();
+            ProofVectorPolynomial next;
+            next.resize(controls.size() - 1U);
+            for (std::size_t index = 0U; index + 1U < controls.size(); ++index) {
+                const int knot_offset = order;
+                const ProofInterval left_knot = PointProofInterval(
+                    spline.u_(static_cast<Eigen::Index>(index + 1U +
+                                                        knot_offset)));
+                const ProofInterval right_knot = PointProofInterval(
+                    spline.u_(static_cast<Eigen::Index>(index + degree + 1 +
+                                                        knot_offset)));
+                const ProofInterval denominator = ProofSub(right_knot, left_knot);
+                const ProofInterval scale = ProofMul(
+                    PointProofInterval(spline.beta_),
+                    PointProofInterval(static_cast<double>(degree)));
+                const ProofInterval factor = ProofDiv(scale, denominator);
+                if (!ProofFinite(factor)) return false;
+                for (std::size_t component = 0U; component < 3U; ++component) {
+                    next[index][component] = ProofMul(
+                        ProofSub(controls[index + 1U][component],
+                                 controls[index][component]), factor);
+                }
+            }
+            derivatives.push_back(std::move(next));
+        }
+        return !derivatives[static_cast<std::size_t>(derivative_order)].empty();
+    }
+};
+
+bool ProofBoundsFromOriginalSpline(
+    OriginalSplineProofControls& prepared, const int derivative_order,
+    const double t0, const double t1,
+    std::array<ProofInterval, 3U>& full,
+    std::array<ProofInterval, 3U>& horizontal)
+{
+    const UniformBspline& spline = prepared.spline;
+    if (derivative_order < 0 || derivative_order > spline.p_ ||
+        !std::isfinite(t0) || !std::isfinite(t1) || !(t1 > t0) ||
+        !std::isfinite(spline.beta_) || spline.beta_ <= 0.0 ||
+        spline.p_ < 0 || spline.m_ <= spline.p_ ||
+        spline.u_.size() <= spline.m_ || spline.control_points_.rows() <= 0 ||
+        spline.control_points_.cols() != 3 ||
+        !prepared.representation_supported) return false;
+    const int source_span_count = spline.m_ - 2 * spline.p_;
+    const double source_span = static_cast<double>(source_span_count);
+    if (source_span_count <= 0 || !std::isfinite(source_span) ||
+        t0 < 0.0 ||
+        !phase_offset_core::binary64ProductLeq(
+            t1, spline.beta_, source_span)) {
+        return false;
+    }
+    if (!prepared.prepare(derivative_order)) return false;
+    const ProofVectorPolynomial& controls =
+        prepared.derivatives[static_cast<std::size_t>(derivative_order)];
+    const int degree = spline.p_ - derivative_order;
+    if (controls.empty() || degree < 0) return false;
+    const int knot_offset = derivative_order;
+    // Each derivative trims one knot from both ends.  The source's derivative
+    // constructor correspondingly reduces p_, n_, and m_; derivative_m is
+    // the final source-backed knot index after those trims.
+    const int derivative_m = spline.m_ - 2 * derivative_order;
+    const ProofInterval u0 = ProofAdd(
+        ProofMul(PointProofInterval(t0), PointProofInterval(spline.beta_)),
+        PointProofInterval(spline.u_(spline.p_)));
+    const ProofInterval u1 = ProofAdd(
+        ProofMul(PointProofInterval(t1), PointProofInterval(spline.beta_)),
+        PointProofInterval(spline.u_(spline.p_)));
+    if (!ProofFinite(u0) || !ProofFinite(u1)) return false;
+    std::array<ProofInterval, 3U> aggregate;
+    std::array<ProofInterval, 3U> aggregate_horizontal;
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        aggregate[component] = ProofIntervalFromBounds(
+            std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity());
+        aggregate_horizontal[component] = aggregate[component];
+    }
+    bool have_span = false;
+    for (int span = degree; span <= derivative_m - degree - 1; ++span) {
+        const ProofInterval knot_left = PointProofInterval(
+            spline.u_(span + knot_offset));
+        const ProofInterval knot_right = PointProofInterval(
+            spline.u_(span + 1 + knot_offset));
+        if (!ProofFinite(knot_left) || !ProofFinite(knot_right) ||
+            !(knot_right.lower > knot_left.upper) ||
+            knot_right.upper < u0.lower || knot_left.lower > u1.upper) {
+            continue;
+        }
+        std::vector<std::array<ProofInterval, 3U>> deBoor(
+            static_cast<std::size_t>(degree + 1));
+        for (int index = 0; index <= degree; ++index) {
+            const std::size_t control_index = static_cast<std::size_t>(
+                span - degree + index);
+            if (control_index >= controls.size()) return false;
+            deBoor[static_cast<std::size_t>(index)] = controls[control_index];
+        }
+        // Restrict de Boor's query to the actual requested parameter
+        // interval.  Using the entire knot span here is sound but needlessly
+        // widens derivative controls (and can erase a strictly positive speed
+        // floor for a small mapped cell).  The intersection endpoints are
+        // already outward interval bounds from the source knot/map arithmetic.
+        const double query_lower = std::max(knot_left.lower, u0.lower);
+        const double query_upper = std::min(knot_right.upper, u1.upper);
+        if (!std::isfinite(query_lower) || !std::isfinite(query_upper) ||
+            query_lower > query_upper) {
+            continue;
+        }
+        const ProofInterval query = ProofIntervalFromBounds(
+            query_lower, query_upper);
+        for (int round = 1; round <= degree; ++round) {
+            for (int index = degree; index >= round; --index) {
+                const int left_index = span + index - degree + knot_offset;
+                const int right_index = span + index - round + 1 + knot_offset;
+                const ProofInterval left = PointProofInterval(
+                    spline.u_(left_index));
+                const ProofInterval right = PointProofInterval(
+                    spline.u_(right_index));
+                const ProofInterval alpha = ProofDiv(ProofSub(query, left),
+                                                     ProofSub(right, left));
+                if (!ProofFinite(alpha)) return false;
+                const ProofInterval one_minus_alpha = ProofSub(
+                    PointProofInterval(1.0), alpha);
+                for (std::size_t component = 0U; component < 3U; ++component) {
+                    deBoor[static_cast<std::size_t>(index)][component] =
+                        ProofAdd(
+                            ProofMul(one_minus_alpha,
+                                     deBoor[static_cast<std::size_t>(index - 1)]
+                                         [component]),
+                            ProofMul(alpha,
+                                     deBoor[static_cast<std::size_t>(index)]
+                                         [component]));
+                }
+            }
+        }
+        for (std::size_t component = 0U; component < 3U; ++component) {
+            const ProofInterval value = deBoor.back()[component];
+            if (!ProofFinite(value)) return false;
+            if (!have_span) {
+                aggregate[component] = value;
+                aggregate_horizontal[component] = component < 2U
+                    ? value : PointProofInterval(0.0);
+            } else {
+                aggregate[component].lower = std::min(
+                    aggregate[component].lower, value.lower);
+                aggregate[component].upper = std::max(
+                    aggregate[component].upper, value.upper);
+                if (component < 2U) {
+                    aggregate_horizontal[component].lower = std::min(
+                        aggregate_horizontal[component].lower, value.lower);
+                    aggregate_horizontal[component].upper = std::max(
+                        aggregate_horizontal[component].upper, value.upper);
+                }
+            }
+        }
+        have_span = true;
+    }
+    if (!have_span) return false;
+    for (std::size_t component = 0U; component < 3U; ++component) {
+        aggregate[component].valid = true;
+        aggregate_horizontal[component].valid = true;
+    }
+    full = aggregate;
+    horizontal = aggregate_horizontal;
+    return ProofVectorFinite(full) && ProofVectorFinite(horizontal);
+}
+
+bool MakeLinearMappedBsplineV2Certificate(
+    const UniformBspline& p, const UniformBspline& dp_dt,
+    const UniformBspline& d2p_dt2, const UniformBspline& d3p_dt3,
+    const double spline_t_anchor, const double spline_t_end,
+    const double phase_w_anchor, const double phase_w_end,
+    const double w0, const double w1,
+    phase_offset_core::CertifiedPathCellV2& certificate)
+{
+    (void)dp_dt;
+    (void)d2p_dt2;
+    (void)d3p_dt3;
+    certificate = phase_offset_core::CertifiedPathCellV2();
+    if (!ProofFloatingPointEnvironmentSupported() ||
+        !std::isfinite(spline_t_anchor) || !std::isfinite(spline_t_end) ||
+        !std::isfinite(phase_w_anchor) || !std::isfinite(phase_w_end) ||
+        !std::isfinite(w0) || !std::isfinite(w1) || !(spline_t_end > spline_t_anchor) ||
+        !(phase_w_end > phase_w_anchor) || w0 < phase_w_anchor ||
+        w1 > phase_w_end || !(w1 > w0)) return false;
+    if (!SupportedSplineTimeDomain(p, spline_t_anchor, spline_t_end)) {
+        return false;
+    }
+    const ProofInterval phase_span = ProofSub(
+        PointProofInterval(phase_w_end), PointProofInterval(phase_w_anchor));
+    const ProofInterval time_span = ProofSub(
+        PointProofInterval(spline_t_end), PointProofInterval(spline_t_anchor));
+    const ProofInterval dt_dw = ProofDiv(time_span, phase_span);
+    const ProofInterval t0 = ProofAdd(PointProofInterval(spline_t_anchor),
+        ProofMul(dt_dw, ProofSub(PointProofInterval(w0),
+                                 PointProofInterval(phase_w_anchor))));
+    const ProofInterval t1 = ProofAdd(PointProofInterval(spline_t_anchor),
+        ProofMul(dt_dw, ProofSub(PointProofInterval(w1),
+                                 PointProofInterval(phase_w_anchor))));
+    if (!ProofFinite(dt_dw) || !ProofFinite(t0) || !ProofFinite(t1) ||
+        !(t1.upper > t0.lower)) return false;
+    std::array<ProofInterval, 3U> p_bounds;
+    std::array<ProofInterval, 3U> p_h_bounds;
+    std::array<ProofInterval, 3U> p_t;
+    std::array<ProofInterval, 3U> p_t_h;
+    std::array<ProofInterval, 3U> p_tt;
+    std::array<ProofInterval, 3U> p_tt_h;
+    std::array<ProofInterval, 3U> p_ttt;
+    std::array<ProofInterval, 3U> p_ttt_h;
+    OriginalSplineProofControls prepared(p);
+    if (!ProofBoundsFromOriginalSpline(prepared, 0, t0.lower, t1.upper, p_bounds,
+                               p_h_bounds) ||
+        !ProofBoundsFromOriginalSpline(prepared, 1, t0.lower, t1.upper, p_t, p_t_h) ||
+        !ProofBoundsFromOriginalSpline(prepared, 2, t0.lower, t1.upper, p_tt,
+                               p_tt_h) ||
+        !ProofBoundsFromOriginalSpline(prepared, 3, t0.lower, t1.upper, p_ttt,
+                               p_ttt_h)) return false;
+    const ProofInterval speed_t = ProofNorm(p_t);
+    const ProofInterval horizontal_speed_t = ProofNorm(p_t_h);
+    const ProofInterval acceleration_t = ProofNorm(p_tt);
+    const ProofInterval horizontal_acceleration_t = ProofNorm(p_tt_h);
+    const ProofInterval jerk_t = ProofNorm(p_ttt);
+    const ProofInterval speed = ProofMul(speed_t, dt_dw);
+    const ProofInterval horizontal_speed = ProofMul(horizontal_speed_t, dt_dw);
+    const ProofInterval acceleration = ProofMul(
+        acceleration_t, ProofMul(dt_dw, dt_dw));
+    const ProofInterval horizontal_acceleration = ProofMul(
+        horizontal_acceleration_t, ProofMul(dt_dw, dt_dw));
+    const ProofInterval jerk = ProofMul(jerk_t,
+        ProofMul(ProofMul(dt_dw, dt_dw), dt_dw));
+    if (!ProofFinite(speed) || !ProofFinite(horizontal_speed) ||
+        !ProofFinite(acceleration) || !ProofFinite(horizontal_acceleration) ||
+        !ProofFinite(jerk)) return false;
+    const double anchor_w_value = w0 + 0.5 * (w1 - w0);
+    const ProofInterval mathematical_anchor_w = ProofMul(
+        PointProofInterval(0.5), ProofAdd(PointProofInterval(w0),
+                                          PointProofInterval(w1)));
+    const ProofInterval rounded_anchor_w = PointProofInterval(anchor_w_value);
+    if (!ProofFinite(mathematical_anchor_w) ||
+        !ProofFinite(rounded_anchor_w)) return false;
+    const ProofInterval anchor_w = ProofIntervalFromBounds(
+        std::min(mathematical_anchor_w.lower, rounded_anchor_w.lower),
+        std::max(mathematical_anchor_w.upper, rounded_anchor_w.upper));
+    const ProofInterval anchor_t = ProofAdd(PointProofInterval(spline_t_anchor),
+        ProofMul(dt_dw, ProofSub(anchor_w, PointProofInterval(phase_w_anchor))));
+    std::array<ProofInterval, 3U> anchor_position;
+    std::array<ProofInterval, 3U> anchor_p_w;
+    std::array<ProofInterval, 3U> anchor_p_ww;
+    if (!ProofBoundsFromOriginalSpline(prepared, 0, anchor_t.lower, anchor_t.upper,
+                               anchor_position, p_h_bounds) ||
+        !ProofBoundsFromOriginalSpline(prepared, 1, anchor_t.lower, anchor_t.upper,
+                               anchor_p_w, p_t_h) ||
+        !ProofBoundsFromOriginalSpline(prepared, 2, anchor_t.lower, anchor_t.upper,
+                               anchor_p_ww, p_tt_h)) return false;
+    anchor_p_w = ProofVectorScale(anchor_p_w, dt_dw);
+    anchor_p_ww = ProofVectorScale(anchor_p_ww,
+        ProofMul(dt_dw, dt_dw));
+    return MakeV2Certificate(w0, w1, anchor_w_value, anchor_position,
+                             anchor_p_w, anchor_p_ww, speed, speed,
+                             horizontal_speed, acceleration,
+                             horizontal_acceleration, jerk, true, certificate);
+}
+
+bool invertArcLengthMap(const ArcLengthMap&, double, double&, double&, double&);
+bool MakeMappedBsplineV2Certificate(
+    const UniformBspline& p, const UniformBspline& dp_dt,
+    const UniformBspline& d2p_dt2, const UniformBspline& d3p_dt3,
+    const ArcLengthMap& map, const double spline_t_anchor,
+    const double spline_t_end, const double phase_w_anchor,
+    const double phase_w_end, const double arclength_per_phase,
+    const double w0, const double w1,
+    phase_offset_core::CertifiedPathCellV2& certificate)
+{
+    (void)dp_dt;
+    (void)d2p_dt2;
+    (void)d3p_dt3;
+    certificate = phase_offset_core::CertifiedPathCellV2();
+    if (!ProofFloatingPointEnvironmentSupported() ||
+        !std::isfinite(w0) || !std::isfinite(w1) || !(w1 > w0) ||
+        w0 < phase_w_anchor || w1 > phase_w_end ||
+        !std::isfinite(arclength_per_phase) || arclength_per_phase <= 0.0 ||
+        map.cells.empty() || map.table_s.size() != map.cells.size() + 1U ||
+        map.table_t.size() != map.table_s.size()) return false;
+    if (!SupportedSplineTimeDomain(p, spline_t_anchor, spline_t_end)) {
+        return false;
+    }
+    for (std::size_t index = 0U; index < map.table_s.size(); ++index) {
+        if (!std::isfinite(map.table_s[index]) ||
+            !std::isfinite(map.table_t[index])) {
+            return false;
+        }
+        if (index > 0U &&
+            !(map.table_s[index] > map.table_s[index - 1U]) ) {
+            return false;
+        }
+    }
+    const ProofInterval scale = PointProofInterval(arclength_per_phase);
+    const ProofInterval target0 = ProofMul(scale,
+        ProofSub(PointProofInterval(w0), PointProofInterval(phase_w_anchor)));
+    const ProofInterval target1 = ProofMul(scale,
+        ProofSub(PointProofInterval(w1), PointProofInterval(phase_w_anchor)));
+    if (!ProofFinite(target0) || !ProofFinite(target1)) return false;
+    const double total_map_s = map.table_s.back();
+    if (!std::isfinite(total_map_s) || total_map_s <= 0.0 ||
+        target0.upper < 0.0 || target1.lower > total_map_s) {
+        return false;
+    }
+    // The phase-domain inequalities are authoritative for the represented
+    // map.  Intersect their outward arithmetic with the known map domain
+    // before selecting cells; this prevents a one-ULP endpoint excursion from
+    // becoming an inverse-coverage claim outside the table.
+    const double target0_lower = std::max(0.0, target0.lower);
+    const double target1_upper = std::min(total_map_s, target1.upper);
+    const auto first_table = std::upper_bound(map.table_s.begin(),
+                                               map.table_s.end(),
+                                               target0_lower);
+    const auto last_table = std::upper_bound(map.table_s.begin(),
+                                              map.table_s.end(),
+                                              target1_upper);
+    std::size_t begin_index = first_table == map.table_s.begin() ? 0U :
+        static_cast<std::size_t>(std::distance(map.table_s.begin(), first_table) - 1);
+    std::size_t end_index = last_table == map.table_s.begin() ? 0U :
+        static_cast<std::size_t>(std::distance(map.table_s.begin(), last_table) - 1);
+    begin_index = std::min(begin_index, map.cells.size() - 1U);
+    end_index = std::min(end_index, map.cells.size() - 1U);
+    double enclosed_t0 = std::numeric_limits<double>::infinity();
+    double enclosed_t1 = -std::numeric_limits<double>::infinity();
+    ProofInterval q_min = PointProofInterval(std::numeric_limits<double>::infinity());
+    ProofInterval q_max = PointProofInterval(0.0);
+    ProofInterval q_prime_abs = PointProofInterval(0.0);
+    ProofInterval q_second_abs = PointProofInterval(0.0);
+    bool any = false;
+    for (std::size_t index = begin_index; index <= end_index; ++index) {
+        const ArcLengthCell& cell = map.cells[index];
+        if (!std::isfinite(cell.t0) || !std::isfinite(cell.h) || cell.h <= 0.0) {
+            return false;
+        }
+        std::vector<ProofInterval> q_coefficients;
+        std::vector<ProofInterval> qp_coefficients;
+        std::vector<ProofInterval> qpp_coefficients;
+        for (int order = 1; order <= 5; ++order) {
+            q_coefficients.push_back(ProofMul(
+                PointProofInterval(static_cast<double>(order)),
+                PointProofInterval(cell.a[static_cast<std::size_t>(order)])));
+        }
+        for (int order = 2; order <= 5; ++order) {
+            qp_coefficients.push_back(ProofMul(
+                PointProofInterval(static_cast<double>(order * (order - 1))),
+                PointProofInterval(cell.a[static_cast<std::size_t>(order)])));
+        }
+        for (int order = 3; order <= 5; ++order) {
+            qpp_coefficients.push_back(ProofMul(
+                PointProofInterval(static_cast<double>(order * (order - 1) *
+                    (order - 2))),
+                PointProofInterval(cell.a[static_cast<std::size_t>(order)])));
+        }
+        const ProofInterval q = ProofDiv(
+            ProofPowerToBernsteinRange(q_coefficients),
+            PointProofInterval(cell.h));
+        const ProofInterval qp = ProofDiv(
+            ProofPowerToBernsteinRange(qp_coefficients),
+            ProofMul(PointProofInterval(cell.h), PointProofInterval(cell.h)));
+        const ProofInterval qpp = ProofDiv(
+            ProofPowerToBernsteinRange(qpp_coefficients),
+            ProofMul(ProofMul(PointProofInterval(cell.h),
+                              PointProofInterval(cell.h)),
+                     PointProofInterval(cell.h)));
+        if (!ProofFinite(q) || !ProofFinite(qp) || !ProofFinite(qpp) ||
+            q.lower <= 0.0) {
+            return false;
+        }
+        q_min.lower = any ? std::min(q_min.lower, q.lower) : q.lower;
+        q_min.upper = any ? std::max(q_min.upper, q.upper) : q.upper;
+        q_max.upper = std::max(q_max.upper, q.upper);
+        q_prime_abs.upper = std::max(q_prime_abs.upper,
+            std::max(std::abs(qp.lower), std::abs(qp.upper)));
+        q_second_abs.upper = std::max(q_second_abs.upper,
+            std::max(std::abs(qpp.lower), std::abs(qpp.upper)));
+        enclosed_t0 = std::min(enclosed_t0, map.table_t[index]);
+        enclosed_t1 = std::max(enclosed_t1, map.table_t[index + 1U]);
+        any = true;
+    }
+    if (!any || !std::isfinite(enclosed_t0) || !std::isfinite(enclosed_t1) ||
+        enclosed_t1 <= enclosed_t0) {
+        return false;
+    }
+    q_min.valid = true;
+    // q_max is used as a positive denominator bound for dt/dw.  It is not
+    // the interval [0, max]; retaining zero as its lower endpoint would make
+    // the otherwise valid division straddle zero and reject every mapped
+    // certificate.  The stored upper bound itself is the conservative scalar
+    // denominator bound.
+    if (!std::isfinite(q_max.upper) || q_max.upper <= 0.0 ||
+        !std::isfinite(q_min.lower) || q_min.lower <= 0.0) {
+        return false;
+    }
+    q_max.lower = q_max.upper;
+    q_max.valid = true;
+    q_prime_abs.valid = true;
+    q_second_abs.valid = true;
+    std::array<ProofInterval, 3U> p_bounds;
+    std::array<ProofInterval, 3U> p_h_bounds;
+    std::array<ProofInterval, 3U> pt_bounds;
+    std::array<ProofInterval, 3U> pt_h_bounds;
+    std::array<ProofInterval, 3U> ptt_bounds;
+    std::array<ProofInterval, 3U> ptt_h_bounds;
+    std::array<ProofInterval, 3U> pttt_bounds;
+    std::array<ProofInterval, 3U> pttt_h_bounds;
+    OriginalSplineProofControls prepared(p);
+    const bool bounds0 = ProofBoundsFromOriginalSpline(
+        prepared, 0, enclosed_t0, enclosed_t1, p_bounds, p_h_bounds);
+    const bool bounds1 = ProofBoundsFromOriginalSpline(
+        prepared, 1, enclosed_t0, enclosed_t1, pt_bounds, pt_h_bounds);
+    const bool bounds2 = ProofBoundsFromOriginalSpline(
+        prepared, 2, enclosed_t0, enclosed_t1, ptt_bounds, ptt_h_bounds);
+    const bool bounds3 = ProofBoundsFromOriginalSpline(
+        prepared, 3, enclosed_t0, enclosed_t1, pttt_bounds, pttt_h_bounds);
+    if (!(bounds0 && bounds1 && bounds2 && bounds3)) return false;
+    const ProofInterval dt_dw_min = ProofDiv(scale, q_max);
+    const ProofInterval dt_dw_max = ProofDiv(scale, q_min);
+    const ProofInterval d2t_dw2 = ProofMul(
+        ProofMul(ProofMul(scale, scale), q_prime_abs),
+        ProofDiv(PointProofInterval(1.0),
+                 ProofMul(ProofMul(q_min, q_min), q_min)));
+    // d2t/dw2 = -scale^2*q'/q^3 has unknown sign because q' may be
+    // positive or negative.  Keep the nonnegative magnitude bound for scalar
+    // acceleration/jerk terms, but use a symmetric signed interval whenever
+    // forming the anchor vector enclosure.
+    if (!ProofFinite(d2t_dw2)) return false;
+    const ProofInterval d2t_dw2_signed = ProofIntervalFromBounds(
+        ProofLower(-d2t_dw2.upper), ProofUpper(d2t_dw2.upper));
+    if (!ProofFinite(d2t_dw2_signed)) return false;
+    // t' = S'/q, t'' = -S'^2 q'/q^3 and
+    // |t'''| <= S'^3 (3|q'|^2/q_min^5 + |q''|/q_min^4).
+    const ProofInterval q_min_squared = ProofMul(q_min, q_min);
+    const ProofInterval q_min_cubed = ProofMul(q_min_squared, q_min);
+    const ProofInterval q_min_fourth = ProofMul(q_min_cubed, q_min);
+    const ProofInterval q_min_fifth = ProofMul(q_min_fourth, q_min);
+    const ProofInterval d3t_dw3 = ProofMul(
+        ProofMul(ProofMul(scale, scale), scale),
+        ProofAdd(ProofDiv(ProofMul(
+                                   ProofIntervalFromBounds(3.0, 3.0),
+                                   ProofMul(q_prime_abs, q_prime_abs)),
+                          q_min_fifth),
+                 ProofDiv(q_second_abs, q_min_fourth)));
+    if (!ProofFinite(dt_dw_min) || !ProofFinite(dt_dw_max) ||
+        !ProofFinite(d2t_dw2) || !ProofFinite(d3t_dw3)) {
+        return false;
+    }
+    const ProofInterval speed = ProofMul(ProofNorm(pt_bounds), dt_dw_min);
+    const ProofInterval horizontal_speed = ProofMul(
+        ProofNorm(pt_h_bounds), dt_dw_min);
+    const ProofInterval acceleration = ProofAdd(
+        ProofMul(ProofNorm(ptt_bounds), ProofMul(dt_dw_max, dt_dw_max)),
+        ProofMul(ProofNorm(pt_bounds), d2t_dw2));
+    const ProofInterval horizontal_acceleration = ProofAdd(
+        ProofMul(ProofNorm(ptt_h_bounds), ProofMul(dt_dw_max, dt_dw_max)),
+        ProofMul(ProofNorm(pt_h_bounds), d2t_dw2));
+    const ProofInterval jerk = ProofAdd(
+        ProofAdd(ProofMul(ProofNorm(pttt_bounds),
+                          ProofMul(ProofMul(dt_dw_max, dt_dw_max), dt_dw_max)),
+                 ProofMul(ProofMul(PointProofInterval(3.0), ProofNorm(ptt_bounds)),
+                          ProofMul(dt_dw_max, d2t_dw2))),
+        ProofMul(ProofNorm(pt_bounds), d3t_dw3));
+    if (!ProofFinite(speed) || !ProofFinite(horizontal_speed) ||
+        !ProofFinite(acceleration) || !ProofFinite(horizontal_acceleration) ||
+        !ProofFinite(jerk)) {
+        return false;
+    }
+    const double anchor_w_value = w0 + 0.5 * (w1 - w0);
+    const ProofInterval mathematical_anchor_w = ProofMul(
+        PointProofInterval(0.5), ProofAdd(PointProofInterval(w0),
+                                          PointProofInterval(w1)));
+    const ProofInterval rounded_anchor_w = PointProofInterval(anchor_w_value);
+    if (!ProofFinite(mathematical_anchor_w) ||
+        !ProofFinite(rounded_anchor_w)) return false;
+    const ProofInterval anchor_w = ProofIntervalFromBounds(
+        std::min(mathematical_anchor_w.lower, rounded_anchor_w.lower),
+        std::max(mathematical_anchor_w.upper, rounded_anchor_w.upper));
+    const ProofInterval anchor_target_s = ProofMul(
+        scale, ProofSub(anchor_w, PointProofInterval(phase_w_anchor)));
+    if (!ProofFinite(anchor_target_s) ||
+        anchor_target_s.upper < target0.lower ||
+        anchor_target_s.lower > target1.upper) {
+        return false;
+    }
+    // Invert the STORED monotone quintic, not the nominal Newton estimate.
+    // Interval Newton uses a positive derivative enclosure over [0,1].
+    // At ambiguous table/polynomial endpoints retain the original cell hull;
+    // do not assert that a rounded endpoint or nominal iterate is an inverse.
+    // This is anchor-only work: all complete-cell bounds above are unchanged.
+    const double anchor_s0 = std::max(target0_lower,
+        std::min(target1_upper, anchor_target_s.lower));
+    const double anchor_s1 = std::max(target0_lower,
+        std::min(target1_upper, anchor_target_s.upper));
+    ProofInterval anchor_t = InvalidProofInterval();
+    ProofInterval anchor_q = InvalidProofInterval();
+    ProofInterval anchor_qp = InvalidProofInterval();
+    // Keep the rigorous inverse enclosure and also cover the executable
+    // inverse's binary64 result; its residual stopping rule is unchanged.
+    double nominal_t, nominal_q, nominal_qp;
+    const double nominal_s = std::max(0.0, std::min(map.table_s.back(),
+        arclength_per_phase * (anchor_w_value - phase_w_anchor)));
+    if (!invertArcLengthMap(map, nominal_s, nominal_t, nominal_q, nominal_qp)) return false;
+    const auto hull = [](ProofInterval& out, const ProofInterval& value) {
+        if (!out.valid) out = value;
+        else {
+            out.lower = std::min(out.lower, value.lower);
+            out.upper = std::max(out.upper, value.upper);
+        }
+    };
+    for (std::size_t index = begin_index; index <= end_index; ++index) {
+        const double s0 = std::max(anchor_s0, map.table_s[index]);
+        const double s1 = std::min(anchor_s1, map.table_s[index + 1U]);
+        if (s0 > s1) continue;
+        const ArcLengthCell& local = map.cells[index];
+        std::vector<ProofInterval> coefficients, first, second;
+        for (std::size_t order = 0U; order < local.a.size(); ++order) {
+            coefficients.push_back(PointProofInterval(local.a[order]));
+            if (order > 0U) first.push_back(ProofMul(
+                PointProofInterval(static_cast<double>(order)), coefficients.back()));
+            if (order > 1U) second.push_back(ProofMul(
+                PointProofInterval(static_cast<double>(order * (order - 1U))), coefficients.back()));
+        }
+        const ProofInterval derivative = ProofPowerToBernsteinRange(first);
+        if (!ProofFinite(derivative) || derivative.lower <= 0.0) return false;
+        const ProofInterval target = ProofIntervalFromBounds(s0, s1);
+        ProofInterval x = ProofIntervalFromBounds(0.0, 1.0);
+        const ProofInterval at_zero = ProofHorner(coefficients, PointProofInterval(0.0));
+        const ProofInterval at_one = ProofHorner(coefficients, PointProofInterval(1.0));
+        if (!ProofFinite(at_zero) || !ProofFinite(at_one)) return false;
+        const bool inverse_bracketed = at_zero.upper <= s0 && s1 <= at_one.lower;
+        // This guess only selects the evaluation point. Every contraction
+        // below is justified by outward arithmetic and monotonicity.
+        double center = std::max(0.0, std::min(1.0,
+            ((s0 + 0.5 * (s1 - s0)) - map.table_s[index]) /
+            (map.table_s[index + 1U] - map.table_s[index])));
+        for (int iteration = 0; inverse_bracketed &&
+             iteration < std::numeric_limits<double>::digits; ++iteration) {
+            if (!std::isfinite(center)) return false;
+            const ProofInterval value = ProofHorner(coefficients, PointProofInterval(center));
+            const ProofInterval inverse = ProofSub(PointProofInterval(center),
+                ProofDiv(ProofSub(value, target), derivative));
+            if (!ProofFinite(inverse)) return false;
+            const double lower = std::max(x.lower, inverse.lower);
+            const double upper = std::min(x.upper, inverse.upper);
+            if (lower > upper) return false;
+            if (lower == x.lower && upper == x.upper) break;
+            x = ProofIntervalFromBounds(lower, upper);
+            center = lower + 0.5 * (upper - lower);
+            if (!(center > lower && center < upper)) break;
+        }
+        if (nominal_s >= map.table_s[index] && nominal_s <= map.table_s[index + 1U]) {
+            const ProofInterval nominal_x = ProofDiv(
+                ProofSub(PointProofInterval(nominal_t), PointProofInterval(local.t0)),
+                PointProofInterval(local.h));
+            if (!ProofFinite(nominal_x)) return false;
+            x.lower = std::min(x.lower, std::max(0.0, nominal_x.lower));
+            x.upper = std::max(x.upper, std::min(1.0, nominal_x.upper));
+        }
+        const ProofInterval time = ProofAdd(PointProofInterval(local.t0),
+            ProofMul(PointProofInterval(local.h), x));
+        ProofInterval q = ProofDiv(ProofHorner(first, x), PointProofInterval(local.h));
+        ProofInterval qp = ProofDiv(ProofHorner(second, x),
+            ProofMul(PointProofInterval(local.h), PointProofInterval(local.h)));
+        if (!ProofFinite(time) || !ProofFinite(q) ||
+            !ProofFinite(qp)) return false;
+        // Intersect with the already-proved full-cell bounds; these remain
+        // untouched and keep dependency widening from destroying positivity.
+        q = ProofIntervalFromBounds(std::max(q.lower, q_min.lower),
+                                     std::min(q.upper, q_max.upper));
+        qp = ProofIntervalFromBounds(std::max(qp.lower, -q_prime_abs.upper),
+                                      std::min(qp.upper, q_prime_abs.upper));
+        if (!ProofFinite(q) || q.lower <= 0.0 || !ProofFinite(qp)) return false;
+        hull(anchor_t, time);
+        hull(anchor_q, q);
+        hull(anchor_qp, qp);
+    }
+    hull(anchor_t, PointProofInterval(nominal_t));
+    hull(anchor_q, PointProofInterval(nominal_q));
+    hull(anchor_qp, PointProofInterval(nominal_qp));
+    if (!ProofFinite(anchor_t) || !ProofFinite(anchor_q) || !ProofFinite(anchor_qp)) return false;
+    // Preserve the authoritative native time domain, including its endpoints.
+    // One outward ULP also lets a singleton inverse use the interval evaluator.
+    anchor_t.lower = std::max(spline_t_anchor,
+        std::nextafter(anchor_t.lower, -std::numeric_limits<double>::infinity()));
+    anchor_t.upper = std::min(spline_t_end,
+        std::nextafter(anchor_t.upper, std::numeric_limits<double>::infinity()));
+    std::array<ProofInterval, 3U> anchor_position, anchor_pt, anchor_ptt, unused_horizontal;
+    if (!ProofBoundsFromOriginalSpline(prepared, 0, anchor_t.lower, anchor_t.upper,
+                                      anchor_position, unused_horizontal) ||
+        !ProofBoundsFromOriginalSpline(prepared, 1, anchor_t.lower, anchor_t.upper,
+                                      anchor_pt, unused_horizontal) ||
+        !ProofBoundsFromOriginalSpline(prepared, 2, anchor_t.lower, anchor_t.upper,
+                                      anchor_ptt, unused_horizontal)) return false;
+    const ProofInterval anchor_dt = ProofDiv(scale, anchor_q);
+    const ProofInterval anchor_d2t = ProofDiv(
+        ProofMul(ProofMul(PointProofInterval(-1.0), ProofMul(scale, scale)), anchor_qp),
+        ProofMul(ProofMul(anchor_q, anchor_q), anchor_q));
+    if (!ProofFinite(anchor_dt) || !ProofFinite(anchor_d2t)) return false;
+    std::array<ProofInterval, 3U> anchor_p_w = ProofVectorScale(anchor_pt, anchor_dt);
+    std::array<ProofInterval, 3U> anchor_p_ww = ProofVectorAdd(
+        ProofVectorScale(anchor_ptt, ProofMul(anchor_dt, anchor_dt)),
+        ProofVectorScale(anchor_pt, anchor_d2t));
+    return MakeV2Certificate(w0, w1, anchor_w_value, anchor_position, anchor_p_w,
+                             anchor_p_ww, speed, ProofMul(ProofNorm(pt_bounds),
+                             dt_dw_max), horizontal_speed, acceleration,
+                             horizontal_acceleration, jerk, true, certificate);
+}
+
 bool finiteState(const ContinuousPhasePathState& state)
 {
     return state.p.allFinite() && state.dp_dw.allFinite() &&
@@ -1112,6 +2620,64 @@ void evaluateArcLengthCell(const ArcLengthCell& cell,
              (cell.h * cell.h);
 }
 
+// Enclose the represented quintic S(t) stored in an ArcLengthMap.  The map's
+// cells are the executable representation (the Simpson samples only define
+// their coefficients), so structural knot mapping must evaluate these power
+// polynomials rather than linearly interpolating table_s.  A time interval is
+// accepted because spline-knot arithmetic itself is rounded; if it straddles
+// a map-cell boundary, both represented cells contribute to the hull.
+bool ProofArcLengthValueAtTime(const ArcLengthMap& map,
+                               const ProofInterval& time,
+                               ProofInterval& value)
+{
+    value = InvalidProofInterval();
+    if (!ProofFloatingPointEnvironmentSupported() || !ProofFinite(time) ||
+        map.cells.empty() || map.table_t.size() != map.cells.size() + 1U ||
+        map.table_s.size() != map.table_t.size()) {
+        return false;
+    }
+    bool have_cell = false;
+    for (std::size_t index = 0U; index < map.cells.size(); ++index) {
+        const double table_t0 = map.table_t[index];
+        const double table_t1 = map.table_t[index + 1U];
+        const ArcLengthCell& cell = map.cells[index];
+        if (!std::isfinite(table_t0) || !std::isfinite(table_t1) ||
+            !(table_t1 > table_t0) || !std::isfinite(cell.t0) ||
+            !std::isfinite(cell.h) || cell.h <= 0.0 ||
+            cell.t0 != table_t0 || cell.h != table_t1 - table_t0) {
+            return false;
+        }
+        if (table_t1 < time.lower || table_t0 > time.upper) continue;
+        const double clipped_lower = std::max(table_t0, time.lower);
+        const double clipped_upper = std::min(table_t1, time.upper);
+        if (!std::isfinite(clipped_lower) || !std::isfinite(clipped_upper) ||
+            clipped_lower > clipped_upper) {
+            continue;
+        }
+        const ProofInterval query = ProofIntervalFromBounds(
+            clipped_lower, clipped_upper);
+        const ProofInterval x = ProofDiv(
+            ProofSub(query, PointProofInterval(cell.t0)),
+            PointProofInterval(cell.h));
+        if (!ProofFinite(x)) return false;
+        std::vector<ProofInterval> coefficients;
+        coefficients.reserve(cell.a.size());
+        for (const double coefficient : cell.a) {
+            coefficients.push_back(PointProofInterval(coefficient));
+        }
+        const ProofInterval local = ProofHorner(coefficients, x);
+        if (!ProofFinite(local)) return false;
+        if (!have_cell) {
+            value = local;
+            have_cell = true;
+        } else {
+            value.lower = std::min(value.lower, local.lower);
+            value.upper = std::max(value.upper, local.upper);
+        }
+    }
+    return have_cell && ProofFinite(value);
+}
+
 bool invertArcLengthMap(const ArcLengthMap& map,
                         double target_s,
                         double& t,
@@ -1263,6 +2829,104 @@ bool ContinuousPhasePath::cellBounds(
         return false;
     }
     return true;
+}
+
+bool ContinuousPhasePath::tubeCellBoundsV2(
+    const double w0, const double w1,
+    phase_offset_core::CertifiedPathCellV2& certificate) const
+{
+    certificate = phase_offset_core::CertifiedPathCellV2();
+    if (segments_.empty() || !std::isfinite(w0) || !std::isfinite(w1) ||
+        !(w1 > w0)) {
+        return false;
+    }
+    const Segment* selected = nullptr;
+    for (const Segment& segment : segments_) {
+        if (w0 >= segment.w0 && w1 <= segment.w1) {
+            selected = &segment;
+            break;
+        }
+    }
+    if (selected == nullptr || !selected->evaluate.hasTubeCellBoundsV2() ||
+        !selected->evaluate.tubeCellBoundsV2(w0, w1, certificate)) {
+        certificate = phase_offset_core::CertifiedPathCellV2();
+        return false;
+    }
+    // A callback is not allowed to return evidence for a different phase
+    // cell and rely on the owner stamp below to relabel it.  Keep the
+    // requested binary64 endpoints as an exact identity check; numerical
+    // slack here would make a structural seam ambiguous.
+    if (certificate.w0 != w0 || certificate.w1 != w1) {
+        certificate = phase_offset_core::CertifiedPathCellV2();
+        return false;
+    }
+    certificate.w0 = w0;
+    certificate.w1 = w1;
+    certificate.path_revision = path_revision_;
+    certificate.frame_revision = path_revision_;
+    certificate.segment_identity = selected->identity;
+    certificate.proof_identity = selected->identity == 0U
+        ? 1U : selected->identity;
+    if (!phase_offset_core::certifiedPathCellV2IsComplete(certificate)) {
+        certificate = phase_offset_core::CertifiedPathCellV2();
+        return false;
+    }
+    return true;
+}
+
+bool ContinuousPhasePath::certificateBreakpointsV2(
+    std::vector<double>& breakpoints) const
+{
+    breakpoints.clear();
+    if (segments_.empty()) return false;
+    for (const Segment& segment : segments_) {
+        if (!std::isfinite(segment.w0) || !std::isfinite(segment.w1) ||
+            !(segment.w1 > segment.w0)) {
+            breakpoints.clear();
+            return false;
+        }
+        if (!segment.evaluate.hasTubeCellBoundsV2() &&
+            !segment.evaluate.hasCertificateBreakpointsV2()) {
+            // A point-only/legacy evaluator has no certified structural
+            // capability.  Do not present its owner endpoints as a V2 proof
+            // partition merely because the segment metadata is finite.
+            breakpoints.clear();
+            return false;
+        }
+        breakpoints.push_back(segment.w0);
+        breakpoints.push_back(segment.w1);
+        if (segment.evaluate.hasCertificateBreakpointsV2()) {
+            std::vector<double> internal;
+            if (!segment.evaluate.certificateBreakpointsV2(internal)) {
+                breakpoints.clear();
+                return false;
+            }
+            for (const double value : internal) {
+                if (!std::isfinite(value)) {
+                    breakpoints.clear();
+                    return false;
+                }
+                // appendSlice deliberately reuses the immutable evaluator
+                // from its source segment.  Its callback may therefore list
+                // structural points owned by the unsliced prefix/suffix;
+                // retain only points that lie in this copied segment while
+                // still rejecting non-finite evidence.
+                if (value < segment.w0 || value > segment.w1) continue;
+                breakpoints.push_back(value);
+            }
+        }
+    }
+    std::sort(breakpoints.begin(), breakpoints.end());
+    breakpoints.erase(std::unique(breakpoints.begin(), breakpoints.end()),
+                      breakpoints.end());
+    return !breakpoints.empty();
+}
+
+std::vector<double> ContinuousPhasePath::certificateBreakpointsV2() const
+{
+    std::vector<double> breakpoints;
+    if (!certificateBreakpointsV2(breakpoints)) breakpoints.clear();
+    return breakpoints;
 }
 
 bool ContinuousPhasePath::evaluate(
@@ -1430,7 +3094,20 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeQuinticHermite(
                                         cell_w1, direct_horizontal_dp_dw,
                                         certificate);
         };
-    return Evaluator(point_evaluator, cell_bound_evaluator);
+    const TubeCellBoundsV2Evaluator tube_cell_bounds_v2 =
+        [coefficients, w0, w1, constant_horizontal_derivative,
+         constant_horizontal_dp_dw](
+            const double cell_w0, const double cell_w1,
+            phase_offset_core::CertifiedPathCellV2& certificate) {
+          const Eigen::Vector3d* direct_horizontal_dp_dw =
+              constant_horizontal_derivative
+                  ? &constant_horizontal_dp_dw : nullptr;
+          return MakeQuinticV2Certificate(
+              coefficients, w0, w1, cell_w0, cell_w1,
+              direct_horizontal_dp_dw, certificate);
+        };
+    return Evaluator(point_evaluator, cell_bound_evaluator,
+                     tube_cell_bounds_v2);
 }
 
 ContinuousPhasePath::Evaluator ContinuousPhasePath::makeMappedBspline(
@@ -1453,6 +3130,8 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeMappedBspline(
     const double phase_span = phase_w_end - phase_w_anchor;
 
     CellBoundEvaluator linear_cell_bound_evaluator;
+    TubeCellBoundsV2Evaluator linear_tube_cell_bounds_v2;
+    CertificateBreakpointsV2Evaluator linear_breakpoints_v2;
     if (p.p_ >= 3) {
         const UniformBspline d3p_dt3 = d2p_dt2.getDerivative();
         linear_cell_bound_evaluator =
@@ -1464,6 +3143,83 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeMappedBspline(
                   dp_dt, d2p_dt2, d3p_dt3, spline_t_anchor, spline_t_end,
                   phase_w_anchor, phase_w_end, cell_w0, cell_w1,
                   certificate);
+            };
+        linear_tube_cell_bounds_v2 =
+            [p, dp_dt, d2p_dt2, d3p_dt3, spline_t_anchor, spline_t_end,
+             phase_w_anchor, phase_w_end](
+                const double cell_w0, const double cell_w1,
+                phase_offset_core::CertifiedPathCellV2& certificate) {
+              return MakeLinearMappedBsplineV2Certificate(
+                  p, dp_dt, d2p_dt2, d3p_dt3, spline_t_anchor, spline_t_end,
+                  phase_w_anchor, phase_w_end, cell_w0, cell_w1,
+                  certificate);
+            };
+        // The strict arclength map may be unavailable (for example when a
+        // raw endpoint is stationary), but the linear fallback still has a
+        // represented phase map.  Retain its structural knots so callers do
+        // not silently merge proof cells across a spline seam.
+        linear_breakpoints_v2 =
+            [p, spline_t_anchor, spline_t_end, phase_w_anchor, phase_w_end](
+                std::vector<double>& breakpoints) {
+              breakpoints.clear();
+              if (!ProofFloatingPointEnvironmentSupported() ||
+                  !std::isfinite(spline_t_anchor) ||
+                  !std::isfinite(spline_t_end) ||
+                  !(spline_t_end > spline_t_anchor) ||
+                  !std::isfinite(phase_w_anchor) ||
+                  !std::isfinite(phase_w_end) ||
+                  !(phase_w_end > phase_w_anchor) ||
+                  !std::isfinite(p.beta_) || p.beta_ <= 0.0 ||
+                  !SupportedSplineTimeDomain(p, spline_t_anchor,
+                                             spline_t_end)) {
+                  return false;
+              }
+              breakpoints.push_back(phase_w_anchor);
+              breakpoints.push_back(phase_w_end);
+              const ProofInterval phase_span = ProofSub(
+                  PointProofInterval(phase_w_end),
+                  PointProofInterval(phase_w_anchor));
+              const ProofInterval time_span = ProofSub(
+                  PointProofInterval(spline_t_end),
+                  PointProofInterval(spline_t_anchor));
+              if (!ProofFinite(phase_span) || !ProofFinite(time_span)) {
+                  breakpoints.clear();
+                  return false;
+              }
+              for (int index = p.p_; index <= p.m_ - p.p_; ++index) {
+                  const ProofInterval knot_t = ProofDiv(
+                      ProofSub(PointProofInterval(p.u_(index)),
+                               PointProofInterval(p.u_(p.p_))),
+                      PointProofInterval(p.beta_));
+                  if (!ProofFinite(knot_t)) return false;
+                  if (knot_t.upper < spline_t_anchor ||
+                      knot_t.lower > spline_t_end) {
+                      continue;
+                  }
+                  const ProofInterval phase = ProofAdd(
+                      PointProofInterval(phase_w_anchor),
+                      ProofDiv(ProofMul(ProofSub(knot_t,
+                                                   PointProofInterval(
+                                                       spline_t_anchor)),
+                                             phase_span),
+                              time_span));
+                  if (!ProofFinite(phase)) return false;
+                  const double phase_lower = std::max(
+                      phase_w_anchor, phase.lower);
+                  const double phase_upper = std::min(
+                      phase_w_end, phase.upper);
+                  if (!std::isfinite(phase_lower) ||
+                      !std::isfinite(phase_upper) || phase_lower > phase_upper) {
+                      return false;
+                  }
+                  breakpoints.push_back(phase_lower);
+                  breakpoints.push_back(phase_upper);
+              }
+              std::sort(breakpoints.begin(), breakpoints.end());
+              breakpoints.erase(std::unique(breakpoints.begin(),
+                                             breakpoints.end()),
+                                breakpoints.end());
+              return !breakpoints.empty();
             };
     }
 
@@ -1499,11 +3255,13 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeMappedBspline(
     ArcLengthMap executable_map;
     if (!buildExecutableArcLengthMap(
             p, spline_t_anchor, spline_t_end, executable_map)) {
-        return Evaluator(linear_point_evaluator, linear_cell_bound_evaluator);
+        return Evaluator(linear_point_evaluator, linear_cell_bound_evaluator,
+                         linear_tube_cell_bounds_v2, linear_breakpoints_v2);
     }
     const double total_length = executable_map.table_s.back();
     if (!std::isfinite(total_length) || total_length <= kDomainEps) {
-        return Evaluator(linear_point_evaluator, linear_cell_bound_evaluator);
+        return Evaluator(linear_point_evaluator, linear_cell_bound_evaluator,
+                         linear_tube_cell_bounds_v2, linear_breakpoints_v2);
     }
     const double arclength_per_phase = total_length / phase_span;
 
@@ -1540,6 +3298,7 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeMappedBspline(
         return state.valid;
     };
     CellBoundEvaluator cell_bound_evaluator;
+    TubeCellBoundsV2Evaluator tube_cell_bounds_v2;
     if (p.p_ >= 3) {
         const UniformBspline d3p_dt3 = d2p_dt2.getDerivative();
         cell_bound_evaluator =
@@ -1553,8 +3312,99 @@ ContinuousPhasePath::Evaluator ContinuousPhasePath::makeMappedBspline(
                   phase_w_end, arclength_per_phase, cell_w0, cell_w1,
                   certificate);
             };
+        tube_cell_bounds_v2 =
+            [p, dp_dt, d2p_dt2, d3p_dt3, executable_map,
+             spline_t_anchor, spline_t_end, phase_w_anchor, phase_w_end,
+             arclength_per_phase](
+                const double cell_w0, const double cell_w1,
+                phase_offset_core::CertifiedPathCellV2& certificate) {
+              return MakeMappedBsplineV2Certificate(
+                  p, dp_dt, d2p_dt2, d3p_dt3, executable_map,
+                  spline_t_anchor, spline_t_end, phase_w_anchor,
+                  phase_w_end, arclength_per_phase, cell_w0, cell_w1,
+                  certificate);
+            };
+        linear_breakpoints_v2 =
+            [executable_map, phase_w_anchor, arclength_per_phase, p,
+             spline_t_anchor, spline_t_end, phase_w_end](
+                std::vector<double>& breakpoints) {
+              breakpoints.clear();
+              if (!ProofFloatingPointEnvironmentSupported() ||
+                  !std::isfinite(arclength_per_phase) ||
+                  arclength_per_phase <= 0.0 ||
+                  !SupportedSplineTimeDomain(p, spline_t_anchor,
+                                             spline_t_end)) return false;
+              breakpoints.push_back(phase_w_anchor);
+              const ProofInterval phase_scale =
+                  PointProofInterval(arclength_per_phase);
+              // Every stored map-cell boundary is a structural breakpoint of
+              // the represented quintic map.  Convert it with outward
+              // arithmetic and retain the enclosure endpoints; no rounded
+              // linear interpolation is used as proof evidence.
+              for (std::size_t table_index = 1U;
+                   table_index + 1U < executable_map.table_s.size();
+                   ++table_index) {
+                  const ProofInterval map_s = PointProofInterval(
+                      executable_map.table_s[table_index]);
+                  const ProofInterval phase = ProofAdd(
+                      PointProofInterval(phase_w_anchor),
+                      ProofDiv(map_s, phase_scale));
+                  if (!ProofFinite(phase)) return false;
+                  const double phase_lower = std::max(
+                      phase_w_anchor, phase.lower);
+                  const double phase_upper = std::min(
+                      phase_w_end, phase.upper);
+                  if (!std::isfinite(phase_lower) ||
+                      !std::isfinite(phase_upper) || phase_lower > phase_upper) {
+                      return false;
+                  }
+                  breakpoints.push_back(phase_lower);
+                  breakpoints.push_back(phase_upper);
+              }
+              breakpoints.push_back(phase_w_end);
+              // Preserve every stored spline knot as a structural identity.
+              // Evaluate the represented quintic S(t) over an outward time
+              // enclosure.  If the rounded phase is not a singleton, retain
+              // both enclosure endpoints so the uncertainty is explicit in
+              // the partition instead of being presented as an exact linear
+              // seam.
+              for (int index = p.p_; index <= p.m_ - p.p_; ++index) {
+                  const ProofInterval knot_t = ProofDiv(
+                      ProofSub(PointProofInterval(p.u_(index)),
+                               PointProofInterval(p.u_(p.p_))),
+                      PointProofInterval(p.beta_));
+                  if (!ProofFinite(knot_t)) return false;
+                  if (knot_t.upper < spline_t_anchor ||
+                      knot_t.lower > spline_t_end) {
+                      continue;
+                  }
+                  ProofInterval map_s;
+                  if (!ProofArcLengthValueAtTime(executable_map, knot_t,
+                                                 map_s)) return false;
+                  const ProofInterval phase = ProofAdd(
+                      PointProofInterval(phase_w_anchor),
+                      ProofDiv(map_s, phase_scale));
+                  if (!ProofFinite(phase)) return false;
+                  const double phase_lower = std::max(
+                      phase_w_anchor, phase.lower);
+                  const double phase_upper = std::min(
+                      phase_w_end, phase.upper);
+                  if (!std::isfinite(phase_lower) ||
+                      !std::isfinite(phase_upper) || phase_lower > phase_upper) {
+                      return false;
+                  }
+                  breakpoints.push_back(phase_lower);
+                  breakpoints.push_back(phase_upper);
+              }
+              std::sort(breakpoints.begin(), breakpoints.end());
+              breakpoints.erase(std::unique(breakpoints.begin(),
+                                             breakpoints.end()),
+                                breakpoints.end());
+              return !breakpoints.empty();
+            };
     }
-    return Evaluator(point_evaluator, cell_bound_evaluator);
+    return Evaluator(point_evaluator, cell_bound_evaluator,
+                     tube_cell_bounds_v2, linear_breakpoints_v2);
 }
 
 bool ContinuousPhasePath::trimBsplineTimeDomainByArcLength(

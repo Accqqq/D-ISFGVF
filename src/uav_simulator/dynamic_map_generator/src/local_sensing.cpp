@@ -14,6 +14,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr full_cloud(new pcl::PointCloud<pcl::PointXYZ
 pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
 bool has_map = false;
 bool has_odom = false;
+bool static_map_frame_verified = false;
 
 // 地图参数
 double resolution, x_size, y_size, z_size;
@@ -21,6 +22,9 @@ Eigen::Vector3d local_range;
 
 // 当前UAV位置
 Eigen::Vector3d current_position;
+// Identify the exact odometry sample used for the sensing box.  The cloud
+// coordinates, filtering and legacy world-frame convention stay unchanged.
+ros::Time sensing_odom_stamp;
 
 // 话题和发布参数。默认值保持原仿真接口不变，同时允许 launch 显式接线。
 std::string odom_topic = "/sim/odom";
@@ -32,6 +36,23 @@ double sensing_rate = 10.0;
 // 发布器
 ros::Publisher local_map_pub;
 
+bool localSensingBoxComplete(const pcl::PointCloud<pcl::PointXYZ>& backing,
+                            const Eigen::Vector3d& center,
+                            const Eigen::Vector3d& range,
+                            std::size_t returned_points) {
+    if (!center.allFinite() || !range.allFinite() || (range.array() <= 0.0).any())
+        return false;
+    std::size_t expected_points = 0U;
+    for (const auto& point : backing.points) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+            return false;
+        if (std::abs(point.x - center.x()) <= range.x() &&
+            std::abs(point.y - center.y()) <= range.y() &&
+            std::abs(point.z - center.z()) <= range.z()) ++expected_points;
+    }
+    return expected_points == returned_points;
+}
+
 void odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
     current_position = Eigen::Vector3d(
         msg->pose.pose.position.x,
@@ -39,12 +60,15 @@ void odomCallback(const nav_msgs::Odometry::ConstPtr& msg) {
         msg->pose.pose.position.z
     );
     has_odom = true;
+    sensing_odom_stamp = msg->header.stamp;
 }
 
 void mockMapCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
     if (!has_map) {
-        pcl::fromROSMsg(*msg, *full_cloud);
-        kdtree.setInputCloud(full_cloud);
+        static_map_frame_verified = msg->header.frame_id == output_frame;
+        // PCL 1.10's conversion/search must not dereference empty storage.
+        if (msg->width != 0U && msg->height != 0U) pcl::fromROSMsg(*msg, *full_cloud);
+        if (!full_cloud->empty()) kdtree.setInputCloud(full_cloud);
         has_map = true;
         ROS_INFO("[local_sensing] Mock map received with %lu points.", full_cloud->points.size());
     }
@@ -63,7 +87,8 @@ void pubLocalMap() {
     // KD-tree 粗筛，再做轴对齐范围过滤，保证两端对参数的解释一致。
     const double sensing_radius = local_range.norm();
 
-    if (kdtree.radiusSearch(center, sensing_radius, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0) {
+    if (!full_cloud->empty() &&
+        kdtree.radiusSearch(center, sensing_radius, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0) {
         for (size_t i = 0; i < pointIdxRadiusSearch.size(); ++i) {
             const pcl::PointXYZ& point = full_cloud->points[pointIdxRadiusSearch[i]];
             if (std::abs(point.x - current_position.x()) <= local_range.x() &&
@@ -83,7 +108,15 @@ void pubLocalMap() {
     sensor_msgs::PointCloud2 localMapMsg;
     pcl::toROSMsg(localMap, localMapMsg);
     localMapMsg.header.frame_id = output_frame;
-    localMapMsg.header.stamp = ros::Time::now();
+    // The float KD-tree is only a broad phase.  Before attributing complete
+    // support, verify it omitted no static-map point passing the SAME box
+    // predicate.  This does not add/remove cloud points or alter sensing.
+    // An unverified observation still reaches the legacy map, with no proof
+    // identity (zero stamp).  In particular an empty box is checked too.
+    localMapMsg.header.stamp = static_map_frame_verified &&
+        localSensingBoxComplete(*full_cloud, current_position,
+                                                     local_range, localMap.points.size())
+        ? sensing_odom_stamp : ros::Time();
 
     local_map_pub.publish(localMapMsg);
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -17,6 +18,203 @@ bool IsFinite(const Eigen::Vector3d& value) { return value.allFinite(); }
 
 bool IsFinite(const phase_offset_core::PortCommand& value) {
   return IsFinite(value.u_w) && IsFinite(value.u_delta);
+}
+
+bool SamePortExact(const phase_offset_core::PortCommand& first,
+                   const phase_offset_core::PortCommand& second) {
+  return IsFinite(first) && IsFinite(second) && first.u_w == second.u_w &&
+      first.u_delta == second.u_delta;
+}
+
+bool SameStateExact(const TubeExecutionStateV2& first,
+                    const TubeExecutionStateV2& second) {
+  return first.finite() && second.finite() && first.w == second.w &&
+      first.delta == second.delta &&
+      SamePortExact(first.previous_u, second.previous_u);
+}
+
+bool SameIdentityExact(const TubeExecutionIdentityV2& first,
+                       const TubeExecutionIdentityV2& second) {
+  return first.execution_generation == second.execution_generation &&
+      first.path_instance_id == second.path_instance_id &&
+      first.path_revision == second.path_revision &&
+      first.frame_revision == second.frame_revision &&
+      first.frame_convention_id == second.frame_convention_id &&
+      first.configuration_id == second.configuration_id &&
+      first.map_instance_id == second.map_instance_id &&
+      first.map_state_id == second.map_state_id &&
+      first.accepted_sequence == second.accepted_sequence &&
+      first.profile_id == second.profile_id &&
+      first.binding_sequence == second.binding_sequence;
+}
+
+bool EmptyIdentity(const TubeExecutionIdentityV2& identity) {
+  return identity.execution_generation == 0U &&
+      identity.path_instance_id == 0U && identity.path_revision == 0U &&
+      identity.frame_revision == 0U && identity.frame_convention_id == 0U &&
+      identity.configuration_id == 0U && identity.map_instance_id == 0U &&
+      identity.map_state_id == 0U && identity.accepted_sequence == 0U &&
+      identity.profile_id == 0U && identity.binding_sequence == 0U;
+}
+
+// The Runtime does not prove copied-prefix geometry; the adapter owns that
+// proof.  It does seal the smallest possible identity transition so a token
+// prepared against one source binding cannot be replayed against another.
+bool ValidBindingTransition(const TubeExecutionIdentityV2& expected,
+                            const TubeExecutionIdentityV2& proposed) {
+  return expected.complete() && proposed.complete() &&
+      !SameIdentityExact(expected, proposed) &&
+      expected.execution_generation == proposed.execution_generation &&
+      expected.configuration_id == proposed.configuration_id &&
+      expected.frame_convention_id == proposed.frame_convention_id &&
+      expected.path_instance_id != proposed.path_instance_id &&
+      expected.profile_id != proposed.profile_id &&
+      expected.binding_sequence != std::numeric_limits<std::uint64_t>::max() &&
+      proposed.binding_sequence == expected.binding_sequence + 1U;
+}
+
+bool ValidPreparedIdentityContract(const RuntimeV2PreparedStep& prepared) {
+  if (!prepared.identity.complete() ||
+      !prepared.expected_identity.complete()) {
+    return false;
+  }
+  return prepared.binding_transition
+      ? ValidBindingTransition(prepared.expected_identity, prepared.identity)
+      : SameIdentityExact(prepared.expected_identity, prepared.identity);
+}
+
+bool SamePolicyExact(const NormalPreviewProductionPolicy& first,
+                     const NormalPreviewProductionPolicy& second) {
+  return first.immutable == second.immutable &&
+      first.preview_horizon_w == second.preview_horizon_w &&
+      first.sample_spacing_w == second.sample_spacing_w &&
+      first.lower_nu == second.lower_nu && first.upper_nu == second.upper_nu &&
+      first.b_tight == second.b_tight && first.b_open == second.b_open &&
+      first.policy_revision == second.policy_revision &&
+      first.configuration_identity == second.configuration_identity &&
+      first.configuration_id == second.configuration_id;
+}
+
+bool SameIntervalExact(const TubeExecutionIntervalV2& first,
+                       const TubeExecutionIntervalV2& second) {
+  return first.valid == second.valid && first.w == second.w &&
+      first.lower == second.lower && first.upper == second.upper;
+}
+
+bool SameTrackingExact(const TubeExecutionTrackingEvidenceV2& first,
+                       const TubeExecutionTrackingEvidenceV2& second) {
+  return first.valid == second.valid && first.physical_tangent_valid ==
+      second.physical_tangent_valid && first.error_norm == second.error_norm &&
+      first.error_bound == second.error_bound;
+}
+
+bool SameLimitsExact(const TubeExecutionLimitsV2& first,
+                     const TubeExecutionLimitsV2& second) {
+  return first.lower_phase_rate == second.lower_phase_rate &&
+      first.upper_phase_rate == second.upper_phase_rate &&
+      first.upper_nu == second.upper_nu && first.max_u_w == second.max_u_w &&
+      first.max_u_delta == second.max_u_delta &&
+      first.u_w_slew_rate == second.u_w_slew_rate &&
+      first.u_delta_slew_rate == second.u_delta_slew_rate &&
+      first.return_u_delta_max == second.return_u_delta_max &&
+      first.return_u_delta_slew_rate == second.return_u_delta_slew_rate &&
+      first.max_schedule_steps == second.max_schedule_steps &&
+      first.max_work == second.max_work && first.valid == second.valid;
+}
+
+bool SameReserveExact(const TubeFiniteReserveV2& first,
+                      const TubeFiniteReserveV2& second) {
+  if (first.valid != second.valid || first.reserve_id != second.reserve_id ||
+      !SameIdentityExact(first.identity, second.identity) ||
+      !SameStateExact(first.initial, second.initial) ||
+      !SameStateExact(first.terminal, second.terminal) ||
+      first.steps.size() != second.steps.size() || first.dt != second.dt ||
+      first.w_max != second.w_max || first.common_lower != second.common_lower ||
+      first.common_upper != second.common_upper || first.cursor != second.cursor ||
+      first.work_count != second.work_count || first.provenance != second.provenance ||
+      first.reason != second.reason) {
+    return false;
+  }
+  for (std::size_t index = 0U; index < first.steps.size(); ++index) {
+    const TubeReserveStepV2& lhs = first.steps[index];
+    const TubeReserveStepV2& rhs = second.steps[index];
+    if (lhs.ordinal != rhs.ordinal || lhs.segment != rhs.segment ||
+        !SameStateExact(lhs.before, rhs.before) ||
+        !SameStateExact(lhs.after, rhs.after) ||
+        !SamePortExact(lhs.command, rhs.command) ||
+        lhs.base_phase_rate != rhs.base_phase_rate ||
+        lhs.phase_rate_lower != rhs.phase_rate_lower ||
+        lhs.phase_rate_upper != rhs.phase_rate_upper || lhs.valid != rhs.valid) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SameLivePreviewBinding(const TubeLiveKPreviewV2& first,
+                            const TubeLiveKPreviewV2& second) {
+  if (first.valid != second.valid || first.min_width != second.min_width ||
+      first.work_count != second.work_count || first.reason != second.reason ||
+      first.nodes.size() != second.nodes.size() ||
+      first.viability.proof_kind != second.viability.proof_kind ||
+      first.viability.status != second.viability.status ||
+      first.viability.valid != second.viability.valid ||
+      first.viability.feasible != second.viability.feasible ||
+      first.viability.current_w != second.viability.current_w ||
+      first.viability.preview_start_w != second.viability.preview_start_w ||
+      first.viability.preview_end_w != second.viability.preview_end_w ||
+      first.viability.upper_u_delta != second.viability.upper_u_delta ||
+      first.viability.work_count != second.viability.work_count ||
+      first.viability.max_work != second.viability.max_work ||
+      first.viability.reason != second.viability.reason) {
+    return false;
+  }
+  for (std::size_t index = 0U; index < first.nodes.size(); ++index) {
+    if (!SameIntervalExact(first.nodes[index], second.nodes[index])) return false;
+  }
+  return true;
+}
+
+bool SameAdmissionBinding(const TubeStepAdmissionV2& first,
+                          const TubeStepAdmissionV2& second) {
+  return first.valid == second.valid && first.status == second.status &&
+      SameIdentityExact(first.identity, second.identity) &&
+      SameStateExact(first.current, second.current) &&
+      SameStateExact(first.successor, second.successor) &&
+      SameLivePreviewBinding(first.live_k, second.live_k) &&
+      SameReserveExact(first.successor_reserve, second.successor_reserve) &&
+      first.crossed_breakpoint_count == second.crossed_breakpoint_count &&
+      first.work_count == second.work_count && first.reason == second.reason &&
+      first.provenance == second.provenance;
+}
+
+bool SamePreparedBinding(const RuntimeV2PreparedStep& first,
+                         const RuntimeV2PreparedStep& second) {
+  return first.valid == second.valid && first.profile == second.profile &&
+      SameAdmissionBinding(first.admission, second.admission) &&
+      SameIdentityExact(first.identity, second.identity) &&
+      SameIdentityExact(first.expected_identity, second.expected_identity) &&
+      first.binding_transition == second.binding_transition &&
+      SameStateExact(first.expected_current, second.expected_current) &&
+      SameStateExact(first.successor, second.successor) &&
+      SamePortExact(first.selected_u, second.selected_u) &&
+      SamePolicyExact(first.preview_policy, second.preview_policy) &&
+      SameLimitsExact(first.limits, second.limits) &&
+      SameTrackingExact(first.tracking, second.tracking) &&
+      first.base_phase_rate == second.base_phase_rate &&
+      first.phase_rate_lower == second.phase_rate_lower &&
+      first.phase_rate_upper == second.phase_rate_upper &&
+      first.horizon_w == second.horizon_w &&
+      first.sample_spacing_w == second.sample_spacing_w &&
+      first.upper_u_delta == second.upper_u_delta && first.dt == second.dt &&
+      first.now == second.now &&
+      first.applicability_deadline == second.applicability_deadline &&
+      first.applicability_deadline_valid == second.applicability_deadline_valid &&
+      first.max_work == second.max_work && first.provenance == second.provenance &&
+      first.invalid_reason == second.invalid_reason &&
+      ((!first.reserve_owner && !second.reserve_owner) ||
+       (first.reserve_owner && second.reserve_owner &&
+        SameReserveExact(*first.reserve_owner, *second.reserve_owner)));
 }
 
 bool HasExecutedOffsetAuthorityState(const double delta,
@@ -50,6 +248,7 @@ bool ValidTubeExecution(const RuntimeTubeExecutionConfig& tube) {
       tube.minimum_reference_speed > 0.0;
 }
 
+#ifndef PHASE_OFFSET_RUNTIME_V2_PRODUCTION
 phase_offset_core::PortProjectionLimits MakeProjectionLimits(
     const ManualProfileConfig& manual, double regularity_margin,
     const bool nonnegative_progress = false) {
@@ -336,6 +535,7 @@ ProjectorFailureDescription DescribeProjectorFailure(
   if (!reason.empty()) description.detail += "; " + reason;
   return description;
 }
+#endif
 
 }  // namespace
 
@@ -386,11 +586,13 @@ void PhaseOffsetRuntime::resetForNewNavigationTask() {
   profile_started_ = false;
   profile_completed_ = false;
   returning_to_center_ = false;
+  invalidateV2State();
   last_preflight_source_revision_ = 0U;
   have_preflight_source_revision_ = false;
   preflight_ = ManualPreflightResult();
 }
 
+#ifndef PHASE_OFFSET_RUNTIME_V2_PRODUCTION
 bool PhaseOffsetRuntime::runPreflightCandidate(const RuntimePathSamples& samples,
                                                 const Eigen::Vector3d& position,
                                                 double amplitude,
@@ -996,6 +1198,7 @@ bool PhaseOffsetRuntime::complete(const RuntimePreparedStep& prepared,
   output.exact_terminal_predicate = output.projection.valid &&
       output.projection.next_delta == 0.0;
   if (output.selected) {
+    invalidateV2State();
     previous_final_port_ = output.projection.final_port;
     delta_ = output.projection.next_delta;
     const bool executed_manual_profile = output.execution.mode !=
@@ -1063,6 +1266,7 @@ bool PhaseOffsetRuntime::commitToken(const RuntimeCommitToken& token) {
   }
   previous_final_port_ = token.next_previous_final_port;
   delta_ = token.next_delta;
+  invalidateV2State();
   if (token.should_start_profile && !token.safety_priority) {
     profile_started_ = true;
   }
@@ -1089,6 +1293,7 @@ void PhaseOffsetRuntime::commitTokenNoFail(
     const RuntimeCommitToken& token) noexcept {
   previous_final_port_ = token.next_previous_final_port;
   delta_ = token.next_delta;
+  invalidateV2State();
   if (token.should_start_profile && !token.safety_priority) {
     profile_started_ = true;
   }
@@ -1109,7 +1314,235 @@ void PhaseOffsetRuntime::commitTokenNoFail(
     returning_to_center_ = false;
   }
 }
+#endif
 
+bool PhaseOffsetRuntime::v2CurrentStateMatches(
+    const TubeExecutionStateV2& state) const {
+  if (!state.finite() || !IsFinite(delta_) ||
+      !IsFinite(previous_final_port_)) {
+    return false;
+  }
+  // Runtime owns only the transverse ZOH state.  The phase coordinate is
+  // supplied by the caller's immutable execution transaction and is carried
+  // through the V2 result/token as evidence; it is never installed here.
+  return state.delta == delta_ &&
+      SamePortExact(state.previous_u, previous_final_port_);
+}
+
+void PhaseOffsetRuntime::invalidateV2State() noexcept {
+  v2_successor_reserve_.reset();
+  v2_identity_ = TubeExecutionIdentityV2();
+  v2_state_valid_ = false;
+}
+
+bool PhaseOffsetRuntime::prepareV2(const RuntimeV2PrepareInput& input,
+                                   RuntimeV2PreparedStep& prepared) {
+  RuntimeV2PreparedStep staged;
+  const auto fail = [&prepared, &staged](const std::string& reason) {
+    staged.valid = false;
+    staged.invalid_reason = reason;
+    prepared = std::move(staged);
+    return false;
+  };
+  if (!configuration_valid_) {
+    return fail("runtime configuration is invalid");
+  }
+  if (input.profile == nullptr || !input.identity.complete() ||
+      !input.current.finite() || !v2CurrentStateMatches(input.current)) {
+    return fail("V2 current execution state is stale or unavailable");
+  }
+  TubeExecutionIdentityV2 expected_identity = input.identity;
+  if (input.binding_transition) {
+    if (!ValidBindingTransition(input.expected_identity, input.identity)) {
+      return fail("V2 binding transition identity is invalid");
+    }
+    expected_identity = input.expected_identity;
+    if (!v2_state_valid_) {
+      return fail("V2 binding transition has no committed source identity");
+    }
+  } else if (!EmptyIdentity(input.expected_identity)) {
+    if (!input.expected_identity.complete() ||
+        !SameIdentityExact(input.expected_identity, input.identity)) {
+      return fail("V2 current identity expectation is invalid");
+    }
+    expected_identity = input.expected_identity;
+  }
+  if (v2_state_valid_ &&
+      !SameIdentityExact(v2_identity_, expected_identity)) {
+    return fail("V2 execution identity is stale");
+  }
+  if (!IsFinite(input.current.w) || !IsFinite(input.horizon_w)) {
+    return fail("V2 phase/window input is invalid");
+  }
+
+  TubeExecutionAdmissionInputV2 admission_input;
+  admission_input.profile = input.profile.get();
+  admission_input.identity = input.identity;
+  admission_input.current = input.current;
+  admission_input.selected_u = input.selected_u;
+  admission_input.selected_u_owner = input.selected_u_owner;
+  admission_input.base_phase_rate = input.base_phase_rate;
+  admission_input.phase_rate_lower = input.phase_rate_lower;
+  admission_input.phase_rate_upper = input.phase_rate_upper;
+  admission_input.horizon_w = input.horizon_w;
+  admission_input.sample_spacing_w = input.sample_spacing_w;
+  admission_input.preview_policy = input.preview_policy;
+  admission_input.upper_u_delta = input.upper_u_delta;
+  admission_input.dt = input.dt;
+  admission_input.now = input.now;
+  admission_input.applicability_deadline = input.applicability_deadline;
+  admission_input.applicability_deadline_valid =
+      input.applicability_deadline_valid;
+  admission_input.limits = input.limits;
+  admission_input.tracking = input.tracking;
+  admission_input.max_work = input.max_work;
+  admission_input.provenance = input.provenance;
+
+  TubeStepAdmissionV2 admission;
+  if (!TubeExecutionGuardV2::prepareAdmission(admission_input, admission)) {
+    staged.admission = std::move(admission);
+    return fail(staged.admission.reason.empty()
+                    ? "V2 execution admission was rejected"
+                    : staged.admission.reason);
+  }
+  if (!admission.valid || admission.status != TubeExecutionStatusV2::ADMISSIBLE ||
+      !SameIdentityExact(admission.identity, input.identity) ||
+      !SameStateExact(admission.current, input.current) ||
+      !SamePortExact(admission.successor.previous_u, input.selected_u) ||
+      !SameStateExact(admission.successor, admission.successor_reserve.initial) ||
+      !admission.successor_reserve.valid ||
+      !admission.successor_reserve.terminalExact() ||
+      !admission.successor_reserve.identity.complete()) {
+    staged.admission = std::move(admission);
+    return fail("V2 admission result is not an exact successor");
+  }
+  std::shared_ptr<const TubeFiniteReserveV2> reserve_owner;
+  try {
+    reserve_owner = std::make_shared<const TubeFiniteReserveV2>(
+        admission.successor_reserve);
+  } catch (const std::exception&) {
+    staged.admission = std::move(admission);
+    return fail("V2 successor reserve could not be materialized");
+  }
+  staged.admission = std::move(admission);
+  staged.profile = input.profile;
+  staged.identity = input.identity;
+  staged.expected_identity = expected_identity;
+  staged.binding_transition = input.binding_transition;
+  staged.expected_current = input.current;
+  staged.successor = staged.admission.successor;
+  staged.selected_u = input.selected_u;
+  staged.preview_policy = input.preview_policy;
+  staged.limits = input.limits;
+  staged.tracking = input.tracking;
+  staged.base_phase_rate = input.base_phase_rate;
+  staged.phase_rate_lower = input.phase_rate_lower;
+  staged.phase_rate_upper = input.phase_rate_upper;
+  // P07/P08 own the exact outward endpoint.  Do not retain the caller's
+  // ordinary `current_w + horizon` arithmetic as a second authority.
+  staged.horizon_w = staged.admission.live_k.viability.preview_end_w;
+  staged.sample_spacing_w = input.sample_spacing_w;
+  staged.upper_u_delta = input.upper_u_delta;
+  staged.dt = input.dt;
+  staged.now = input.now;
+  staged.applicability_deadline = input.applicability_deadline;
+  staged.applicability_deadline_valid = input.applicability_deadline_valid;
+  staged.max_work = input.max_work;
+  staged.provenance = input.provenance;
+  staged.reserve_owner = std::move(reserve_owner);
+  staged.valid = true;
+  staged.invalid_reason.clear();
+  prepared = std::move(staged);
+  return true;
+}
+
+bool PhaseOffsetRuntime::dryRunV2(const RuntimeV2PrepareInput& input,
+                                  RuntimeV2PreparedStep& prepared) const {
+  // Keep dry-run physically separate from the live object even though
+  // prepareV2 is currently pure; this preserves the no-authority guarantee if
+  // the staging implementation gains additional value-only checks later.
+  PhaseOffsetRuntime staged(*this);
+  return staged.prepareV2(input, prepared);
+}
+
+bool PhaseOffsetRuntime::makeCommitTokenV2(
+    const RuntimeV2PreparedStep& prepared,
+    RuntimeV2CommitToken& token) const {
+  token = RuntimeV2CommitToken();
+  if (!prepared.valid || !prepared.admission.valid ||
+      prepared.admission.status != TubeExecutionStatusV2::ADMISSIBLE ||
+      prepared.profile == nullptr || !ValidPreparedIdentityContract(prepared) ||
+      !prepared.expected_current.finite() || !prepared.successor.finite() ||
+      !SamePortExact(prepared.selected_u, prepared.successor.previous_u) ||
+      !prepared.reserve_owner ||
+      !SameReserveExact(*prepared.reserve_owner,
+                        prepared.admission.successor_reserve) ||
+      !v2CurrentStateMatches(prepared.expected_current)) {
+    return false;
+  }
+  if ((prepared.binding_transition && !v2_state_valid_) ||
+      (v2_state_valid_ &&
+       !SameIdentityExact(v2_identity_, prepared.expected_identity))) {
+    return false;
+  }
+  try {
+    token.prepared = prepared;
+    token.sealed_prepared =
+        std::make_shared<const RuntimeV2PreparedStep>(prepared);
+  } catch (const std::exception&) {
+    token = RuntimeV2CommitToken();
+    return false;
+  }
+  token.valid = true;
+  return true;
+}
+
+bool PhaseOffsetRuntime::commitV2(const RuntimeV2CommitToken& token) {
+  if (!configuration_valid_ || !token.valid || !token.sealed_prepared) {
+    return false;
+  }
+  const RuntimeV2PreparedStep& sealed = *token.sealed_prepared;
+  if (!SamePreparedBinding(token.prepared, sealed) || !sealed.valid ||
+      !sealed.admission.valid ||
+      sealed.admission.status != TubeExecutionStatusV2::ADMISSIBLE ||
+      sealed.profile == nullptr || !ValidPreparedIdentityContract(sealed) ||
+      !sealed.expected_current.finite() || !sealed.successor.finite() ||
+      !SamePortExact(sealed.selected_u, sealed.successor.previous_u) ||
+      !sealed.reserve_owner ||
+      !SameReserveExact(*sealed.reserve_owner,
+                        sealed.admission.successor_reserve) ||
+      !v2CurrentStateMatches(sealed.expected_current)) {
+    return false;
+  }
+  // A V2 token cannot be replayed against a replacement immutable binding.
+  // Legacy commits invalidate this marker, so a subsequent V2 preparation must
+  // capture the new current state afresh.
+  if ((sealed.binding_transition && !v2_state_valid_) ||
+      (v2_state_valid_ &&
+       !SameIdentityExact(v2_identity_, sealed.expected_identity))) {
+    return false;
+  }
+  commitV2NoFail(token);
+  return true;
+}
+
+void PhaseOffsetRuntime::commitV2NoFail(
+    const RuntimeV2CommitToken& token) noexcept {
+  if (!token.valid || !token.sealed_prepared) return;
+  const RuntimeV2PreparedStep& prepared = *token.sealed_prepared;
+  // All fallible validation (including public/sealed token equality and the
+  // expected-vs-proposed identity CAS) is completed by commitV2 before this
+  // publication-gated no-fail seam.  Consume only the immutable sealed value
+  // here; adding a late predicate would permit a published command and
+  // Runtime state to diverge.
+  previous_final_port_ = prepared.successor.previous_u;
+  delta_ = prepared.successor.delta;
+  v2_successor_reserve_ = prepared.reserve_owner;
+  v2_identity_ = prepared.identity;
+  v2_state_valid_ = true;
+}
+
+#ifndef PHASE_OFFSET_RUNTIME_V2_PRODUCTION
 bool PhaseOffsetRuntime::dryRun(const RuntimeDryRunInput& input,
                                 RuntimeDryRunResult& result) const {
   result = RuntimeDryRunResult();
@@ -1123,5 +1556,6 @@ bool PhaseOffsetRuntime::dryRun(const RuntimeDryRunInput& input,
                                  input.base_guidance_valid, result.step);
   return result.valid;
 }
+#endif
 
 }  // namespace phase_offset_navigation

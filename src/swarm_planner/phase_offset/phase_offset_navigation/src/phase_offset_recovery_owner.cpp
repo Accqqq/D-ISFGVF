@@ -168,6 +168,30 @@ bool ValidConfig(const PhaseOffsetRecoveryOwnerConfig& config) {
       (!config.require_finite_deadline || config.max_dt > 0.0);
 }
 
+bool SameExecutionState(const TubeExecutionStateV2& first,
+                        const TubeExecutionStateV2& second) {
+  return first.finite() && second.finite() && first.w == second.w &&
+      first.delta == second.delta &&
+      first.previous_u.u_w == second.previous_u.u_w &&
+      first.previous_u.u_delta == second.previous_u.u_delta;
+}
+
+bool SameExecutionIdentity(const TubeExecutionIdentityV2& first,
+                           const TubeExecutionIdentityV2& second) {
+  return first.complete() && second.complete() &&
+      first.execution_generation == second.execution_generation &&
+      first.path_instance_id == second.path_instance_id &&
+      first.path_revision == second.path_revision &&
+      first.frame_revision == second.frame_revision &&
+      first.frame_convention_id == second.frame_convention_id &&
+      first.configuration_id == second.configuration_id &&
+      first.map_instance_id == second.map_instance_id &&
+      first.map_state_id == second.map_state_id &&
+      first.accepted_sequence == second.accepted_sequence &&
+      first.profile_id == second.profile_id &&
+      first.binding_sequence == second.binding_sequence;
+}
+
 }  // namespace
 
 PhaseOffsetRecoveryOwner::PhaseOffsetRecoveryOwner(
@@ -673,6 +697,119 @@ bool PhaseOffsetRecoveryOwner::prepare(const RecoveryPrepareInput& input,
   return true;
 }
 
+bool PhaseOffsetRecoveryOwner::prepareCertifiedReserveV2(
+    const CertifiedReservePrepareInputV2& input,
+    RecoveryPreparedStep& output) const {
+  output = RecoveryPreparedStep();
+  output.recovery_session = input.recovery_session;
+  output.proof_kind = RecoveryStepProofKind::FINITE_RESERVE_V2;
+  output.reserve_id = input.reserve.reserve_id;
+  output.reserve_cursor = input.cursor;
+  output.reserve_size = input.reserve.steps.size();
+  output.now = input.now;
+  output.deadline = input.deadline_valid ? input.deadline : input.now;
+  output.deadline_valid = input.deadline_valid;
+  output.selected_u_owner = "PhaseOffsetRecoveryOwner";
+  output.provenance = input.provenance;
+
+  std::string reserve_reason;
+  if (!configuration_valid_ || input.recovery_session == 0U ||
+      input.provenance.empty() || !input.expected_identity.complete() ||
+      !SameExecutionIdentity(input.expected_identity, input.reserve.identity) ||
+      !input.expected_state.finite() ||
+      !TubeExecutionGuardV2::validateReserve(input.reserve,
+                                              &reserve_reason) ||
+      input.cursor >= input.reserve.steps.size() ||
+      input.cursor != input.reserve.cursor ||
+      !Finite(input.dt) || input.dt <= 0.0 || input.dt != input.reserve.dt ||
+      !input.deadline_valid || !Finite(input.now) || !Finite(input.deadline) ||
+      input.now >= input.deadline) {
+    output.status = input.deadline_valid && Finite(input.now) &&
+            Finite(input.deadline) && input.now >= input.deadline
+        ? RecoveryStepStatus::DEADLINE_EXPIRED
+        : RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+    output.proof = reserve_reason.empty() ? "finite V2 reserve is unavailable"
+                                          : reserve_reason;
+    return false;
+  }
+  if (status_->proof_kind == RecoveryStepProofKind::FINITE_RESERVE_V2 &&
+      status_->reserve_id == input.reserve.reserve_id &&
+      (status_->recovery_session != input.recovery_session ||
+       status_->reserve_cursor != input.cursor)) {
+    output.status = RecoveryStepStatus::STALE;
+    output.proof = "finite V2 reserve session or cursor is stale";
+    return false;
+  }
+  const TubeReserveStepV2& step = input.reserve.steps[input.cursor];
+  if (!step.valid || !SameExecutionState(input.expected_state, step.before) ||
+      step.command.u_w != step.after.previous_u.u_w ||
+      step.command.u_delta != step.after.previous_u.u_delta) {
+    output.status = RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+    output.proof = "finite V2 reserve expected state or command mismatches";
+    return false;
+  }
+  output.current_w = step.before.w;
+  output.current_delta = step.before.delta;
+  output.next_w = step.after.w;
+  output.next_delta = step.after.delta;
+  output.reserve_segment = step.segment;
+  output.u_prev = step.before.previous_u;
+  output.selected_u = step.command;
+  output.selected_u_w = step.command.u_w;
+  output.selected_u_delta = step.command.u_delta;
+  output.u_w_lower = step.command.u_w;
+  output.u_w_upper = step.command.u_w;
+  output.u_delta_lower = step.command.u_delta;
+  output.u_delta_upper = step.command.u_delta;
+  output.dt = input.dt;
+  output.measure = std::abs(step.before.delta);
+  output.next_measure_upper_bound = std::abs(step.after.delta);
+  output.progress = output.measure - output.next_measure_upper_bound;
+  output.required_progress = 0.0;
+  output.remaining_domain_duration = 0.0;
+  output.proof_valid = true;
+  output.exact_terminal_predicate = input.cursor + 1U == input.reserve.steps.size() &&
+      step.after.delta == 0.0 && step.after.previous_u.u_delta == 0.0 &&
+      step.after.previous_u.u_w == 0.0;
+  output.terminal_predicate = output.exact_terminal_predicate;
+  output.status = RecoveryStepStatus::PREPARED;
+  output.valid = output.finite() && output.selectedUExact();
+  if (!output.valid) {
+    output.status = RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+    output.proof = "finite V2 prepared step is not finite or exact";
+    return false;
+  }
+  output.proof = "finite V2 BRAKE-RETURN-SETTLE step";
+  try {
+    auto committed = std::make_shared<RecoveryOwnerStatus>();
+    committed->recovery_session = output.recovery_session;
+    committed->committed_sequence = status_->committed_sequence + 1U;
+    committed->last_status = RecoveryStepStatus::PREPARED;
+    committed->selected_u = output.selected_u;
+    committed->current_w = output.next_w;
+    committed->current_delta = output.next_delta;
+    committed->active = true;
+    committed->deadline_expired = false;
+    committed->nonzero_authority_retained = output.next_delta != 0.0 ||
+        output.selected_u.u_delta != 0.0 || output.selected_u.u_w != 0.0;
+    committed->terminal_predicate = output.exact_terminal_predicate;
+    committed->exact_terminal_predicate = output.exact_terminal_predicate;
+    committed->proof_kind = RecoveryStepProofKind::FINITE_RESERVE_V2;
+    committed->reserve_id = input.reserve.reserve_id;
+    committed->reserve_cursor = input.cursor + 1U;
+    committed->reserve_size = input.reserve.steps.size();
+    committed->reserve_segment = step.segment;
+    committed->reason = output.proof;
+    output.committed_status = std::move(committed);
+  } catch (const std::bad_alloc&) {
+    output.status = RecoveryStepStatus::INVALID;
+    output.valid = false;
+    output.proof = "finite V2 committed status could not be materialized";
+    return false;
+  }
+  return true;
+}
+
 bool PhaseOffsetRecoveryOwner::validateCommit(
     const RecoveryPreparedStep& prepared) const {
   if (!configuration_valid_ || !prepared.valid || prepared.owner_committed ||
@@ -682,6 +819,24 @@ bool PhaseOffsetRecoveryOwner::validateCommit(
       !prepared.committed_status ||
       (prepared.deadline_valid && prepared.now >= prepared.deadline)) {
     return false;
+  }
+  if (prepared.proof_kind == RecoveryStepProofKind::FINITE_RESERVE_V2) {
+    if (!prepared.selectedUExact() || prepared.reserve_id == 0U ||
+        prepared.reserve_size == 0U || prepared.reserve_cursor >=
+            prepared.reserve_size || !prepared.committed_status ||
+        prepared.committed_status->proof_kind !=
+            RecoveryStepProofKind::FINITE_RESERVE_V2 ||
+        prepared.committed_status->recovery_session != prepared.recovery_session ||
+        prepared.committed_status->reserve_id != prepared.reserve_id ||
+        prepared.committed_status->reserve_cursor != prepared.reserve_cursor + 1U) {
+      return false;
+    }
+    if (status_->proof_kind == RecoveryStepProofKind::FINITE_RESERVE_V2 &&
+        status_->reserve_id == prepared.reserve_id &&
+        (status_->recovery_session != prepared.recovery_session ||
+         status_->reserve_cursor != prepared.reserve_cursor)) {
+      return false;
+    }
   }
   return true;
 }

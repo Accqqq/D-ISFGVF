@@ -1,6 +1,7 @@
 #pragma once
 
 #include "phase_offset_navigation/tube_epoch_types.h"
+#include "phase_offset_navigation/tube_execution_v2.h"
 #include "phase_offset_navigation/tube_filter.h"
 #include "phase_offset_navigation/recovery_prepared_step.h"
 
@@ -13,6 +14,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -267,6 +269,97 @@ struct RuntimeDryRunResult {
   bool valid = false;
 };
 
+// Narrow value-only V2 handoff.  This path deliberately lives alongside the
+// legacy Runtime API: adapters can stage an immutable V2 admission without
+// exposing TubeExecutionGuardV2 (or any mutable authority) to the caller.
+// Every value below is captured at preparation time and copied into the
+// commit token.  The only Runtime state changed by a successful V2 commit is
+// the existing exact ZOH successor (delta_/previous_final_port_) plus the
+// immutable reserve evidence pointer.
+struct RuntimeV2PrepareInput {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  std::shared_ptr<const TubeProfileV2> profile;
+  // `identity` is the proposed immutable execution binding carried by the
+  // profile.  A copied-prefix handoff may prepare that proposal while the
+  // currently committed Runtime binding is still the source binding; in
+  // that narrow case `binding_transition` is true and `expected_identity`
+  // names the exact binding against which the publication CAS is made.
+  // Ordinary CURRENT preparation leaves the flag false and retains the
+  // original identity==expected-identity contract.
+  TubeExecutionIdentityV2 identity;
+  TubeExecutionIdentityV2 expected_identity;
+  bool binding_transition = false;
+  TubeExecutionStateV2 current;
+  NormalPreviewProductionPolicy preview_policy;
+  TubeExecutionLimitsV2 limits;
+  phase_offset_core::PortCommand selected_u;
+  std::string selected_u_owner = "PhaseOffsetAllocator";
+  double base_phase_rate = std::numeric_limits<double>::quiet_NaN();
+  // Immutable source phase-rate bounds captured with the selected command;
+  // the profile's certified w-domain remains the sole phase-range authority.
+  double phase_rate_lower = std::numeric_limits<double>::quiet_NaN();
+  double phase_rate_upper = std::numeric_limits<double>::quiet_NaN();
+  double horizon_w = std::numeric_limits<double>::quiet_NaN();
+  double sample_spacing_w = std::numeric_limits<double>::quiet_NaN();
+  double upper_u_delta = std::numeric_limits<double>::quiet_NaN();
+  double dt = std::numeric_limits<double>::quiet_NaN();
+  double now = std::numeric_limits<double>::quiet_NaN();
+  double applicability_deadline = std::numeric_limits<double>::quiet_NaN();
+  bool applicability_deadline_valid = false;
+  TubeExecutionTrackingEvidenceV2 tracking;
+  std::size_t max_work = 0U;
+  std::string provenance;
+};
+
+struct RuntimeV2PreparedStep {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  TubeStepAdmissionV2 admission;
+  std::shared_ptr<const TubeProfileV2> profile;
+  TubeExecutionIdentityV2 identity;
+  TubeExecutionIdentityV2 expected_identity;
+  bool binding_transition = false;
+  TubeExecutionStateV2 expected_current;
+  TubeExecutionStateV2 successor;
+  phase_offset_core::PortCommand selected_u;
+  NormalPreviewProductionPolicy preview_policy;
+  TubeExecutionLimitsV2 limits;
+  TubeExecutionTrackingEvidenceV2 tracking;
+  double base_phase_rate = 0.0;
+  double phase_rate_lower = 0.0;
+  double phase_rate_upper = 0.0;
+  // Authoritative endpoint copied from the P07/P08 viability result.  The
+  // caller's nominal endpoint is never retained as a second window authority.
+  double horizon_w = 0.0;
+  double sample_spacing_w = 0.0;
+  double upper_u_delta = 0.0;
+  double dt = 0.0;
+  double now = 0.0;
+  double applicability_deadline = std::numeric_limits<double>::quiet_NaN();
+  bool applicability_deadline_valid = false;
+  std::size_t max_work = 0U;
+  std::string provenance;
+  // Allocated while preparation is still fallible.  The no-fail commit seam
+  // only assigns this already-materialized owner.
+  std::shared_ptr<const TubeFiniteReserveV2> reserve_owner;
+  bool valid = false;
+  std::string invalid_reason;
+};
+
+struct RuntimeV2CommitToken {
+  // Public value snapshot is useful to the publication owner for auditing;
+  // `sealed_prepared` is the immutable copy used to reject substituted token
+  // fields at commit time.
+  RuntimeV2PreparedStep prepared;
+  std::shared_ptr<const RuntimeV2PreparedStep> sealed_prepared;
+  bool valid = false;
+};
+
+using RuntimePrepareInputV2 = RuntimeV2PrepareInput;
+using RuntimePrepareResultV2 = RuntimeV2PreparedStep;
+using RuntimeCommitTokenV2 = RuntimeV2CommitToken;
+
 class PhaseOffsetRuntime {
  public:
   explicit PhaseOffsetRuntime(const PhaseOffsetRuntimeConfig& config);
@@ -274,6 +367,9 @@ class PhaseOffsetRuntime {
   bool configurationValid() const;
   // Refresh is explicit and is intended for an accepted-path revision event.
   // Repeated calls with the same revision do not resample/recompute preflight.
+  // These legacy preflight/complete/dry-run entry points are defined only by
+  // the explicit regression library.  The production target supplies the V2
+  // Runtime implementation below and has no old proof-path definitions.
   bool refreshPreflight(const RuntimePreflightInput& input);
   bool prepare(const RuntimePrepareInput& input, RuntimePreparedStep& prepared);
   bool complete(const RuntimePreparedStep& prepared,
@@ -292,6 +388,34 @@ class PhaseOffsetRuntime {
   // Runs refresh/prepare/complete on a local copy.  Live preflight, delta,
   // previous port and profile lifecycle remain unchanged on every outcome.
   bool dryRun(const RuntimeDryRunInput& input, RuntimeDryRunResult& result) const;
+
+  // V2 preparation is side-effect free.  It accepts a complete immutable
+  // profile/identity/policy snapshot and calls TubeExecutionGuardV2 exactly
+  // once.  A successful result contains the exact successor and finite
+  // reserve needed by the post-publication no-fail commit.
+  bool prepareV2(const RuntimeV2PrepareInput& input,
+                RuntimeV2PreparedStep& prepared);
+  bool dryRunV2(const RuntimeV2PrepareInput& input,
+                RuntimeV2PreparedStep& prepared) const;
+  bool makeCommitTokenV2(const RuntimeV2PreparedStep& prepared,
+                         RuntimeV2CommitToken& token) const;
+  bool commitV2(const RuntimeV2CommitToken& token);
+  void commitV2NoFail(const RuntimeV2CommitToken& token) noexcept;
+  // Alias names keep the seam readable to publication owners that use the
+  // token terminology directly.
+  bool makeV2CommitToken(const RuntimeV2PreparedStep& prepared,
+                         RuntimeV2CommitToken& token) const {
+    return makeCommitTokenV2(prepared, token);
+  }
+  bool commitV2Token(const RuntimeV2CommitToken& token) {
+    return commitV2(token);
+  }
+  void commitV2TokenNoFail(const RuntimeV2CommitToken& token) noexcept {
+    commitV2NoFail(token);
+  }
+  const TubeFiniteReserveV2* committedV2Reserve() const {
+    return v2_successor_reserve_.get();
+  }
   // A user-issued navigation goal starts a new path-coordinate task.  This
   // deliberately differs from an H2 owner retirement: it drops only
   // task-scoped execution history, while retaining validated configuration.
@@ -348,6 +472,8 @@ class PhaseOffsetRuntime {
   void makeManualRawPort(RuntimePreparedStep& prepared,
                          bool allow_new_excursion,
                          bool force_recenter) const;
+  bool v2CurrentStateMatches(const TubeExecutionStateV2& state) const;
+  void invalidateV2State() noexcept;
 
   PhaseOffsetRuntimeConfig config_;
   bool configuration_valid_ = false;
@@ -358,6 +484,11 @@ class PhaseOffsetRuntime {
   bool profile_started_ = false;
   bool profile_completed_ = false;
   bool returning_to_center_ = false;
+  // V2 reserve evidence is immutable and never a second command authority.
+  // It is installed only by commitV2NoFail after publication.
+  std::shared_ptr<const TubeFiniteReserveV2> v2_successor_reserve_;
+  TubeExecutionIdentityV2 v2_identity_;
+  bool v2_state_valid_ = false;
   std::uint64_t last_preflight_source_revision_ = 0U;
   bool have_preflight_source_revision_ = false;
   ManualPreflightResult preflight_;

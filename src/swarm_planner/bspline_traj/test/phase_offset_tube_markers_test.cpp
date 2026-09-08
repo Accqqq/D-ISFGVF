@@ -62,6 +62,170 @@ phase_offset_navigation::TubeProfile MakeRawCandidateProfile() {
   return profile;
 }
 
+void SetV2Interval(phase_offset_core::Binary64Interval& interval,
+                   const double lower, const double upper) {
+  interval.lower = lower;
+  interval.upper = upper;
+  interval.valid = true;
+}
+
+void SetV2Vector(phase_offset_core::Binary64VectorInterval& interval,
+                 const Eigen::Vector3d& value) {
+  interval.valid = true;
+  for (std::size_t index = 0U; index < 3U; ++index) {
+    SetV2Interval(interval.component[index], value(index), value(index));
+  }
+}
+
+std::shared_ptr<const ContinuousPhasePath> MakeV2MarkerPath(
+    const std::uint64_t revision = 41U) {
+  std::shared_ptr<ContinuousPhasePath> path(new ContinuousPhasePath());
+  if (!path->appendSegment(
+          0.0, 1.0, "v2-marker-straight",
+          [](const double w, ContinuousPhasePathState& state) {
+            state.p = Eigen::Vector3d(w, 0.0, 1.0);
+            state.dp_dw = Eigen::Vector3d::UnitX();
+            state.d2p_dw2.setZero();
+            state.vel = state.dp_dw;
+            state.valid = std::isfinite(w) && w >= 0.0 && w <= 1.0;
+            return state.valid;
+          })) {
+    return std::shared_ptr<const ContinuousPhasePath>();
+  }
+  path->setPathRevision(revision);
+  return path;
+}
+
+phase_offset_core::CertifiedPathCellV2 MakeV2MarkerPathCell(
+    const std::uint64_t revision) {
+  phase_offset_core::CertifiedPathCellV2 cell;
+  cell.w0 = 0.0;
+  cell.w1 = 1.0;
+  cell.anchor_w = 0.5;
+  cell.path_revision = revision;
+  cell.frame_revision = revision;
+  cell.segment_identity = 1U;
+  cell.proof_identity = 2U;
+  SetV2Vector(cell.anchor_position, Eigen::Vector3d(0.5, 0.0, 1.0));
+  SetV2Vector(cell.anchor_p_w, Eigen::Vector3d::UnitX());
+  SetV2Vector(cell.anchor_p_ww, Eigen::Vector3d::Zero());
+  SetV2Interval(cell.inf_p_w_norm, 1.0, 1.0);
+  SetV2Interval(cell.sup_p_w_norm, 1.0, 1.0);
+  SetV2Interval(cell.inf_horizontal_p_w_norm, 1.0, 1.0);
+  SetV2Interval(cell.sup_p_ww_norm, 0.0, 0.0);
+  SetV2Interval(cell.sup_horizontal_p_ww_norm, 0.0, 0.0);
+  SetV2Interval(cell.sup_p_www_norm, 0.0, 0.0);
+  SetV2Interval(cell.sup_normal_derivative, 0.0, 0.0);
+  SetV2Interval(cell.normal_variation, 0.0, 0.0);
+  SetV2Interval(cell.tangent_variation, 0.0, 0.0);
+  SetV2Interval(cell.curvature_variation, 0.0, 0.0);
+  SetV2Interval(cell.midpoint_position_variation, 0.0, 0.5);
+  SetV2Interval(cell.chord_deviation, 0.0, 0.0);
+  cell.horizontal_acceleration_bound_complete = true;
+  cell.normal_frame_proof_complete = true;
+  cell.phase_map_proof_complete = true;
+  cell.provenance =
+      phase_offset_core::kWorldHorizontalCrossProductProvenance;
+  cell.valid = true;
+  cell.complete = true;
+  return cell;
+}
+
+std::shared_ptr<phase_offset_navigation::TubeProfileV2> MakeV2MarkerProfile(
+    const std::shared_ptr<const ContinuousPhasePath>& path) {
+  const std::uint64_t revision = path ? path->pathRevision() : 41U;
+  std::shared_ptr<phase_offset_navigation::TubeProfileV2> profile(
+      new phase_offset_navigation::TubeProfileV2());
+  profile->path_key.execution_generation = 3U;
+  profile->path_key.path_instance_id = 17U;
+  profile->path_key.path_revision = revision;
+  profile->path_key.frame_revision = revision;
+  profile->path_key.frame_convention_id = 1U;
+  profile->path_key.frame_convention =
+      phase_offset_core::kWorldHorizontalCrossProductProvenance;
+  profile->path_key.phase_orientation = 1;
+  profile->path_key.domain_start = 0.0;
+  profile->path_key.domain_end = 1.0;
+  profile->configuration_key.configuration_id = 5U;
+  profile->configuration_key.epsilon = 0.4;
+  profile->configuration_key.nominal_half_width = 0.5;
+  profile->configuration_key.ray_step = 0.05;
+  profile->configuration_key.snapshot_resolution = 0.1;
+  profile->configuration_key.minimum_reference_speed = 1e-8;
+  profile->map_capture_key.map_instance_id = 7U;
+  profile->map_capture_key.state_id = 8U;
+  profile->map_capture_key.accepted_sequence = 8U;
+  profile->map_capture_key.configuration_generation = 9U;
+  profile->map_capture_key.configuration_id = 5U;
+  profile->map_capture_key.frame_provenance_id = 10U;
+  profile->map_capture_key.frame_provenance = "world";
+  profile->map_capture_key.support_provenance_id = 11U;
+  profile->map_capture_key.accepted_time_ticks = 12U;
+  profile->map_capture_key.support_expiry_timeless = true;
+  profile->map_capture_key.halo_reconciled = true;
+  profile->map_capture_key.grid_min_index_x = -1;
+  profile->map_capture_key.grid_min_index_y = -1;
+  profile->map_capture_key.grid_min_index_z = -1;
+  profile->map_capture_key.grid_max_index_x = 1;
+  profile->map_capture_key.grid_max_index_y = 1;
+  profile->map_capture_key.grid_max_index_z = 1;
+  profile->map_capture_key.grid_voxel_resolution =
+      Eigen::Vector3d::Constant(0.1);
+  profile->map_capture_key.complete_support = true;
+  profile->profile_id = 13U;
+  profile->request_id = 14U;
+  profile->requested_start = 0.0;
+  profile->requested_end = 1.0;
+  profile->anchor_w = 0.5;
+  profile->certified_start = 0.0;
+  profile->certified_end = 1.0;
+  profile->valid = true;
+  profile->complete = true;
+  profile->contains_anchor = true;
+  profile->contains_zero_everywhere = true;
+  profile->nonzero_capacity = true;
+  profile->capability =
+      phase_offset_navigation::TubeProfileV2Capability::OFFSET_CERTIFIED;
+  profile->path_owner = path;
+  profile->capture_owner = std::make_shared<const int>(1);
+  profile->query_owner = std::make_shared<const int>(2);
+  profile->applicability_assumptions = "v2-marker-test";
+  profile->applicability_deadline_timeless = true;
+
+  phase_offset_navigation::TubePwlKnotV2 first;
+  first.w = 0.0;
+  first.lower = -0.2;
+  first.upper = 0.3;
+  first.right_lower_slope_interval = {0.0, 0.0, true};
+  first.right_upper_slope_interval = {0.0, 0.0, true};
+  first.right_cell_id = 1U;
+  first.valid = true;
+  phase_offset_navigation::TubePwlKnotV2 last = first;
+  last.w = 1.0;
+  last.left_lower_slope_interval = {0.0, 0.0, true};
+  last.left_upper_slope_interval = {0.0, 0.0, true};
+  last.right_lower_slope_interval = {};
+  last.right_upper_slope_interval = {};
+  last.left_cell_id = 1U;
+  last.right_cell_id = 0U;
+  profile->knots = {first, last};
+
+  phase_offset_navigation::TubeProofCellV2 proof;
+  proof.w0 = 0.0;
+  proof.w1 = 1.0;
+  proof.lower = -0.2;
+  proof.upper = 0.3;
+  proof.cell_id = 1U;
+  proof.segment_identity = 1U;
+  proof.proof_identity = 2U;
+  proof.complete = true;
+  proof.valid = true;
+  proof.path_cell = MakeV2MarkerPathCell(revision);
+  profile->cells.push_back(proof);
+  EXPECT_TRUE(profile->structurallyValid());
+  return profile;
+}
+
 TEST(TubeMarkersTest, CompleteFixedProfileAddsBothWhenCertified) {
   const auto profile = MakeProfile();
   const ros::Time stamp(1.0);
@@ -312,6 +476,89 @@ TEST(TubeMarkersTest, CertifiedGeometryRequiresEsdfAndDisplayability) {
   const auto denied = MakeCertifiedGeometryTubeMarkers(
       ros::Time(1.0), "world", profile, false);
   ExpectActions(denied, visualization_msgs::Marker::DELETE);
+}
+
+TEST(TubeMarkersTest, V2ActiveAndCandidateUseCertifiedKnotsAndFrameOwner) {
+  const auto path = MakeV2MarkerPath();
+  ASSERT_TRUE(path);
+  const auto profile = MakeV2MarkerProfile(path);
+  const auto frame = std::make_shared<const ContinuousPhaseNormalFrame>(
+      path, profile->path_key.path_revision, profile->path_key.frame_revision);
+  const auto active = MakeCertifiedTubeMarkersV2(
+      ros::Time(2.0), "world", profile, frame);
+  const auto candidate = MakeCandidateTubeMarkersV2(
+      ros::Time(2.0), "world", profile, frame);
+  ExpectActions(active, visualization_msgs::Marker::ADD);
+  ExpectActions(candidate, visualization_msgs::Marker::ADD);
+  ASSERT_EQ(active.markers[0].points.size(), 2U);
+  ASSERT_EQ(active.markers[1].points.size(), 2U);
+  EXPECT_DOUBLE_EQ(active.markers[0].points[0].x, 0.0);
+  EXPECT_DOUBLE_EQ(active.markers[0].points[0].y, -0.2);
+  EXPECT_DOUBLE_EQ(active.markers[0].points[0].z, 1.0);
+  EXPECT_DOUBLE_EQ(active.markers[1].points[1].x, 1.0);
+  EXPECT_DOUBLE_EQ(active.markers[1].points[1].y, 0.3);
+  EXPECT_EQ(active.markers[0].ns, "phase_offset_manual_tube");
+  EXPECT_EQ(candidate.markers[0].ns,
+            "phase_offset_manual_tube_candidate");
+  EXPECT_FLOAT_EQ(active.markers[2].color.b, 1.0F);
+  EXPECT_GT(candidate.markers[2].color.r,
+            candidate.markers[2].color.b);
+  EXPECT_EQ(active.markers[2].points.size(), 6U);
+}
+
+TEST(TubeMarkersTest, V2ZeroOnlyProfileRemainsVisibleOnCenterline) {
+  const auto path = MakeV2MarkerPath();
+  auto profile = MakeV2MarkerProfile(path);
+  for (auto& knot : profile->knots) {
+    knot.lower = 0.0;
+    knot.upper = 0.0;
+  }
+  profile->cells[0].lower = 0.0;
+  profile->cells[0].upper = 0.0;
+  profile->nonzero_capacity = false;
+  profile->capability =
+      phase_offset_navigation::TubeProfileV2Capability::ZERO_ONLY;
+  ASSERT_TRUE(profile->structurallyValid());
+  const auto frame = std::make_shared<const ContinuousPhaseNormalFrame>(
+      path, profile->path_key.path_revision, profile->path_key.frame_revision);
+  const auto markers = MakeCertifiedTubeMarkersV2(
+      ros::Time(2.0), "world", profile, frame);
+  ExpectActions(markers, visualization_msgs::Marker::ADD);
+  ASSERT_EQ(markers.markers[0].points.size(), 2U);
+  EXPECT_DOUBLE_EQ(markers.markers[0].points[0].y, 0.0);
+  EXPECT_DOUBLE_EQ(markers.markers[1].points[0].y, 0.0);
+}
+
+TEST(TubeMarkersTest, V2InvalidOrPathFrameMismatchDeletesWholeBundle) {
+  const auto path = MakeV2MarkerPath();
+  auto profile = MakeV2MarkerProfile(path);
+  const auto correct_frame =
+      std::make_shared<const ContinuousPhaseNormalFrame>(path, 41U, 41U);
+  profile->valid = false;
+  ExpectActions(MakeCertifiedTubeMarkersV2(
+                    ros::Time(2.0), "world", profile, correct_frame),
+                visualization_msgs::Marker::DELETE);
+  profile->valid = true;
+  const auto wrong_frame =
+      std::make_shared<const ContinuousPhaseNormalFrame>(path, 41U, 42U);
+  ExpectActions(MakeCandidateTubeMarkersV2(
+                    ros::Time(2.0), "world", profile, wrong_frame),
+                visualization_msgs::Marker::DELETE);
+  profile->knots[1].w = profile->knots[0].w;
+  ExpectActions(MakeCertifiedTubeMarkersV2(
+                    ros::Time(2.0), "world", profile, correct_frame),
+                visualization_msgs::Marker::DELETE);
+}
+
+TEST(TubeMarkersTest, V2MissingSnapshotPublishesDeletesForBothTopics) {
+  const std::shared_ptr<const phase_offset_navigation::TubeProfileV2> profile;
+  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame;
+  ExpectActions(MakeCertifiedTubeMarkersV2(
+                    ros::Time(2.0), "world", profile, frame),
+                visualization_msgs::Marker::DELETE);
+  ExpectActions(MakeCandidateTubeMarkersV2(
+                    ros::Time(2.0), "world", profile, frame),
+                visualization_msgs::Marker::DELETE);
 }
 
 }  // namespace

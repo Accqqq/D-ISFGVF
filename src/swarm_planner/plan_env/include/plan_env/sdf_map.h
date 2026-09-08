@@ -29,6 +29,7 @@
 #include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <algorithm>
+#include <atomic>
 #include <cv_bridge/cv_bridge.h>
 #include <fstream>
 #include <geometry_msgs/PointStamped.h>
@@ -38,8 +39,10 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <string>
 #include <nav_msgs/Odometry.h>
 #include <queue>
+#include <deque>
 #include <ros/ros.h>
 #include <sstream>
 #include <tuple>
@@ -72,6 +75,20 @@ struct CloudOccupancySnapshotStore {
   std::mutex mutex;
   std::uint64_t observation_sequence = 0U;
   std::shared_ptr<const CloudOccupancySnapshot> latest;
+};
+
+// A copyable wrapper around the map-owned serialization primitive.  Copying a
+// legacy SDFMap creates an independent lock (and its own copied buffers) while
+// retaining the class's historical copyability; the lock is never shared with
+// the legacy single-frame snapshot store.
+struct SDFMapCaptureMutexV2 {
+  mutable std::recursive_mutex mutex;
+  std::uint64_t instance_id = 0U;
+  mutable std::uint64_t observed_configuration_key = 0U;
+  mutable bool support_binding_invalidated = false;
+  SDFMapCaptureMutexV2();
+  SDFMapCaptureMutexV2(const SDFMapCaptureMutexV2&);
+  SDFMapCaptureMutexV2& operator=(const SDFMapCaptureMutexV2&);
 };
 
 }  // namespace plan_env
@@ -179,6 +196,38 @@ struct MappingData {
   bool static_preinflated_map_ready_ = false;
   size_t static_preinflated_voxel_count_ = 0;
 
+  // Authoritative V2 support is independent from the legacy cloud snapshot.
+  // A nonzero byte means this voxel has genuine complete observation/support
+  // evidence; initialization and clearing leave it invalid/zero.
+  std::vector<char> authoritative_support_buffer_v2_;
+  bool authoritative_support_valid_v2_ = false;
+  bool authoritative_support_complete_v2_ = false;
+  std::uint32_t authoritative_support_evidence_basis_v2_ =
+      plan_env::kSDFMapCaptureSupportEvidenceNone;
+  std::uint64_t authoritative_support_sequence_v2_ = 0U;
+  std::uint64_t authoritative_support_map_instance_id_v2_ = 0U;
+  std::uint64_t authoritative_support_configuration_generation_v2_ = 0U;
+  std::uint64_t authoritative_support_configuration_key_v2_ = 0U;
+  std::string authoritative_support_frame_id_v2_;
+  std::uint64_t authoritative_support_accepted_ticks_v2_ = 0U;
+  std::uint64_t authoritative_support_valid_until_ticks_v2_ = 0U;
+  ros::Time authoritative_support_stamp_v2_;
+  ros::Time authoritative_support_valid_until_v2_;
+  Eigen::Vector3d authoritative_support_min_v2_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d authoritative_support_max_v2_ = Eigen::Vector3d::Zero();
+  double authoritative_support_halo_v2_ = 0.0;
+  bool authoritative_support_halo_reconciled_v2_ = false;
+
+  // Monotonic accepted-state identity for coherent V2 captures.  It is
+  // advanced only at map-owned mutation boundaries, without wall-clock reads.
+  std::uint64_t authoritative_state_sequence_v2_ = 0U;
+  std::uint64_t authoritative_state_notification_sequence_v2_ = 0U;
+  std::uint64_t authoritative_state_time_ticks_v2_ = 0U;
+  bool authoritative_state_identity_exhausted_v2_ = false;
+  ros::Time authoritative_state_stamp_v2_;
+  std::uint64_t authoritative_configuration_generation_v2_ = 0U;
+  bool authoritative_configuration_identity_exhausted_v2_ = false;
+
   // camera position and pose data
 
   Eigen::Vector3d camera_pos_, last_camera_pos_;
@@ -260,6 +309,22 @@ public:
   // before one cloud message has been processed with a valid odom.
   std::shared_ptr<const plan_env::CloudOccupancySnapshot>
   cloudOccupancySnapshot() const;
+
+  // Captures the existing effective planner backing at one map-owned
+  // serialization boundary.  The capture is read-only and independent of the
+  // legacy per-cloud snapshot.  The no-argument overload captures the full map;
+  // region overloads include every closed voxel volume intersecting the
+  // requested region expanded by halo.
+  std::shared_ptr<const plan_env::SDFMapCaptureV2>
+  captureAuthoritativeSDFMapV2() const;
+  std::shared_ptr<const plan_env::SDFMapCaptureV2>
+  captureAuthoritativeSDFMapV2(
+      const plan_env::SDFMapCaptureRegionV2& region) const;
+  // Copies the latest accepted-state identity/support notification under the
+  // same map-owned serialization boundary as captureAuthoritativeSDFMapV2().
+  // Raw cloud arrival alone never fabricates this visibility value.
+  plan_env::SDFMapAcceptedStateVisibilityV2
+  acceptedStateVisibilityV2() const;
   plan_env::SDFMapEnvironmentEvidenceCapabilities
   observedUninflatedEnvironmentCapabilities() const;
   plan_env::SDFMapEnvironmentEvidenceResult
@@ -311,6 +376,10 @@ private:
   void depthOdomCallback(const sensor_msgs::ImageConstPtr& img, const nav_msgs::OdometryConstPtr& odom);
   void depthCallback(const sensor_msgs::ImageConstPtr& img);
   void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img);
+  void cloudObservationCallbackV2(
+      const ros::MessageEvent<sensor_msgs::PointCloud2 const>& event);
+  void acceptCloudSupportV2Locked(const sensor_msgs::PointCloud2& cloud,
+                                 const pcl::PointCloud<pcl::PointXYZ>& points);
   void poseCallback(const geometry_msgs::PoseStampedConstPtr& pose);
   void odomCallback(const nav_msgs::OdometryConstPtr& odom);
 
@@ -329,6 +398,17 @@ private:
   void saveManualMapFile();
   void loadStaticPreinflatedMapFile();
   void applyStaticPreinflatedLayer();
+
+  // `stamp` is supplied only by source messages that carry an accepted
+  // observation time.  Direct/manual map mutations advance identity without
+  // inventing a wall-clock timestamp.
+  void noteAuthoritativeMapMutationV2Locked(const ros::Time& stamp = ros::Time());
+  void invalidateAuthoritativeSupportV2Locked(
+      const Eigen::Vector3i& min_id, const Eigen::Vector3i& max_id);
+  void markAuthoritativeSupportV2Locked(const Eigen::Vector3i& index,
+                                        std::uint32_t evidence_basis,
+                                        const ros::Time& stamp = ros::Time());
+  void rebuildAuthoritativeSupportBoundsV2Locked();
 
   // main update process
   void projectDepthImage();
@@ -371,6 +451,17 @@ private:
   default_random_engine eng_;
   std::shared_ptr<plan_env::CloudOccupancySnapshotStore>
       cloud_occupancy_snapshot_store_;
+  mutable plan_env::SDFMapCaptureMutexV2 authoritative_capture_mutex_v2_;
+  // Proof-only provenance; never replaces camera_pos_ used by the planner.
+  bool cloud_complete_declared_v2_ = false;
+  bool cloud_source_contract_v2_ = false;
+  Eigen::Vector3d cloud_source_range_v2_ = Eigen::Vector3d::Zero();
+  double cloud_source_period_v2_ = 0.0;
+  std::string cloud_source_name_v2_;
+  std::string cloud_odom_topic_v2_;
+  std::string cloud_complete_param_v2_;
+  std::deque<nav_msgs::Odometry> cloud_odom_history_v2_;
+  ros::Time cloud_support_last_stamp_v2_;
 };
 
 /* ============================== definition of inline function
@@ -484,6 +575,8 @@ inline double SDFMap::getDistWithGradTrilinear(Eigen::Vector3d pos, Eigen::Vecto
 }
 
 inline void SDFMap::setOccupied(Eigen::Vector3d pos) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (!isInMap(pos)) return;
 
   Eigen::Vector3i id;
@@ -491,9 +584,12 @@ inline void SDFMap::setOccupied(Eigen::Vector3d pos) {
 
   md_.occupancy_buffer_inflate_[id(0) * mp_.map_voxel_num_(1) * mp_.map_voxel_num_(2) +
                                 id(1) * mp_.map_voxel_num_(2) + id(2)] = 1;
+  noteAuthoritativeMapMutationV2Locked();
 }
 
 inline void SDFMap::setOccupancy(Eigen::Vector3d pos, double occ) {
+  const std::lock_guard<std::recursive_mutex> lock(
+      authoritative_capture_mutex_v2_.mutex);
   if (occ != 1 && occ != 0) {
     cout << "occ value error!" << endl;
     return;
@@ -505,6 +601,7 @@ inline void SDFMap::setOccupancy(Eigen::Vector3d pos, double occ) {
   posToIndex(pos, id);
 
   md_.occupancy_buffer_[toAddress(id)] = occ;
+  noteAuthoritativeMapMutationV2Locked();
 }
 
 inline int SDFMap::getOccupancy(Eigen::Vector3d pos) {

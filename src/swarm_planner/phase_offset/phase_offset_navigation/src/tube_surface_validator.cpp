@@ -148,6 +148,7 @@ struct CellEvaluation {
   bool cell_certificate_complete = false;
   bool cell_certificate_revision_match = false;
   double proof_residual = 0.0;
+  double refinement_priority = 0.0;
   bool geometry_valid = false;
   // Exact operands copied from the successful EvaluateSurfacePoint call.
   // They are transport-only diagnostic facts and never feed validation.
@@ -565,6 +566,82 @@ CellEvaluation EvaluateCell(ValidationContext& context,
     evaluation.legacy_reason = TubeStopReason::OCCUPIED;
     return evaluation;
   }
+  if (query.status == DistanceStatus::UNKNOWN) {
+    // A proof-cell-induced UNKNOWN may be refined only after one real query
+    // at the planner's required clearance.  The primary UNKNOWN and its
+    // larger requested radius remain the supporting evidence for REFINE.
+    if (context.result->query_sample_count >=
+        context.config->max_query_samples) {
+      context.result->limit_exceeded = true;
+      context.result->query_budget_reached = true;
+      evaluation.reason = TubeSurfaceInconclusiveReason::QUERY_BUDGET;
+      return evaluation;
+    }
+    ++context.result->query_sample_count;
+    const ClearanceQueryResult base = (*context.clearance_query)(
+        evaluation.center.point, context.required_clearance);
+    const auto use_base_evidence = [&evaluation, &context, &base]() {
+      evaluation.requested_radius = context.required_clearance;
+      evaluation.requested_clearance_valid = IsFinite(
+          context.required_clearance) && context.required_clearance >= 0.0;
+      evaluation.clearance_query_attempted = true;
+      evaluation.clearance_status = base.status;
+      evaluation.witness_clearance = base.clearance;
+      evaluation.witness_clearance_certified = base.clearance_certified;
+      evaluation.witness_clearance_valid =
+          base.status == DistanceStatus::KNOWN_FREE &&
+          base.clearance_certified && IsFinite(base.clearance);
+      evaluation.witness_clearance_exact = evaluation.witness_clearance_valid &&
+          base.clearance_is_exact;
+    };
+    if (base.status == DistanceStatus::OCCUPIED) {
+      use_base_evidence();
+      evaluation.outcome = TubeSurfaceOutcome::CONTRACT_UNSAFE;
+      evaluation.reason = TubeSurfaceInconclusiveReason::NONE;
+      evaluation.legacy_reason = TubeStopReason::OCCUPIED;
+      return evaluation;
+    }
+    if (base.status == DistanceStatus::UNKNOWN ||
+        base.status == DistanceStatus::OUT_OF_MAP ||
+        base.status == DistanceStatus::UNAVAILABLE) {
+      use_base_evidence();
+      evaluation.reason = InconclusiveReason(base.status);
+      return evaluation;
+    }
+    if (base.status != DistanceStatus::KNOWN_FREE) {
+      use_base_evidence();
+      evaluation.reason = TubeSurfaceInconclusiveReason::NUMERICAL_FAILURE;
+      return evaluation;
+    }
+    if (!base.clearance_certified || !IsFinite(base.clearance)) {
+      use_base_evidence();
+      evaluation.reason = !IsFinite(base.clearance)
+          ? TubeSurfaceInconclusiveReason::NUMERICAL_FAILURE
+          : TubeSurfaceInconclusiveReason::CLEARANCE_UNCERTIFIED;
+      return evaluation;
+    }
+    if (base.clearance < context.required_clearance) {
+      use_base_evidence();
+      if (base.clearance_is_exact) {
+        evaluation.outcome = TubeSurfaceOutcome::CONTRACT_UNSAFE;
+        evaluation.reason = TubeSurfaceInconclusiveReason::NONE;
+        evaluation.legacy_reason = TubeStopReason::INSUFFICIENT_CLEARANCE;
+      } else {
+        evaluation.reason = TubeSurfaceInconclusiveReason::
+            CLEARANCE_UNCERTIFIED;
+      }
+      return evaluation;
+    }
+    const double refinement_priority = OutwardUpper(
+        requirement - context.required_clearance);
+    if (!IsFinite(refinement_priority) || refinement_priority <= 0.0) {
+      evaluation.reason = TubeSurfaceInconclusiveReason::NUMERICAL_FAILURE;
+      return evaluation;
+    }
+    evaluation.outcome = TubeSurfaceOutcome::REFINE;
+    evaluation.refinement_priority = refinement_priority;
+    return evaluation;
+  }
   if (query.status != DistanceStatus::KNOWN_FREE) {
     evaluation.reason = InconclusiveReason(query.status);
     return evaluation;
@@ -597,6 +674,13 @@ CellEvaluation EvaluateCell(ValidationContext& context,
         context.required_clearance - context.cover_epsilon;
     evaluation.proof_residual = evaluation.breakdown.geometric_cover -
         evaluation.breakdown.allowable_cover;
+    evaluation.refinement_priority = evaluation.proof_residual;
+    if (!IsFinite(evaluation.refinement_priority) ||
+        evaluation.refinement_priority <= 0.0) {
+      evaluation.outcome = TubeSurfaceOutcome::INCONCLUSIVE;
+      evaluation.reason = TubeSurfaceInconclusiveReason::NUMERICAL_FAILURE;
+      return evaluation;
+    }
     context.result->proof_residual = std::max(
         context.result->proof_residual, evaluation.proof_residual);
     return evaluation;
@@ -1305,7 +1389,7 @@ bool TubeSurfaceValidator::validate(
       const CellEvaluation child_evaluation = EvaluateCell(context, child);
       const double unresolved = child_evaluation.outcome ==
           TubeSurfaceOutcome::REFINE
-          ? child_evaluation.proof_residual : 0.0;
+          ? child_evaluation.refinement_priority : 0.0;
       queue.push({child, unresolved, true, child_evaluation});
     }
   }

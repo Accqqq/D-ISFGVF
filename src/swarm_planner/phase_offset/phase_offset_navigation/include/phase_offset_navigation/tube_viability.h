@@ -1,6 +1,7 @@
 #pragma once
 
 #include "phase_offset_navigation/tube_types.h"
+#include "phase_offset_navigation/tube_profile_v2.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,14 @@ enum class TubeViabilityStatus {
   CURRENT_DELTA_OUTSIDE,
   STALE,
   INVALID_INPUT,
+};
+
+enum class TubeViabilityProofKind {
+  // Existing value-only/legacy preview path.  This is the default so old
+  // callers retain their historical interpolation and tolerance behavior.
+  LEGACY,
+  // Strict live preview over an immutable TubeProfileV2 merged partition.
+  V2_LIVE_PWL,
 };
 
 // Immutable production NORMAL Preview policy.  The policy is deliberately a
@@ -102,8 +111,11 @@ struct TubeViabilityKnot {
   TubeViabilityInterval geometric;
   TubeViabilityInterval reachable;
 
-  // Exact PWL one-sided slopes.  A missing side is marked by the matching
-  // *_slope_*_valid bit; no smoothing or extrapolation is performed.
+  // One-sided slope diagnostics.  A missing side is marked by the matching
+  // *_slope_*_valid bit; no smoothing or extrapolation is performed.  On the
+  // strict V2 branch these scalars expose the conservative endpoint used for
+  // the corresponding boundary test; the directed *_slope_*_interval fields
+  // below are the authoritative evidence.
   double lower_slope_left = 0.0;
   double lower_slope_right = 0.0;
   double upper_slope_left = 0.0;
@@ -112,6 +124,13 @@ struct TubeViabilityKnot {
   bool lower_slope_right_valid = false;
   bool upper_slope_left_valid = false;
   bool upper_slope_right_valid = false;
+  // Directed ratio evidence for the corresponding one-sided slopes.  Legacy
+  // callers may leave these invalid; V2 live preview populates every present
+  // side and uses the intervals for contraction/rate bounds.
+  TubeViabilityInterval lower_slope_left_interval;
+  TubeViabilityInterval lower_slope_right_interval;
+  TubeViabilityInterval upper_slope_left_interval;
+  TubeViabilityInterval upper_slope_right_interval;
 
   TubeViabilityRateInterval lower_boundary_rate;
   TubeViabilityRateInterval upper_boundary_rate;
@@ -142,9 +161,20 @@ struct TubeViabilityInput {
   std::uint64_t expected_path_revision = 0U;
   std::uint64_t expected_frame_revision = 0U;
   std::uint64_t expected_profile_revision = 0U;
+  // Caller-bounded V2 preview work.  Zero preserves the unbounded legacy
+  // value-only overload; strict V2 callers must provide a positive budget.
+  std::size_t max_work = 0U;
+  // Optional exact V2 provenance binding.  When set, all immutable key fields
+  // (including map capture/grid support) must match the supplied profile;
+  // scalar revision checks above remain for legacy/value-only callers.
+  bool v2_provenance_bound = false;
+  TubePathKey expected_v2_path_key;
+  TubeConfigurationKey expected_v2_configuration_key;
+  TubeMapCaptureKey expected_v2_map_capture_key;
 };
 
 struct TubeViabilityResult {
+  TubeViabilityProofKind proof_kind = TubeViabilityProofKind::LEGACY;
   TubeViabilityStatus status = TubeViabilityStatus::NOT_EVALUATED;
   bool valid = false;
   bool feasible = false;
@@ -163,6 +193,12 @@ struct TubeViabilityResult {
   TubeViabilityInterval delta_reach;
   double upper_u_delta = 0.0;
   NormalPreviewProductionPolicy policy;
+  // Exact immutable V2 authorities retained for downstream audit.  They stay
+  // default-constructed on the legacy branch.
+  TubePathKey path_key;
+  TubeConfigurationKey configuration_key;
+  TubeMapCaptureKey map_capture_key;
+  std::uint64_t profile_id = 0U;
 
   double b_pre = 0.0;
   double beta_argument = 0.0;
@@ -172,6 +208,8 @@ struct TubeViabilityResult {
   double beta_i = 0.0;
   double max_inward_contraction_slope = 0.0;
   double allowed_inward_contraction_slope = 0.0;
+  std::size_t work_count = 0U;
+  std::size_t max_work = 0U;
 
   TubeViabilityRateInterval current_rate_interval;
   TubeViabilityProvenance provenance;
@@ -201,6 +239,22 @@ class TubeViability {
       const std::vector<TubeViabilityCrossSection>& cross_sections,
       const TubeViabilityInput& input,
       TubeViabilityResult& output);
+
+  // Pure V2 NORMAL Preview over one already accepted immutable geometric
+  // profile.  The overload never rebuilds geometry or queries a map: it
+  // merges the live W window with the profile's frozen PWL breakpoints and
+  // computes the inward reachable envelope K on that same partition.
+  static bool evaluate(const TubeProfileV2& profile,
+                       const TubeViabilityInput& input,
+                       TubeViabilityResult& output);
+
+  // Convenience value overload for callers that do not need the legacy
+  // TubeViabilityInput wrapper.
+  static bool evaluate(const TubeProfileV2& profile, double current_w,
+                       double current_delta,
+                       const NormalPreviewProductionPolicy& policy,
+                       double upper_u_delta,
+                       TubeViabilityResult& output);
 
   static double smoothstep(double q);
 

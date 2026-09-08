@@ -1,11 +1,14 @@
 #pragma once
 
+#include <bspline_race/continuous_phase_normal_frame.h>
+#include <phase_offset_navigation/tube_profile_v2.h>
 #include <phase_offset_navigation/tube_types.h>
 
 #include <ros/ros.h>
 #include <visualization_msgs/MarkerArray.h>
 
 #include <string>
+#include <memory>
 
 namespace FLAG_Race {
 
@@ -51,5 +54,21 @@ visualization_msgs::MarkerArray MakeCandidateTubeMarkers(
     const phase_offset_navigation::TubeProfile& profile,
     bool manual_mode,
     double current_w);
+
+// V2 visualization reads the certified PWL bounds directly and evaluates the
+// immutable path/frame owner at each knot.  These overloads deliberately do
+// not translate V2 evidence into a legacy TubeProfile.  Missing, malformed or
+// path/frame-mismatched evidence produces one complete DELETE bundle.
+visualization_msgs::MarkerArray MakeCertifiedTubeMarkersV2(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame_owner);
+
+visualization_msgs::MarkerArray MakeCandidateTubeMarkersV2(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame_owner);
 
 }  // namespace FLAG_Race

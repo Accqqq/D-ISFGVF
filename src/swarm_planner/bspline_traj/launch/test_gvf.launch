@@ -6,7 +6,7 @@
     <arg name="init_y" default="0.0" />
     <arg name="init_z" default="1.0" />
     <!--  disabled/manual -->
-    <arg name="phase_offset_mode" default="disabled" />
+    <arg name="phase_offset_mode" default="manual" />
     <arg name="phase_offset_coordination_backend" default="disabled" />
     <arg name="enable_neighbor_transport" default="false" />
     <arg name="enable_sph_provider" default="false" />
@@ -23,7 +23,8 @@
     <arg name="phase_offset_active_equivalence_tolerance" default="1e-10" />
     <arg name="phase_offset_active_required_consecutive_cycles" default="100" />
     <arg name="phase_offset_manual_amplitude" default="0.10" />
-    <arg name="phase_offset_manual_observe_only" default="true" />
+    <!-- false正式接入导航 -->
+    <arg name="phase_offset_manual_observe_only" default="false" />
     <!-- 10.0/2.0 -->
     <arg name="phase_offset_manual_profile_period" default="10.0" />
     <arg name="phase_offset_manual_warmup_cycles" default="100" />
@@ -37,16 +38,16 @@
     <arg name="phase_offset_manual_tangent_speed_min" default="0.02" />
     <arg name="phase_offset_manual_preflight_sample_step_w" default="0.10" />
     <!--  none/esdf/fixed -->
-    <arg name="phase_offset_manual_tube_source" default="none" />
+    <arg name="phase_offset_manual_tube_source" default="esdf" />
     <!-- NORMAL Preview policy is intentionally unset by default.  The
          integration stages pass all six values explicitly; empty values do
          not create production parameters on the server. -->
-    <arg name="phase_offset_normal_preview_horizon_w" default="" />
-    <arg name="phase_offset_normal_preview_sample_spacing_w" default="" />
-    <arg name="phase_offset_normal_preview_lower_nu" default="" />
-    <arg name="phase_offset_normal_preview_upper_nu" default="" />
-    <arg name="phase_offset_normal_preview_b_tight" default="" />
-    <arg name="phase_offset_normal_preview_b_open" default="" />
+    <arg name="phase_offset_normal_preview_horizon_w" default="1.0" />
+    <arg name="phase_offset_normal_preview_sample_spacing_w" default="0.25" />
+    <arg name="phase_offset_normal_preview_lower_nu" default="0.02" />
+    <arg name="phase_offset_normal_preview_upper_nu" default="2.0" />
+    <arg name="phase_offset_normal_preview_b_tight" default="0.10" />
+    <arg name="phase_offset_normal_preview_b_open" default="0.90" />
     <arg name="phase_offset_tube_fixed_delta_max" default="0.06" />
     <arg name="phase_offset_tube_nominal_half_width" default="1.0" />
     <arg name="phase_offset_tube_sample_step_w" default="0.10" />

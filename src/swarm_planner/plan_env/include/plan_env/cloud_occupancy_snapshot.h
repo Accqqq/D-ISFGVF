@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <ros/time.h>
+#include <string>
 #include <vector>
 
 namespace plan_env {
@@ -28,6 +29,10 @@ struct CloudOccupancySnapshot;
 struct CloudOccupancySnapshotBuildInput;
 struct CloudOccupancySnapshotClearanceResult;
 struct CloudOccupancySnapshotPlannerEsdfBaseClearanceResult;
+struct SDFMapCaptureRegionV2;
+struct SDFMapCaptureSupportV2;
+struct SDFMapCaptureV2;
+struct SDFMapCaptureFreeBallResultV2;
 
 CloudOccupancySnapshot buildCloudOccupancySnapshot(
     const CloudOccupancySnapshotBuildInput& input);
@@ -48,6 +53,9 @@ struct CloudOccupancySnapshot {
   bool valid = false;
   std::uint64_t observation_sequence = 0U;
   ros::Time observation_stamp;
+  // Effective planner-admissible domain.  This is the native SDFMap base
+  // domain intersected with an enabled manual boundary; grid_origin and the
+  // integer source offsets below remain the native backing geometry.
   Eigen::Vector3d map_min = Eigen::Vector3d::Zero();
   Eigen::Vector3d map_max = Eigen::Vector3d::Zero();
   Eigen::Vector3d observed_min = Eigen::Vector3d::Zero();
@@ -167,5 +175,174 @@ queryCloudOccupancySnapshotPlannerEsdfBaseClearance(
     const CloudOccupancySnapshot& snapshot,
     const Eigen::Vector3d& point,
     double required_radius);
+
+// Evidence basis for the authoritative SDFMap support carried by a V2
+// capture.  A caller cannot make support complete by setting a legacy
+// cloud-completeness flag; the producer must attribute it to an actual
+// observation or a pre-known complete domain.
+enum SDFMapCaptureSupportEvidenceBasisV2 : std::uint32_t {
+  kSDFMapCaptureSupportEvidenceNone = 0U,
+  kSDFMapCaptureSupportEvidenceDepthRaycast = 1U << 0,
+  kSDFMapCaptureSupportEvidenceCompletePreknownDomain = 1U << 1,
+};
+
+enum SDFMapCaptureEffectiveLayerV2 : std::uint32_t {
+  kSDFMapCaptureLayerSensor = 1U << 0,
+  kSDFMapCaptureLayerManual = 1U << 1,
+  kSDFMapCaptureLayerStatic = 1U << 2,
+  kSDFMapCaptureLayerCeiling = 1U << 3,
+};
+
+// Optional requested map-space region.  The capture includes every grid voxel
+// whose closed volume intersects the region expanded by halo.  An invalid or
+// omitted region asks for the complete map, which is useful for small unit
+// fixtures and remains one value copied from SDFMap.
+struct SDFMapCaptureRegionV2 {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  bool valid = false;
+  Eigen::Vector3d min = Eigen::Vector3d::Zero();
+  Eigen::Vector3d max = Eigen::Vector3d::Zero();
+  double halo = 0.0;
+};
+
+// Minimum valid support/completeness evidence accompanying one authoritative
+// map value.  The dense mask is indexed exactly like SDFMapCaptureV2::occupied
+// and is copied at the same serialization boundary.  `valid` is intentionally
+// false by default; zero occupancy/allocation and legacy cloud flags never
+// promote it.
+struct SDFMapCaptureSupportV2 {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  bool valid = false;
+  bool complete = false;
+  std::uint32_t evidence_basis = kSDFMapCaptureSupportEvidenceNone;
+  std::uint64_t evidence_sequence = 0U;
+  std::uint64_t evidence_accepted_ticks = 0U;
+  std::uint64_t map_instance_id = 0U;
+  std::uint64_t configuration_generation = 0U;
+  std::uint64_t configuration_key = 0U;
+  std::string frame_id;
+  ros::Time evidence_stamp;
+  ros::Time valid_until;
+  // A nonzero finite expiry must be grounded in the same monotonic acceptance
+  // tick domain as SDFMapCaptureV2::accepted_time_ticks.  Zero means an
+  // explicitly timeless preknown domain, not an unknown expiry.
+  std::uint64_t valid_until_accepted_ticks = 0U;
+  Eigen::Vector3d support_min = Eigen::Vector3d::Zero();
+  Eigen::Vector3d support_max = Eigen::Vector3d::Zero();
+  double required_halo = 0.0;
+  bool halo_reconciled = false;
+  std::vector<std::uint8_t> mask;
+};
+
+// Immutable read-only value of the existing authoritative SDFMap.  The
+// occupied vector is the effective accumulated/inflated planner backing after
+// enabled manual/static/ceiling layers have been applied; no cloud
+// reconstruction or second map lifecycle is represented here.
+struct SDFMapCaptureV2 {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  bool valid = false;
+  std::uint64_t map_instance_id = 0U;
+  std::uint64_t configuration_generation = 0U;
+  std::uint64_t configuration_key = 0U;
+  std::string frame_id;
+  std::uint64_t accepted_state_sequence = 0U;
+  // Monotonic notification fact for accepted authoritative mutations.  It is
+  // copied with the state under SDFMap's serialization boundary and is never
+  // advanced by raw cloud arrival or by a consumer reading this value.
+  std::uint64_t accepted_state_notification_sequence = 0U;
+  // Monotonic steady-clock acceptance metadata.  It is separate from the
+  // source observation stamp below and never synthesized from ros::Time::now.
+  std::uint64_t accepted_time_ticks = 0U;
+  ros::Time observation_stamp;
+  ros::Time accepted_state_stamp;
+  std::uint32_t effective_layer_mask = 0U;
+  Eigen::Vector3d map_min = Eigen::Vector3d::Zero();
+  Eigen::Vector3d map_max = Eigen::Vector3d::Zero();
+  // Native SDFMap grid origin.  Cropped captures retain this value and use
+  // source_min_index/source_max_index as integer offsets into the native
+  // grid; this is never a rounded/rebased crop origin.
+  Eigen::Vector3d grid_origin = Eigen::Vector3d::Zero();
+  // Directed clipped request bounds in map coordinates.  The occupied vector
+  // contains every native voxel whose closed volume intersects these bounds.
+  Eigen::Vector3d capture_min = Eigen::Vector3d::Zero();
+  Eigen::Vector3d capture_max = Eigen::Vector3d::Zero();
+  Eigen::Vector3i source_min_index = Eigen::Vector3i::Zero();
+  Eigen::Vector3i source_max_index = Eigen::Vector3i::Constant(-1);
+  Eigen::Vector3i voxel_count = Eigen::Vector3i::Zero();
+  double resolution = 0.0;
+  double included_map_inflation = 0.0;
+  SDFMapCaptureSupportV2 support;
+  std::vector<std::uint8_t> occupied;
+};
+
+// Bounded value-only visibility of the latest accepted authoritative map
+// mutation.  This DTO intentionally carries identity/support metadata but no
+// mutable SDFMap pointer or callback.  A zero/default value means that no
+// accepted state has been published yet.
+struct SDFMapAcceptedStateVisibilityV2 {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  bool valid = false;
+  std::uint64_t map_instance_id = 0U;
+  std::uint64_t accepted_state_sequence = 0U;
+  std::uint64_t accepted_state_notification_sequence = 0U;
+  std::uint64_t accepted_time_ticks = 0U;
+  std::uint64_t configuration_generation = 0U;
+  std::uint64_t configuration_key = 0U;
+  std::string frame_id;
+  ros::Time accepted_state_stamp;
+  SDFMapCaptureSupportV2 support;
+};
+
+enum class SDFMapCaptureFreeBallStatusV2 {
+  UNAVAILABLE,
+  OUT_OF_MAP,
+  UNKNOWN,
+  OCCUPIED,
+  INCONCLUSIVE,
+  CERTIFIED_FREE,
+};
+
+// Result of the pure closed-volume free-ball predicate.  It is intentionally
+// convertible to bool for small callers while retaining typed fail-closed
+// status and support/work evidence for V2 diagnostics.
+struct SDFMapCaptureFreeBallResultV2 {
+  SDFMapCaptureFreeBallStatusV2 status =
+      SDFMapCaptureFreeBallStatusV2::UNAVAILABLE;
+  bool clearance_certified = false;
+  double certified_radius = 0.0;
+  std::size_t voxel_checks = 0U;
+  Eigen::Vector3d support_min = Eigen::Vector3d::Zero();
+  Eigen::Vector3d support_max = Eigen::Vector3d::Zero();
+  // Capture-local inclusive range of every voxel enumerated as potentially
+  // touched by the closed query ball.  Constant(-1) denotes that no bounded
+  // voxel range was established (for example, out-of-domain input).
+  Eigen::Vector3i enumerated_min_index = Eigen::Vector3i::Zero();
+  Eigen::Vector3i enumerated_max_index = Eigen::Vector3i::Constant(-1);
+
+  explicit operator bool() const { return clearance_certified; }
+};
+
+// Short aliases keep the DTO ergonomic without creating a second contract.
+using SDFMapCaptureFreeBallResult = SDFMapCaptureFreeBallResultV2;
+using SDFMapCaptureFreeBallStatus = SDFMapCaptureFreeBallStatusV2;
+
+// Pure predicate over one immutable authoritative capture.  It certifies a
+// complete closed Euclidean ball against closed occupied voxel volumes and a
+// complete attributed support mask.  Any unsupported, nonfinite, overflowed,
+// or unresolved comparison is fail-closed.
+SDFMapCaptureFreeBallResultV2 certifySDFMapCaptureFreeBallV2(
+    const SDFMapCaptureV2& capture,
+    const Eigen::Vector3d& qhat,
+    double radius);
+
+// Structural validation for manually assembled/captured V2 values.  Support
+// validity is checked separately by the predicate and is never inferred from
+// an allocated or all-zero occupied vector.
+bool sdfMapCaptureV2FloatingPointEnvironmentSupported();
+bool sdfMapCaptureV2Consistent(const SDFMapCaptureV2& capture);
 
 }  // namespace plan_env

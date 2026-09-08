@@ -240,7 +240,8 @@ TEST(TubeEpochDiagnosticsTest,
     EXPECT_STREQ(raw_names[index], expected_raw_names[index]);
   }
 
-  const TubeProfile raw_profile = MakeRawRepresentativeProfile();
+  const phase_offset_navigation::TubeProfile raw_profile =
+      MakeRawRepresentativeProfile();
   const RawCandidateDiagnosticsInput raw_input =
       MakeRawRepresentativeInput(&raw_profile);
   const auto raw_values = makeRawCandidateDiagnostics(raw_input);

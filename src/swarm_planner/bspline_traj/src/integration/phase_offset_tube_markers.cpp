@@ -85,6 +85,10 @@ visualization_msgs::Marker MakeDelete(const ros::Time& stamp,
   return marker;
 }
 
+visualization_msgs::MarkerArray MakeDeleteAll(const ros::Time& stamp,
+                                              const std::string& frame_id,
+                                              const std::string& ns);
+
 bool AppendBoundaryPoints(const TubeSampleVector& samples,
                           visualization_msgs::Marker& lower,
                           visualization_msgs::Marker& upper,
@@ -118,6 +122,88 @@ bool AppendBoundaryPoints(const phase_offset_navigation::TubeProfile& profile,
                           visualization_msgs::Marker& ribbon) {
   if (!profile.complete) return false;
   return AppendBoundaryPoints(profile.samples, lower, upper, ribbon);
+}
+
+bool SelectV2DisplaySamples(
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame_owner,
+    TubeSampleVector& samples) {
+  samples.clear();
+  if (!profile || !frame_owner || !profile->structurallyValid() ||
+      frame_owner->pathRevision() != profile->path_key.path_revision ||
+      frame_owner->frameRevision() != profile->path_key.frame_revision ||
+      frame_owner->startW() != profile->path_key.domain_start ||
+      frame_owner->endW() != profile->path_key.domain_end ||
+      profile->certified_start < frame_owner->startW() ||
+      profile->certified_end > frame_owner->endW()) {
+    return false;
+  }
+  samples.reserve(profile->knots.size());
+  for (const phase_offset_navigation::TubePwlKnotV2& knot : profile->knots) {
+    ContinuousPhasePathState state;
+    if (!knot.valid || !std::isfinite(knot.w) ||
+        !std::isfinite(knot.lower) || !std::isfinite(knot.upper) ||
+        knot.lower > knot.upper ||
+        !frame_owner->evaluatePathState(knot.w, state) || !state.valid ||
+        !state.frame_valid ||
+        state.path_revision != profile->path_key.path_revision ||
+        state.frame_revision != profile->path_key.frame_revision ||
+        !state.p.allFinite() || !state.N.allFinite()) {
+      samples.clear();
+      return false;
+    }
+    phase_offset_navigation::TubeRawSample sample;
+    sample.w = knot.w;
+    sample.p = state.p;
+    sample.N = state.N;
+    sample.filtered_lower = knot.lower;
+    sample.filtered_upper = knot.upper;
+    sample.complete = true;
+    samples.push_back(sample);
+  }
+  return samples.size() >= 2U;
+}
+
+visualization_msgs::MarkerArray MakeTubeMarkersV2(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame_owner,
+    const bool candidate) {
+  const char* const marker_namespace = candidate
+      ? "phase_offset_manual_tube_candidate"
+      : "phase_offset_manual_tube";
+  TubeSampleVector samples;
+  if (!SelectV2DisplaySamples(profile, frame_owner, samples)) {
+    return MakeDeleteAll(stamp, frame_id, marker_namespace);
+  }
+
+  const float lower_red = candidate ? 0.58F : 0.0F;
+  const float lower_green = candidate ? 0.38F : 0.78F;
+  const float lower_blue = candidate ? 0.16F : 1.0F;
+  const float upper_red = candidate ? 0.42F : 0.0F;
+  const float upper_green = candidate ? 0.28F : 0.38F;
+  const float upper_blue = candidate ? 0.12F : 1.0F;
+  auto lower = MakeTubeLine(stamp, frame_id, marker_namespace, 0,
+                            candidate ? 0.04F : 0.06F,
+                            lower_red, lower_green, lower_blue);
+  auto upper = MakeTubeLine(stamp, frame_id, marker_namespace, 1,
+                            candidate ? 0.04F : 0.06F,
+                            upper_red, upper_green, upper_blue);
+  auto ribbon = MakeTubeRibbon(
+      stamp, frame_id, marker_namespace,
+      candidate ? 0.50F : 0.0F,
+      candidate ? 0.32F : 0.58F,
+      candidate ? 0.14F : 1.0F,
+      candidate ? 0.12F : 0.22F);
+  if (!AppendBoundaryPoints(samples, lower, upper, ribbon)) {
+    return MakeDeleteAll(stamp, frame_id, marker_namespace);
+  }
+  visualization_msgs::MarkerArray markers;
+  markers.markers.push_back(lower);
+  markers.markers.push_back(upper);
+  markers.markers.push_back(ribbon);
+  return markers;
 }
 
 bool CertifiedGeometryProfileDisplayable(
@@ -315,6 +401,22 @@ visualization_msgs::MarkerArray MakeCandidateTubeMarkers(
   markers.markers.push_back(upper);
   markers.markers.push_back(ribbon);
   return markers;
+}
+
+visualization_msgs::MarkerArray MakeCertifiedTubeMarkersV2(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame_owner) {
+  return MakeTubeMarkersV2(stamp, frame_id, profile, frame_owner, false);
+}
+
+visualization_msgs::MarkerArray MakeCandidateTubeMarkersV2(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame_owner) {
+  return MakeTubeMarkersV2(stamp, frame_id, profile, frame_owner, true);
 }
 
 }  // namespace FLAG_Race

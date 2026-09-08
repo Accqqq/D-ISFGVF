@@ -1,17 +1,13 @@
 #include "bspline_race/integration/phase_offset_matched_adapter.h"
-#include "bspline_race/integration/phase_offset_tube_epoch_diagnostics.h"
-#include "bspline_race/integration/phase_offset_tube_markers.h"
 #include <bspline_race/continuous_phase_normal_frame.h>
 #include <bspline_race/integration/phase_offset_executed_reference_query.h>
-#include <bspline_race/integration/phase_offset_recovery_continuation_provider.h>
+#include <bspline_race/integration/phase_offset_tube_markers.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <limits>
-#include <thread>
 #include <utility>
 
 namespace FLAG_Race {
@@ -29,27 +25,130 @@ const char* phaseOffsetCoordinationBackendName(
   return "disabled";
 }
 
-struct PathTubePairPinRegistry {
-  std::mutex mutex;
-  std::uint64_t next_lease_id = 0U;
-  std::uint64_t active_lease_id = 0U;
-  std::shared_ptr<const PathTubePair> active_pair;
-  std::uint64_t active_generation = 0U;
-  std::uint64_t active_session = 0U;
-};
-
 namespace {
-// A replan callback may produce two adjacent adapter updates before a
-// subscriber drains its queue.  Keep the diagnostic and both tube-marker
-// streams together so a recorder/RViz never receives only the later DELETE
-// for an already published certificate frame.  This is transport buffering
-// only; it does not change geometry, certification, or control selection.
-constexpr std::uint32_t kManualEvidenceQueueSize = 10U;
 constexpr double kRecoveryNonzeroDeltaTolerance = 1e-3;
 
 bool IsFinite(double value) { return std::isfinite(value); }
 bool IsFinite(const Eigen::Vector3d& value) { return value.allFinite(); }
-double FiniteOrZero(double value) { return IsFinite(value) ? value : 0.0; }
+
+// An accepted-map refresh changes the state/acceptance portion of a capture
+// key while retaining the same map backing, frame, support geometry and
+// configuration.  Such a refresh must not blindly retire an otherwise useful
+// incumbent.  Changes to any authority-bearing backing/support field are
+// incompatible and fail closed; the next coherent profile must then replace
+// the old one before it can be used.  Compatibility only permits bounded use
+// of the old profile under its own applicability deadline; it never claims
+// that the old profile proves the incoming map contents.
+bool V2MapRefreshAuthorityCompatible(
+    const phase_offset_navigation::TubeMapCaptureKey& incumbent,
+    const phase_offset_navigation::TubeMapCaptureKey& incoming) {
+  // A refresh is an accepted-state advance, not a relabel of an older
+  // capture.  Do not allow any state/time component to move backwards, and
+  // require at least one accepted-state component to advance.  Request-ID
+  // monotonicity is enforced by PhaseOffsetTubeWorkerV2 separately.
+  if (incoming.state_id < incumbent.state_id ||
+      incoming.accepted_sequence < incumbent.accepted_sequence ||
+      incoming.accepted_time_ticks < incumbent.accepted_time_ticks ||
+      (incoming.state_id == incumbent.state_id &&
+       incoming.accepted_sequence == incumbent.accepted_sequence &&
+       incoming.accepted_time_ticks == incumbent.accepted_time_ticks)) {
+    return false;
+  }
+  if (!incoming.complete_support) return false;
+  // Reuse the key's complete equality for every authority-bearing backing
+  // field.  Only accepted-state identity/time and its support-expiry bound
+  // are allowed to advance during a compatible refresh; normalizing those
+  // fields makes the policy explicit without a parallel field checklist.
+  phase_offset_navigation::TubeMapCaptureKey normalized = incoming;
+  normalized.state_id = incumbent.state_id;
+  normalized.accepted_sequence = incumbent.accepted_sequence;
+  normalized.accepted_time_ticks = incumbent.accepted_time_ticks;
+  normalized.support_expiry_ticks = incumbent.support_expiry_ticks;
+  return normalized == incumbent;
+}
+
+phase_offset_navigation::RuntimeV2PrepareInput MakeV2RuntimePrepareInput(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    const MatchedAdapterInput::TubeV2AdmissionEvidence& evidence,
+    const bool use_profile_deadline,
+    const double retained_delta,
+    const phase_offset_core::PortCommand& previous_final_port) {
+  phase_offset_navigation::RuntimeV2PrepareInput runtime_input;
+  runtime_input.profile = profile;
+  runtime_input.identity.execution_generation = profile->path_key.execution_generation;
+  runtime_input.identity.path_instance_id = profile->path_key.path_instance_id;
+  runtime_input.identity.path_revision = profile->path_key.path_revision;
+  runtime_input.identity.frame_revision = profile->path_key.frame_revision;
+  runtime_input.identity.frame_convention_id = profile->path_key.frame_convention_id;
+  runtime_input.identity.configuration_id = profile->configuration_key.configuration_id;
+  runtime_input.identity.map_instance_id = profile->map_capture_key.map_instance_id;
+  runtime_input.identity.map_state_id = profile->map_capture_key.state_id;
+  runtime_input.identity.accepted_sequence = profile->map_capture_key.accepted_sequence;
+  runtime_input.identity.profile_id = profile->profile_id;
+  runtime_input.identity.binding_sequence = evidence.binding_sequence;
+  runtime_input.current.w = input.path.w;
+  runtime_input.current.delta = retained_delta;
+  runtime_input.current.previous_u = previous_final_port;
+  runtime_input.preview_policy = evidence.preview_policy;
+  runtime_input.selected_u = evidence.selected_u;
+  runtime_input.selected_u_owner = evidence.selected_u_owner;
+  runtime_input.base_phase_rate = evidence.base_phase_rate;
+  runtime_input.phase_rate_lower = evidence.phase_rate_lower;
+  runtime_input.phase_rate_upper = evidence.phase_rate_upper;
+  runtime_input.upper_u_delta = evidence.upper_u_delta;
+  runtime_input.horizon_w = profile->certified_end;
+  runtime_input.sample_spacing_w = evidence.preview_policy.sample_spacing_w;
+  runtime_input.dt = input.dt;
+  runtime_input.now = evidence.now;
+  runtime_input.applicability_deadline_valid = use_profile_deadline
+      ? !profile->applicability_deadline_timeless
+      : evidence.applicability_deadline_valid;
+  runtime_input.applicability_deadline = use_profile_deadline
+      ? (runtime_input.applicability_deadline_valid
+          ? static_cast<double>(profile->applicability_deadline_ticks)
+          : std::numeric_limits<double>::quiet_NaN())
+      : evidence.applicability_deadline;
+  runtime_input.tracking = evidence.tracking;
+  runtime_input.max_work = evidence.max_work;
+  runtime_input.limits = evidence.limits;
+  runtime_input.provenance = evidence.provenance;
+  return runtime_input;
+}
+
+phase_offset_navigation::TubeExecutionIdentityV2 MakeV2ExecutionIdentity(
+    const phase_offset_navigation::TubeProfileV2& profile,
+    const std::uint64_t binding_sequence) {
+  phase_offset_navigation::TubeExecutionIdentityV2 identity;
+  identity.execution_generation = profile.path_key.execution_generation;
+  identity.path_instance_id = profile.path_key.path_instance_id;
+  identity.path_revision = profile.path_key.path_revision;
+  identity.frame_revision = profile.path_key.frame_revision;
+  identity.frame_convention_id = profile.path_key.frame_convention_id;
+  identity.configuration_id = profile.configuration_key.configuration_id;
+  identity.map_instance_id = profile.map_capture_key.map_instance_id;
+  identity.map_state_id = profile.map_capture_key.state_id;
+  identity.accepted_sequence = profile.map_capture_key.accepted_sequence;
+  identity.profile_id = profile.profile_id;
+  identity.binding_sequence = binding_sequence;
+  return identity;
+}
+
+bool SameV2ExecutionIdentity(
+    const phase_offset_navigation::TubeExecutionIdentityV2& lhs,
+    const phase_offset_navigation::TubeExecutionIdentityV2& rhs) {
+  return lhs.execution_generation == rhs.execution_generation &&
+      lhs.path_instance_id == rhs.path_instance_id &&
+      lhs.path_revision == rhs.path_revision &&
+      lhs.frame_revision == rhs.frame_revision &&
+      lhs.frame_convention_id == rhs.frame_convention_id &&
+      lhs.configuration_id == rhs.configuration_id &&
+      lhs.map_instance_id == rhs.map_instance_id &&
+      lhs.map_state_id == rhs.map_state_id &&
+      lhs.accepted_sequence == rhs.accepted_sequence &&
+      lhs.profile_id == rhs.profile_id &&
+      lhs.binding_sequence == rhs.binding_sequence;
+}
 
 std::uint64_t MixPolicyBits(std::uint64_t hash, const double value) {
   std::uint64_t bits = 0U;
@@ -71,505 +170,6 @@ std::uint64_t NormalPreviewPolicyIdentity(
   return hash == 0U ? 1U : hash;
 }
 
-bool HasNonzeroRawBuildCapacity(
-    const phase_offset_navigation::TubeProfile& profile) {
-  constexpr double kCapacityTolerance = 1e-10;
-  for (const phase_offset_navigation::TubeRawSample& sample :
-       profile.raw_build_samples) {
-    if (!IsFinite(sample.raw_lower) || !IsFinite(sample.raw_upper)) continue;
-    if (sample.raw_lower < -kCapacityTolerance ||
-        sample.raw_upper > kCapacityTolerance) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void LogZeroBaselineAttribution(
-    const phase_offset_navigation::TubeEpochUpdateResult& result) {
-  if (!result.status.candidate_complete ||
-      result.status.candidate_classification !=
-          phase_offset_navigation::TubeProfileClassification::
-              ZERO_ONLY_PLANNER_BASELINE ||
-      !HasNonzeroRawBuildCapacity(result.candidate_profile)) {
-    return;
-  }
-  const phase_offset_navigation::TubeStopReason first_stop_reason =
-      static_cast<phase_offset_navigation::TubeStopReason>(
-          result.candidate_profile.diagnostics.first_stop_reason);
-  ROS_WARN(
-      "[PHASE_OFFSET][TUBE][ZERO_BASELINE] candidate_seq=%llu "
-      "map_seq=%llu obstacle_certified=%d first_stop_reason=%s "
-      "first_stop_w=%.9f invalid_reason=\"%s\"",
-      static_cast<unsigned long long>(result.status.candidate_sequence),
-      static_cast<unsigned long long>(
-          result.status.candidate_map_observation_sequence),
-      result.candidate_profile.obstacle_certified ? 1 : 0,
-      phase_offset_navigation::tubeStopReasonName(first_stop_reason),
-      FiniteOrZero(result.candidate_profile.diagnostics.first_invalid_w),
-      result.candidate_profile.diagnostics.invalid_reason.c_str());
-}
-
-bool IsOffsetCertifiedProfile(
-    const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile) {
-  return profile && profile->classification ==
-      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
-}
-
-bool FrameMatchesRevision(
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame,
-    const std::uint64_t revision) {
-  return frame && revision != 0U && frame->pathRevision() == revision &&
-      frame->frameRevision() != 0U;
-}
-
-bool CertifiedGeometrySampleFiniteAndOrdered(
-    const phase_offset_navigation::TubeRawSample& sample,
-    const phase_offset_navigation::TubeProfile& profile,
-    const bool have_previous,
-    const double previous_w) {
-  if (!sample.complete || !std::isfinite(sample.w) ||
-      !sample.p.allFinite() || !sample.N.allFinite() ||
-      !std::isfinite(sample.filtered_lower) ||
-      !std::isfinite(sample.filtered_upper) ||
-      sample.filtered_lower > sample.filtered_upper ||
-      sample.path_revision != profile.path_revision ||
-      sample.frame_revision != profile.frame_revision) {
-    return false;
-  }
-  if (have_previous && !(sample.w > previous_w)) return false;
-  const Eigen::Vector3d lower =
-      sample.p + sample.N * sample.filtered_lower;
-  const Eigen::Vector3d upper =
-      sample.p + sample.N * sample.filtered_upper;
-  return lower.allFinite() && upper.allFinite();
-}
-
-bool CertifiedGeometryProfileSamplesValid(
-    const phase_offset_navigation::TubeProfile& profile) {
-  if (profile.samples.size() < 2U) return false;
-  bool have_previous = false;
-  double previous_w = 0.0;
-  for (const phase_offset_navigation::TubeRawSample& sample :
-       profile.samples) {
-    if (!CertifiedGeometrySampleFiniteAndOrdered(
-            sample, profile, have_previous, previous_w)) {
-      return false;
-    }
-    previous_w = sample.w;
-    have_previous = true;
-  }
-  return true;
-}
-
-constexpr double kPreparedCoverageTolerance = 1e-10;
-// Must remain aligned with TubeBuilder's frozen current-anchor contract.  It
-// is used only to prove that this adapter-side partition contains exactly one
-// owner-evaluated representation of the original current phase; it does not
-// change any Tube acceptance tolerance.
-constexpr double kTubeCurrentPhaseAnchorTolerance = 1e-9;
-
-// Measurement-only serialization.  Keep the ROS-facing CSV vocabulary
-// stable and textual even though TubeDueTimingSample stores the enum as its
-// underlying integer for the sidecar record.
-const char* MeasurementNominalWidthSourceName(const int source) {
-  switch (source) {
-    case static_cast<int>(
-        phase_offset_navigation::TubeNominalWidthSource::DEFAULT_ABSENT):
-      return "DEFAULT_ABSENT";
-    case static_cast<int>(
-        phase_offset_navigation::TubeNominalWidthSource::EXPLICIT_PARAMETER):
-      return "EXPLICIT_PARAMETER";
-  }
-  return "DEFAULT_ABSENT";
-}
-
-// This spelling is intentionally adapter-local.  The manager owns the
-// ROS-facing bootstrap result log; stagePathTubePair only carries its exact
-// temporary enum to that caller and never publishes a second diagnostic.
-const char* PathTubePairStageFailureName(
-    const PathTubePairStageFailure failure) {
-  switch (failure) {
-    case PathTubePairStageFailure::NONE:
-      return "none";
-    case PathTubePairStageFailure::INPUT_PRECONDITION:
-      return "input_precondition";
-    case PathTubePairStageFailure::TRANSACTION_PRECONDITION:
-      return "transaction_precondition";
-    case PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT:
-      return "pair_session_runtime_snapshot";
-    case PathTubePairStageFailure::OWNER_EVALUATE:
-      return "owner_evaluate";
-    case PathTubePairStageFailure::TUBE_BUILD_PRECONDITION:
-      return "tube_build_precondition";
-    case PathTubePairStageFailure::TUBE_RAW_BUILD:
-      return "tube_raw_build";
-    case PathTubePairStageFailure::TUBE_FILTER:
-      return "tube_filter";
-    case PathTubePairStageFailure::TUBE_SURFACE_VALIDATOR:
-      return "tube_surface_validator";
-    case PathTubePairStageFailure::TUBE_PROFILE_COVERAGE:
-      return "tube_profile_coverage";
-    case PathTubePairStageFailure::TUBE_PROFILE_OWNER_MATCH:
-      return "tube_profile_owner_match";
-    case PathTubePairStageFailure::STAGING_DRY_RUN:
-      return "staging_dry_run";
-  }
-  return "unknown";
-}
-
-bool NearlyEqual(const double first, const double second,
-                 const double tolerance = kPreparedCoverageTolerance) {
-  return IsFinite(first) && IsFinite(second) &&
-      std::abs(first - second) <= tolerance;
-}
-
-bool StateFiniteAndValid(const phase_offset_core::PathDifferentialState& state) {
-  return state.valid && IsFinite(state.w) && IsFinite(state.p) &&
-      IsFinite(state.p_w) && IsFinite(state.p_ww);
-}
-
-bool ExactDoubleBits(const double first, const double second) {
-  return std::memcmp(&first, &second, sizeof(first)) == 0;
-}
-
-bool PathStatesEquivalent(
-    const phase_offset_core::PathDifferentialState& first,
-    const phase_offset_core::PathDifferentialState& second) {
-  return StateFiniteAndValid(first) && StateFiniteAndValid(second) &&
-      ExactDoubleBits(first.w, second.w) &&
-      (first.p - second.p).norm() <= kPreparedCoverageTolerance &&
-      (first.p_w - second.p_w).norm() <= kPreparedCoverageTolerance &&
-      (first.p_ww - second.p_ww).norm() <= kPreparedCoverageTolerance;
-}
-
-bool PathStateMatchesOwner(
-    const phase_offset_core::PathDifferentialState& state,
-    const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
-        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
-  if (!StateFiniteAndValid(state) || !owner || owner->empty()) return false;
-  ContinuousPhasePathState evaluated;
-  // A missing shared frame is accepted only for legacy synthetic fixtures;
-  // production owner/profile checks pass the handoff frame explicitly.
-  const bool evaluated_ok = shared_frame
-      ? shared_frame->evaluatePathState(state.w, evaluated)
-      : (owner->pathRevision() == 0U
-          ? owner->evaluate(state.w, evaluated, false)
-          : ContinuousPhaseNormalFrame(
-                owner, owner->pathRevision(), owner->pathRevision())
-                .evaluatePathState(state.w, evaluated));
-  return evaluated_ok && evaluated.valid &&
-      IsFinite(evaluated.p) && IsFinite(evaluated.dp_dw) &&
-      IsFinite(evaluated.d2p_dw2) &&
-      (evaluated.p - state.p).norm() <= kPreparedCoverageTolerance &&
-      (evaluated.dp_dw - state.p_w).norm() <= kPreparedCoverageTolerance &&
-      (evaluated.d2p_dw2 - state.p_ww).norm() <= kPreparedCoverageTolerance;
-}
-
-bool EvaluateOwnerState(
-    const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const double w,
-    phase_offset_core::PathDifferentialState& state,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
-        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
-  if (!owner || owner->empty() || !IsFinite(w)) return false;
-  ContinuousPhasePathState evaluated;
-  if (shared_frame) {
-    if (!shared_frame->evaluatePathState(w, evaluated)) return false;
-  } else if (owner->pathRevision() == 0U) {
-    if (!owner->evaluate(w, evaluated, false)) return false;
-  } else {
-    const ContinuousPhaseNormalFrame frame(
-        owner, owner->pathRevision(), owner->pathRevision());
-    if (!frame.evaluatePathState(w, evaluated)) return false;
-  }
-  state = ConvertContinuousPhasePathStateForActive(evaluated, w);
-  return StateFiniteAndValid(state);
-}
-
-bool CaptureMatchesPair(const PathTubePairPinCapture& capture,
-                        const std::shared_ptr<const PathTubePair>& pair) {
-  return pair && capture.valid() && capture.pair == pair &&
-      capture.source_revision == pair->source_revision &&
-      capture.generation == pair->generation &&
-      capture.authority_session == pair->authority_session &&
-      capture.map_observation_sequence == pair->map_observation_sequence &&
-      capture.map_observation_is_snapshot == pair->map_observation_is_snapshot &&
-      capture.path_owner == pair->path_owner &&
-      capture.frame_owner == pair->frame_owner &&
-      capture.frozen_cloud_occupancy_snapshot ==
-          pair->frozen_cloud_occupancy_snapshot &&
-      capture.full_path_samples == pair->full_path_samples &&
-      capture.active_profile == pair->active_profile &&
-      capture.epoch_snapshot == pair->epoch_snapshot;
-}
-
-bool ActiveLeaseMatchesCapture(
-    const std::shared_ptr<PathTubePairPinRegistry>& registry,
-    const PathTubePairPinCapture& capture, const std::uint64_t lease_id) {
-  if (!registry || lease_id == 0U || !capture.valid()) return false;
-  std::lock_guard<std::mutex> lock(registry->mutex);
-  return registry->active_lease_id == lease_id &&
-      registry->active_pair == capture.pair &&
-      registry->active_generation == capture.generation &&
-      registry->active_session == capture.authority_session;
-}
-
-phase_offset_navigation::RuntimeFutureStepContract
-MakeFutureStepContract(
-    const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const std::shared_ptr<const MatchedAdapterPathSamples>& samples,
-    const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile,
-    const guidance::IsfGains& gains,
-    const double regularity_margin,
-    const double minimum_reference_speed,
-    const double tube_update_period,
-    const double min_certified_forward_w) {
-  phase_offset_navigation::RuntimeFutureStepContract contract;
-  if ((!owner || owner->empty()) && (!samples || samples->size() < 2U)) {
-    return contract;
-  }
-  if (!profile || !profile->complete ||
-      profile->samples.size() < 2U || !std::isfinite(tube_update_period) ||
-      tube_update_period <= 0.0 || !std::isfinite(min_certified_forward_w) ||
-      min_certified_forward_w < 0.0 || !std::isfinite(regularity_margin) ||
-      regularity_margin <= 0.0 || regularity_margin >= 1.0 ||
-      !std::isfinite(minimum_reference_speed) ||
-      minimum_reference_speed <= 0.0) {
-    return contract;
-  }
-  contract.tube_update_period = tube_update_period;
-  contract.min_certified_forward_w = min_certified_forward_w;
-  const double certified_start = profile->certified_segment_start_w;
-  const double certified_end = profile->certified_segment_end_w;
-  if (!std::isfinite(certified_start) || !std::isfinite(certified_end) ||
-      certified_end < certified_start ||
-      certified_start < profile->samples.front().w -
-          kPreparedCoverageTolerance ||
-      certified_end > profile->samples.back().w +
-          kPreparedCoverageTolerance ||
-      certified_end - certified_start <= kPreparedCoverageTolerance) {
-    return phase_offset_navigation::RuntimeFutureStepContract();
-  }
-  contract.profile_domain_end_w = certified_end;
-  // Capture only immutable owner/profile/configuration values.  Each rollout
-  // step reevaluates its own owner state and uses the unchanged live ISF
-  // kernel/gains; no frozen current geometry or base command is reused.
-  phase_offset_navigation::PathStateQuery state_query;
-  if (owner && !owner->empty()) {
-    state_query = [owner](
-        const double w,
-        phase_offset_core::PathDifferentialState& state) {
-      return EvaluateOwnerState(owner, w, state);
-    };
-  } else {
-    state_query = [samples](
-        const double w,
-        phase_offset_core::PathDifferentialState& state) {
-      if (!samples || samples->empty() || !std::isfinite(w) ||
-          w < samples->front().w - kPreparedCoverageTolerance ||
-          w > samples->back().w + kPreparedCoverageTolerance) {
-        return false;
-      }
-      for (std::size_t index = 1U; index < samples->size(); ++index) {
-        const auto& left = (*samples)[index - 1U];
-        const auto& right = (*samples)[index];
-        if (w > right.w + kPreparedCoverageTolerance) continue;
-        const double span = right.w - left.w;
-        if (!StateFiniteAndValid(left) || !StateFiniteAndValid(right) ||
-            span <= kPreparedCoverageTolerance) {
-          return false;
-        }
-        const double alpha = std::max(
-            0.0, std::min(1.0, (w - left.w) / span));
-        state.w = w;
-        state.p = left.p + alpha * (right.p - left.p);
-        state.p_w = left.p_w + alpha * (right.p_w - left.p_w);
-        state.p_ww = left.p_ww + alpha * (right.p_ww - left.p_ww);
-        state.valid = left.valid && right.valid;
-        return StateFiniteAndValid(state);
-      }
-      state = samples->back();
-      state.w = w;
-      return StateFiniteAndValid(state);
-    };
-  }
-  contract.evaluate = [state_query, gains, regularity_margin,
-                       minimum_reference_speed](
-      const phase_offset_navigation::RuntimeFutureStepInput& input,
-      phase_offset_navigation::RuntimeFutureStepResult& output) {
-    output = phase_offset_navigation::RuntimeFutureStepResult();
-    if (!std::isfinite(input.phase) || !std::isfinite(input.delta) ||
-        !std::isfinite(input.dt) || input.dt <= 0.0 ||
-        !input.matched_position.allFinite() ||
-        !input.previous_matched_reference.allFinite() ||
-        !std::isfinite(input.previous_final_port.u_w) ||
-        !std::isfinite(input.previous_final_port.u_delta)) {
-      output.invalid_reason = "future matched input is invalid";
-      return false;
-    }
-    if (!state_query || !state_query(input.phase, output.path) ||
-        !StateFiniteAndValid(output.path)) {
-      output.invalid_reason = "immutable future owner cannot evaluate phase";
-      return false;
-    }
-    phase_offset_core::GeometryParams geometry_params;
-    // Runtime independently rechecks this exact reference against its own
-    // evaluator, so this only binds the owner/guidance side of the contract.
-    geometry_params.regularity_margin = regularity_margin;
-    geometry_params.minimum_reference_speed = minimum_reference_speed;
-    phase_offset_core::GeometryEvaluator evaluator(geometry_params);
-    phase_offset_core::PhaseOffsetGeometryState geometry;
-    if (!evaluator.evaluate(output.path, input.matched_position, input.delta,
-                            geometry) || !geometry.valid) {
-      output.invalid_reason = geometry.invalid_reason;
-      return false;
-    }
-    guidance::ReferenceGeometry reference;
-    reference.point = geometry.r;
-    reference.tangent = geometry.T;
-    reference.derivative_norm = geometry.r_w.norm();
-    reference.valid = geometry.valid;
-    guidance::IsfGuidance base;
-    if (!guidance::IsfReferenceKernel::evaluate(input.matched_position,
-                                                 reference, gains, base) ||
-        !base.valid) {
-      output.invalid_reason = base.invalid_reason;
-      return false;
-    }
-    output.matched_reference = reference.point;
-    output.matched_tangent = reference.tangent;
-    output.matched_derivative_norm = reference.derivative_norm;
-    output.base_v_cmd = base.v_cmd;
-    output.base_w_dot = base.w_dot;
-    output.base_guidance_valid = true;
-    output.valid = true;
-    return true;
-  };
-  return contract;
-}
-
-bool PreparedSamplesOrderedAndFinite(const MatchedAdapterPathSamples& samples) {
-  if (samples.size() < 2U) return false;
-  for (std::size_t index = 0U; index < samples.size(); ++index) {
-    if (!StateFiniteAndValid(samples[index])) return false;
-    if (index > 0U &&
-        samples[index].w <= samples[index - 1U].w + kPreparedCoverageTolerance) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool PreparedSamplesMatchOwner(
-    const MatchedAdapterPathSamples& samples,
-    const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
-        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
-  if (!owner || owner->empty() || !PreparedSamplesOrderedAndFinite(samples)) {
-    return false;
-  }
-  for (const phase_offset_core::PathDifferentialState& sample : samples) {
-    if (!PathStateMatchesOwner(sample, owner, shared_frame)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool PreparedProfileSamplesOrderedAndComplete(
-    const phase_offset_navigation::TubeProfile& profile) {
-  if (!profile.complete || profile.samples.size() < 2U) return false;
-  for (std::size_t index = 0U; index < profile.samples.size(); ++index) {
-    const phase_offset_navigation::TubeRawSample& sample = profile.samples[index];
-    if (!sample.complete || !IsFinite(sample.w) || !IsFinite(sample.p) ||
-        !IsFinite(sample.N)) {
-      return false;
-    }
-    if (index > 0U &&
-        sample.w <= profile.samples[index - 1U].w + kPreparedCoverageTolerance) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// This is structural/provenance coverage only.  The retained port must be
-// inside the exact *current* interval (TubeEpochManager and Runtime enforce
-// that independently), but requiring that unchanged scalar to appear at a
-// future seam/horizon rejects an otherwise reachable continuous port witness.
-// Runtime dry-run is the sole normal-execution proof across those future PWL
-// sections, using the same immutable owner/profile/snapshot as the candidate.
-bool ProfileStructurallyCoversPreparedRange(
-    const phase_offset_navigation::TubeProfile& profile,
-    const double captured_w0,
-    const double future_seam_w,
-    const double existing_future_horizon_end_w) {
-  if (!PreparedProfileSamplesOrderedAndComplete(profile) ||
-      !IsFinite(captured_w0) || !IsFinite(future_seam_w) ||
-      !IsFinite(existing_future_horizon_end_w) ||
-      future_seam_w <= captured_w0 + kPreparedCoverageTolerance ||
-      existing_future_horizon_end_w + kPreparedCoverageTolerance < future_seam_w ||
-      profile.preview_start_w > captured_w0 + kPreparedCoverageTolerance ||
-      profile.preview_end_w + kPreparedCoverageTolerance <
-          existing_future_horizon_end_w ||
-      profile.certified_segment_start_w > captured_w0 +
-          kPreparedCoverageTolerance ||
-      profile.certified_segment_end_w + kPreparedCoverageTolerance <
-          existing_future_horizon_end_w ||
-      profile.samples.front().w > captured_w0 + kPreparedCoverageTolerance ||
-      profile.samples.back().w + kPreparedCoverageTolerance <
-          existing_future_horizon_end_w) {
-    return false;
-  }
-  phase_offset_navigation::TubeBounds seam_bounds;
-  return phase_offset_navigation::TubeFilter::query(profile, captured_w0,
-                                                      seam_bounds) &&
-      seam_bounds.valid &&
-      phase_offset_navigation::TubeFilter::query(profile, future_seam_w,
-                                                  seam_bounds) &&
-      seam_bounds.valid &&
-      phase_offset_navigation::TubeFilter::query(
-          profile, existing_future_horizon_end_w, seam_bounds) &&
-      seam_bounds.valid;
-}
-
-bool ProfileSamplesMatchOwner(
-    const phase_offset_navigation::TubeProfile& profile,
-    const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const double regularity_margin,
-    const double minimum_reference_speed,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
-        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
-  if (!PreparedProfileSamplesOrderedAndComplete(profile) || !owner ||
-      owner->empty() || !IsFinite(regularity_margin) ||
-      regularity_margin <= 0.0 || regularity_margin >= 1.0 ||
-      !IsFinite(minimum_reference_speed) || minimum_reference_speed <= 0.0) {
-    return false;
-  }
-  phase_offset_core::GeometryParams params;
-  params.regularity_margin = regularity_margin;
-  params.minimum_reference_speed = minimum_reference_speed;
-  phase_offset_core::GeometryEvaluator evaluator(params);
-  for (const phase_offset_navigation::TubeRawSample& sample : profile.samples) {
-    phase_offset_core::PathDifferentialState owner_state;
-    phase_offset_core::PhaseOffsetGeometryState geometry;
-    const double probe_delta = sample.filtered_lower <= 0.0 &&
-            sample.filtered_upper >= 0.0
-        ? 0.0 : sample.filtered_lower;
-    if (!EvaluateOwnerState(owner, sample.w, owner_state, shared_frame) ||
-        !IsFinite(probe_delta) ||
-        !evaluator.evaluate(owner_state, owner_state.p, probe_delta, geometry) ||
-        !geometry.valid || (geometry.p - sample.p).norm() >
-            kPreparedCoverageTolerance ||
-        (geometry.N - sample.N).norm() > kPreparedCoverageTolerance) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool BitsEqual(const double first, const double second) {
   return std::memcmp(&first, &second, sizeof(double)) == 0;
 }
@@ -580,35 +180,10 @@ bool BitsEqual(const phase_offset_core::PortCommand& first,
       BitsEqual(first.u_delta, second.u_delta);
 }
 
-bool LatestCategoricalUnsafe(
-    const PhaseOffsetMatchedAdapterConfig& config,
-    const CloudOccupancyQueryConfig& query_config,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>& snapshot,
-    const phase_offset_core::PathDifferentialState& current_path,
-    const Eigen::Vector3d& position,
-    const double retained_delta) {
-  if (config.tube_source != phase_offset_navigation::TubeSource::ESDF) {
-    return false;
-  }
-  phase_offset_core::GeometryParams geometry_params;
-  geometry_params.regularity_margin = config.tube.cross_section.regularity_margin;
-  geometry_params.minimum_reference_speed =
-      config.tube.cross_section.minimum_reference_speed;
-  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
-  phase_offset_core::PhaseOffsetGeometryState geometry;
-  if (!evaluator.evaluate(current_path, position, retained_delta, geometry) ||
-      !geometry.valid) {
-    return false;
-  }
-  const phase_offset_navigation::RawOccupancyQuery query =
-      makeCloudOccupancyQuery(snapshot, query_config);
-  using phase_offset_navigation::DistanceStatus;
-  const DistanceStatus reference = query(geometry.r);
-  const DistanceStatus actual = query(position);
-  return reference == DistanceStatus::OCCUPIED ||
-      reference == DistanceStatus::OUT_OF_MAP ||
-      actual == DistanceStatus::OCCUPIED ||
-      actual == DistanceStatus::OUT_OF_MAP;
+bool BitsEqual(const Eigen::Vector3d& first, const Eigen::Vector3d& second) {
+  return BitsEqual(first.x(), second.x()) &&
+      BitsEqual(first.y(), second.y()) &&
+      BitsEqual(first.z(), second.z());
 }
 
 bool HasUsablePathInput(const phase_offset_core::PathDifferentialState& path) {
@@ -620,14 +195,6 @@ bool HasUsableLegacyInput(const LegacyGuidanceSnapshot& legacy) {
   return legacy.valid && IsFinite(legacy.v_cmd) && IsFinite(legacy.w_dot) &&
       IsFinite(legacy.e_parallel) && IsFinite(legacy.e_perp) &&
       IsFinite(legacy.ref_pt) && IsFinite(legacy.tangent);
-}
-phase_offset_navigation::TubeSource ParseTubeSource(const std::string& value, bool& valid) {
-  valid = true;
-  if (value == "none") return phase_offset_navigation::TubeSource::NONE;
-  if (value == "fixed") return phase_offset_navigation::TubeSource::FIXED;
-  if (value == "esdf") return phase_offset_navigation::TubeSource::ESDF;
-  valid = false;
-  return phase_offset_navigation::TubeSource::NONE;
 }
 
 phase_offset_navigation::PhaseOffsetRuntimeConfig MakeRuntimeConfig(const PhaseOffsetMatchedAdapterConfig& config) {
@@ -654,449 +221,350 @@ phase_offset_navigation::PhaseOffsetRuntimeConfig MakeRuntimeConfig(const PhaseO
   return runtime;
 }
 
-phase_offset_navigation::TubeEpochManagerConfig MakeEpochConfig(const PhaseOffsetMatchedAdapterConfig& config) {
-  phase_offset_navigation::TubeEpochManagerConfig epoch;
-  epoch.builder = config.tube;
-  epoch.filter = config.filter;
-  return epoch;
-}
-geometry_msgs::Point ToPoint(const Eigen::Vector3d& value) {
-  geometry_msgs::Point point;
-  point.x = value.x(); point.y = value.y(); point.z = value.z();
-  return point;
-}
-visualization_msgs::Marker MakeLine(const ros::Time& stamp, const std::string& frame,
-                                    const std::string& ns, int id, float r, float g, float b) {
-  visualization_msgs::Marker marker;
-  marker.header.stamp = stamp; marker.header.frame_id = frame; marker.ns = ns;
-  marker.id = id; marker.type = visualization_msgs::Marker::LINE_STRIP;
-  marker.action = visualization_msgs::Marker::ADD; marker.pose.orientation.w = 1.0;
-  marker.scale.x = 0.04; marker.color.r = r; marker.color.g = g; marker.color.b = b;
-  marker.color.a = 1.0;
-  return marker;
-}
-visualization_msgs::Marker MakeDelete(const ros::Time& stamp, const std::string& frame,
-                                      const std::string& ns, int id) {
-  visualization_msgs::Marker marker;
-  marker.header.stamp = stamp; marker.header.frame_id = frame; marker.ns = ns;
-  marker.id = id; marker.action = visualization_msgs::Marker::DELETE;
-  return marker;
-}
 void SetGuidance(const guidance::IsfGuidance& base,
                  const phase_offset_core::MatchedPortOutput& matched,
                  guidance::IsfGuidance& output) {
   output = base; output.v_cmd = matched.v_cmd; output.w_dot = matched.w_dot;
   output.valid = matched.valid; output.invalid_reason = matched.invalid_reason;
 }
-int CountAsInt(std::uint64_t value) {
-  return static_cast<int>(std::min<std::uint64_t>(
-      value, static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
+
+bool PopulateV2LiveCommandEvidence(
+    const PhaseOffsetMatchedAdapterConfig& config,
+    const phase_offset_core::PhaseOffsetGeometryState& geometry,
+    const guidance::IsfGuidance& base,
+    const phase_offset_core::PortCommand& selected_u,
+    MatchedAdapterInput::TubeV2AdmissionEvidence& evidence) {
+  if (!geometry.valid || !base.valid || !IsFinite(selected_u.u_w) ||
+      !IsFinite(selected_u.u_delta)) {
+    return false;
+  }
+  phase_offset_core::MatchedPortInput matched_input;
+  matched_input.geometry = geometry;
+  matched_input.base_v_cmd = base.v_cmd;
+  matched_input.base_w_dot = base.w_dot;
+  matched_input.final_port = selected_u;
+  phase_offset_core::MatchedPortOutput matched;
+  if (!phase_offset_core::MatchedPort::evaluate(matched_input, matched) ||
+      !matched.valid) {
+    return false;
+  }
+  const double tangent_speed = geometry.T.dot(matched.v_cmd);
+  const phase_offset_navigation::PhaseOffsetRuntimeConfig runtime_config =
+      MakeRuntimeConfig(config);
+  evidence.selected_u = selected_u;
+  evidence.selected_u_owner =
+      phase_offset_navigation::PhaseOffsetAllocator::ownerName();
+  evidence.base_phase_rate = base.w_dot;
+  evidence.phase_rate_lower = config.normal_preview_policy.lower_nu;
+  evidence.phase_rate_upper = config.normal_preview_policy.upper_nu;
+  evidence.upper_u_delta = std::max(0.0, config.u_delta_abs_max);
+  evidence.preview_policy = config.normal_preview_policy;
+  evidence.limits.lower_phase_rate = config.normal_preview_policy.lower_nu;
+  evidence.limits.upper_phase_rate = config.normal_preview_policy.upper_nu;
+  evidence.limits.upper_nu = config.normal_preview_policy.upper_nu;
+  evidence.limits.max_u_w = std::max(0.0, config.u_w_abs_max);
+  evidence.limits.max_u_delta = std::max(0.0, config.u_delta_abs_max);
+  evidence.limits.u_w_slew_rate = std::max(0.0, config.u_w_rate_max);
+  evidence.limits.u_delta_slew_rate = std::max(0.0, config.u_delta_rate_max);
+  evidence.limits.return_u_delta_max =
+      std::max(0.0, config.u_delta_abs_max);
+  evidence.limits.return_u_delta_slew_rate =
+      std::max(0.0, config.u_delta_rate_max);
+  evidence.limits.max_schedule_steps =
+      config.tube_certificate_v2.budgets.max_cells;
+  evidence.limits.max_work =
+      config.tube_certificate_v2.budgets.max_queries;
+  evidence.limits.valid = evidence.limits.complete();
+  evidence.tracking.error_norm = geometry.error.norm();
+  evidence.tracking.error_bound = runtime_config.tube.tracking_error_bound;
+  evidence.tracking.physical_tangent_valid = IsFinite(tangent_speed) &&
+      tangent_speed >= config.tangent_speed_min;
+  evidence.tracking.valid = IsFinite(evidence.tracking.error_norm) &&
+      IsFinite(evidence.tracking.error_bound) &&
+      evidence.tracking.error_bound >= 0.0 &&
+      evidence.tracking.physical_tangent_valid;
+  evidence.max_work = config.tube_certificate_v2.budgets.max_queries;
+  return evidence.limits.valid && IsFinite(evidence.base_phase_rate);
 }
 
-phase_offset_navigation::PathStateQuery MakeTimerPathStateQuery(
-    const std::shared_ptr<const ContinuousPhasePath>& semantic_path_owner,
-    const std::shared_ptr<const MatchedAdapterPathSamples>& samples,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
-        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
-  if (semantic_path_owner) {
-    // Production requests carry shared_frame; this construction is only the
-    // legacy synthetic-owner fallback.
-    const std::shared_ptr<const ContinuousPhaseNormalFrame> immutable_frame =
-        shared_frame ? shared_frame :
-        (semantic_path_owner->pathRevision() == 0U
-        ? std::shared_ptr<const ContinuousPhaseNormalFrame>()
-        : std::shared_ptr<const ContinuousPhaseNormalFrame>(
-              new ContinuousPhaseNormalFrame(
-                  semantic_path_owner, semantic_path_owner->pathRevision(),
-                  semantic_path_owner->pathRevision())));
-    return [semantic_path_owner, immutable_frame](const double w,
-                                 phase_offset_core::PathDifferentialState& state) {
-      ContinuousPhasePathState continuous;
-      if (immutable_frame) {
-        if (!immutable_frame->evaluatePathState(w, continuous)) return false;
-      } else if (!semantic_path_owner->evaluate(w, continuous, false)) {
-        return false;
-      }
-      state = ConvertContinuousPhasePathStateForActive(continuous, w);
-      return state.valid;
-    };
+bool RuntimeExecutionExactlyNeutral(
+    const phase_offset_navigation::PhaseOffsetRuntime* runtime) {
+  if (!runtime || !IsFinite(runtime->retainedDelta()) ||
+      runtime->retainedDelta() != 0.0) {
+    return false;
   }
-  if (!samples || samples->empty()) {
-    return phase_offset_navigation::PathStateQuery();
-  }
-  // Synthetic/unit-test requests may carry complete immutable samples rather
-  // than a semantic owner.  This timer-local interpolation never crosses a
-  // callback boundary as a PathStateQuery.
-  return [samples](const double w,
-                   phase_offset_core::PathDifferentialState& state) {
-    if (!std::isfinite(w) || samples->empty()) return false;
-    const auto& values = *samples;
-    if (w < values.front().w - 1e-12 || w > values.back().w + 1e-12) {
-      return false;
-    }
-    for (std::size_t index = 1U; index < values.size(); ++index) {
-      const auto& left = values[index - 1U];
-      const auto& right = values[index];
-      if (w > right.w + 1e-12) continue;
-      const double span = right.w - left.w;
-      if (!std::isfinite(span) || span <= 1e-12) return false;
-      const double alpha = std::max(0.0, std::min(1.0, (w - left.w) / span));
-      state = left;
-      state.w = w;
-      state.p = left.p + alpha * (right.p - left.p);
-      state.p_w = left.p_w + alpha * (right.p_w - left.p_w);
-      state.p_ww = left.p_ww + alpha * (right.p_ww - left.p_ww);
-      state.valid = left.valid && right.valid;
-      return state.valid;
-    }
-    state = values.back();
-    state.w = w;
-    return state.valid;
-  };
+  const phase_offset_core::PortCommand previous = runtime->previousFinalPort();
+  return IsFinite(previous.u_w) && IsFinite(previous.u_delta) &&
+      previous.u_w == 0.0 && previous.u_delta == 0.0;
 }
 
-phase_offset_navigation::PathCellBoundQuery MakeTimerPathCellBoundQuery(
-    const std::shared_ptr<const ContinuousPhasePath>& semantic_path_owner,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame =
-        std::shared_ptr<const ContinuousPhaseNormalFrame>()) {
-  if (!semantic_path_owner || semantic_path_owner->empty()) {
-    return phase_offset_navigation::PathCellBoundQuery();
+bool PendingV2ApplicabilityEvidenceMatches(
+    const MatchedAdapterInput& input,
+    const TubeV2ShadowAdmissionCandidate& pending) {
+  if (!pending.profile || !pending.commit_token.sealed_prepared) return false;
+  const MatchedAdapterInput::TubeV2AdmissionEvidence& evidence =
+      input.tube_v2_admission;
+  const phase_offset_navigation::RuntimeV2PreparedStep& prepared =
+      *pending.commit_token.sealed_prepared;
+  const std::uint64_t expected_binding_sequence = prepared.binding_transition
+      ? prepared.expected_identity.binding_sequence
+      : prepared.identity.binding_sequence;
+  if (!evidence.valid || expected_binding_sequence == 0U ||
+      evidence.binding_sequence != expected_binding_sequence ||
+      !IsFinite(evidence.now) || !IsFinite(input.dt) || input.dt <= 0.0 ||
+      !BitsEqual(input.dt, prepared.dt) ||
+      evidence.latest_accepted_state_sequence !=
+          pending.latest_accepted_state_sequence ||
+      evidence.latest_accepted_state_notification_sequence !=
+          pending.latest_accepted_state_notification_sequence ||
+      evidence.latest_accepted_time_ticks !=
+          pending.latest_accepted_time_ticks ||
+      evidence.latest_map_instance_id != pending.latest_map_instance_id ||
+      evidence.latest_configuration_generation !=
+          pending.latest_configuration_generation ||
+      evidence.latest_configuration_key != pending.latest_configuration_key ||
+      evidence.latest_support_provenance_id !=
+          pending.latest_support_provenance_id ||
+      evidence.latest_frame_provenance != pending.latest_frame_provenance ||
+      evidence.latest_accepted_state_notification_sequence <
+          evidence.latest_accepted_state_sequence) {
+    return false;
   }
-  // Both pure queries capture the same immutable owner.  A query crossing
-  // source segments, or touching an unsupported/low-speed evaluator, returns
-  // false and the navigation layer retains an inconclusive certificate.
-  // Production requests carry shared_frame; the construction below is only a
-  // legacy synthetic-owner fallback.
-  const std::shared_ptr<const ContinuousPhaseNormalFrame> immutable_frame =
-      shared_frame ? shared_frame :
-      (semantic_path_owner->pathRevision() == 0U
-      ? std::shared_ptr<const ContinuousPhaseNormalFrame>()
-      : std::shared_ptr<const ContinuousPhaseNormalFrame>(
-            new ContinuousPhaseNormalFrame(
-                semantic_path_owner, semantic_path_owner->pathRevision(),
-                semantic_path_owner->pathRevision())));
-  return [semantic_path_owner, immutable_frame](
-      const double w0, const double w1,
-      phase_offset_core::PathCellGeometryCertificate& certificate) {
-    if (!semantic_path_owner->cellBounds(w0, w1, certificate)) return false;
-    if (immutable_frame) {
-      phase_offset_core::NormalFrameCellProof frame_proof;
-      if (!immutable_frame->certifyCell(w0, w1, frame_proof) ||
-          !phase_offset_core::normalFrameCellProofIsComplete(frame_proof)) {
-        return false;
-      }
-      certificate.path_revision = immutable_frame->pathRevision();
-      certificate.frame_revision = immutable_frame->frameRevision();
-      certificate.inf_horizontal_p_w_norm =
-          frame_proof.inf_horizontal_path_speed;
-      certificate.sup_horizontal_p_ww_norm =
-          frame_proof.sup_horizontal_p_ww_norm;
-      certificate.horizontal_acceleration_bound_complete =
-          frame_proof.horizontal_acceleration_bound_complete;
-      certificate.sup_N_w_norm = frame_proof.sup_normal_derivative;
-      certificate.normal_variation_bound = frame_proof.normal_variation_bound;
-      certificate.tangent_variation_bound = frame_proof.tangent_variation_bound;
-      certificate.normal_frame_proof_complete = true;
-      // The frame certifies path-speed/normal variation only.  The combined
-      // ||p_w + N_w*delta|| bound is deliberately left unset until Builder
-      // has the actual admissible delta interval for this cell.
-      certificate.combined_regularity_proof_complete = false;
-      certificate.provenance =
-          "ContinuousPhaseNormalFrame/WorldHorizontalCrossProduct";
-    }
-    return phase_offset_core::pathCellGeometryCertificateIsComplete(certificate);
-  };
+  if (!pending.profile->applicability_deadline_timeless &&
+      (evidence.now >= static_cast<double>(
+           pending.profile->applicability_deadline_ticks) ||
+       evidence.latest_accepted_time_ticks >=
+           pending.profile->applicability_deadline_ticks)) {
+    return false;
+  }
+  const phase_offset_navigation::TubeMapCaptureKey& captured =
+      pending.profile->map_capture_key;
+  if (!captured.support_expiry_timeless &&
+      (evidence.now >= static_cast<double>(captured.support_expiry_ticks) ||
+       evidence.latest_accepted_time_ticks >= captured.support_expiry_ticks)) {
+    return false;
+  }
+  return true;
 }
 
-// Build the immutable preview partition used by TubeBuilder.  A semantic
-// owner may contain several C2 pieces (copied prefix, quintic connector and
-// mapped tail), while the planner sample list is intentionally independent
-// of those structural boundaries.  TubeBuilder's cell certificate is valid
-// only within one owner segment, so include every segment endpoint in the
-// transaction range before sorting/deduplicating the preview.  This is a
-// partitioning/provenance operation; it does not alter the path, margins or
-// any runtime acceptance predicate.
-bool BuildOwnerAlignedTubePreview(
-    const std::shared_ptr<const ContinuousPhasePath>& owner,
-    const std::shared_ptr<const ContinuousPhaseNormalFrame>& shared_frame,
-    const MatchedAdapterPathSamples& supplied_samples,
-    const double start_w,
-    const double end_w,
-    const double required_current_w,
-    MatchedAdapterPathSamples& output,
-    const CanonicalOwnerStateReuse* const canonical_owner_state = nullptr) {
-  output.clear();
-  if (!owner || owner->empty() || !IsFinite(start_w) || !IsFinite(end_w) ||
-      !IsFinite(required_current_w) ||
-      end_w <= start_w + kPreparedCoverageTolerance ||
-      required_current_w < start_w - kPreparedCoverageTolerance ||
-      required_current_w > end_w + kPreparedCoverageTolerance) {
+bool PopulateV2RecoveryOutput(
+    const PhaseOffsetMatchedAdapterConfig& config,
+    const MatchedAdapterInput& input,
+    const TubeV2ShadowAdmissionCandidate& candidate,
+    MatchedAdapterOutput& output) {
+  const phase_offset_navigation::RecoveryPreparedStep& step =
+      candidate.recovery_step;
+  if (!step.valid || !step.selectedUExact() ||
+      step.proof_kind !=
+          phase_offset_navigation::RecoveryStepProofKind::FINITE_RESERVE_V2 ||
+      !candidate.commit_token.sealed_prepared ||
+      !BitsEqual(input.path.w, step.current_w) ||
+      !BitsEqual(input.dt, step.dt)) {
     return false;
   }
-  // Validate the requested anchor before it participates in any partition
-  // equivalence class.  In particular, the boundary roundoff allowance above
-  // never authorizes replacing this original global phase with start_w or
-  // end_w: TubeBuilder's current-state policy is about this exact double.
-  phase_offset_core::PathDifferentialState required_current_state;
-  if (canonical_owner_state && canonical_owner_state->valid &&
-      canonical_owner_state->owner == owner &&
-      ExactDoubleBits(canonical_owner_state->state.w, required_current_w)) {
-    required_current_state = canonical_owner_state->state;
-  } else if (!EvaluateOwnerState(owner, required_current_w,
-                                 required_current_state, shared_frame)) {
+  phase_offset_core::GeometryParams geometry_params;
+  geometry_params.regularity_margin =
+      MakeRuntimeConfig(config).tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      MakeRuntimeConfig(config).tube.minimum_reference_speed;
+  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
+  phase_offset_core::PhaseOffsetGeometryState geometry;
+  if (!evaluator.evaluate(input.path, input.position, step.current_delta,
+                          geometry) || !geometry.valid) {
     return false;
   }
-  std::vector<double> knots;
-  knots.reserve(supplied_samples.size() + 2U * owner->segments().size() + 3U);
-  // Keep structural seam values separate from ordinary partition hints.  The
-  // owner is the only authority for these boundaries: cellBounds() proves one
-  // stored owner segment, not a numerical neighbourhood which happens to
-  // straddle two segments.
-  std::vector<double> structural_seams;
-  structural_seams.reserve(2U * owner->segments().size());
-  const auto append_if_in_range = [&knots, start_w, end_w](double w) {
-    if (IsFinite(w) && w >= start_w - kPreparedCoverageTolerance &&
-        w <= end_w + kPreparedCoverageTolerance) {
-      if (std::abs(w - start_w) <= kPreparedCoverageTolerance) {
-        knots.push_back(start_w);
-      } else if (std::abs(w - end_w) <= kPreparedCoverageTolerance) {
-        knots.push_back(end_w);
-      } else {
-        knots.push_back(w);
-      }
-    }
-  };
-  append_if_in_range(start_w);
-  append_if_in_range(end_w);
-  // The Tube current-state policy is anchored to this exact global phase.  It
-  // is neither a sampling hint nor a point that may be snapped to a nearby
-  // planner knot: the owner below evaluates this original double directly.
-  // Do not route it through append_if_in_range(): that helper intentionally
-  // canonicalizes ordinary range-neighbouring samples to a range endpoint,
-  // whereas the required current phase must own its equivalence class even
-  // when it is within kPreparedCoverageTolerance of start_w or end_w.
-  knots.push_back(required_current_w);
-  for (const auto& sample : supplied_samples) append_if_in_range(sample.w);
-  const std::vector<ContinuousPhasePath::Segment>& owner_segments =
-      owner->segments();
-  for (std::size_t index = 1U; index < owner_segments.size(); ++index) {
-    const ContinuousPhasePath::Segment& left = owner_segments[index - 1U];
-    const ContinuousPhasePath::Segment& right = owner_segments[index];
-    // Do not pass an owner seam through append_if_in_range(): that helper
-    // intentionally canonicalizes ordinary range-neighbour knots to a
-    // preview endpoint, whereas a structural seam must retain its exact owner
-    // double whenever it lies in the preview range.
-    if (IsFinite(left.w1) && left.w1 >= start_w && left.w1 <= end_w) {
-      structural_seams.push_back(left.w1);
-      knots.push_back(left.w1);
-    }
-    if (IsFinite(right.w0) && right.w0 >= start_w && right.w0 <= end_w) {
-      structural_seams.push_back(right.w0);
-      knots.push_back(right.w0);
-    }
+  guidance::ReferenceGeometry reference;
+  reference.point = geometry.r;
+  reference.tangent = geometry.T;
+  reference.derivative_norm = geometry.r_w.norm();
+  reference.valid = geometry.valid;
+  guidance::IsfGuidance base;
+  if (!guidance::IsfReferenceKernel::evaluate(
+          input.position, reference, input.gains, base) || !base.valid) {
+    return false;
   }
-  std::sort(structural_seams.begin(), structural_seams.end());
-  structural_seams.erase(std::unique(structural_seams.begin(),
-                                     structural_seams.end()),
-                         structural_seams.end());
+  // The reserve was certified from the actual kernel rate captured at
+  // admission.  Never overwrite a newly evaluated kernel result to make a
+  // stale recurrence appear exact.
+  if (!BitsEqual(base.w_dot,
+                 candidate.commit_token.sealed_prepared->base_phase_rate)) {
+    return false;
+  }
+  phase_offset_core::MatchedPortInput matched_input;
+  matched_input.geometry = geometry;
+  matched_input.base_v_cmd = base.v_cmd;
+  matched_input.base_w_dot = base.w_dot;
+  matched_input.final_port = step.selected_u;
+  phase_offset_core::MatchedPortOutput matched;
+  if (!phase_offset_core::MatchedPort::evaluate(matched_input, matched) ||
+      !matched.valid ||
+      !BitsEqual(step.next_w, step.current_w + step.dt * matched.w_dot) ||
+      !BitsEqual(step.next_delta,
+                 step.current_delta + step.dt * matched.delta_dot)) {
+    return false;
+  }
+  output.base_guidance = base;
+  output.geometry = geometry;
+  output.raw_port = step.selected_u;
+  output.projection.final_port = step.selected_u;
+  output.projection.final_w_dot = matched.w_dot;
+  output.projection.final_tangent_speed = geometry.T.dot(matched.v_cmd);
+  output.projection.next_delta = step.next_delta;
+  output.projection.next_regularity = geometry.regularity;
+  output.projection.valid = IsFinite(output.projection.final_w_dot) &&
+      IsFinite(output.projection.final_tangent_speed) &&
+      IsFinite(output.projection.next_delta) &&
+      IsFinite(output.projection.next_regularity);
+  if (!output.projection.valid) return false;
+  output.matched = matched;
+  SetGuidance(base, matched, output.guidance);
+  output.delta = step.current_delta;
+  output.delta_ref = 0.0;
+  output.profile_active = false;
+  output.selected = true;
+  output.valid = true;
+  output.recovery_status = phase_offset_navigation::RecoveryStepStatus::PREPARED;
+  output.recovery_replan_required = false;
+  output.runtime_execution.mode =
+      phase_offset_navigation::RuntimeExecutionMode::SAFETY_PRIORITY;
+  output.runtime_execution.active_profile_available = true;
+  output.runtime_execution.current_geometry_valid = true;
+  output.runtime_execution.retained_delta_current_inside = true;
+  output.runtime_execution.tracking_within_bound = true;
+  output.runtime_execution.executable = true;
+  output.invalid_reason.clear();
+  return true;
+}
 
-  // Canonical precedence is structural seam > exact required current >
-  // ordinary supplied/range-neighbour knot.  TubeBuilder already freezes a
-  // nearest-current match within kTubeCurrentPhaseAnchorTolerance; when that
-  // equivalence class contains an immutable seam, use the exact seam as its
-  // sole representative.  Retaining both values could manufacture a cell
-  // smaller than the Builder's minimum cell epsilon.
-  double current_match_representative = required_current_w;
-  double nearest_seam_error = std::numeric_limits<double>::infinity();
-  for (const double seam : structural_seams) {
-    const double error = std::abs(seam - required_current_w);
-    if (error <= kTubeCurrentPhaseAnchorTolerance &&
-        error < nearest_seam_error) {
-      current_match_representative = seam;
-      nearest_seam_error = error;
-    }
-  }
-  const auto is_structural_seam = [&structural_seams](const double w) {
-    return std::binary_search(structural_seams.begin(),
-                              structural_seams.end(), w);
-  };
-  std::sort(knots.begin(), knots.end());
-  // Preserve the representative of the one direct current-match
-  // neighbourhood.  Do not form a transitive chain over adjacent values
-  // here: structural knots always survive, while ordinary planner/range knots
-  // outside that direct neighbourhood retain the old non-transitive
-  // partitioning.
-  std::vector<double> canonical_knots;
-  canonical_knots.reserve(knots.size());
-  for (const double knot : knots) {
-    if (is_structural_seam(knot)) {
-      canonical_knots.push_back(knot);
-      continue;
-    }
-    if (std::abs(knot - current_match_representative) <=
-        kTubeCurrentPhaseAnchorTolerance) {
-      continue;
-    }
-    // A nearby ordinary knot must not win the later tolerance deduplication
-    // merely because it sorts before an exact structural seam.
-    bool near_structural_seam = false;
-    for (const double seam : structural_seams) {
-      if (std::abs(knot - seam) <= kPreparedCoverageTolerance) {
-        near_structural_seam = true;
-        break;
-      }
-    }
-    if (!near_structural_seam) {
-      canonical_knots.push_back(knot);
-    }
-  }
-  canonical_knots.erase(std::unique(canonical_knots.begin(),
-                                    canonical_knots.end()),
-                        canonical_knots.end());
-  std::vector<double> deduplicated_knots;
-  deduplicated_knots.reserve(canonical_knots.size() + 1U);
-  for (const double knot : canonical_knots) {
-    if (deduplicated_knots.empty() ||
-        knot - deduplicated_knots.back() > kPreparedCoverageTolerance) {
-      deduplicated_knots.push_back(knot);
-      continue;
-    }
-    // Two distinct structural seams inside the established partition epsilon
-    // cannot be represented without a degenerate cell.  Fail closed rather
-    // than swallowing a seam and creating a cross-owner certificate request.
-    if (is_structural_seam(knot) &&
-        is_structural_seam(deduplicated_knots.back())) {
-      output.clear();
-      return false;
-    }
-  }
-  canonical_knots.swap(deduplicated_knots);
-  canonical_knots.insert(std::lower_bound(canonical_knots.begin(),
-                                          canonical_knots.end(),
-                                          current_match_representative),
-                         current_match_representative);
-  canonical_knots.erase(std::unique(canonical_knots.begin(),
-                                    canonical_knots.end()),
-                        canonical_knots.end());
-  knots.swap(canonical_knots);
-  // The current-match representative is permitted to be the canonical value
-  // of a range-endpoint equivalence class.  It is normally the exact current;
-  // only an immutable structural seam may replace it.
-  const bool start_preserved =
-      std::abs(knots.front() - start_w) <= kPreparedCoverageTolerance ||
-      std::abs(knots.front() - current_match_representative) <=
-          kTubeCurrentPhaseAnchorTolerance;
-  const bool end_preserved =
-      std::abs(knots.back() - end_w) <= kPreparedCoverageTolerance ||
-      std::abs(knots.back() - current_match_representative) <=
-          kTubeCurrentPhaseAnchorTolerance;
-  if (knots.size() < 2U || !start_preserved || !end_preserved) {
-    output.clear();
+bool PopulateV2NormalOutput(
+    const PhaseOffsetMatchedAdapterConfig& config,
+    const MatchedAdapterInput& input,
+    const TubeV2ShadowAdmissionCandidate& candidate,
+    MatchedAdapterOutput& output) {
+  if (candidate.nonselecting || !candidate.applicable || !candidate.prepared ||
+      !candidate.proposed_binding || !candidate.proposed_binding->complete() ||
+      !candidate.commit_token.sealed_prepared) {
     return false;
   }
-  output.reserve(knots.size());
-  for (const double w : knots) {
-    if (canonical_owner_state && canonical_owner_state->valid &&
-        canonical_owner_state->owner == owner &&
-        canonical_owner_state->verified_samples == &supplied_samples) {
-      bool reused = false;
-      for (const auto& supplied : supplied_samples) {
-        if (ExactDoubleBits(supplied.w, w)) {
-          if (!shared_frame ||
-              (supplied.path_revision == shared_frame->pathRevision() &&
-               supplied.frame_revision == shared_frame->frameRevision())) {
-            output.push_back(supplied);
-            reused = true;
-          }
-          break;
-        }
-      }
-      if (reused) continue;
-    }
-    if (canonical_owner_state && canonical_owner_state->valid &&
-        canonical_owner_state->owner == owner &&
-        ExactDoubleBits(canonical_owner_state->state.w, w)) {
-      output.push_back(canonical_owner_state->state);
-      continue;
-    }
-    phase_offset_core::PathDifferentialState owner_state;
-    if (!EvaluateOwnerState(owner, w, owner_state, shared_frame) ||
-        !owner_state.valid) {
-      output.clear();
-      return false;
-    }
-    output.push_back(owner_state);
-  }
-  std::size_t current_anchor_count = 0U;
-  for (std::size_t index = 0U; index < output.size(); ++index) {
-    if (!StateFiniteAndValid(output[index]) ||
-        (index > 0U && output[index].w <= output[index - 1U].w +
-            kPreparedCoverageTolerance)) {
-      output.clear();
-      return false;
-    }
-    if (std::abs(output[index].w - required_current_w) <=
-        kTubeCurrentPhaseAnchorTolerance) {
-      ++current_anchor_count;
-    }
-  }
-  if (current_anchor_count != 1U) {
-    output.clear();
+  const phase_offset_navigation::RuntimeV2PreparedStep& step =
+      candidate.prepared_step;
+  if (!step.valid || !step.expected_current.finite() ||
+      !step.successor.finite() ||
+      !BitsEqual(input.path.w, step.expected_current.w) ||
+      !BitsEqual(input.dt, step.dt)) {
     return false;
   }
-  return output.size() >= 2U;
+  phase_offset_core::GeometryParams geometry_params;
+  geometry_params.regularity_margin =
+      MakeRuntimeConfig(config).tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      MakeRuntimeConfig(config).tube.minimum_reference_speed;
+  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
+  phase_offset_core::PhaseOffsetGeometryState geometry;
+  if (!evaluator.evaluate(input.path, input.position,
+                          step.expected_current.delta, geometry) ||
+      !geometry.valid) {
+    return false;
+  }
+  guidance::ReferenceGeometry reference;
+  reference.point = geometry.r;
+  reference.tangent = geometry.T;
+  reference.derivative_norm = geometry.r_w.norm();
+  reference.valid = true;
+  guidance::IsfGuidance base;
+  if (!guidance::IsfReferenceKernel::evaluate(
+          input.position, reference, input.gains, base) || !base.valid ||
+      !BitsEqual(base.w_dot, step.base_phase_rate)) {
+    return false;
+  }
+  phase_offset_core::MatchedPortInput matched_input;
+  matched_input.geometry = geometry;
+  matched_input.base_v_cmd = base.v_cmd;
+  matched_input.base_w_dot = base.w_dot;
+  matched_input.final_port = step.selected_u;
+  phase_offset_core::MatchedPortOutput matched;
+  if (!phase_offset_core::MatchedPort::evaluate(matched_input, matched) ||
+      !matched.valid ||
+      !BitsEqual(step.successor.w,
+                 step.expected_current.w + step.dt * matched.w_dot) ||
+      !BitsEqual(step.successor.delta,
+                 step.expected_current.delta + step.dt * matched.delta_dot)) {
+    return false;
+  }
+  output.base_guidance = base;
+  output.geometry = geometry;
+  output.raw_port = step.selected_u;
+  output.projection.final_port = step.selected_u;
+  output.projection.final_w_dot = matched.w_dot;
+  output.projection.final_tangent_speed = geometry.T.dot(matched.v_cmd);
+  output.projection.next_delta = step.successor.delta;
+  output.projection.next_regularity = geometry.regularity;
+  output.projection.valid = IsFinite(output.projection.final_w_dot) &&
+      IsFinite(output.projection.final_tangent_speed) &&
+      IsFinite(output.projection.next_delta) &&
+      IsFinite(output.projection.next_regularity);
+  if (!output.projection.valid) return false;
+  output.matched = matched;
+  SetGuidance(base, matched, output.guidance);
+  output.g_des = candidate.g_des;
+  output.g_des_valid = candidate.g_des_valid;
+  output.normal_preview = candidate.normal_preview;
+  output.allocator = candidate.allocator;
+  output.allocator_evaluated = candidate.allocator_evaluated;
+  output.delta = step.expected_current.delta;
+  output.delta_ref = step.successor.delta;
+  output.profile_active = true;
+  output.selected = true;
+  output.valid = true;
+  output.recovery_status = phase_offset_navigation::RecoveryStepStatus::NONE;
+  output.recovery_replan_required = false;
+  output.runtime_execution.mode =
+      phase_offset_navigation::RuntimeExecutionMode::NORMAL;
+  output.runtime_execution.active_profile_available = true;
+  output.runtime_execution.current_geometry_valid = true;
+  output.runtime_execution.retained_delta_current_inside = true;
+  output.runtime_execution.tracking_within_bound = true;
+  output.runtime_execution.executable = true;
+  output.invalid_reason.clear();
+  return true;
+}
+
+bool PopulateV2SuccessorOutput(
+    const PhaseOffsetMatchedAdapterConfig& config,
+    const MatchedAdapterInput& input,
+    const TubeV2ShadowAdmissionCandidate& candidate,
+    MatchedAdapterOutput& output) {
+  return candidate.purpose == TubeWorkerPurposeV2::SUCCESSOR &&
+      candidate.prepared_step.binding_transition &&
+      PopulateV2NormalOutput(config, input, candidate, output);
 }
 }  // namespace
 
-PathTubePairPin::PathTubePairPin(
-    const std::shared_ptr<PathTubePairPinRegistry>& registry,
-    const PathTubePairPinCapture& capture, const std::uint64_t lease_id)
-    : registry_(registry), capture_(capture), lease_id_(lease_id) {}
-
-PathTubePairPin::~PathTubePairPin() { release(); }
-
-PathTubePairPin::PathTubePairPin(PathTubePairPin&& other) noexcept
-    : registry_(std::move(other.registry_)), capture_(std::move(other.capture_)),
-      lease_id_(other.lease_id_) {
-  other.lease_id_ = 0U;
-  other.capture_ = PathTubePairPinCapture();
-}
-
-PathTubePairPin& PathTubePairPin::operator=(PathTubePairPin&& other) noexcept {
-  if (this == &other) return *this;
-  release();
-  registry_ = std::move(other.registry_);
-  capture_ = std::move(other.capture_);
-  lease_id_ = other.lease_id_;
-  other.lease_id_ = 0U;
-  other.capture_ = PathTubePairPinCapture();
-  return *this;
-}
-
-void PathTubePairPin::release() {
-  if (!registry_ || lease_id_ == 0U) {
-    registry_.reset();
-    capture_ = PathTubePairPinCapture();
-    lease_id_ = 0U;
-    return;
-  }
-  {
-    std::lock_guard<std::mutex> lock(registry_->mutex);
-    // ABA protection: a late guard can clear only the exact lease and exact
-    // authority identity which it acquired.  A newer lease survives intact.
-    if (registry_->active_lease_id == lease_id_ &&
-        registry_->active_pair == capture_.pair &&
-        registry_->active_generation == capture_.generation &&
-        registry_->active_session == capture_.authority_session) {
-      registry_->active_lease_id = 0U;
-      registry_->active_pair.reset();
-      registry_->active_generation = 0U;
-      registry_->active_session = 0U;
-    }
-  }
-  registry_.reset();
-  capture_ = PathTubePairPinCapture();
-  lease_id_ = 0U;
+bool TubeV2ExecutionBinding::complete() const {
+  return valid && profile && source_input && frame_owner &&
+      identity.complete() &&
+      source_input->complete() && profile->valid && profile->complete &&
+      profile->path_key == source_input->path_key &&
+      profile->configuration_key == source_input->configuration_key &&
+      profile->map_capture_key == source_input->map_capture_key &&
+      profile->request_id == source_input->request_id &&
+      profile->path_owner == source_input->path_owner &&
+      profile->capture_owner == source_input->capture_owner &&
+      profile->query_owner == source_input->query_owner &&
+      frame_owner->pathRevision() == profile->path_key.path_revision &&
+      frame_owner->frameRevision() == profile->path_key.frame_revision &&
+      frame_owner->startW() == profile->path_key.domain_start &&
+      frame_owner->endW() == profile->path_key.domain_end &&
+      identity.execution_generation == profile->path_key.execution_generation &&
+      identity.path_instance_id == profile->path_key.path_instance_id &&
+      identity.path_revision == profile->path_key.path_revision &&
+      identity.frame_revision == profile->path_key.frame_revision &&
+      identity.frame_convention_id == profile->path_key.frame_convention_id &&
+      identity.configuration_id == profile->configuration_key.configuration_id &&
+      identity.map_instance_id == profile->map_capture_key.map_instance_id &&
+      identity.map_state_id == profile->map_capture_key.state_id &&
+      identity.accepted_sequence == profile->map_capture_key.accepted_sequence &&
+      identity.profile_id == profile->profile_id;
 }
 
 PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
@@ -1161,8 +629,10 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
         "normal-preview-w-v1";
     config.normal_preview_policy_explicit = true;
   }
-  std::string source = "none"; nh.param<std::string>("phase_offset/manual/tube_source", source, source);
-  bool source_valid = false; config.tube_source = ParseTubeSource(source, source_valid);
+  // Stage-7 production has one Tube backend.  Synthetic FIXED values remain
+  // usable only by direct, unadvertised unit fixtures; ROS configuration no
+  // longer selects a live proof implementation.
+  config.tube_source = phase_offset_navigation::TubeSource::ESDF;
   // Sole P1 ESDF nominal-width owner.  Use hasParam so diagnostics can
   // distinguish the exact absent/default path from an explicit value.
   const std::string nominal_key = "phase_offset/tube/nominal_half_width";
@@ -1189,6 +659,8 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
   nh.param("phase_offset/tube/curvature_epsilon", config.tube.cross_section.curvature_epsilon, 1e-9);
   nh.param("planning/safe_distance",
            config.tube.cross_section.planner_safe_distance, 0.4);
+  double sdf_map_resolution = -1.0;
+  nh.param("sdf_map/resolution", sdf_map_resolution, -1.0);
   // The raw robust-margin parameters below are retained only for legacy
   // diagnostics.  Production Tube geometry uses planning/safe_distance.
   nh.param("phase_offset/tube/raw_uav_radius", config.tube.cross_section.margins.uav_radius, 0.25);
@@ -1216,27 +688,30 @@ PhaseOffsetMatchedAdapterConfig PhaseOffsetMatchedAdapter::loadConfig(
        differs_from_nominal(config.tube.max_offset)) ||
       (config.tube.search_extent_explicit &&
        differs_from_nominal(config.tube.cross_section.search_extent));
+  // Final V2 configuration is copied from the existing frozen authorities;
+  // no legacy profile or runtime builder is consulted.  Missing/nonpositive
+  // safety or map inputs remain invalid and disable MANUAL V2 construction.
+  config.tube_certificate_v2.configuration_id =
+      config.normal_preview_policy.configuration_identity;
+  config.tube_certificate_v2.epsilon =
+      config.tube.cross_section.planner_safe_distance;
+  config.tube_certificate_v2.nominal_half_width =
+      config.tube.cross_section.nominal_half_width;
+  config.tube_certificate_v2.ray_step =
+      config.tube.cross_section.ray_step;
+  config.tube_certificate_v2.snapshot_resolution = sdf_map_resolution;
+  config.tube_certificate_v2.minimum_reference_speed =
+      config.tube.cross_section.minimum_reference_speed;
+  config.tube_certificate_v2.sample_step_w = config.tube.sample_step_w;
   nh.param<std::string>("phase_offset/frame_id", config.frame_id, "world");
-  if (!source_valid) config.tube.fixed_delta_max = -1.0;
   return config;
 }
-PhaseOffsetMatchedAdapter::PhaseOffsetMatchedAdapter(const PhaseOffsetMatchedAdapterConfig& config)
-    : config_(config), path_tube_pin_registry_(
-          std::make_shared<PathTubePairPinRegistry>()) {
-  // Unadvertised adapter instances are deterministic unit/observe fixtures.
-  // They may exercise the legacy Runtime path, but this exception is removed
-  // at advertise() so production can never substitute Runtime for the sole
-  // PhaseOffsetAllocator owner.
-  execution_authority_.setTestOnlyRuntimeOwnerAllowed(true);
-  measurement_tube_due_enabled_ = config_.measurement_enabled &&
-      !config_.measurement_tube_due_csv_path.empty();
-  if (measurement_tube_due_enabled_) {
-    measurement_tube_due_samples_.reserve(4096U);
-  }
-  cloud_occupancy_query_config_.obstacle_set_complete =
-      config_.cloud_obstacle_set_complete;
-  cloud_occupancy_query_config_.required_preincluded_map_uncertainty =
-      config_.tube.cross_section.margins.preincluded_map_uncertainty;
+PhaseOffsetMatchedAdapter::PhaseOffsetMatchedAdapter(
+    const PhaseOffsetMatchedAdapterConfig& config)
+    : config_(config) {
+  // Stage 7 retires backend selection from the production lifecycle.  Every
+  // MANUAL adapter owns exactly one V2 worker; ACTIVE remains the unchanged
+  // zero-port comparator.
   configuration_valid_ = (config_.mode == PhaseOffsetMatchedMode::ACTIVE ||
       config_.mode == PhaseOffsetMatchedMode::MANUAL) &&
       IsFinite(config_.equivalence_tolerance) && config_.equivalence_tolerance >= 0.0 &&
@@ -1244,200 +719,1736 @@ PhaseOffsetMatchedAdapter::PhaseOffsetMatchedAdapter(const PhaseOffsetMatchedAda
   if (config_.frame_id.empty()) config_.frame_id = "world";
   if (config_.mode == PhaseOffsetMatchedMode::MANUAL) {
     runtime_.reset(new phase_offset_navigation::PhaseOffsetRuntime(MakeRuntimeConfig(config_)));
-    tube_epoch_manager_.reset(new phase_offset_navigation::TubeEpochManager(MakeEpochConfig(config_)));
     configuration_valid_ = configuration_valid_ && runtime_->configurationValid() &&
-        tube_epoch_manager_->configurationValid() && IsFinite(config_.tube_update_period) &&
-        config_.tube_update_period >= 0.05 && config_.tube_update_period <= 0.10 &&
-        cloudOccupancyQueryConfigurationValid(cloud_occupancy_query_config_);
+        config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
+        config_.tube_certificate_v2.complete() &&
+        config_.normal_preview_policy_explicit &&
+        config_.normal_preview_policy.valid() &&
+        config_.normal_preview_policy.configuration_identity ==
+            config_.tube_certificate_v2.configuration_id &&
+        IsFinite(config_.tube_update_period) &&
+        config_.tube_update_period >= 0.05 &&
+        config_.tube_update_period <= 0.10;
+    if (configuration_valid_) {
+      v2_shadow_worker_.reset(new PhaseOffsetTubeWorkerV2(
+          config_.tube_certificate_v2));
+    }
   }
 }
 
-PhaseOffsetMatchedAdapter::RequestInstanceIdentity
-PhaseOffsetMatchedAdapter::makeRequestInstanceIdentity(
-    const std::shared_ptr<const TubeBuildRequest>& request) const {
-  RequestInstanceIdentity identity;
-  identity.request_owner = request;
-  identity.request = request.get();
-  identity.task_generation = request ? request->task_generation : 0U;
+PhaseOffsetMatchedAdapter::V2ShadowRequestIdentity
+PhaseOffsetMatchedAdapter::makeV2ShadowRequestIdentity(
+    const TubeWorkerPurposeV2 purpose,
+    const phase_offset_navigation::TubeBuildInputV2& input) const {
+  V2ShadowRequestIdentity identity;
+  identity.purpose = purpose;
+  identity.request_id = input.request_id;
+  identity.execution_generation = input.path_key.execution_generation;
+  identity.accepted_state_demand = input.map_capture_key.accepted_sequence;
+  identity.useful_start = input.requested_start;
+  identity.useful_end = input.requested_end;
+  identity.path_key = input.path_key;
+  identity.configuration_key = input.configuration_key;
+  identity.map_capture_key = input.map_capture_key;
   return identity;
 }
 
-PhaseOffsetMatchedAdapter::TubeWorkIdentity
-PhaseOffsetMatchedAdapter::makeTubeWorkIdentity(
-    const std::shared_ptr<const TubeBuildRequest>& request) const {
-  TubeWorkIdentity identity;
-  if (!request) return identity;
-  identity.task_generation = request->task_generation;
-  identity.active = request->active;
-  identity.source_revision = request->source_revision;
-  identity.path_revision = request->path_revision;
-  identity.frame_revision = request->frame_revision;
-  identity.authority_session = request->authority_session;
-  identity.shutdown_invalidated = shutdown_requested_.load(
-      std::memory_order_acquire);
-  identity.semantic_path_owner = request->semantic_path_owner.get();
-  identity.frame_owner = request->frame_owner.get();
-  identity.base_path_tube_pair = request->base_path_tube_pair.get();
-  identity.base_path_tube_pair_generation =
-      request->base_path_tube_pair_generation;
-  return identity;
-}
-
-void PhaseOffsetMatchedAdapter::prepareTubeJobLocalState(
-    const SchedulePermit& permit, TubeJobLocalState& state) {
-  state = TubeJobLocalState();
-  state.pair_refresh = permit.request &&
-      static_cast<bool>(permit.request->base_path_tube_pair);
-  state.timer_task_generation = timer_task_generation_;
-  // Every actual worker attempt consumes one diagnostic/measurement sequence,
-  // including work which later becomes stale.  Candidate sequence remains
-  // owned by the copied manager and is committed only for current work.
-  state.timer_build_sequence = ++timer_build_sequence_;
-  state.cached_full_path_samples = cached_full_path_samples_;
-  state.cached_path_source_revision = cached_path_source_revision_;
-  state.have_cached_path = have_cached_path_;
-  state.timer_active_profile = timer_active_profile_;
-  state.timer_installed_active_epoch = timer_installed_active_epoch_;
-  state.latest_cloud_occupancy_query_status =
-      latest_cloud_occupancy_query_status_;
-  if (state.pair_refresh) {
-    state.tube_epoch_manager.reset(
-        new phase_offset_navigation::TubeEpochManager(MakeEpochConfig(config_)));
-  } else if (tube_epoch_manager_) {
-    // TubeEpochManager is an owning value type.  Copying it here preserves
-    // ordinary Candidate/Active history while isolating heavy construction
-    // from committed worker state.
-    state.tube_epoch_manager.reset(
-        new phase_offset_navigation::TubeEpochManager(*tube_epoch_manager_));
+void PhaseOffsetMatchedAdapter::retainV2ShadowCompletionLocked(
+    const TubeWorkerCompletionV2& completion) {
+  if (completion.purpose == TubeWorkerPurposeV2::CURRENT &&
+      pinned_current_cohort_ && pinned_current_cohort_->tube_worker_input_v2 &&
+      completion.request_id == pinned_current_cohort_->tube_worker_input_v2->request_id &&
+      !completion.built()) pinned_current_cohort_.reset();
+  std::shared_ptr<const TubeWorkerCompletionV2>& retained =
+      completion.purpose == TubeWorkerPurposeV2::CURRENT
+      ? latest_v2_shadow_current_completion_
+      : latest_v2_shadow_successor_completion_;
+  const auto retain = [&]() {
+    try {
+      retained = std::make_shared<const TubeWorkerCompletionV2>(completion);
+    } catch (const std::exception&) {
+      retained.reset();
+    }
+  };
+  if (!retained) {
+    retain();
+    return;
+  }
+  // Failed/cancelled evidence never displaces a useful built proof.  A
+  // Advancing windows may extend the forward end without retaining the old
+  // backward prefix. This replaces a whole immutable result, never rebinds
+  // its proof to another map/path or merges proof cells across captures.
+  if (!completion.built()) return;
+  if (!retained->built()) {
+    retain();
+    return;
+  }
+  const bool same_authority =
+      completion.execution_generation == retained->execution_generation &&
+      completion.path_key == retained->path_key &&
+      completion.configuration_key == retained->configuration_key &&
+      completion.map_capture_key == retained->map_capture_key;
+  bool dominates = false;
+  const auto live_request = std::atomic_load(&latest_build_request_);
+  const bool replaces_passed_range = live_request && live_request->active &&
+      live_request->tube_worker_input_v2 &&
+      live_request->tube_worker_input_v2->path_key == completion.path_key &&
+      live_request->task_generation == completion.execution_generation &&
+      std::isfinite(live_request->current_w) &&
+      live_request->current_w >= retained->build.profile.certified_end &&
+      live_request->current_w >= completion.build.profile.certified_start &&
+      live_request->current_w < completion.build.profile.certified_end;
+  const bool forward_extension =
+      completion.path_key == retained->path_key &&
+      completion.configuration_key == retained->configuration_key &&
+      completion.map_capture_key.map_instance_id == retained->map_capture_key.map_instance_id &&
+      completion.map_capture_key.configuration_generation == retained->map_capture_key.configuration_generation &&
+      completion.map_capture_key.configuration_id == retained->map_capture_key.configuration_id &&
+      completion.map_capture_key.frame_provenance == retained->map_capture_key.frame_provenance &&
+      ((completion.useful_start > retained->useful_start &&
+        completion.useful_start <= retained->useful_end &&
+        completion.useful_end > retained->useful_end) || replaces_passed_range);
+  if (!same_authority) {
+    dominates = completion.execution_generation ==
+            retained->execution_generation &&
+        completion.request_id > retained->request_id &&
+        completion.accepted_state_demand >=
+            retained->accepted_state_demand &&
+        ((completion.useful_start <= retained->useful_start &&
+          completion.useful_end >= retained->useful_end) || forward_extension);
   } else {
-    state.tube_epoch_manager.reset(
-        new phase_offset_navigation::TubeEpochManager(MakeEpochConfig(config_)));
+    const bool wider_prefix = completion.useful_start <=
+            retained->useful_start &&
+        completion.useful_end >= retained->useful_end;
+    dominates = completion.accepted_state_demand >=
+            retained->accepted_state_demand &&
+        completion.request_id > retained->request_id && (wider_prefix || forward_extension);
+  }
+  if (dominates) {
+    retain();
   }
 }
 
-void PhaseOffsetMatchedAdapter::commitTubeJobLocalState(
-    TubeJobLocalState& state) {
-  if (state.pair_refresh) return;
-  if (state.tube_epoch_manager) tube_epoch_manager_ =
-      std::move(state.tube_epoch_manager);
-  cached_full_path_samples_ = std::move(state.cached_full_path_samples);
-  cached_path_source_revision_ = state.cached_path_source_revision;
-  have_cached_path_ = state.have_cached_path;
-  timer_active_profile_ = std::move(state.timer_active_profile);
-  timer_installed_active_epoch_ = state.timer_installed_active_epoch;
-  latest_cloud_occupancy_query_status_ =
-      state.latest_cloud_occupancy_query_status;
+bool PhaseOffsetMatchedAdapter::evaluateV2NormalAllocator(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+    phase_offset_core::PhaseOffsetGeometryState& geometry,
+    guidance::IsfGuidance& base,
+    phase_offset_navigation::NormalPreviewResult& preview,
+    phase_offset_navigation::PhaseOffsetAllocatorResult& allocator,
+    Eigen::Vector3d& g_des,
+    std::string& reason) const {
+  geometry = phase_offset_core::PhaseOffsetGeometryState();
+  base = guidance::IsfGuidance();
+  preview = phase_offset_navigation::NormalPreviewResult();
+  allocator = phase_offset_navigation::PhaseOffsetAllocatorResult();
+  g_des.setZero();
+  reason.clear();
+  if (!runtime_ || !profile || !profile->structurallyValid() ||
+      !config_.normal_preview_policy_explicit ||
+      !config_.normal_preview_policy.valid()) {
+    reason = "V2 NORMAL profile or preview policy is unavailable";
+    return false;
+  }
+  phase_offset_core::GeometryParams geometry_params;
+  geometry_params.regularity_margin =
+      runtime_->config().tube.regularity_margin;
+  geometry_params.minimum_reference_speed =
+      runtime_->config().tube.minimum_reference_speed;
+  geometry_params.require_frame_binding = true;
+  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
+  if (!evaluator.evaluate(input.path, input.position,
+                          runtime_->retainedDelta(), geometry) ||
+      !geometry.valid ||
+      geometry.path_revision != profile->path_key.path_revision ||
+      geometry.frame_revision != profile->path_key.frame_revision) {
+    reason = "V2 NORMAL live geometry is unavailable or stale";
+    return false;
+  }
+  guidance::ReferenceGeometry reference;
+  reference.point = geometry.r;
+  reference.tangent = geometry.T;
+  reference.derivative_norm = geometry.r_w.norm();
+  reference.valid = true;
+  if (!guidance::IsfReferenceKernel::evaluate(
+          input.position, reference, input.gains, base) || !base.valid) {
+    reason = "V2 NORMAL base guidance is unavailable";
+    return false;
+  }
+
+  phase_offset_navigation::TubeViabilityInput preview_input;
+  preview_input.current_w = geometry.w;
+  preview_input.current_delta = runtime_->retainedDelta();
+  preview_input.policy = config_.normal_preview_policy;
+  preview_input.upper_u_delta = std::max(0.0, config_.u_delta_abs_max);
+  preview_input.boundary_tolerance = 0.0;
+  preview_input.path_revision = profile->path_key.path_revision;
+  preview_input.frame_revision = profile->path_key.frame_revision;
+  preview_input.profile_revision = profile->profile_id;
+  preview_input.expected_path_revision = profile->path_key.path_revision;
+  preview_input.expected_frame_revision = profile->path_key.frame_revision;
+  preview_input.expected_profile_revision = profile->profile_id;
+  preview_input.max_work = config_.tube_certificate_v2.budgets.max_queries;
+  preview_input.v2_provenance_bound = true;
+  preview_input.expected_v2_path_key = profile->path_key;
+  preview_input.expected_v2_configuration_key = profile->configuration_key;
+  preview_input.expected_v2_map_capture_key = profile->map_capture_key;
+  if (!phase_offset_navigation::TubeViability::evaluate(
+          *profile, preview_input, preview) || !preview.valid ||
+      !preview.feasible || !preview.rate_feasible ||
+      !preview.contraction_rate_feasible || !preview.current_delta_inside) {
+    reason = preview.reason.empty()
+        ? "V2 NORMAL live preview is infeasible" : preview.reason;
+    return false;
+  }
+
+  const Eigen::Vector3d recenter = -config_.delta_tracking_gain *
+      runtime_->retainedDelta() * geometry.N;
+  if (!recenter.allFinite()) {
+    reason = "V2 NORMAL recenter motion is nonfinite";
+    return false;
+  }
+  Eigen::Vector3d g_swarm = Eigen::Vector3d::Zero();
+  switch (config_.coordination_backend) {
+    case PhaseOffsetCoordinationBackend::SPH:
+      if (input.sph_bridge != nullptr) {
+        const bspline_race::integration::GCoordResolveResult resolved =
+            input.sph_bridge->resolveGCoord(
+                input.captured_gcoord, ros::Time::now().toSec(),
+                ros::SteadyTime::now().toSec());
+        if (resolved.usable()) {
+          g_swarm = Eigen::Vector3d(resolved.sample.g_coord.x,
+                                    resolved.sample.g_coord.y, 0.0);
+        }
+      }
+      g_des = g_swarm + recenter;
+      break;
+    case PhaseOffsetCoordinationBackend::D1B:
+      g_des = input.g_des_valid ? input.g_des : recenter;
+      break;
+    case PhaseOffsetCoordinationBackend::DISABLED:
+      g_des = recenter;
+      break;
+  }
+  if (!g_des.allFinite()) {
+    reason = "V2 NORMAL desired reference motion is nonfinite";
+    return false;
+  }
+
+  phase_offset_navigation::PhaseOffsetAllocatorInput allocator_input;
+  allocator_input.geometry = geometry;
+  allocator_input.preview = &preview;
+  allocator_input.g_des = g_des;
+  allocator_input.f_w0 = base.w_dot;
+  allocator_input.previous_u = runtime_->previousFinalPort();
+  allocator_input.dt = input.dt;
+  allocator_input.bounds.lower_nu = config_.normal_preview_policy.lower_nu;
+  allocator_input.bounds.upper_nu = config_.normal_preview_policy.upper_nu;
+  allocator_input.bounds.u_w_abs_max = std::max(0.0, config_.u_w_abs_max);
+  allocator_input.bounds.upper_u_delta =
+      std::max(0.0, config_.u_delta_abs_max);
+  allocator_input.bounds.u_w_slew_rate =
+      std::max(0.0, config_.u_w_rate_max);
+  allocator_input.bounds.u_delta_slew_rate =
+      std::max(0.0, config_.u_delta_rate_max);
+  allocator_input.bounds.zoh_dt = input.dt;
+  allocator_input.expected_path_revision = preview.provenance.path_revision;
+  allocator_input.expected_frame_revision = preview.provenance.frame_revision;
+  allocator_input.expected_profile_revision = preview.provenance.profile_revision;
+  allocator_input.expected_source_revision = preview.provenance.source_revision;
+  allocator_input.expected_tube_revision = preview.provenance.tube_revision;
+  allocator_input.expected_map_revision = preview.provenance.map_revision;
+  allocator_input.expected_obstacle_contract_id =
+      preview.provenance.obstacle_contract_id;
+  if (!phase_offset_navigation::PhaseOffsetAllocator::allocate(
+          allocator_input, allocator) || !allocator.valid ||
+      !allocator.feasible ||
+      allocator.selected_u_owner !=
+          phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
+      !allocator.selectedUConsistent(0.0)) {
+    reason = allocator.reason.empty()
+        ? "V2 NORMAL allocator rejected the command" : allocator.reason;
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::prepareV2ShadowAdmission(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
+        source_owner,
+    const std::shared_ptr<const TubeWorkerCompletionV2>& completion,
+    std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate,
+    const TubeWorkerPurposeV2 purpose) {
+  candidate.reset();
+  TubeV2ShadowAdmissionCandidate staged;
+  if (!source_owner) return false;
+  const phase_offset_navigation::TubeBuildInputV2& source = *source_owner;
+  staged.nonselecting = config_.observe_only || !zero_gate_open_ ||
+      failure_latched_;
+  staged.purpose = purpose;
+  staged.request_id = source.request_id;
+  staged.execution_generation = source.path_key.execution_generation;
+  staged.accepted_state_demand = source.map_capture_key.accepted_sequence;
+  staged.accepted_update_visible = false;
+  staged.accepted_update_compatible = false;
+  staged.path_key = source.path_key;
+  staged.configuration_key = source.configuration_key;
+  staged.map_capture_key = source.map_capture_key;
+
+  const auto fail = [&staged, &candidate](
+      const phase_offset_navigation::TubeExecutionStatusV2 status,
+      const std::string& reason) {
+    staged.status = status;
+    staged.reason = reason;
+    try {
+      candidate = std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+          staged);
+    } catch (const std::exception&) {
+      candidate.reset();
+    }
+    return false;
+  };
+
+  if (!completion || completion->purpose != purpose ||
+      !completion->built() || completion->request_id != source.request_id ||
+      completion->execution_generation != source.path_key.execution_generation ||
+      completion->path_key != source.path_key ||
+      completion->configuration_key != source.configuration_key ||
+      completion->map_capture_key != source.map_capture_key ||
+      !source.complete() ||
+      source.path_key.execution_generation !=
+          task_generation_.load(std::memory_order_acquire)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                purpose == TubeWorkerPurposeV2::CURRENT
+                    ? "CURRENT completion is stale or identity-mismatched"
+                    : "SUCCESSOR completion is stale or identity-mismatched");
+  }
+
+  const auto& certified = completion->build.profile;
+  if (!IsFinite(certified.certified_start) || !IsFinite(certified.certified_end) ||
+      source.requested_start > certified.certified_start ||
+      certified.certified_start > certified.certified_end ||
+      certified.certified_end > source.requested_end ||
+      completion->useful_start != certified.certified_start ||
+      completion->useful_end != certified.certified_end) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "V2 certified range is inconsistent with original source");
+  }
+  const std::shared_ptr<const phase_offset_navigation::TubeProfileV2> profile_copy(
+      completion, &completion->build.profile);
+  if (!profile_copy->structurallyValid() ||
+      profile_copy->path_key != source.path_key ||
+      profile_copy->configuration_key != source.configuration_key ||
+      profile_copy->map_capture_key != source.map_capture_key ||
+      profile_copy->request_id != source.request_id ||
+      profile_copy->path_owner != source.path_owner ||
+      profile_copy->query_owner != source.query_owner ||
+      profile_copy->capture_owner != source.capture_owner ||
+      profile_copy->applicability_assumptions !=
+          source.applicability_assumptions ||
+      profile_copy->applicability_deadline_ticks !=
+          source.applicability_deadline_ticks ||
+      profile_copy->applicability_deadline_timeless !=
+          source.applicability_deadline_timeless ||
+      !source.map_capture_key.complete() ||
+      !source.map_capture_key.complete_support) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::PROFILE_UNAVAILABLE,
+                "V2 profile support or applicability is stale");
+  }
+
+  MatchedAdapterInput evaluated_input = input;
+  MatchedAdapterInput::TubeV2AdmissionEvidence& evidence =
+      evaluated_input.tube_v2_admission;
+  // Captured provenance is pinned; latest_* and command evidence remain live.
+  evidence.accepted_state_sequence = source.map_capture_key.accepted_sequence;
+  evidence.accepted_state_notification_sequence = source.map_capture_key.accepted_sequence;
+  evidence.accepted_time_ticks = source.map_capture_key.accepted_time_ticks;
+  evidence.map_instance_id = source.map_capture_key.map_instance_id;
+  evidence.configuration_generation = source.map_capture_key.configuration_generation;
+  evidence.configuration_key = source.map_capture_key.configuration_id;
+  evidence.support_provenance_id = source.map_capture_key.support_provenance_id;
+  evidence.frame_provenance = source.map_capture_key.frame_provenance;
+  evidence.support_expiry_timeless = source.map_capture_key.support_expiry_timeless;
+  evidence.support_expiry_ticks = source.map_capture_key.support_expiry_ticks;
+  evidence.applicability_deadline_valid = !source.applicability_deadline_timeless;
+  evidence.applicability_deadline = static_cast<double>(source.applicability_deadline_ticks);
+  if (!evidence.valid || evidence.binding_sequence == 0U) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "V2 admission applicability evidence is unavailable");
+  }
+  staged.binding_sequence = evidence.binding_sequence;
+  if (!IsFinite(evidence.now) || !IsFinite(input.dt) || input.dt <= 0.0 ||
+      evidence.provenance.empty() ||
+      (evidence.applicability_deadline_valid &&
+       !IsFinite(evidence.applicability_deadline)) ||
+      evidence.accepted_state_sequence !=
+          source.map_capture_key.accepted_sequence ||
+      evidence.accepted_state_sequence != source.map_capture_key.state_id ||
+      evidence.accepted_state_notification_sequence <
+          evidence.accepted_state_sequence ||
+      evidence.accepted_time_ticks != source.map_capture_key.accepted_time_ticks ||
+      evidence.map_instance_id != source.map_capture_key.map_instance_id ||
+      evidence.configuration_generation !=
+          source.map_capture_key.configuration_generation ||
+      evidence.configuration_key != source.map_capture_key.configuration_id ||
+      evidence.support_provenance_id !=
+          source.map_capture_key.support_provenance_id ||
+      evidence.frame_provenance != source.map_capture_key.frame_provenance ||
+      evidence.support_expiry_timeless !=
+          source.map_capture_key.support_expiry_timeless ||
+      (evidence.support_expiry_timeless && evidence.support_expiry_ticks != 0U) ||
+      (!evidence.support_expiry_timeless &&
+       evidence.support_expiry_ticks != source.map_capture_key.support_expiry_ticks) ||
+      evidence.applicability_deadline_valid !=
+          !profile_copy->applicability_deadline_timeless ||
+      (evidence.applicability_deadline_valid &&
+       evidence.applicability_deadline != static_cast<double>(
+           profile_copy->applicability_deadline_ticks)) ||
+      evidence.latest_accepted_state_sequence <
+          evidence.accepted_state_sequence ||
+      evidence.latest_accepted_state_notification_sequence <
+          evidence.latest_accepted_state_sequence ||
+      evidence.latest_accepted_time_ticks < evidence.accepted_time_ticks) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "V2 admission applicability identity or timing is invalid");
+  }
+  if (evidence.latest_map_instance_id != evidence.map_instance_id ||
+      evidence.latest_configuration_generation !=
+          evidence.configuration_generation ||
+      evidence.latest_configuration_key != evidence.configuration_key ||
+      evidence.latest_support_provenance_id !=
+          evidence.support_provenance_id ||
+      evidence.latest_frame_provenance != evidence.frame_provenance) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "latest accepted map identity is not coherent");
+  }
+  if (!source.map_capture_key.support_expiry_timeless) {
+    const double expiry = static_cast<double>(
+        source.map_capture_key.support_expiry_ticks);
+    if (!IsFinite(expiry) || evidence.now >= expiry ||
+        (evidence.applicability_deadline_valid &&
+         evidence.applicability_deadline > expiry) ||
+        evidence.latest_accepted_time_ticks >=
+            source.map_capture_key.support_expiry_ticks ||
+        (evidence.applicability_deadline_valid &&
+         evidence.latest_accepted_time_ticks >= static_cast<std::uint64_t>(
+             evidence.applicability_deadline))) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::DEADLINE_EXPIRED,
+                  "V2 map support applicability has expired");
+    }
+  }
+  staged.accepted_update_visible =
+      evidence.latest_accepted_state_sequence >
+          evidence.accepted_state_sequence ||
+      evidence.latest_accepted_state_notification_sequence >
+          evidence.accepted_state_notification_sequence;
+  staged.latest_accepted_state_sequence =
+      evidence.latest_accepted_state_sequence;
+  staged.latest_accepted_state_notification_sequence =
+      evidence.latest_accepted_state_notification_sequence;
+  staged.latest_accepted_time_ticks = evidence.latest_accepted_time_ticks;
+  staged.latest_map_instance_id = evidence.latest_map_instance_id;
+  staged.latest_configuration_generation =
+      evidence.latest_configuration_generation;
+  staged.latest_configuration_key = evidence.latest_configuration_key;
+  staged.latest_support_provenance_id = evidence.latest_support_provenance_id;
+  staged.latest_frame_provenance = evidence.latest_frame_provenance;
+  staged.accepted_update_compatible =
+      !staged.accepted_update_visible || source.map_capture_key.complete_support;
+  if (!staged.accepted_update_compatible) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "newer accepted map state is not covered by the captured support");
+  }
+  const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>
+      retained_admission = std::atomic_load_explicit(
+          &retained_v2_shadow_admission_candidate_,
+          std::memory_order_acquire);
+  if (retained_admission &&
+      retained_admission->request_id == source.request_id &&
+      retained_admission->execution_generation ==
+          source.path_key.execution_generation &&
+      retained_admission->path_key == source.path_key &&
+      retained_admission->configuration_key == source.configuration_key &&
+      retained_admission->map_capture_key ==
+          source.map_capture_key &&
+      retained_admission->prepared &&
+      retained_admission->applicable &&
+      retained_admission->binding_sequence != 0U &&
+      retained_admission->binding_sequence != evidence.binding_sequence) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "V2 admission binding identity was substituted");
+  }
+
+  phase_offset_core::PhaseOffsetGeometryState live_geometry;
+  guidance::IsfGuidance live_base;
+  phase_offset_navigation::NormalPreviewResult live_preview;
+  phase_offset_navigation::PhaseOffsetAllocatorResult live_allocator;
+  Eigen::Vector3d live_g_des = Eigen::Vector3d::Zero();
+  std::string allocator_reason;
+  if (!evaluateV2NormalAllocator(
+          input, profile_copy, live_geometry, live_base, live_preview,
+          live_allocator, live_g_des, allocator_reason)) {
+    staged.allocator_evaluated = true;
+    staged.normal_preview = live_preview;
+    staged.allocator = live_allocator;
+    staged.g_des = live_g_des;
+    staged.g_des_valid = live_g_des.allFinite();
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::COMMAND_INFEASIBLE,
+                allocator_reason.empty()
+                    ? "V2 NORMAL allocator is unavailable"
+                    : allocator_reason);
+  }
+  if (!PopulateV2LiveCommandEvidence(
+          config_, live_geometry, live_base, live_allocator.selected_u,
+          evidence)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "V2 NORMAL live command evidence is unavailable");
+  }
+  staged.g_des = live_g_des;
+  staged.g_des_valid = true;
+  staged.normal_preview = live_preview;
+  staged.allocator = live_allocator;
+  staged.allocator_evaluated = true;
+  phase_offset_navigation::RuntimeV2PrepareInput runtime_input =
+      MakeV2RuntimePrepareInput(
+          evaluated_input, profile_copy, evidence, false,
+          runtime_->retainedDelta(),
+          runtime_->previousFinalPort());
+  if (purpose == TubeWorkerPurposeV2::SUCCESSOR) {
+    // The successor profile is the proposed binding, while Runtime still
+    // owns the installed source binding until the later publish-first
+    // transaction.  Keep the stale-identity CAS strict by carrying both
+    // identities explicitly through the value-only prepare seam.
+    if (!v2_execution_binding_ || !v2_execution_binding_->complete() ||
+        evidence.binding_sequence ==
+            std::numeric_limits<std::uint64_t>::max()) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                  "SUCCESSOR binding transition identity is unavailable");
+    }
+    runtime_input.binding_transition = true;
+    runtime_input.expected_identity = MakeV2ExecutionIdentity(
+        *v2_execution_binding_->profile, evidence.binding_sequence);
+    runtime_input.identity.binding_sequence = evidence.binding_sequence + 1U;
+  } else if (v2_execution_binding_ && v2_execution_binding_->complete() &&
+             !SameV2ExecutionIdentity(runtime_input.identity,
+                                      v2_execution_binding_->identity)) {
+    if (evidence.binding_sequence ==
+            std::numeric_limits<std::uint64_t>::max() ||
+        evidence.binding_sequence !=
+            v2_execution_binding_->identity.binding_sequence ||
+        source.path_key != v2_execution_binding_->profile->path_key ||
+        source.configuration_key !=
+            v2_execution_binding_->profile->configuration_key ||
+        !V2MapRefreshAuthorityCompatible(
+            v2_execution_binding_->profile->map_capture_key,
+            source.map_capture_key)) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                  "CURRENT replacement binding is incompatible");
+    }
+    runtime_input.binding_transition = true;
+    runtime_input.expected_identity = v2_execution_binding_->identity;
+    runtime_input.identity.binding_sequence = evidence.binding_sequence + 1U;
+  }
+  phase_offset_navigation::RuntimeV2PreparedStep prepared;
+  if (!runtime_->prepareV2(runtime_input, prepared)) {
+    staged.status = prepared.admission.status;
+    if (staged.status == phase_offset_navigation::TubeExecutionStatusV2::UNAVAILABLE) {
+      staged.status = phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT;
+    }
+    return fail(staged.status, prepared.invalid_reason.empty()
+                    ? "V2 Runtime admission was rejected"
+                    : prepared.invalid_reason);
+  }
+  phase_offset_navigation::RuntimeV2CommitToken token;
+  if (!runtime_->makeCommitTokenV2(prepared, token)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::RESERVE_UNAVAILABLE,
+                "V2 Runtime commit token could not be materialized");
+  }
+  staged.profile = profile_copy;
+  staged.prepared_step = std::move(prepared);
+  staged.binding_sequence = staged.prepared_step.identity.binding_sequence;
+  staged.commit_token = std::move(token);
+  try {
+    std::shared_ptr<TubeV2ExecutionBinding> binding(
+        new TubeV2ExecutionBinding());
+    binding->profile = profile_copy;
+    binding->source_input = source_owner;
+    const std::shared_ptr<const ContinuousPhasePath> path_owner =
+        std::static_pointer_cast<const ContinuousPhasePath>(
+            source_owner->path_owner);
+    if (!path_owner || path_owner->empty() ||
+        path_owner->pathRevision() != source.path_key.path_revision ||
+        path_owner->startW() != source.path_key.domain_start ||
+        path_owner->endW() != source.path_key.domain_end) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                  "V2 proposed path owner is incomplete");
+    }
+    binding->frame_owner =
+        std::make_shared<const ContinuousPhaseNormalFrame>(
+            path_owner, source.path_key.path_revision,
+            source.path_key.frame_revision);
+    binding->identity = staged.prepared_step.identity;
+    binding->valid = true;
+    if (!binding->complete()) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                  "V2 proposed execution binding is incomplete");
+    }
+    staged.proposed_binding =
+        std::shared_ptr<const TubeV2ExecutionBinding>(binding);
+  } catch (const std::exception&) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "V2 proposed execution binding could not be materialized");
+  }
+  staged.status = phase_offset_navigation::TubeExecutionStatusV2::ADMISSIBLE;
+  staged.applicable = true;
+  staged.prepared = true;
+  staged.reason.clear();
+  try {
+    candidate = std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+        std::move(staged));
+  } catch (const std::exception&) {
+    candidate.reset();
+    return false;
+  }
+  if (purpose == TubeWorkerPurposeV2::CURRENT) {
+    std::atomic_store_explicit(&retained_v2_shadow_admission_candidate_,
+                               candidate, std::memory_order_release);
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::prepareV2ShadowSuccessorAdmission(
+    const MatchedAdapterInput& input,
+    const TubeV2SuccessorHandoffEvidence& handoff,
+    const std::shared_ptr<const TubeWorkerCompletionV2>& completion,
+    std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate) {
+  candidate.reset();
+  TubeV2ShadowAdmissionCandidate staged;
+  staged.nonselecting = true;
+  staged.purpose = TubeWorkerPurposeV2::SUCCESSOR;
+  staged.source_path_key = handoff.source_path_key;
+  staged.copied_prefix_start_w = handoff.copied_prefix_start_w;
+  staged.copied_prefix_end_w = handoff.copied_prefix_end_w;
+
+  const auto fail = [&staged, &candidate](
+      const phase_offset_navigation::TubeExecutionStatusV2 status,
+      const std::string& reason) {
+    staged.status = status;
+    staged.reason = reason;
+    try {
+      candidate = std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+          std::move(staged));
+    } catch (const std::exception&) {
+      candidate.reset();
+    }
+    return false;
+  };
+
+  // The manager attests the copied prefix at construction time.  Admission
+  // additionally checks every immutable owner/key and the exact request
+  // pointer, so an independently coincident path cannot use the attestation.
+  if (!handoff.valid || !handoff.structurally_copied_prefix ||
+      handoff.expected_execution_generation == 0U ||
+      !handoff.source_path_key.complete() ||
+      !handoff.successor_path_key.complete() ||
+      handoff.source_path_key == handoff.successor_path_key ||
+      handoff.source_path_key.execution_generation !=
+          handoff.expected_execution_generation ||
+      handoff.successor_path_key.execution_generation !=
+          handoff.expected_execution_generation ||
+      !handoff.source_path_owner || !handoff.successor_path_owner ||
+      !handoff.successor_request || !handoff.successor_request->complete() ||
+      handoff.successor_request->path_key != handoff.successor_path_key ||
+      handoff.successor_request->path_owner.get() !=
+          handoff.successor_path_owner.get() ||
+      handoff.provenance.empty() ||
+      !IsFinite(handoff.phase_after_w) ||
+      !IsFinite(handoff.copied_prefix_start_w) ||
+      !IsFinite(handoff.copied_prefix_end_w) ||
+      handoff.phase_after_w != handoff.copied_prefix_start_w ||
+      !(handoff.copied_prefix_end_w > handoff.copied_prefix_start_w) ||
+      handoff.phase_after_w < handoff.source_path_key.domain_start ||
+      handoff.copied_prefix_end_w > handoff.source_path_key.domain_end ||
+      handoff.phase_after_w < handoff.successor_path_key.domain_start ||
+      handoff.copied_prefix_end_w > handoff.successor_path_key.domain_end ||
+      handoff.source_path_key.phase_orientation !=
+          handoff.successor_path_key.phase_orientation ||
+      handoff.source_path_key.frame_convention_id !=
+          handoff.successor_path_key.frame_convention_id ||
+      handoff.source_path_key.frame_convention !=
+          handoff.successor_path_key.frame_convention ||
+      handoff.source_path_owner->startW() !=
+          handoff.source_path_key.domain_start ||
+      handoff.source_path_owner->endW() !=
+          handoff.source_path_key.domain_end ||
+      handoff.source_path_owner->pathRevision() !=
+          handoff.source_path_key.path_revision ||
+      handoff.successor_path_owner->startW() !=
+          handoff.successor_path_key.domain_start ||
+      handoff.successor_path_owner->endW() !=
+          handoff.successor_path_key.domain_end ||
+      handoff.successor_path_owner->pathRevision() !=
+          handoff.successor_path_key.path_revision ||
+      handoff.successor_request->requested_start !=
+          handoff.copied_prefix_start_w ||
+      handoff.successor_request->anchor_w != handoff.phase_after_w ||
+      handoff.successor_request->requested_end <
+          handoff.copied_prefix_end_w) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "SUCCESSOR copied-prefix handoff is malformed");
+  }
+  const std::uint64_t generation =
+      task_generation_.load(std::memory_order_acquire);
+  if (handoff.expected_execution_generation != generation ||
+      handoff.successor_request->path_key.execution_generation != generation ||
+      !runtime_ || !v2_execution_binding_ ||
+      !v2_execution_binding_->complete() ||
+      v2_execution_binding_->profile->path_key != handoff.source_path_key ||
+      v2_execution_binding_->profile->path_owner.get() !=
+          handoff.source_path_owner.get() ||
+      v2_execution_binding_->source_input->path_key != handoff.source_path_key ||
+      v2_execution_binding_->source_input->path_owner.get() !=
+          handoff.source_path_owner.get() ||
+      !input.semantic_path_owner ||
+      input.semantic_path_owner.get() != handoff.source_path_owner.get()) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "SUCCESSOR source binding is stale or substituted");
+  }
+  if (!std::isfinite(input.path.w) ||
+      input.path.w < handoff.copied_prefix_start_w ||
+      input.path.w > handoff.copied_prefix_end_w) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::RANGE_UNAVAILABLE,
+                "live phase is outside the copied prefix");
+  }
+
+  ContinuousPhasePathState source_state;
+  ContinuousPhasePathState successor_state;
+  if (!handoff.source_path_owner->evaluate(input.path.w, source_state, false) ||
+      !handoff.successor_path_owner->evaluate(input.path.w, successor_state,
+                                               false) ||
+      !source_state.valid || !successor_state.valid ||
+      !source_state.p.allFinite() || !successor_state.p.allFinite() ||
+      !source_state.dp_dw.allFinite() || !successor_state.dp_dw.allFinite()) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "copied-prefix path evaluation is unavailable");
+  }
+  if (!BitsEqual(input.path.p, source_state.p) ||
+      !BitsEqual(input.path.p_w, source_state.dp_dw) ||
+      !BitsEqual(input.path.p_ww, source_state.d2p_dw2)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "live path state is not the installed source owner");
+  }
+
+  // Structural provenance is the authority for continuity.  These residuals
+  // are evaluated only as immutable diagnostics (and must be finite); using a
+  // sampled epsilon here would turn a copied-prefix proof into a numerical
+  // coincidence test.
+  staged.path_position_residual =
+      (successor_state.p - source_state.p).norm();
+  staged.path_derivative_residual =
+      (successor_state.dp_dw - source_state.dp_dw).norm();
+  const ContinuousPhaseNormalFrame source_frame(
+      handoff.source_path_owner, handoff.source_path_key.path_revision,
+      handoff.source_path_key.frame_revision);
+  const ContinuousPhaseNormalFrame successor_frame(
+      handoff.successor_path_owner,
+      handoff.successor_path_key.path_revision,
+      handoff.successor_path_key.frame_revision);
+  phase_offset_core::NormalFrameQuery source_normal;
+  phase_offset_core::NormalFrameQuery successor_normal;
+  if (!source_frame.query(input.path.w, source_normal) ||
+      !successor_frame.query(input.path.w, successor_normal) ||
+      !source_normal.valid || !successor_normal.valid) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "copied-prefix normal-frame evaluation is unavailable");
+  }
+  const double live_delta = runtime_->retainedDelta();
+  const phase_offset_core::PortCommand live_previous =
+      runtime_->previousFinalPort();
+  const Eigen::Vector3d source_r = source_state.p + source_normal.N * live_delta;
+  const Eigen::Vector3d successor_r =
+      successor_state.p + successor_normal.N * live_delta;
+  const Eigen::Vector3d source_rw =
+      source_state.dp_dw + source_normal.N_w * live_delta;
+  const Eigen::Vector3d successor_rw =
+      successor_state.dp_dw + successor_normal.N_w * live_delta;
+  guidance::ReferenceGeometry source_reference;
+  source_reference.point = source_r;
+  source_reference.tangent = source_normal.T;
+  source_reference.derivative_norm = source_rw.norm();
+  source_reference.valid = source_reference.point.allFinite() &&
+      source_reference.tangent.allFinite() &&
+      IsFinite(source_reference.derivative_norm);
+  guidance::IsfGuidance live_base;
+  if (!source_reference.valid ||
+      !guidance::IsfReferenceKernel::evaluate(
+          input.position, source_reference, input.gains, live_base) ||
+      !live_base.valid) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "copied-prefix live base guidance is unavailable");
+  }
+  const double nu = live_base.w_dot + live_previous.u_w;
+  const Eigen::Vector3d source_r_dot =
+      source_rw * nu + source_normal.N * live_previous.u_delta;
+  const Eigen::Vector3d successor_r_dot =
+      successor_rw * nu + successor_normal.N * live_previous.u_delta;
+  staged.reference_position_residual = (successor_r - source_r).norm();
+  staged.reference_derivative_residual =
+      (successor_r_dot - source_r_dot).norm();
+  if (!IsFinite(staged.path_position_residual) ||
+      !IsFinite(staged.path_derivative_residual) ||
+      !IsFinite(staged.reference_position_residual) ||
+      !IsFinite(staged.reference_derivative_residual) || !IsFinite(nu)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "copied-prefix continuity diagnostics are nonfinite");
+  }
+  // Structural copied-prefix provenance is the continuity proof.  Evaluated
+  // source/successor values may use different, mathematically equivalent
+  // representations and are retained only as finite residual diagnostics;
+  // bitwise coincidence is not an additional availability gate.
+  staged.copied_prefix_continuity_valid = true;
+
+  MatchedAdapterInput successor_input = input;
+  successor_input.path.p = successor_state.p;
+  successor_input.path.p_w = successor_state.dp_dw;
+  successor_input.path.p_ww = successor_state.d2p_dw2;
+  successor_input.path.w = input.path.w;
+  successor_input.path.path_revision =
+      handoff.successor_path_key.path_revision;
+  successor_input.path.frame_revision =
+      handoff.successor_path_key.frame_revision;
+  successor_input.path.T = successor_normal.T;
+  successor_input.path.N = successor_normal.N;
+  successor_input.path.N_w = successor_normal.N_w;
+  successor_input.path.frame_valid = true;
+  successor_input.path.frame_provenance = successor_normal.provenance;
+  successor_input.path.valid = true;
+  successor_input.semantic_path_owner = handoff.successor_path_owner;
+  successor_input.semantic_path_start_w =
+      handoff.successor_path_key.domain_start;
+  successor_input.semantic_path_end_w = handoff.successor_path_key.domain_end;
+  if (!prepareV2ShadowAdmission(
+          successor_input, handoff.successor_request, completion,
+                                candidate, TubeWorkerPurposeV2::SUCCESSOR) ||
+      !candidate) {
+    return false;
+  }
+  // Preserve the continuity evidence while retaining the immutable candidate
+  // produced by the common K/command/reserve preparation path.
+  TubeV2ShadowAdmissionCandidate enriched = *candidate;
+  enriched.purpose = TubeWorkerPurposeV2::SUCCESSOR;
+  enriched.nonselecting = candidate->nonselecting;
+  enriched.source_path_key = handoff.source_path_key;
+  enriched.copied_prefix_start_w = handoff.copied_prefix_start_w;
+  enriched.copied_prefix_end_w = handoff.copied_prefix_end_w;
+  enriched.copied_prefix_continuity_valid = true;
+  enriched.path_position_residual = staged.path_position_residual;
+  enriched.path_derivative_residual = staged.path_derivative_residual;
+  enriched.reference_position_residual = staged.reference_position_residual;
+  enriched.reference_derivative_residual = staged.reference_derivative_residual;
+  if (!enriched.prepared || !enriched.applicable ||
+      !enriched.prepared_step.valid ||
+      !enriched.prepared_step.admission.valid ||
+      !enriched.prepared_step.admission.successor_reserve.valid ||
+      enriched.prepared_step.expected_current.w <
+          handoff.copied_prefix_start_w ||
+      enriched.prepared_step.expected_current.w >
+          handoff.copied_prefix_end_w ||
+      enriched.prepared_step.successor.w < handoff.copied_prefix_start_w ||
+      enriched.prepared_step.successor.w > handoff.copied_prefix_end_w) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::RANGE_UNAVAILABLE,
+                "SUCCESSOR first held step crosses copied-prefix seam");
+  }
+  try {
+    candidate = std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+        std::move(enriched));
+  } catch (const std::exception&) {
+    candidate.reset();
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::prepareV2ShadowIncumbentApplicability(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>&
+        incumbent,
+    std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate,
+    phase_offset_navigation::RecoveryPreparedStep* recovery_step,
+    const bool force_reserve) {
+  candidate.reset();
+  if (recovery_step) *recovery_step = phase_offset_navigation::RecoveryPreparedStep();
+
+  TubeV2ShadowAdmissionCandidate staged;
+  staged.nonselecting = true;
+  staged.profile = incumbent;
+  const auto fail = [&staged, &candidate](
+      const phase_offset_navigation::TubeExecutionStatusV2 status,
+      const std::string& reason) {
+    staged.status = status;
+    staged.reason = reason;
+    try {
+      candidate = std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+          std::move(staged));
+    } catch (const std::exception&) {
+      candidate.reset();
+    }
+    return false;
+  };
+  if (!incumbent) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::PROFILE_UNAVAILABLE,
+                "installed V2 incumbent is unavailable");
+  }
+  staged.request_id = incumbent->request_id;
+  staged.execution_generation = incumbent->path_key.execution_generation;
+  staged.accepted_state_demand = incumbent->map_capture_key.accepted_sequence;
+  staged.path_key = incumbent->path_key;
+  staged.configuration_key = incumbent->configuration_key;
+  staged.map_capture_key = incumbent->map_capture_key;
+  if (!runtime_ || !incumbent->structurallyValid() || !incumbent->complete ||
+      !incumbent->path_key.complete() || !incumbent->map_capture_key.complete() ||
+      !incumbent->map_capture_key.complete_support ||
+      incumbent->path_key.execution_generation !=
+          task_generation_.load(std::memory_order_acquire)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::PROFILE_UNAVAILABLE,
+                "installed V2 incumbent is incomplete or stale");
+  }
+
+  const MatchedAdapterInput::TubeV2AdmissionEvidence& evidence =
+      input.tube_v2_admission;
+  if (!evidence.valid || evidence.binding_sequence == 0U ||
+      !IsFinite(evidence.now) || !IsFinite(input.dt) || input.dt <= 0.0 ||
+      evidence.provenance.empty()) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "incumbent applicability evidence is unavailable");
+  }
+  if (!v2_execution_binding_ || !v2_execution_binding_->complete() ||
+      v2_execution_binding_->profile != incumbent ||
+      v2_execution_binding_->identity.binding_sequence !=
+          evidence.binding_sequence) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "incumbent execution binding is stale or substituted");
+  }
+
+  // Reconstruct one observed key and run the same semantic refresh predicate
+  // used by worker coalescing.  All support/grid authority stays bound to the
+  // incumbent; only accepted-state identity/time may advance.
+  phase_offset_navigation::TubeMapCaptureKey observed =
+      incumbent->map_capture_key;
+  observed.map_instance_id = evidence.latest_map_instance_id;
+  observed.state_id = evidence.latest_accepted_state_sequence;
+  observed.accepted_sequence = evidence.latest_accepted_state_sequence;
+  observed.configuration_generation = evidence.latest_configuration_generation;
+  observed.configuration_id = evidence.latest_configuration_key;
+  observed.frame_provenance = evidence.latest_frame_provenance;
+  observed.support_provenance_id = evidence.latest_support_provenance_id;
+  observed.accepted_time_ticks = evidence.latest_accepted_time_ticks;
+  observed.support_expiry_ticks = evidence.support_expiry_ticks;
+  observed.support_expiry_timeless = evidence.support_expiry_timeless;
+  const bool support_expiry_compatible =
+      incumbent->map_capture_key.support_expiry_timeless
+          ? evidence.support_expiry_timeless &&
+                evidence.support_expiry_ticks == 0U
+          : !evidence.support_expiry_timeless &&
+                evidence.support_expiry_ticks >=
+                    incumbent->map_capture_key.support_expiry_ticks;
+  if (evidence.latest_map_instance_id != evidence.map_instance_id ||
+      evidence.latest_configuration_generation !=
+          evidence.configuration_generation ||
+      evidence.latest_configuration_key != evidence.configuration_key ||
+      evidence.latest_support_provenance_id != evidence.support_provenance_id ||
+      evidence.latest_frame_provenance != evidence.frame_provenance ||
+      evidence.latest_accepted_state_sequence <
+          evidence.accepted_state_sequence ||
+      evidence.latest_accepted_state_notification_sequence <
+          evidence.latest_accepted_state_sequence ||
+      evidence.latest_accepted_time_ticks < evidence.accepted_time_ticks ||
+      !support_expiry_compatible ||
+      (observed != incumbent->map_capture_key &&
+       !V2MapRefreshAuthorityCompatible(
+           incumbent->map_capture_key, observed))) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                "incumbent accepted-map authority is incompatible");
+  }
+  if (!incumbent->applicability_deadline_timeless &&
+      (evidence.now >= static_cast<double>(
+           incumbent->applicability_deadline_ticks) ||
+       evidence.latest_accepted_time_ticks >=
+           incumbent->applicability_deadline_ticks)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::DEADLINE_EXPIRED,
+                "incumbent applicability deadline expired");
+  }
+  if (!incumbent->map_capture_key.support_expiry_timeless &&
+      (evidence.now >= static_cast<double>(
+           incumbent->map_capture_key.support_expiry_ticks) ||
+       evidence.latest_accepted_time_ticks >=
+           incumbent->map_capture_key.support_expiry_ticks)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::DEADLINE_EXPIRED,
+                "incumbent map support applicability expired");
+  }
+
+  staged.binding_sequence = evidence.binding_sequence;
+  staged.accepted_update_visible = observed != incumbent->map_capture_key;
+  staged.accepted_update_compatible = !staged.accepted_update_visible ||
+      incumbent->map_capture_key.complete_support;
+  staged.latest_accepted_state_sequence =
+      evidence.latest_accepted_state_sequence;
+  staged.latest_accepted_state_notification_sequence =
+      evidence.latest_accepted_state_notification_sequence;
+  staged.latest_accepted_time_ticks = evidence.latest_accepted_time_ticks;
+  staged.latest_map_instance_id = evidence.latest_map_instance_id;
+  staged.latest_configuration_generation =
+      evidence.latest_configuration_generation;
+  staged.latest_configuration_key = evidence.latest_configuration_key;
+  staged.latest_support_provenance_id = evidence.latest_support_provenance_id;
+  staged.latest_frame_provenance = evidence.latest_frame_provenance;
+  staged.purpose = TubeWorkerPurposeV2::CURRENT;
+  staged.proposed_binding = v2_execution_binding_;
+  staged.nonselecting = config_.observe_only || !zero_gate_open_ ||
+      failure_latched_;
+
+  phase_offset_core::PhaseOffsetGeometryState live_geometry;
+  guidance::IsfGuidance live_base;
+  phase_offset_navigation::NormalPreviewResult live_preview;
+  phase_offset_navigation::PhaseOffsetAllocatorResult live_allocator;
+  Eigen::Vector3d live_g_des = Eigen::Vector3d::Zero();
+  std::string normal_reason;
+  const bool normal_allocator_available = evaluateV2NormalAllocator(
+      input, incumbent, live_geometry, live_base, live_preview,
+      live_allocator, live_g_des, normal_reason);
+  staged.g_des = live_g_des;
+  staged.g_des_valid = live_g_des.allFinite();
+  staged.normal_preview = live_preview;
+  staged.allocator = live_allocator;
+  staged.allocator_evaluated = true;
+
+  phase_offset_navigation::RuntimeV2PreparedStep prepared;
+  const phase_offset_navigation::RecoveryOwnerStatus& recovery_status =
+      recovery_owner_.status();
+  const phase_offset_navigation::TubeFiniteReserveV2* runtime_reserve =
+      runtime_->committedV2Reserve();
+  const bool recovery_running = recovery_status.active &&
+      recovery_status.proof_kind ==
+          phase_offset_navigation::RecoveryStepProofKind::FINITE_RESERVE_V2 &&
+      recovery_status.reserve_cursor < recovery_status.reserve_size;
+  if (recovery_running &&
+      (!runtime_reserve ||
+       runtime_reserve->reserve_id != recovery_status.reserve_id ||
+       runtime_reserve->cursor != recovery_status.reserve_cursor ||
+       runtime_reserve->steps.size() != recovery_status.reserve_size)) {
+    return fail(phase_offset_navigation::TubeExecutionStatusV2::
+                    RESERVE_UNAVAILABLE,
+                "running V2 recovery reserve identity is stale");
+  }
+  if (!force_reserve && !recovery_running && normal_allocator_available) {
+    MatchedAdapterInput::TubeV2AdmissionEvidence live_evidence = evidence;
+    if (!PopulateV2LiveCommandEvidence(
+            config_, live_geometry, live_base, live_allocator.selected_u,
+            live_evidence)) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::INVALID_INPUT,
+                  "incumbent live command evidence is unavailable");
+    }
+    phase_offset_navigation::RuntimeV2PrepareInput runtime_input =
+        MakeV2RuntimePrepareInput(input, incumbent, live_evidence, true,
+                                  runtime_->retainedDelta(),
+                                  runtime_->previousFinalPort());
+    if (runtime_->dryRunV2(runtime_input, prepared) && prepared.valid &&
+        runtime_->makeCommitTokenV2(prepared, staged.commit_token)) {
+      staged.prepared_step = std::move(prepared);
+      staged.status =
+          phase_offset_navigation::TubeExecutionStatusV2::ADMISSIBLE;
+      staged.applicable = true;
+      staged.prepared = true;
+      try {
+        candidate = std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+            std::move(staged));
+      } catch (const std::exception&) {
+        candidate.reset();
+        return false;
+      }
+      return true;
+    }
+  }
+
+  // The P10 execution guard is the single owner of the audited tracking and
+  // physical-tangent predicate.  A violation denies stale offset execution;
+  // it cannot be reclassified as an applicable certified recovery merely
+  // because an older reserve value is still stored in Runtime.
+  if (normal_allocator_available && !recovery_running &&
+      prepared.admission.status ==
+      phase_offset_navigation::TubeExecutionStatusV2::TRACKING_UNAVAILABLE) {
+    return fail(prepared.admission.status,
+                prepared.invalid_reason.empty()
+                    ? "incumbent tracking contract is unavailable"
+                    : prepared.invalid_reason);
+  }
+
+  if (recovery_step && runtime_reserve) {
+    const phase_offset_navigation::TubeFiniteReserveV2& committed_reserve =
+        *runtime_reserve;
+    const std::size_t cursor = committed_reserve.cursor;
+    if (cursor >= committed_reserve.steps.size()) {
+      return fail(
+          phase_offset_navigation::TubeExecutionStatusV2::RESERVE_UNAVAILABLE,
+          "committed V2 reserve cursor is exhausted");
+    }
+    const phase_offset_navigation::TubeReserveStepV2& reserve_step =
+        committed_reserve.steps[cursor];
+    MatchedAdapterInput::TubeV2AdmissionEvidence recovery_evidence = evidence;
+    if (!PopulateV2LiveCommandEvidence(
+            config_, live_geometry, live_base, reserve_step.command,
+            recovery_evidence) ||
+        !BitsEqual(live_base.w_dot, reserve_step.base_phase_rate) ||
+        !recovery_evidence.tracking.valid ||
+        recovery_evidence.tracking.error_norm >
+            recovery_evidence.tracking.error_bound) {
+      return fail(phase_offset_navigation::TubeExecutionStatusV2::
+                      TRACKING_UNAVAILABLE,
+                  "incumbent reserve live geometry, rate, or tracking is unavailable");
+    }
+    const phase_offset_navigation::RuntimeV2PrepareInput runtime_input =
+        MakeV2RuntimePrepareInput(input, incumbent, recovery_evidence, true,
+                                  runtime_->retainedDelta(),
+                                  runtime_->previousFinalPort());
+    phase_offset_navigation::CertifiedReservePrepareInputV2 recovery_input;
+    recovery_input.recovery_session = incumbent->path_key.execution_generation;
+    recovery_input.reserve = committed_reserve;
+    recovery_input.expected_identity = recovery_input.reserve.identity;
+    recovery_input.cursor = recovery_input.reserve.cursor;
+    recovery_input.expected_state.w = input.path.w;
+    recovery_input.expected_state.delta = runtime_->retainedDelta();
+    recovery_input.expected_state.previous_u = runtime_->previousFinalPort();
+    recovery_input.dt = input.dt;
+    recovery_input.now = evidence.now;
+    recovery_input.deadline = runtime_input.applicability_deadline;
+    recovery_input.deadline_valid = runtime_input.applicability_deadline_valid;
+    recovery_input.provenance =
+        "PhaseOffsetMatchedAdapter/V2/incumbent-reserve";
+    if (recovery_owner_.prepareCertifiedReserveV2(
+            recovery_input, *recovery_step)) {
+      if (recovery_step->reserve_cursor != cursor) {
+        return fail(
+            phase_offset_navigation::TubeExecutionStatusV2::
+                RESERVE_UNAVAILABLE,
+            "committed V2 reserve cursor changed during preparation");
+      }
+      // Materialize the exact post-publication Runtime value while every
+      // operation may still fail.  The finite schedule itself is unchanged;
+      // only its immutable consumption cursor advances by one step.
+      phase_offset_navigation::TubeFiniteReserveV2 advanced_reserve =
+          committed_reserve;
+      advanced_reserve.cursor = cursor + 1U;
+      std::string reserve_reason;
+      if (!phase_offset_navigation::TubeExecutionGuardV2::validateReserve(
+              advanced_reserve, &reserve_reason)) {
+        return fail(
+            phase_offset_navigation::TubeExecutionStatusV2::
+                RESERVE_UNAVAILABLE,
+            reserve_reason.empty()
+                ? "advanced V2 reserve is invalid" : reserve_reason);
+      }
+      phase_offset_navigation::RuntimeV2PreparedStep recovery_prepared;
+      recovery_prepared.admission.valid = true;
+      recovery_prepared.admission.status =
+          phase_offset_navigation::TubeExecutionStatusV2::ADMISSIBLE;
+      recovery_prepared.admission.identity = committed_reserve.identity;
+      recovery_prepared.admission.current = reserve_step.before;
+      recovery_prepared.admission.successor = reserve_step.after;
+      recovery_prepared.admission.successor_reserve = advanced_reserve;
+      recovery_prepared.admission.live_k.min_width = 0.0;
+      recovery_prepared.admission.provenance = recovery_input.provenance;
+      recovery_prepared.profile = incumbent;
+      recovery_prepared.identity = committed_reserve.identity;
+      recovery_prepared.expected_identity = recovery_prepared.identity;
+      recovery_prepared.binding_transition = false;
+      recovery_prepared.expected_current = reserve_step.before;
+      recovery_prepared.successor = reserve_step.after;
+      recovery_prepared.selected_u = reserve_step.command;
+      recovery_prepared.preview_policy = runtime_input.preview_policy;
+      recovery_prepared.limits = runtime_input.limits;
+      recovery_prepared.tracking = runtime_input.tracking;
+      recovery_prepared.base_phase_rate = reserve_step.base_phase_rate;
+      recovery_prepared.phase_rate_lower =
+          reserve_step.phase_rate_lower - reserve_step.command.u_w;
+      recovery_prepared.phase_rate_upper =
+          reserve_step.phase_rate_upper - reserve_step.command.u_w;
+      recovery_prepared.horizon_w = incumbent->certified_end;
+      recovery_prepared.sample_spacing_w = runtime_input.sample_spacing_w;
+      recovery_prepared.upper_u_delta = runtime_input.upper_u_delta;
+      recovery_prepared.dt = committed_reserve.dt;
+      recovery_prepared.now = runtime_input.now;
+      recovery_prepared.applicability_deadline =
+          runtime_input.applicability_deadline_valid
+              ? runtime_input.applicability_deadline : 0.0;
+      recovery_prepared.applicability_deadline_valid =
+          runtime_input.applicability_deadline_valid;
+      recovery_prepared.max_work = runtime_input.max_work;
+      recovery_prepared.provenance = recovery_input.provenance;
+      try {
+        recovery_prepared.reserve_owner =
+            std::make_shared<const phase_offset_navigation::TubeFiniteReserveV2>(
+                advanced_reserve);
+      } catch (const std::exception&) {
+        return fail(
+            phase_offset_navigation::TubeExecutionStatusV2::
+                RESERVE_UNAVAILABLE,
+            "advanced V2 reserve owner could not be materialized");
+      }
+      recovery_prepared.valid = true;
+      if (!runtime_->makeCommitTokenV2(recovery_prepared,
+                                       staged.commit_token)) {
+        return fail(
+            phase_offset_navigation::TubeExecutionStatusV2::
+                RESERVE_UNAVAILABLE,
+            "V2 recovery Runtime token could not be sealed");
+      }
+      staged.prepared_step = std::move(recovery_prepared);
+      staged.recovery_step = *recovery_step;
+      staged.prepared = true;
+      staged.nonselecting = false;
+    }
+  }
+  return fail(phase_offset_navigation::TubeExecutionStatusV2::COMMAND_INFEASIBLE,
+              !prepared.invalid_reason.empty()
+                  ? prepared.invalid_reason
+                  : (!normal_reason.empty()
+                         ? normal_reason
+                         : "incumbent next command or exact successor is unavailable"));
+}
+
+bool PhaseOffsetMatchedAdapter::stageV2ShadowBootstrapLocked(
+    const MatchedAdapterInput& input,
+    const phase_offset_navigation::TubeBuildInputV2& source,
+    const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate) {
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL ||
+      config_.observe_only || !runtime_ ||
+      pending_v2_shadow_bootstrap_candidate_ ||
+      !candidate || !candidate->applicable ||
+      !candidate->prepared || candidate->nonselecting ||
+      candidate->status != phase_offset_navigation::TubeExecutionStatusV2::ADMISSIBLE ||
+      !candidate->profile || !candidate->commit_token.valid ||
+      !candidate->commit_token.sealed_prepared ||
+      candidate->commit_token.sealed_prepared->profile != candidate->profile ||
+      !candidate->proposed_binding ||
+      !candidate->proposed_binding->complete() ||
+      candidate->proposed_binding->profile != candidate->profile ||
+      candidate->proposed_binding->source_input.get() != &source ||
+      candidate->request_id != source.request_id ||
+      candidate->path_key != source.path_key ||
+      candidate->configuration_key != source.configuration_key ||
+      candidate->map_capture_key != source.map_capture_key ||
+      candidate->execution_generation != source.path_key.execution_generation ||
+      source.path_key.execution_generation !=
+          task_generation_.load(std::memory_order_acquire) ||
+      !source.complete() || failure_latched_) {
+    return false;
+  }
+  const phase_offset_navigation::RuntimeV2PreparedStep& sealed =
+      *candidate->commit_token.sealed_prepared;
+  if (!sealed.valid ||
+      !SameV2ExecutionIdentity(
+          sealed.identity, candidate->proposed_binding->identity) ||
+      !BitsEqual(runtime_->retainedDelta(), sealed.expected_current.delta) ||
+      !BitsEqual(runtime_->previousFinalPort(),
+                 sealed.expected_current.previous_u) ||
+      !BitsEqual(input.path.w, sealed.expected_current.w)) {
+    return false;
+  }
+  if (v2_execution_binding_) {
+    if (!v2_execution_binding_->complete()) return false;
+    const bool same_identity = SameV2ExecutionIdentity(
+        sealed.identity, v2_execution_binding_->identity);
+    if ((same_identity && sealed.binding_transition) ||
+        (!same_identity &&
+         (!sealed.binding_transition ||
+          !SameV2ExecutionIdentity(
+              sealed.expected_identity, v2_execution_binding_->identity)))) {
+      return false;
+    }
+    pending_v2_shadow_bootstrap_candidate_ = candidate;
+    if (!validatePendingV2ShadowBootstrapLocked(nullptr)) {
+      pending_v2_shadow_bootstrap_candidate_.reset();
+      return false;
+    }
+    return true;
+  }
+  const auto exact_zero = [](const double value) {
+    return std::isfinite(value) && value == 0.0;
+  };
+  if (!exact_zero(runtime_->retainedDelta()) ||
+      runtime_->hasExecutedOffsetAuthority()) {
+    return false;
+  }
+  const phase_offset_core::PortCommand previous =
+      runtime_->previousFinalPort();
+  if (!exact_zero(previous.u_w) || !exact_zero(previous.u_delta)) return false;
+  if (execution_authority_.snapshot().valid) {
+    return false;
+  }
+  if (!std::isfinite(input.path.w) ||
+      !candidate->prepared_step.expected_current.finite() ||
+      candidate->prepared_step.expected_current.w != input.path.w ||
+      candidate->prepared_step.expected_current.delta != 0.0 ||
+      !exact_zero(candidate->prepared_step.expected_current.previous_u.u_w) ||
+      !exact_zero(candidate->prepared_step.expected_current.previous_u.u_delta)) {
+    return false;
+  }
+  pending_v2_shadow_bootstrap_candidate_ = candidate;
+  if (!validatePendingV2ShadowBootstrapLocked(nullptr)) {
+    pending_v2_shadow_bootstrap_candidate_.reset();
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::stageV2ShadowRecoveryLocked(
+    const MatchedAdapterInput& input,
+    const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate) {
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL ||
+      config_.observe_only || !runtime_ ||
+      pending_v2_shadow_bootstrap_candidate_ || !v2_execution_binding_ ||
+      !candidate || candidate->profile != v2_execution_binding_->profile ||
+      candidate->applicable || candidate->nonselecting ||
+      !candidate->prepared || !candidate->recovery_step.valid ||
+      candidate->recovery_step.proof_kind !=
+          phase_offset_navigation::RecoveryStepProofKind::FINITE_RESERVE_V2 ||
+      !candidate->commit_token.valid ||
+      !candidate->commit_token.sealed_prepared ||
+      candidate->execution_generation !=
+          task_generation_.load(std::memory_order_acquire) ||
+      !IsFinite(input.path.w) ||
+      !BitsEqual(input.path.w, candidate->recovery_step.current_w) ||
+      !recovery_owner_.validateCommit(candidate->recovery_step)) {
+    return false;
+  }
+  pending_v2_shadow_bootstrap_candidate_ = candidate;
+  if (!validatePendingV2ShadowBootstrapLocked(nullptr)) {
+    pending_v2_shadow_bootstrap_candidate_.reset();
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::stageV2ShadowSuccessorLocked(
+    const MatchedAdapterInput& input,
+    const TubeV2SuccessorHandoffEvidence& handoff,
+    const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& candidate) {
+  if (!runtime_ || pending_v2_shadow_bootstrap_candidate_ ||
+      !v2_execution_binding_ || !v2_execution_binding_->complete() ||
+      !candidate || !candidate->applicable || !candidate->prepared ||
+      candidate->nonselecting ||
+      candidate->purpose != TubeWorkerPurposeV2::SUCCESSOR ||
+      !candidate->copied_prefix_continuity_valid ||
+      !candidate->proposed_binding ||
+      !candidate->proposed_binding->complete() ||
+      !candidate->prepared_step.binding_transition ||
+      !candidate->commit_token.valid ||
+      !candidate->commit_token.sealed_prepared ||
+      candidate->commit_token.sealed_prepared->profile != candidate->profile ||
+      candidate->proposed_binding->profile != candidate->profile ||
+      candidate->proposed_binding->source_input != handoff.successor_request ||
+      candidate->source_path_key != handoff.source_path_key ||
+      candidate->path_key != handoff.successor_path_key ||
+      v2_execution_binding_->profile->path_key != handoff.source_path_key ||
+      !SameV2ExecutionIdentity(
+          v2_execution_binding_->identity,
+          candidate->prepared_step.expected_identity) ||
+      !SameV2ExecutionIdentity(
+          candidate->proposed_binding->identity,
+          candidate->prepared_step.identity) ||
+      candidate->execution_generation !=
+          task_generation_.load(std::memory_order_acquire) ||
+      !BitsEqual(input.path.w,
+                 candidate->prepared_step.expected_current.w) ||
+      !BitsEqual(runtime_->retainedDelta(),
+                 candidate->prepared_step.expected_current.delta) ||
+      !BitsEqual(runtime_->previousFinalPort(),
+                 candidate->prepared_step.expected_current.previous_u) ||
+      failure_latched_) {
+    return false;
+  }
+  pending_v2_shadow_bootstrap_candidate_ = candidate;
+  if (!validatePendingV2ShadowBootstrapLocked(nullptr)) {
+    pending_v2_shadow_bootstrap_candidate_.reset();
+    return false;
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::prepareV2ExecutionAuthorityLocked(
+    const MatchedAdapterInput& input,
+    const MatchedAdapterOutput& output,
+    const phase_offset_navigation::ActiveReferenceOwnerMode owner_mode,
+    const std::shared_ptr<const TubeV2ExecutionBinding>& binding,
+    TubeV2ShadowAdmissionCandidate& candidate,
+    std::string* reason) {
+  if (reason) reason->clear();
+  const auto fail = [reason](const std::string& text) {
+    if (reason) *reason = text;
+    return false;
+  };
+  candidate.authority_prepared =
+      phase_offset_navigation::AuthorityPreparedStep();
+  if (!runtime_ || !binding || !binding->complete() ||
+      !candidate.prepared || !candidate.commit_token.valid ||
+      !candidate.commit_token.sealed_prepared ||
+      candidate.profile != binding->profile || !output.selected ||
+      !output.valid || !output.matched.valid || !output.guidance.valid ||
+      !output.base_guidance.valid || !output.geometry.valid) {
+    return fail("V2 authority input is incomplete");
+  }
+  const phase_offset_navigation::RuntimeV2PreparedStep& prepared =
+      *candidate.commit_token.sealed_prepared;
+  if (!prepared.valid || prepared.profile != binding->profile ||
+      !prepared.expected_current.finite() || !prepared.successor.finite() ||
+      !BitsEqual(prepared.expected_current.w, output.geometry.w) ||
+      !BitsEqual(prepared.expected_current.delta, output.delta) ||
+      !BitsEqual(prepared.selected_u, output.projection.final_port) ||
+      !BitsEqual(prepared.dt, input.dt)) {
+    return fail("V2 authority state or selected command was substituted");
+  }
+
+  const std::shared_ptr<const ContinuousPhasePath> path_owner =
+      std::static_pointer_cast<const ContinuousPhasePath>(
+          binding->source_input->path_owner);
+  if (!path_owner || path_owner->empty() ||
+      path_owner->pathRevision() != binding->profile->path_key.path_revision) {
+    return fail("V2 authority path owner is unavailable");
+  }
+  const std::uint64_t query_revision = binding->profile->profile_id;
+  const std::uint64_t owner_revision =
+      binding->identity.binding_sequence != 0U
+          ? binding->identity.binding_sequence
+          : binding->identity.execution_generation;
+  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr query;
+  try {
+    query = phase_offset_navigation::ImmutableExecutedReferenceQueryPtr(
+        new PhaseOffsetExecutedReferenceQuery(
+            path_owner, prepared.expected_current.delta,
+            binding->frame_owner, binding->profile->path_key.path_revision,
+            binding->profile->path_key.frame_revision, owner_revision,
+            query_revision));
+  } catch (const std::exception&) {
+    return fail("V2 immutable executed-reference query allocation failed");
+  }
+  phase_offset_navigation::ExecutedReferenceQueryResult reference;
+  phase_offset_core::NormalFrameQuery frame;
+  if (!query ||
+      !query->query(prepared.expected_current.w, reference) ||
+      !reference.valid ||
+      !binding->frame_owner->query(prepared.expected_current.w, frame) ||
+      !frame.valid) {
+    return fail("V2 immutable executed-reference query failed");
+  }
+
+  const phase_offset_navigation::ActiveReferenceSnapshot current =
+      execution_authority_.snapshot();
+  phase_offset_navigation::ActiveReferenceSnapshot snapshot;
+  snapshot.authority_session = current.valid
+      ? current.authority_session
+      : task_generation_.load(std::memory_order_acquire);
+  snapshot.planner_path_revision = input.path.path_revision != 0U
+      ? input.path.path_revision : binding->profile->path_key.path_revision;
+  snapshot.executed_path_revision = query->pathRevision();
+  snapshot.frame_revision = query->frameRevision();
+  snapshot.tube_revision = binding->profile->profile_id;
+  snapshot.profile_revision = binding->profile->profile_id;
+  snapshot.map_revision = binding->profile->map_capture_key.state_id;
+  snapshot.obstacle_contract_id =
+      "phase_offset_navigation/tube_certificate_v2";
+  snapshot.owner_mode = owner_mode;
+  snapshot.selected_u_owner = owner_mode ==
+          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY
+      ? "PhaseOffsetRecoveryOwner"
+      : phase_offset_navigation::PhaseOffsetAllocator::ownerName();
+  snapshot.w = prepared.expected_current.w;
+  snapshot.delta = prepared.expected_current.delta;
+  snapshot.dt = prepared.dt;
+  snapshot.u_prev = prepared.expected_current.previous_u;
+  snapshot.selected_u = prepared.selected_u;
+  snapshot.selected_u_w = prepared.selected_u.u_w;
+  snapshot.selected_u_delta = prepared.selected_u.u_delta;
+  snapshot.proposed_next_w = prepared.successor.w;
+  snapshot.proposed_next_delta = prepared.successor.delta;
+  snapshot.proposed_next_u_prev = prepared.successor.previous_u;
+  snapshot.r = reference.r;
+  snapshot.r_w = reference.r_w;
+  snapshot.r_ww = reference.r_ww;
+  snapshot.r_ww_valid = reference.r_ww_valid;
+  snapshot.matched_base_v_cmd = output.base_guidance.v_cmd;
+  snapshot.matched_base_w_dot = output.base_guidance.w_dot;
+  snapshot.executed_N = frame.N;
+  snapshot.executed_reference_query = query;
+  snapshot.reference_query_revision = query->queryRevision();
+  snapshot.provenance = owner_mode ==
+          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY
+      ? "PhaseOffsetMatchedAdapter/V2/recovery"
+      : (candidate.purpose == TubeWorkerPurposeV2::SUCCESSOR
+             ? "PhaseOffsetMatchedAdapter/V2/successor"
+             : "PhaseOffsetMatchedAdapter/V2/normal");
+  snapshot.safety_status = owner_mode ==
+          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY
+      ? "SAFETY_PRIORITY" : "SAFE";
+  snapshot.handoff_state = candidate.purpose ==
+          TubeWorkerPurposeV2::SUCCESSOR
+      ? "COPIED_PREFIX_SUCCESSOR" : "V2_BOUND";
+  snapshot.valid = true;
+
+  phase_offset_navigation::AuthorityPrepareInput authority_input;
+  authority_input.candidate = snapshot;
+  if (current.valid) {
+    authority_input.expected_authority_session = current.authority_session;
+    authority_input.expected_sequence = current.sequence;
+  }
+  authority_input.matched_output_valid = true;
+  authority_input.reference_valid = snapshot.governorViewValid();
+  authority_input.provenance = snapshot.provenance;
+  if (!execution_authority_.prepare(
+          authority_input, candidate.authority_prepared)) {
+    return fail(candidate.authority_prepared.failure_reason.empty()
+                    ? "V2 execution authority rejected the command"
+                    : candidate.authority_prepared.failure_reason);
+  }
+  return true;
+}
+
+bool PhaseOffsetMatchedAdapter::validatePendingV2ShadowBootstrapLocked(
+    std::string* reason) const {
+  if (reason) reason->clear();
+  const auto fail = [reason](const char* text) {
+    if (reason) *reason = text;
+    return false;
+  };
+  const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& pending =
+      pending_v2_shadow_bootstrap_candidate_;
+  if (!pending) return true;
+  const bool recovery = pending->recovery_step.valid &&
+      pending->recovery_step.proof_kind ==
+          phase_offset_navigation::RecoveryStepProofKind::FINITE_RESERVE_V2;
+  const bool successor = pending->purpose == TubeWorkerPurposeV2::SUCCESSOR &&
+      pending->prepared_step.binding_transition;
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL ||
+      config_.observe_only || !runtime_ ||
+      !pending->prepared || !pending->profile ||
+      !pending->commit_token.valid || !pending->commit_token.sealed_prepared ||
+      pending->commit_token.sealed_prepared->profile != pending->profile) {
+    return fail("pending V2 transaction is unavailable");
+  }
+  if (failure_latched_) {
+    return fail("pending V2 transaction was retired by a control failure");
+  }
+  if (!pending->authority_prepared.valid ||
+      !pending->authority_prepared.committed_snapshot ||
+      !pending->authority_prepared.committed_snapshot->governorViewValid()) {
+    return fail("pending V2 execution authority is unavailable");
+  }
+  std::string authority_reason;
+  if (!execution_authority_.finalValidate(
+          pending->authority_prepared, &authority_reason)) {
+    return fail("pending V2 execution authority changed");
+  }
+  if (recovery) {
+    const phase_offset_navigation::TubeFiniteReserveV2* committed =
+        runtime_->committedV2Reserve();
+    const phase_offset_navigation::RecoveryPreparedStep& step =
+        pending->recovery_step;
+    const phase_offset_navigation::RuntimeV2PreparedStep& sealed =
+        *pending->commit_token.sealed_prepared;
+    if (pending->nonselecting || pending->applicable ||
+        !v2_execution_binding_ ||
+        v2_execution_binding_->profile != pending->profile || !committed ||
+        step.reserve_id != committed->reserve_id ||
+        step.reserve_cursor != committed->cursor ||
+        step.reserve_size != committed->steps.size() ||
+        step.reserve_cursor >= committed->steps.size() ||
+        !step.selectedUExact() || !step.committed_status ||
+        !recovery_owner_.validateCommit(step) ||
+        !sealed.valid || sealed.profile != pending->profile ||
+        !sealed.reserve_owner ||
+        !sealed.identity.complete() ||
+        sealed.identity.profile_id != pending->profile->profile_id ||
+        sealed.identity.execution_generation != pending->execution_generation ||
+        sealed.identity.binding_sequence != pending->binding_sequence ||
+        !sealed.expected_current.finite() ||
+        !sealed.successor.finite() ||
+        !BitsEqual(sealed.expected_current.w,
+                   committed->steps[committed->cursor].before.w) ||
+        !BitsEqual(sealed.expected_current.delta,
+                   committed->steps[committed->cursor].before.delta) ||
+        !BitsEqual(sealed.expected_current.previous_u,
+                   committed->steps[committed->cursor].before.previous_u) ||
+        !BitsEqual(sealed.successor.w,
+                   committed->steps[committed->cursor].after.w) ||
+        !BitsEqual(sealed.successor.delta,
+                   committed->steps[committed->cursor].after.delta) ||
+        !BitsEqual(sealed.successor.previous_u,
+                   committed->steps[committed->cursor].after.previous_u) ||
+        !BitsEqual(sealed.selected_u,
+                   committed->steps[committed->cursor].command) ||
+        !BitsEqual(runtime_->retainedDelta(), step.current_delta) ||
+        !BitsEqual(runtime_->previousFinalPort(), step.u_prev) ||
+        sealed.reserve_owner->cursor != committed->cursor + 1U ||
+        sealed.admission.successor_reserve.cursor != committed->cursor + 1U ||
+        sealed.reserve_owner->reserve_id != committed->reserve_id ||
+        sealed.reserve_owner->steps.size() != committed->steps.size() ||
+        sealed.admission.successor_reserve.reserve_id != committed->reserve_id ||
+        sealed.admission.successor_reserve.steps.size() !=
+            committed->steps.size()) {
+      return fail("pending V2 recovery binding or cursor changed");
+    }
+    std::string committed_reason;
+    std::string advanced_reason;
+    if (!phase_offset_navigation::TubeExecutionGuardV2::validateReserve(
+            *committed, &committed_reason) ||
+        !phase_offset_navigation::TubeExecutionGuardV2::validateReserve(
+            *sealed.reserve_owner, &advanced_reason)) {
+      return fail("pending V2 recovery reserve is invalid");
+    }
+    return true;
+  }
+  if (successor) {
+    const phase_offset_navigation::RuntimeV2PreparedStep& sealed =
+        *pending->commit_token.sealed_prepared;
+    if (pending->nonselecting || !pending->applicable ||
+        !pending->copied_prefix_continuity_valid ||
+        !pending->proposed_binding ||
+        !pending->proposed_binding->complete() ||
+        !v2_execution_binding_ || !v2_execution_binding_->complete() ||
+        sealed.profile != pending->profile || !sealed.valid ||
+        !sealed.binding_transition ||
+        !SameV2ExecutionIdentity(
+            sealed.expected_identity, v2_execution_binding_->identity) ||
+        !SameV2ExecutionIdentity(
+            sealed.identity, pending->proposed_binding->identity) ||
+        pending->proposed_binding->profile != pending->profile ||
+        !BitsEqual(runtime_->retainedDelta(), sealed.expected_current.delta) ||
+        !BitsEqual(runtime_->previousFinalPort(),
+                   sealed.expected_current.previous_u)) {
+      return fail("pending V2 successor binding changed");
+    }
+    std::shared_ptr<const TubeWorkerCompletionV2> completion;
+    {
+      std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+      completion = latest_v2_shadow_successor_completion_;
+    }
+    if (!completion || !completion->built() ||
+        completion->request_id != pending->request_id ||
+        completion->path_key != pending->path_key ||
+        completion->configuration_key != pending->configuration_key ||
+        completion->map_capture_key != pending->map_capture_key ||
+        completion->build.profile.profile_id != pending->profile->profile_id) {
+      return fail("pending V2 successor completion changed");
+    }
+    return true;
+  }
+  const phase_offset_navigation::RuntimeV2PreparedStep& sealed =
+      *pending->commit_token.sealed_prepared;
+  if (pending->purpose != TubeWorkerPurposeV2::CURRENT ||
+      pending->nonselecting || !pending->applicable || !sealed.valid ||
+      !pending->proposed_binding ||
+      !pending->proposed_binding->complete() ||
+      pending->proposed_binding->profile != pending->profile ||
+      !SameV2ExecutionIdentity(
+          sealed.identity, pending->proposed_binding->identity) ||
+      !BitsEqual(runtime_->retainedDelta(), sealed.expected_current.delta) ||
+      !BitsEqual(runtime_->previousFinalPort(),
+                 sealed.expected_current.previous_u)) {
+    return fail("pending V2 NORMAL transaction is unavailable");
+  }
+  const bool incumbent_tick = v2_execution_binding_ &&
+      pending->proposed_binding == v2_execution_binding_;
+  if (v2_execution_binding_) {
+    if (!v2_execution_binding_->complete()) {
+      return fail("pending V2 incumbent binding is incomplete");
+    }
+    const bool same_identity = SameV2ExecutionIdentity(
+        sealed.identity, v2_execution_binding_->identity);
+    if ((same_identity && sealed.binding_transition) ||
+        (!same_identity &&
+         (!sealed.binding_transition ||
+          !SameV2ExecutionIdentity(
+              sealed.expected_identity, v2_execution_binding_->identity)))) {
+      return fail("pending V2 CURRENT replacement binding changed");
+    }
+  } else if (sealed.binding_transition) {
+    return fail("pending V2 first binding unexpectedly replaces an incumbent");
+  }
+  const auto exact_zero = [](const double value) {
+    return std::isfinite(value) && value == 0.0;
+  };
+  if (!v2_execution_binding_) {
+    if (!exact_zero(runtime_->retainedDelta()) ||
+        runtime_->hasExecutedOffsetAuthority()) {
+      return fail("pending V2 Runtime state is no longer neutral");
+    }
+    const phase_offset_core::PortCommand previous =
+        runtime_->previousFinalPort();
+    if (!exact_zero(previous.u_w) || !exact_zero(previous.u_delta)) {
+      return fail("pending V2 previous port is no longer neutral");
+    }
+  }
+  if (!pending->prepared_step.expected_current.finite() ||
+      !BitsEqual(runtime_->previousFinalPort(),
+                 pending->prepared_step.expected_current.previous_u) ||
+      !BitsEqual(runtime_->retainedDelta(),
+                 pending->prepared_step.expected_current.delta)) {
+    return fail("pending V2 prepared current state changed");
+  }
+  if (!incumbent_tick) {
+    const std::shared_ptr<const TubeBuildRequestV2> request =
+        std::atomic_load(&latest_build_request_);
+    if (!request || !request->active || !request->tube_worker_input_v2 ||
+        request->tube_worker_purpose_v2 != TubeWorkerPurposeV2::CURRENT ||
+        request->task_generation !=
+            task_generation_.load(std::memory_order_acquire) ||
+        request->tube_worker_input_v2 !=
+            pending->proposed_binding->source_input ||
+        request->tube_worker_input_v2->request_id != pending->request_id ||
+        request->tube_worker_input_v2->path_key != pending->path_key ||
+        request->tube_worker_input_v2->configuration_key !=
+            pending->configuration_key ||
+        request->tube_worker_input_v2->map_capture_key !=
+            pending->map_capture_key ||
+        request->tube_worker_input_v2->path_key.execution_generation !=
+            pending->execution_generation ||
+        pending->prepared_step.expected_current.w != request->current_w) {
+      return fail("pending V2 request cohort changed");
+    }
+    std::shared_ptr<const TubeWorkerCompletionV2> completion;
+    {
+      std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+      completion = latest_v2_shadow_current_completion_;
+    }
+    if (!completion || !completion->built() ||
+        completion->request_id != pending->request_id ||
+        completion->path_key != pending->path_key ||
+        completion->configuration_key != pending->configuration_key ||
+        completion->map_capture_key != pending->map_capture_key ||
+        completion->build.profile.profile_id != pending->profile->profile_id) {
+      return fail("pending V2 completion cohort changed");
+    }
+  }
+  return true;
 }
 
 PhaseOffsetMatchedAdapter::~PhaseOffsetMatchedAdapter() {
   shutdown();
-  flushTubeDueTiming();
 }
-void PhaseOffsetMatchedAdapter::recordTubeDueTiming(
-    const std::uint64_t steady_duration_ns,
-    const std::uint64_t ros_stamp_ns,
-    const bool source_current_finalized,
-    const bool raw_cloud_publish_attempted,
-    const phase_offset_navigation::TubeBuildDiagnostics* const diagnostics) {
-  if (!measurement_tube_due_enabled_) return;
-  std::lock_guard<std::mutex> lock(measurement_tube_due_mutex_);
-  TubeDueTimingSample sample;
-  sample.sequence = measurement_tube_due_sequence_++;
-  sample.steady_duration_ns = steady_duration_ns;
-  sample.ros_stamp_ns = ros_stamp_ns;
-  sample.source_current_finalized = source_current_finalized;
-  sample.raw_cloud_publish_attempted = raw_cloud_publish_attempted;
-  if (diagnostics != nullptr) {
-    sample.cross_section_directional_query_count =
-        diagnostics->cross_section_directional_query_count;
-    sample.adaptive_refinement_centerline_query_count =
-        diagnostics->adaptive_refinement_centerline_query_count;
-    sample.adaptive_sample_base_clearance_query_count =
-        diagnostics->adaptive_sample_base_clearance_query_count;
-    sample.builder_certified_cell_bound_query_count =
-        diagnostics->builder_certified_cell_bound_query_count;
-    sample.validator_certified_cell_bound_query_count =
-        diagnostics->validator_certified_cell_bound_query_count;
-    sample.certified_cell_bound_query_count =
-        diagnostics->certified_cell_bound_query_count;
-    sample.validator_surface_query_count =
-        diagnostics->validator_surface_query_count;
-    sample.total_tube_construction_clearance_query_count =
-        diagnostics->total_tube_construction_clearance_query_count;
-    sample.total_tube_construction_query_count =
-        diagnostics->total_tube_construction_query_count;
-    sample.surface_validator_invocation_count =
-        diagnostics->surface_validator_invocation_count;
-    sample.inward_search_attempt_count =
-        diagnostics->inward_search_attempt_count;
-    sample.max_bounded_construction_abs_delta =
-        diagnostics->max_bounded_construction_abs_delta;
-    sample.effective_nominal_half_width_m =
-        diagnostics->effective_nominal_half_width_m;
-    sample.nominal_width_source =
-        static_cast<int>(diagnostics->nominal_width_source);
-    sample.nominal_width_legacy_conflict =
-        diagnostics->nominal_width_legacy_conflict;
-  }
-  measurement_tube_due_samples_.push_back(sample);
+
+bool PhaseOffsetMatchedAdapter::configurationValid() const {
+  return configuration_valid_;
 }
-void PhaseOffsetMatchedAdapter::flushTubeDueTiming() {
-  if (!measurement_tube_due_enabled_) return;
-  std::vector<TubeDueTimingSample> samples;
-  {
-    std::lock_guard<std::mutex> lock(measurement_tube_due_mutex_);
-    samples.swap(measurement_tube_due_samples_);
-  }
-  if (samples.empty()) return;
-  std::ofstream stream(config_.measurement_tube_due_csv_path.c_str(),
-                       std::ios::out | std::ios::trunc);
-  if (!stream.is_open()) return;
-  stream << "kind,sequence,steady_duration_ns,ros_stamp_ns,"
-         << "source_current_finalized,raw_cloud_publish_attempted,"
-         << "cross_section_directional_query_count,"
-         << "adaptive_refinement_centerline_query_count,"
-         << "adaptive_sample_base_clearance_query_count,"
-         << "builder_certified_cell_bound_query_count,"
-         << "validator_certified_cell_bound_query_count,"
-         << "certified_cell_bound_query_count,validator_surface_query_count,"
-         << "total_tube_construction_clearance_query_count,"
-         << "total_tube_construction_query_count,"
-         << "surface_validator_invocation_count,inward_search_attempt_count,"
-         << "max_bounded_construction_abs_delta,effective_nominal_half_width_m,"
-         << "nominal_width_source,nominal_width_legacy_conflict\n";
-  for (const TubeDueTimingSample& sample : samples) {
-    stream << "tube_due," << sample.sequence << ','
-           << sample.steady_duration_ns << ',' << sample.ros_stamp_ns << ','
-           << (sample.source_current_finalized ? 1 : 0) << ','
-           << (sample.raw_cloud_publish_attempted ? 1 : 0) << ','
-           << sample.cross_section_directional_query_count << ','
-           << sample.adaptive_refinement_centerline_query_count << ','
-           << sample.adaptive_sample_base_clearance_query_count << ','
-           << sample.builder_certified_cell_bound_query_count << ','
-           << sample.validator_certified_cell_bound_query_count << ','
-           << sample.certified_cell_bound_query_count << ','
-           << sample.validator_surface_query_count << ','
-           << sample.total_tube_construction_clearance_query_count << ','
-           << sample.total_tube_construction_query_count << ','
-           << sample.surface_validator_invocation_count << ','
-           << sample.inward_search_attempt_count << ','
-           << sample.max_bounded_construction_abs_delta << ','
-           << sample.effective_nominal_half_width_m << ','
-           << MeasurementNominalWidthSourceName(sample.nominal_width_source)
-           << ','
-           << (sample.nominal_width_legacy_conflict ? 1 : 0) << '\n';
-  }
-}
-bool PhaseOffsetMatchedAdapter::configurationValid() const { return configuration_valid_; }
+
 bool PhaseOffsetMatchedAdapter::requiresPathSamples() const { return false; }
+
 double PhaseOffsetMatchedAdapter::sampleStepW() const {
-  return std::min(0.10,
-                  std::min(config_.tube.sample_step_w,
-                           config_.preflight_sample_step_w));
+  return config_.preflight_sample_step_w;
 }
+
 bool PhaseOffsetMatchedAdapter::requiresTubeTimer() const {
-  return configuration_valid_ &&
-      config_.mode == PhaseOffsetMatchedMode::MANUAL;
+  return config_.mode == PhaseOffsetMatchedMode::MANUAL &&
+      configuration_valid_ && static_cast<bool>(v2_shadow_worker_);
 }
 
 bool PhaseOffsetMatchedAdapter::requiresAuthoritativeOffsetHandoff() const {
@@ -1446,640 +2457,18 @@ bool PhaseOffsetMatchedAdapter::requiresAuthoritativeOffsetHandoff() const {
 }
 
 bool PhaseOffsetMatchedAdapter::requiresAuthoritativeOffsetHandoffLocked() const {
-  if (!requiresTubeTimer() || config_.observe_only || !runtime_ ||
-      config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
-    return false;
-  }
-  if (runtime_->hasExecutedOffsetAuthority()) return true;
-  // A committed RECOVERY tick may have reached neutral while the immutable
-  // authority snapshot still names RecoveryOwner.  Keep the pair on the
-  // command path until the explicit atomic neutral handoff is published.
-  const phase_offset_navigation::ActiveReferenceSnapshot authority =
-      execution_authority_.snapshot();
-  return authority.valid &&
-      authority.owner_mode ==
-          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY &&
-      authority.proposed_next_delta == 0.0;
-}
-
-bool PhaseOffsetMatchedAdapter::requiresPathTubePairBootstrap() const {
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  return requiresPathTubePairBootstrapLocked();
-}
-
-bool PhaseOffsetMatchedAdapter::requiresPathTubePairBootstrapLocked() const {
-  if (!requiresTubeTimer() || config_.observe_only || !runtime_ ||
-      config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
-    return false;
-  }
-  const std::shared_ptr<const TubeEpochSnapshot> epoch =
-      std::atomic_load(&latest_epoch_snapshot_);
-  if (!epoch || !IsOffsetCertifiedProfile(epoch->active_profile)) {
-    return false;
-  }
-  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
-  if (pair || !zero_gate_open_ || failure_latched_ ||
-      runtime_->hasExecutedOffsetAuthority() || runtime_->retainedDelta() != 0.0) {
-    return false;
-  }
-
-  // Advertised NORMAL always reconnects to the existing H2 null-expected-pair
-  // stage/prepare/final-CAS lifecycle.  The predicate is deliberately
-  // independent of manual waveform intent and the test-only Runtime owner.
-  // The old intent-gated behavior remains only for explicitly unadvertised
-  // compatibility fixtures.
-  if (advertised_) {
-    const phase_offset_navigation::ActiveReferenceSnapshot authority =
-        execution_authority_.snapshot();
-    return !authority.valid ||
-        authority.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
-  }
-  if (!execution_authority_.config().allow_test_only_runtime_owner) {
-    return false;
-  }
-  return runtime_->hasPendingOrActiveOffsetIntent();
-}
-
-void PhaseOffsetMatchedAdapter::clearBootstrapRendezvousLocked() {
-  bootstrap_rendezvous_state_ = BootstrapRendezvousState::DISARMED;
-  bootstrap_rendezvous_arm_ = BootstrapRendezvousIdentity();
-  bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
-  bootstrap_rendezvous_ready_build_sequence_ = 0U;
-  bootstrap_rendezvous_watermark_ = 0U;
-  bootstrap_rendezvous_claim_ = BootstrapRendezvousTicket();
-  bootstrap_rendezvous_claim_active_ = false;
-  bootstrap_rendezvous_armed_logged_ = false;
-  bootstrap_rendezvous_ready_logged_ = false;
-}
-
-bool PhaseOffsetMatchedAdapter::armBootstrapRendezvousLocked(
-    const std::shared_ptr<const TubeBuildRequest>& request) {
-  // Direct/unadvertised fixtures intentionally retain their historical
-  // synchronous bootstrap path.  Arming is still harmless there (the
-  // manager only claims tickets on its production timer), and keeping the
-  // state visible makes deterministic adapter tests exercise the same
-  // post-request rendezvous boundary.
-  // Invalidate an older arm as soon as a no-Pair request names a different
-  // task/session/source/path/frame, even if the replacement is not yet
-  // eligible to arm (for example while Runtime is non-neutral).
-  if (request && request->active && !request->base_path_tube_pair &&
-      bootstrap_rendezvous_arm_.valid() &&
-      (bootstrap_rendezvous_arm_.task_generation != request->task_generation ||
-       bootstrap_rendezvous_arm_.authority_session !=
-           request->authority_session ||
-       bootstrap_rendezvous_arm_.source_revision != request->source_revision ||
-       bootstrap_rendezvous_arm_.path_revision != request->path_revision ||
-       bootstrap_rendezvous_arm_.frame_revision != request->frame_revision ||
-       bootstrap_rendezvous_arm_.semantic_path_owner !=
-           request->semantic_path_owner.get() ||
-       bootstrap_rendezvous_arm_.frame_owner != request->frame_owner.get())) {
-    clearBootstrapRendezvousLocked();
-  }
-  const bool had_rendezvous =
-      bootstrap_rendezvous_state_ != BootstrapRendezvousState::DISARMED;
-  if (!request || !request->active || request->base_path_tube_pair ||
-      !requiresTubeTimer() || config_.observe_only ||
-      config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
-      !zero_gate_open_ || failure_latched_ || !runtime_ ||
-      capturePathTubePair() ||
-      !std::isfinite(runtime_->retainedDelta()) ||
-      runtime_->retainedDelta() != 0.0 ||
-      runtime_->hasExecutedOffsetAuthority() ||
-      !request->semantic_path_owner || request->source_revision == 0U ||
-      request->task_generation != task_generation_.load(
-          std::memory_order_acquire) ||
-      request->authority_session != authority_session_.load(
-          std::memory_order_acquire)) {
-    if (had_rendezvous) clearBootstrapRendezvousLocked();
-    return false;
-  }
-
-  const phase_offset_navigation::ActiveReferenceSnapshot authority =
-      execution_authority_.snapshot();
-  if (advertised_) {
-    if (authority.valid &&
-        (authority.authority_session != request->authority_session ||
-         authority.owner_mode !=
-             phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY)) {
-      if (had_rendezvous) clearBootstrapRendezvousLocked();
-      return false;
-    }
-  } else if (!execution_authority_.config().allow_test_only_runtime_owner ||
-             !runtime_->hasPendingOrActiveOffsetIntent()) {
-    if (had_rendezvous) clearBootstrapRendezvousLocked();
-    return false;
-  }
-
-  BootstrapRendezvousIdentity identity;
-  identity.task_generation = request->task_generation;
-  identity.authority_session = request->authority_session;
-  identity.source_revision = request->source_revision;
-  identity.path_revision = request->path_revision;
-  identity.frame_revision = request->frame_revision;
-  identity.semantic_path_owner = request->semantic_path_owner.get();
-  identity.frame_owner = request->frame_owner.get();
-  if (!identity.valid()) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-
-  if (bootstrap_rendezvous_arm_ != identity) {
-    // A source/path/frame/session replacement invalidates any READY or
-    // claimed ticket.  The newer request gets a fresh finalized-build
-    // watermark; a late completion can no longer match this identity.
-    clearBootstrapRendezvousLocked();
-    bootstrap_rendezvous_arm_ = identity;
-    bootstrap_rendezvous_watermark_ =
-        timer_last_finalized_build_sequence_.load(std::memory_order_acquire);
-    bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
-    if (!bootstrap_rendezvous_armed_logged_) {
-      ROS_INFO(
-          "[PHASE_OFFSET][BOOTSTRAP_RENDEZVOUS] state=ARMED task=%llu "
-          "session=%llu source=%llu path=%llu frame=%llu watermark=%llu",
-          static_cast<unsigned long long>(identity.task_generation),
-          static_cast<unsigned long long>(identity.authority_session),
-          static_cast<unsigned long long>(identity.source_revision),
-          static_cast<unsigned long long>(identity.path_revision),
-          static_cast<unsigned long long>(identity.frame_revision),
-          static_cast<unsigned long long>(bootstrap_rendezvous_watermark_));
-      bootstrap_rendezvous_armed_logged_ = true;
-    }
-  } else if (bootstrap_rendezvous_state_ ==
-             BootstrapRendezvousState::DISARMED) {
-    bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
-  }
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::candidateBootstrapRendezvousEligibleLocked(
-    const TubeBuildRequest& request,
-    const TubeEpochSnapshot& snapshot) {
-  if (request.task_generation != task_generation_.load(
-          std::memory_order_acquire) ||
-      request.authority_session != authority_session_.load(
-          std::memory_order_acquire)) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  if (bootstrap_rendezvous_state_ == BootstrapRendezvousState::DISARMED ||
-      !bootstrap_rendezvous_arm_.valid() ||
-      request.base_path_tube_pair || !request.active ||
-      !zero_gate_open_ || failure_latched_ ||
-      shutdown_requested_.load(std::memory_order_acquire) ||
-      snapshot.build_sequence == 0U ||
-      snapshot.build_sequence <= bootstrap_rendezvous_watermark_) {
-    return false;
-  }
-  BootstrapRendezvousIdentity request_identity;
-  request_identity.task_generation = request.task_generation;
-  request_identity.authority_session = request.authority_session;
-  request_identity.source_revision = request.source_revision;
-  request_identity.path_revision = request.path_revision;
-  request_identity.frame_revision = request.frame_revision;
-  request_identity.semantic_path_owner = request.semantic_path_owner.get();
-  request_identity.frame_owner = request.frame_owner.get();
-  if (request_identity != bootstrap_rendezvous_arm_) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  if (snapshot.task_generation != request.task_generation ||
-      snapshot.source_revision != request.source_revision ||
-      snapshot.path_revision != request.path_revision ||
-      snapshot.frame_revision != request.frame_revision ||
-      snapshot.semantic_path_owner != request.semantic_path_owner ||
-      snapshot.frame_owner != request.frame_owner) {
-    return false;
-  }
-  const std::shared_ptr<const TubeBuildRequest> latest =
-      std::atomic_load(&latest_build_request_);
-  if (!latest || !latest->active || latest->base_path_tube_pair ||
-      !requestSourceStillCurrent(request) ||
-      latest->task_generation != request.task_generation ||
-      latest->authority_session != request.authority_session ||
-      latest->source_revision != request.source_revision ||
-      latest->path_revision != request.path_revision ||
-      latest->frame_revision != request.frame_revision ||
-      latest->semantic_path_owner != request.semantic_path_owner ||
-      latest->frame_owner != request.frame_owner) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  // Keep the existing request/epoch and cloud gates authoritative.  This is
-  // deliberately checked before any rendezvous state is exposed as READY.
-  if (!epochMatchesRequest(snapshot, *latest)) return false;
-
-  const phase_offset_navigation::TubeEpochStatus& status =
-      snapshot.epoch_status;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
-      candidate = snapshot.candidate_profile;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& active =
-      snapshot.active_profile;
-  constexpr phase_offset_navigation::TubeProfileClassification kCertified =
-      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
-  // A planner-owned ContinuousPhasePath may legitimately have no intrinsic
-  // path revision (the production owner defaults to zero).  The immutable
-  // handoff frame still carries the effective path/frame revisions used by
-  // TubeBuilder.  Compare profile provenance with that canonical frame value
-  // rather than rejecting a valid epoch merely because the request's legacy
-  // owner revision is zero.
-  const std::uint64_t expected_profile_path_revision =
-      request.path_revision != 0U
-          ? request.path_revision
-          : (request.frame_owner ? request.frame_owner->pathRevision() : 0U);
-  const std::uint64_t expected_profile_frame_revision =
-      request.frame_revision != 0U
-          ? request.frame_revision
-          : (request.frame_owner ? request.frame_owner->frameRevision() : 0U);
-  if (!candidate || !active || !candidate->complete ||
-      !active->complete || !candidate->obstacle_certified ||
-      !active->obstacle_certified || candidate->classification != kCertified ||
-      active->classification != kCertified || !status.candidate_complete ||
-      status.candidate_classification != kCertified ||
-      !status.active_available || !status.active_current_validation_valid ||
-      status.active_classification != kCertified ||
-      status.candidate_path_source_revision != request.source_revision ||
-      status.active_path_source_revision != request.source_revision ||
-      candidate->source_revision != request.source_revision ||
-      active->source_revision != request.source_revision ||
-      (expected_profile_path_revision != 0U &&
-       (candidate->path_revision != expected_profile_path_revision ||
-        active->path_revision != expected_profile_path_revision)) ||
-      (expected_profile_frame_revision != 0U &&
-       (candidate->frame_revision != expected_profile_frame_revision ||
-        active->frame_revision != expected_profile_frame_revision)) ||
-      !snapshot.full_path_samples) {
-    return false;
-  }
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    if (!snapshot.map_observation_is_snapshot ||
-        snapshot.map_observation_sequence == 0U ||
-        !status.map_observation_is_snapshot ||
-        status.candidate_map_observation_sequence !=
-            snapshot.map_observation_sequence ||
-        status.active_map_observation_sequence !=
-            snapshot.map_observation_sequence ||
-        candidate->map_revision != snapshot.map_observation_sequence ||
-        candidate->snapshot_sequence != snapshot.map_observation_sequence ||
-        !candidate->snapshot_provenance_is_immutable) {
-      return false;
-    }
-  } else if (snapshot.map_observation_is_snapshot ||
-             snapshot.map_observation_sequence != 0U ||
-             status.candidate_map_observation_sequence != 0U ||
-             status.active_map_observation_sequence != 0U ||
-             candidate->map_revision != 0U) {
-    return false;
-  }
-  return true;
-}
-
-void PhaseOffsetMatchedAdapter::recordBootstrapReadyLocked(
-    const TubeBuildRequest& request, const TubeEpochSnapshot& snapshot) {
-  if (!candidateBootstrapRendezvousEligibleLocked(request, snapshot)) return;
-  BootstrapRendezvousIdentity identity;
-  identity.task_generation = request.task_generation;
-  identity.authority_session = request.authority_session;
-  identity.source_revision = request.source_revision;
-  identity.path_revision = request.path_revision;
-  identity.frame_revision = request.frame_revision;
-  identity.semantic_path_owner = request.semantic_path_owner.get();
-  identity.frame_owner = request.frame_owner.get();
-  if (bootstrap_rendezvous_ready_.valid() &&
-      bootstrap_rendezvous_ready_ == identity &&
-      bootstrap_rendezvous_ready_build_sequence_ >= snapshot.build_sequence) {
-    return;
-  }
-  bootstrap_rendezvous_ready_ = identity;
-  bootstrap_rendezvous_ready_build_sequence_ = snapshot.build_sequence;
-  bootstrap_rendezvous_state_ = BootstrapRendezvousState::READY;
-  bootstrap_rendezvous_ready_logged_ = false;
-  if (!bootstrap_rendezvous_ready_logged_) {
-    ROS_INFO(
-        "[PHASE_OFFSET][BOOTSTRAP_RENDEZVOUS] state=READY task=%llu "
-        "session=%llu source=%llu path=%llu frame=%llu build_sequence=%llu",
-        static_cast<unsigned long long>(identity.task_generation),
-        static_cast<unsigned long long>(identity.authority_session),
-        static_cast<unsigned long long>(identity.source_revision),
-        static_cast<unsigned long long>(identity.path_revision),
-        static_cast<unsigned long long>(identity.frame_revision),
-        static_cast<unsigned long long>(snapshot.build_sequence));
-    bootstrap_rendezvous_ready_logged_ = true;
-  }
-}
-
-bool PhaseOffsetMatchedAdapter::claimMatchesBootstrapRendezvousLocked(
-    const BootstrapRendezvousTicket& ticket) const {
-  if (!bootstrap_rendezvous_claim_active_ || !ticket.valid()) return false;
-  return ticket.claim_id == bootstrap_rendezvous_claim_.claim_id &&
-      ticket.task_generation == bootstrap_rendezvous_claim_.task_generation &&
-      ticket.authority_session == bootstrap_rendezvous_claim_.authority_session &&
-      ticket.source_revision == bootstrap_rendezvous_claim_.source_revision &&
-      ticket.path_revision == bootstrap_rendezvous_claim_.path_revision &&
-      ticket.frame_revision == bootstrap_rendezvous_claim_.frame_revision &&
-      ticket.build_sequence == bootstrap_rendezvous_claim_.build_sequence &&
-      ticket.semantic_path_owner ==
-          bootstrap_rendezvous_claim_.semantic_path_owner &&
-      ticket.frame_owner == bootstrap_rendezvous_claim_.frame_owner;
-}
-
-bool PhaseOffsetMatchedAdapter::bootstrapReadyEpochMatchesLocked(
-    const BootstrapRendezvousIdentity& identity,
-    const std::uint64_t build_sequence) const {
-  if (!identity.valid() || build_sequence == 0U) return false;
-  const std::shared_ptr<const TubeEpochSnapshot> epoch =
-      std::atomic_load(&latest_epoch_snapshot_);
-  if (!epoch || !epoch->active || epoch->build_sequence != build_sequence ||
-      epoch->task_generation != identity.task_generation ||
-      epoch->source_revision != identity.source_revision ||
-      epoch->path_revision != identity.path_revision ||
-      epoch->frame_revision != identity.frame_revision ||
-      epoch->semantic_path_owner.get() != identity.semantic_path_owner ||
-      epoch->frame_owner.get() != identity.frame_owner) {
-    return false;
-  }
-
-  const phase_offset_navigation::TubeEpochStatus& status =
-      epoch->epoch_status;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& candidate =
-      epoch->candidate_profile;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& active =
-      epoch->active_profile;
-  constexpr phase_offset_navigation::TubeProfileClassification kCertified =
-      phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED;
-  if (!candidate || !active || !candidate->complete ||
-      !active->complete || !candidate->obstacle_certified ||
-      !active->obstacle_certified || candidate->classification != kCertified ||
-      active->classification != kCertified || !status.candidate_complete ||
-      status.candidate_classification != kCertified ||
-      !status.active_available || !status.active_current_validation_valid ||
-      status.active_classification != kCertified ||
-      status.candidate_path_source_revision != identity.source_revision ||
-      status.active_path_source_revision != identity.source_revision ||
-      candidate->source_revision != identity.source_revision ||
-      active->source_revision != identity.source_revision ||
-      (identity.path_revision != 0U &&
-       (candidate->path_revision != identity.path_revision ||
-        active->path_revision != identity.path_revision)) ||
-      (identity.frame_revision != 0U &&
-       (candidate->frame_revision != identity.frame_revision ||
-        active->frame_revision != identity.frame_revision)) ||
-      !epoch->full_path_samples) {
-    return false;
-  }
-
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    if (!epoch->map_observation_is_snapshot ||
-        epoch->map_observation_sequence == 0U ||
-        !status.map_observation_is_snapshot ||
-        status.candidate_map_observation_sequence !=
-            epoch->map_observation_sequence ||
-        status.active_map_observation_sequence !=
-            epoch->map_observation_sequence ||
-        candidate->map_revision != epoch->map_observation_sequence ||
-        candidate->snapshot_sequence != epoch->map_observation_sequence ||
-        !candidate->snapshot_provenance_is_immutable) {
-      return false;
-    }
-  } else if (epoch->map_observation_is_snapshot ||
-             epoch->map_observation_sequence != 0U ||
-             status.candidate_map_observation_sequence != 0U ||
-             status.active_map_observation_sequence != 0U ||
-             candidate->map_revision != 0U) {
-    return false;
-  }
-  return true;
-}
-
-void PhaseOffsetMatchedAdapter::demoteBootstrapReadyLocked() {
-  if (bootstrap_rendezvous_state_ != BootstrapRendezvousState::READY) return;
-  bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
-  bootstrap_rendezvous_ready_build_sequence_ = 0U;
-  bootstrap_rendezvous_ready_logged_ = false;
-  bootstrap_rendezvous_state_ = bootstrap_rendezvous_arm_.valid()
-      ? BootstrapRendezvousState::ARMED
-      : BootstrapRendezvousState::DISARMED;
-}
-
-BootstrapRendezvousState
-PhaseOffsetMatchedAdapter::bootstrapRendezvousState() const {
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  return bootstrap_rendezvous_state_;
-}
-
-bool PhaseOffsetMatchedAdapter::claimBootstrapRendezvous(
-    BootstrapRendezvousTicket& ticket) {
-  ticket = BootstrapRendezvousTicket();
-  std::unique_lock<std::mutex> lock(runtime_command_mutex_,
-                                    std::try_to_lock);
-  if (!lock.owns_lock()) {
-    return false;
-  }
-  if (capturePathTubePair()) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  if (shutdown_requested_.load(std::memory_order_acquire) ||
-      bootstrap_rendezvous_claim_active_ ||
-      bootstrap_rendezvous_state_ != BootstrapRendezvousState::READY ||
-      !bootstrap_rendezvous_ready_.valid() ||
-      bootstrap_rendezvous_ready_build_sequence_ == 0U || !zero_gate_open_ ||
-      failure_latched_ ||
-      bootstrap_rendezvous_ready_build_sequence_ <=
-          bootstrap_rendezvous_watermark_) {
-    if (bootstrap_rendezvous_state_ == BootstrapRendezvousState::READY &&
-        bootstrap_rendezvous_ready_build_sequence_ <=
-            bootstrap_rendezvous_watermark_) {
-      bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
-      bootstrap_rendezvous_ready_build_sequence_ = 0U;
-      bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
-    }
-    return false;
-  }
-  const std::shared_ptr<const TubeBuildRequest> latest =
-      std::atomic_load(&latest_build_request_);
-  if (!latest || !latest->active || latest->base_path_tube_pair ||
-      latest->task_generation != bootstrap_rendezvous_ready_.task_generation ||
-      latest->authority_session != bootstrap_rendezvous_ready_.authority_session ||
-      latest->source_revision != bootstrap_rendezvous_ready_.source_revision ||
-      latest->path_revision != bootstrap_rendezvous_ready_.path_revision ||
-      latest->frame_revision != bootstrap_rendezvous_ready_.frame_revision ||
-      latest->semantic_path_owner.get() !=
-          bootstrap_rendezvous_ready_.semantic_path_owner ||
-      latest->frame_owner.get() != bootstrap_rendezvous_ready_.frame_owner ||
-      task_generation_.load(std::memory_order_acquire) !=
-          bootstrap_rendezvous_ready_.task_generation ||
-      authority_session_.load(std::memory_order_acquire) !=
-          bootstrap_rendezvous_ready_.authority_session) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  // READY is only a trigger.  Before consuming it, require that its exact
-  // finalized build sequence is still the current active certified epoch.
-  // The epoch/profile itself is never carried into the transaction; a
-  // missing, superseded, or no-longer-certified epoch demotes us to ARMED and
-  // fences that sequence so only a later fresh epoch can retry.
-  if (!bootstrapReadyEpochMatchesLocked(
-          bootstrap_rendezvous_ready_,
-          bootstrap_rendezvous_ready_build_sequence_)) {
-    bootstrap_rendezvous_watermark_ = std::max(
-        bootstrap_rendezvous_watermark_,
-        bootstrap_rendezvous_ready_build_sequence_);
-    demoteBootstrapReadyLocked();
-    return false;
-  }
-  // A claim may be consumed by the timer between command cycles.  Recheck
-  // the neutral/owner eligibility that was true when the request was armed;
-  // an externally committed Runtime authority without a Pair must never be
-  // allowed to turn a stale READY ticket into a second authority.
-  const phase_offset_navigation::ActiveReferenceSnapshot authority =
-      execution_authority_.snapshot();
-  const bool neutral_runtime = runtime_ &&
-      std::isfinite(runtime_->retainedDelta()) &&
-      runtime_->retainedDelta() == 0.0 &&
-      !runtime_->hasExecutedOffsetAuthority();
-  const bool owner_eligible = advertised_
-      ? (!authority.valid ||
-         (authority.authority_session ==
-              bootstrap_rendezvous_ready_.authority_session &&
-          authority.owner_mode ==
-              phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY))
-      : (execution_authority_.config().allow_test_only_runtime_owner &&
-         runtime_ && runtime_->hasPendingOrActiveOffsetIntent());
-  if (!neutral_runtime || !owner_eligible) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  ticket.claim_id = ++bootstrap_rendezvous_next_claim_id_;
-  ticket.task_generation = bootstrap_rendezvous_ready_.task_generation;
-  ticket.authority_session = bootstrap_rendezvous_ready_.authority_session;
-  ticket.source_revision = bootstrap_rendezvous_ready_.source_revision;
-  ticket.path_revision = bootstrap_rendezvous_ready_.path_revision;
-  ticket.frame_revision = bootstrap_rendezvous_ready_.frame_revision;
-  ticket.build_sequence = bootstrap_rendezvous_ready_build_sequence_;
-  ticket.semantic_path_owner = bootstrap_rendezvous_ready_.semantic_path_owner;
-  ticket.frame_owner = bootstrap_rendezvous_ready_.frame_owner;
-  bootstrap_rendezvous_claim_ = ticket;
-  bootstrap_rendezvous_claim_active_ = true;
-  bootstrap_rendezvous_ready_ = BootstrapRendezvousIdentity();
-  bootstrap_rendezvous_ready_build_sequence_ = 0U;
-  // Consuming READY advances the watermark immediately.  A failed transaction
-  // therefore cannot consume the same epoch a second time.
-  bootstrap_rendezvous_watermark_ = std::max(
-      bootstrap_rendezvous_watermark_, ticket.build_sequence);
-  bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::validateBootstrapRendezvousClaim(
-    const BootstrapRendezvousTicket& ticket) const {
-  std::unique_lock<std::mutex> lock(runtime_command_mutex_,
-                                    std::try_to_lock);
-  if (!lock.owns_lock()) return false;
-  if (!claimMatchesBootstrapRendezvousLocked(ticket) ||
-      shutdown_requested_.load(std::memory_order_acquire) ||
-      failure_latched_ || !zero_gate_open_ ||
-      capturePathTubePair()) {
-    return false;
-  }
-  BootstrapRendezvousIdentity ticket_identity;
-  ticket_identity.task_generation = ticket.task_generation;
-  ticket_identity.authority_session = ticket.authority_session;
-  ticket_identity.source_revision = ticket.source_revision;
-  ticket_identity.path_revision = ticket.path_revision;
-  ticket_identity.frame_revision = ticket.frame_revision;
-  ticket_identity.semantic_path_owner = ticket.semantic_path_owner;
-  ticket_identity.frame_owner = ticket.frame_owner;
-  if (!bootstrapReadyEpochMatchesLocked(ticket_identity,
-                                        ticket.build_sequence)) {
-    return false;
-  }
-  const phase_offset_navigation::ActiveReferenceSnapshot authority =
-      execution_authority_.snapshot();
-  const bool neutral_runtime = runtime_ &&
-      std::isfinite(runtime_->retainedDelta()) &&
-      runtime_->retainedDelta() == 0.0 &&
-      !runtime_->hasExecutedOffsetAuthority();
-  const bool owner_eligible = advertised_
-      ? (!authority.valid ||
-         (authority.authority_session == ticket.authority_session &&
-          authority.owner_mode ==
-              phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY))
-      : (execution_authority_.config().allow_test_only_runtime_owner &&
-         runtime_ && runtime_->hasPendingOrActiveOffsetIntent());
-  if (!neutral_runtime || !owner_eligible) return false;
-  const std::shared_ptr<const TubeBuildRequest> latest =
-      std::atomic_load(&latest_build_request_);
-  return latest && latest->active && !latest->base_path_tube_pair &&
-      latest->task_generation == ticket.task_generation &&
-      latest->authority_session == ticket.authority_session &&
-      latest->source_revision == ticket.source_revision &&
-      latest->path_revision == ticket.path_revision &&
-      latest->frame_revision == ticket.frame_revision &&
-      latest->semantic_path_owner.get() == ticket.semantic_path_owner &&
-      latest->frame_owner.get() == ticket.frame_owner &&
-      task_generation_.load(std::memory_order_acquire) ==
-          ticket.task_generation &&
-      authority_session_.load(std::memory_order_acquire) ==
-          ticket.authority_session;
-}
-
-bool PhaseOffsetMatchedAdapter::completeBootstrapRendezvous(
-    const BootstrapRendezvousTicket& ticket, const bool bootstrap_succeeded) {
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  if (!claimMatchesBootstrapRendezvousLocked(ticket)) {
-    return false;
-  }
-  if (task_generation_.load(std::memory_order_acquire) !=
-          ticket.task_generation ||
-      authority_session_.load(std::memory_order_acquire) !=
-          ticket.authority_session) {
-    clearBootstrapRendezvousLocked();
-    return false;
-  }
-  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
-  // The bootstrap transaction deliberately allocates a fresh source/frame
-  // revision for the installed Pair.  Recognize success by the committed
-  // authority/session and the exact planner owner captured by the ticket;
-  // never compare those newly allocated revisions with the sidecar request.
-  const bool pair_matches = pair &&
-      pair->authority_session == ticket.authority_session &&
-      authority_session_.load(std::memory_order_acquire) ==
-          ticket.authority_session &&
-      pair->path_owner.get() == ticket.semantic_path_owner &&
-      pair->active_profile && pair->epoch_snapshot &&
-      pair->epoch_status.active_available &&
-      pair->epoch_status.active_current_validation_valid;
-  if (bootstrap_succeeded && pair_matches) {
-    clearBootstrapRendezvousLocked();
-    return true;
-  }
-  // A Pair installed by another path invalidates this rendezvous even when
-  // the claimed transaction reports failure.  Otherwise retain ARMED (or a
-  // newer READY recorded while this claim was in flight) for a fresh retry.
-  bootstrap_rendezvous_claim_ = BootstrapRendezvousTicket();
-  bootstrap_rendezvous_claim_active_ = false;
-  if (pair) {
-    clearBootstrapRendezvousLocked();
-  } else if (bootstrap_rendezvous_ready_.valid()) {
-    bootstrap_rendezvous_state_ = BootstrapRendezvousState::READY;
-  } else {
-    bootstrap_rendezvous_state_ = BootstrapRendezvousState::ARMED;
-  }
-  return !bootstrap_succeeded;
-}
-
-bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPair(
-    const std::shared_ptr<const PathTubePair>& pair) const {
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  return hasPendingOffsetActivationPairLocked(pair);
+  return config_.mode == PhaseOffsetMatchedMode::MANUAL && runtime_ &&
+      (static_cast<bool>(v2_execution_binding_) ||
+       static_cast<bool>(pending_v2_shadow_bootstrap_candidate_) ||
+       runtime_->hasExecutedOffsetAuthority() ||
+       std::abs(runtime_->retainedDelta()) >
+           kRecoveryNonzeroDeltaTolerance);
 }
 
 bool PhaseOffsetMatchedAdapter::requestRecenter() {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  if (!runtime_ || !configuration_valid_ || config_.observe_only ||
-      config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
-      !runtime_->hasExecutedOffsetAuthority()) {
+  if (!runtime_ || !v2_execution_binding_ ||
+      !v2_execution_binding_->complete()) {
     return false;
   }
   runtime_->requestRecenter();
@@ -2091,621 +2480,136 @@ bool PhaseOffsetMatchedAdapter::recenterRequested() const {
   return runtime_ && runtime_->recenterRequested();
 }
 
-bool PhaseOffsetMatchedAdapter::hasPendingOffsetActivationPairLocked(
-    const std::shared_ptr<const PathTubePair>& pair) const {
-  if (!pair || !requiresTubeTimer() || config_.observe_only || !runtime_ ||
-      config_.tube_source == phase_offset_navigation::TubeSource::NONE) {
-    return false;
-  }
-  if (pair != capturePathTubePair() || !IsOffsetCertifiedProfile(pair->active_profile) ||
-      !zero_gate_open_ || failure_latched_ ||
-      runtime_->hasExecutedOffsetAuthority() || runtime_->retainedDelta() != 0.0) {
-    return false;
-  }
-  if (advertised_) {
-    // A live production Pair remains the command-local activation owner even
-    // when the selected NORMAL command is exactly neutral/zero.  This keeps
-    // steady NORMAL and planner replacement on the same H2 lifecycle.
-    const phase_offset_navigation::ActiveReferenceSnapshot authority =
-        execution_authority_.snapshot();
-    if (!authority.valid || authority.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY) {
-      return true;
-    }
-    const bool steady_zero_normal =
-        (authority.owner_mode ==
-             phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
-         authority.owner_mode ==
-             phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION) &&
-        authority.selected_u_owner ==
-            phase_offset_navigation::PhaseOffsetAllocator::ownerName() &&
-        authority.authority_session == pair->authority_session &&
-        authority.executed_path_revision == pair->path_revision &&
-        authority.frame_revision == pair->frame_revision &&
-        authority.tube_revision == pair->active_profile->tube_revision &&
-        authority.profile_revision == pair->active_profile->profile_revision &&
-        authority.proposed_next_delta == 0.0;
-    return steady_zero_normal;
-  }
-  if (!execution_authority_.config().allow_test_only_runtime_owner) {
-    return false;
-  }
-  return runtime_->hasPendingOrActiveOffsetIntent();
-}
-
-double PhaseOffsetMatchedAdapter::bootstrapPreparedHorizonEnd(
-    const double current_w, const double future_seam_w,
-    const double path_end_w) const {
-  if (!IsFinite(current_w) || !IsFinite(future_seam_w) ||
-      !IsFinite(path_end_w) || future_seam_w <= current_w ||
-      path_end_w < future_seam_w) {
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-  return std::min(path_end_w,
-                  std::max(future_seam_w,
-                           current_w +
-                               config_.tube.min_certified_forward_w));
-}
-
-std::shared_ptr<const PathTubePair>
-PhaseOffsetMatchedAdapter::capturePathTubePair() const {
-  return std::atomic_load(&authoritative_path_tube_pair_);
-}
-
-std::unique_ptr<PathTubePairPin>
-PhaseOffsetMatchedAdapter::captureAndAcquirePathTubePairPin() {
-  if (!runtime_ || !path_tube_pin_registry_ ||
-      shutdown_requested_.load(std::memory_order_acquire)) {
-    return std::unique_ptr<PathTubePairPin>();
-  }
-  // Capture pair identity/provenance and the Runtime bits under the one
-  // short command boundary.  No seam selection, tube build, or dry-run may
-  // start until this acquisition succeeds.
-  std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
-  const std::shared_ptr<const PathTubePair> pair =
-      std::atomic_load(&authoritative_path_tube_pair_);
-  if (!pair || pair->source_revision == 0U || pair->generation == 0U ||
-      pair->authority_session !=
-          authority_session_.load(std::memory_order_acquire) ||
-      !pair->path_owner || !pair->full_path_samples ||
-      !pair->active_profile || !pair->epoch_snapshot) {
-    return std::unique_ptr<PathTubePairPin>();
-  }
-  PathTubePairPinCapture capture;
-  capture.pair = pair;
-  capture.source_revision = pair->source_revision;
-  capture.generation = pair->generation;
-  capture.authority_session = pair->authority_session;
-  capture.map_observation_sequence = pair->map_observation_sequence;
-  capture.map_observation_is_snapshot = pair->map_observation_is_snapshot;
-  capture.path_owner = pair->path_owner;
-  capture.frame_owner = pair->frame_owner;
-  capture.frozen_cloud_occupancy_snapshot =
-      pair->frozen_cloud_occupancy_snapshot;
-  capture.full_path_samples = pair->full_path_samples;
-  capture.active_profile = pair->active_profile;
-  capture.epoch_snapshot = pair->epoch_snapshot;
-  capture.retained_delta = runtime_->retainedDelta();
-  capture.previous_final_port = runtime_->previousFinalPort();
-  if (!capture.valid()) return std::unique_ptr<PathTubePairPin>();
-
-  std::lock_guard<std::mutex> pin_lock(path_tube_pin_registry_->mutex);
-  if (path_tube_pin_registry_->active_lease_id != 0U) {
-    return std::unique_ptr<PathTubePairPin>();
-  }
-  const std::uint64_t lease_id = ++path_tube_pin_registry_->next_lease_id;
-  path_tube_pin_registry_->active_lease_id = lease_id;
-  path_tube_pin_registry_->active_pair = pair;
-  path_tube_pin_registry_->active_generation = capture.generation;
-  path_tube_pin_registry_->active_session = capture.authority_session;
-  return std::unique_ptr<PathTubePairPin>(
-      new PathTubePairPin(path_tube_pin_registry_, capture, lease_id));
-}
-
 void PhaseOffsetMatchedAdapter::requestShutdown() {
-  // The shutdown ownership flip is linearized with Candidate/diagnostic
-  // publication.  A finalizer already inside the publication barrier is
-  // allowed to finish before this flag becomes visible; no later finalizer
-  // can publish after requestShutdown() returns.
   {
     std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
     shutdown_requested_.store(true, std::memory_order_release);
   }
   {
     std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
-    clearBootstrapRendezvousLocked();
+    clearPendingPositionCommandLocked();
+    v2_execution_binding_.reset();
+    std::atomic_store(&latest_build_request_,
+                      std::shared_ptr<const TubeBuildRequestV2>());
   }
   {
-    std::lock_guard<std::mutex> lock(worker_state_mutex_);
+    std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
     worker_stop_requested_ = true;
-    pending_request_.reset();
-    pending_permit_id_ = 0U;
-    pending_request_identity_ = RequestInstanceIdentity();
-    pending_work_identity_ = TubeWorkIdentity();
+    pinned_current_cohort_.reset();
+    latest_v2_shadow_current_completion_.reset();
+    latest_v2_shadow_successor_completion_.reset();
+    latest_v2_shadow_admission_candidate_.reset();
+    std::atomic_store_explicit(
+        &retained_v2_shadow_admission_candidate_,
+        std::shared_ptr<const TubeV2ShadowAdmissionCandidate>(),
+        std::memory_order_release);
+    v2_shadow_last_current_identity_ = V2ShadowRequestIdentity();
+    v2_shadow_last_successor_identity_ = V2ShadowRequestIdentity();
+    v2_shadow_last_current_path_key_ = phase_offset_navigation::TubePathKey();
+    v2_shadow_last_successor_path_key_ = phase_offset_navigation::TubePathKey();
+    v2_shadow_have_current_path_key_ = false;
+    v2_shadow_have_successor_path_key_ = false;
   }
-  worker_condition_.notify_all();
 }
 
 void PhaseOffsetMatchedAdapter::shutdown() {
   requestShutdown();
-  while (timer_inflight_.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  // The worker may finish one already-running Stage 1A build, but it must be
-  // joined before any adapter-owned state or publishers are cleared.
   joinTubeWorker();
   std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
-  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
-  pending_authority_prepared_ =
-      phase_offset_navigation::AuthorityPreparedStep();
-  pending_authority_session_ = 0U;
-  pending_authority_valid_ = false;
-  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
-  pending_recovery_step_valid_ = false;
-  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
-  pending_handoff_valid_ = false;
-  pending_normal_source_pair_.reset();
-  pending_recovery_source_pair_.reset();
-  pending_recovery_execution_pair_.reset();
-  pending_recovery_target_pair_.reset();
-  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
-  recovery_deadline_session_ = 0U;
-  recovery_deadline_target_revision_ = 0U;
-  if (path_tube_pin_registry_) {
-    std::lock_guard<std::mutex> pin_lock(path_tube_pin_registry_->mutex);
-    path_tube_pin_registry_->active_lease_id = 0U;
-    path_tube_pin_registry_->active_pair.reset();
-    path_tube_pin_registry_->active_generation = 0U;
-    path_tube_pin_registry_->active_session = 0U;
-  }
-  std::atomic_store(&latest_build_request_,
-                    std::shared_ptr<const TubeBuildRequest>());
-  std::atomic_store(&latest_candidate_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  std::atomic_store(&latest_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  std::atomic_store(&latest_control_snapshot_,
-                    std::shared_ptr<const ControlPublishSnapshot>());
-  std::atomic_store(&authoritative_path_tube_pair_,
-                    std::shared_ptr<const PathTubePair>());
-  clearBootstrapRendezvousLocked();
-  authority_session_.fetch_add(1U, std::memory_order_acq_rel);
-  advertised_ = false;
+  clearPendingPositionCommandLocked();
+  v2_execution_binding_.reset();
   active_diagnostics_pub_ = ros::Publisher();
-  manual_base_path_pub_ = ros::Publisher();
-  manual_active_path_pub_ = ros::Publisher();
-  manual_frame_pub_ = ros::Publisher();
-  manual_tube_pub_ = ros::Publisher();
-  manual_tube_candidate_pub_ = ros::Publisher();
-  manual_tube_certified_geometry_pub_ = ros::Publisher();
-  manual_diagnostics_pub_ = ros::Publisher();
-  manual_tube_epoch_diagnostics_pub_ = ros::Publisher();
-  manual_raw_candidate_diagnostics_pub_ = ros::Publisher();
-  manual_cloud_snapshot_diagnostics_pub_ = ros::Publisher();
+  {
+    std::lock_guard<std::mutex> marker_lock(marker_publication_mutex_);
+    manual_tube_pub_ = ros::Publisher();
+    manual_tube_candidate_pub_ = ros::Publisher();
+    published_active_marker_identity_ = TubeMarkerIdentityV2();
+    published_candidate_marker_identity_ = TubeMarkerIdentityV2();
+    marker_snapshot_published_ = false;
+  }
 }
 
-std::uint64_t PhaseOffsetMatchedAdapter::retirePathTubeAuthority(
-    const std::uint64_t authority_session) {
-  // This is intentionally only an ownership retirement.  In particular do
-  // not reset Runtime's retained delta/previous final port: a stale command
-  // must be rejected, and any surviving executed authority remains unpaired
-  // and fail-closed rather than being silently rebound by bootstrap.
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  return retirePathTubeAuthorityLocked(authority_session);
-}
-
-bool PhaseOffsetMatchedAdapter::resetForNewNavigationTask(
-    const std::uint64_t expected_authority_session,
-    std::uint64_t& retired_authority_session) {
-  retired_authority_session = 0U;
-  // This is the task-boundary linearization point.  A timer completion that
-  // already owns the publication barrier finishes before reset returns; a
-  // later completion observes the new generation and cannot publish old
-  // diagnostics, markers, or evidence slots.  Keep this order consistent
-  // with finalizeTubeEpoch to avoid a runtime/publication lock inversion.
+bool PhaseOffsetMatchedAdapter::resetForNewNavigationTask() {
   std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  const std::uint64_t current =
-      authority_session_.load(std::memory_order_acquire);
-  if (expected_authority_session != current || !runtime_) return false;
+  std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+  if (shutdown_requested_.load(std::memory_order_acquire)) return false;
 
-  const std::shared_ptr<const ControlPublishSnapshot> previous_control =
-      std::atomic_load(&latest_control_snapshot_);
-
-  // The timer owns its manager/profile/cache and will consume this token on
-  // its next tick.  Do not touch timer-owned state from this command thread.
-  task_generation_.fetch_add(1U, std::memory_order_acq_rel);
+  const std::uint64_t next_generation =
+      task_generation_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
   {
     std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
-    // Invalidate only the waiting slot.  A running job retains its immutable
-    // local state and will fail the post-build task-generation gate.
-    pending_request_.reset();
-    pending_permit_id_ = 0U;
-    pending_request_identity_ = RequestInstanceIdentity();
-    pending_work_identity_ = TubeWorkIdentity();
+    if (v2_shadow_worker_) v2_shadow_worker_->reset(next_generation);
+    pinned_current_cohort_.reset();
+    latest_v2_shadow_current_completion_.reset();
+    latest_v2_shadow_successor_completion_.reset();
+    latest_v2_shadow_admission_candidate_.reset();
+    std::atomic_store_explicit(
+        &retained_v2_shadow_admission_candidate_,
+        std::shared_ptr<const TubeV2ShadowAdmissionCandidate>(),
+        std::memory_order_release);
+    v2_shadow_last_current_identity_ = V2ShadowRequestIdentity();
+    v2_shadow_last_successor_identity_ = V2ShadowRequestIdentity();
+    v2_shadow_last_current_path_key_ = phase_offset_navigation::TubePathKey();
+    v2_shadow_last_successor_path_key_ = phase_offset_navigation::TubePathKey();
+    v2_shadow_have_current_path_key_ = false;
+    v2_shadow_have_successor_path_key_ = false;
   }
-  worker_condition_.notify_all();
-
-  // Reuse the established retirement operation for the old lease, pair, and
-  // timer evidence, then deliberately clear only the new-task additions.
-  // Ordinary H2 retirement must keep Runtime history and therefore never
-  // reaches this branch.
-  retired_authority_session = retirePathTubeAuthorityLocked(current + 1U);
-  // The new task now owns the lifecycle boundary.  It may clear the old
-  // namespaces once, while stale timer callbacks remain unable to do so.
-  if (previous_control && previous_control->active) {
-    publishManualDelete(*previous_control);
-  }
-  std::atomic_store(&latest_control_snapshot_,
-                    std::shared_ptr<const ControlPublishSnapshot>());
+  clearPendingPositionCommandLocked();
+  v2_execution_binding_.reset();
+  std::atomic_store(&latest_build_request_,
+                    std::shared_ptr<const TubeBuildRequestV2>());
+  control_sequence_ = 0U;
+  command_active_ = false;
   zero_gate_consecutive_count_ = 0;
   zero_gate_open_ = false;
-  source_identity_ = nullptr;
-  source_start_w_ = 0.0;
-  source_end_w_ = 0.0;
-  // Revisions are deliberately monotonic across tasks.  A new planner may
-  // restart its local revision at one; reusing that number could otherwise
-  // make an old timer profile look equivalent to a new task's profile.
-  last_preflight_revision_ = 0U;
-  have_preflight_revision_ = false;
-  last_consumed_epoch_build_sequence_ = 0U;
-  runtime_->resetForNewNavigationTask();
-  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
-  pending_authority_prepared_ =
-      phase_offset_navigation::AuthorityPreparedStep();
-  pending_authority_session_ = 0U;
-  pending_authority_valid_ = false;
-  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
-  pending_recovery_step_valid_ = false;
-  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
-  pending_handoff_valid_ = false;
-  pending_normal_source_pair_.reset();
-  pending_recovery_source_pair_.reset();
-  pending_recovery_execution_pair_.reset();
-  pending_recovery_target_pair_.reset();
-  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
-  recovery_deadline_session_ = 0U;
-  recovery_deadline_target_revision_ = 0U;
-  execution_authority_.resetForNewTask(retired_authority_session);
-  return true;
-}
-
-std::uint64_t PhaseOffsetMatchedAdapter::retirePathTubeAuthorityLocked(
-    const std::uint64_t authority_session) {
-  const std::uint64_t current =
-      authority_session_.load(std::memory_order_acquire);
-  const std::uint64_t retired_session = authority_session > current
-      ? authority_session : current + 1U;
-  if (path_tube_pin_registry_) {
-    std::lock_guard<std::mutex> pin_lock(path_tube_pin_registry_->mutex);
-    path_tube_pin_registry_->active_lease_id = 0U;
-    path_tube_pin_registry_->active_pair.reset();
-    path_tube_pin_registry_->active_generation = 0U;
-    path_tube_pin_registry_->active_session = 0U;
-  }
-  authority_session_.store(retired_session, std::memory_order_release);
-  std::atomic_store(&authoritative_path_tube_pair_,
-                    std::shared_ptr<const PathTubePair>());
-  std::atomic_store(&latest_build_request_,
-                    std::shared_ptr<const TubeBuildRequest>());
-  std::atomic_store(&latest_candidate_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  std::atomic_store(&latest_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  have_source_identity_ = false;
-  have_preflight_revision_ = false;
-  command_active_ = false;
-  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
-  pending_authority_prepared_ =
-      phase_offset_navigation::AuthorityPreparedStep();
-  pending_authority_session_ = 0U;
-  pending_authority_valid_ = false;
-  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
-  pending_recovery_step_valid_ = false;
-  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
-  pending_handoff_valid_ = false;
-  pending_normal_source_pair_.reset();
-  pending_recovery_source_pair_.reset();
-  pending_recovery_execution_pair_.reset();
-  pending_recovery_target_pair_.reset();
-  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
-  recovery_deadline_session_ = 0U;
-  recovery_deadline_target_revision_ = 0U;
-  clearBootstrapRendezvousLocked();
-  return retired_session;
-}
-
-bool PhaseOffsetMatchedAdapter::retirePathTubeAuthorityIfNeutral(
-    const std::uint64_t authority_session,
-    std::uint64_t& retired_session) {
-  retired_session = 0U;
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  if (!runtime_) {
-    return false;
-  }
-
-  // The manager calls this only while it is linearizing a planner frontend
-  // installation.  Keep the complete neutral proof in this Runtime lock so
-  // a pending activation, command publication, or timer refresh cannot pass a
-  // check and then change the facts before the Pair/session retirement.
-  const auto exact_zero = [](const double value) {
-    // Mathematical-zero classification intentionally accepts both IEEE
-    // signed zeros while rejecting every non-finite and nonzero value.  Keep
-    // bit-exact identity checks below on BitsEqual; this predicate is only for
-    // the neutral scalar proof.
-    return std::isfinite(value) && value == 0.0;
-  };
-
-  // Formal NORMAL publication and this retirement edge share one
-  // side-effect-free transaction proof.  A malformed/changed pending
-  // transaction is cancelled first; the neutral decision below then observes
-  // only the already-committed authority and Runtime state.
-  std::string pending_reason;
-  if (!validatePendingPositionCommandLocked(&pending_reason)) {
-    clearPendingPositionCommandLocked();
-  }
-  if (pending_authority_valid_ && pending_runtime_commit_.valid) {
-    const phase_offset_navigation::ActiveReferenceSnapshot& pending =
-        *pending_authority_prepared_.committed_snapshot;
-    const bool recovery_or_handoff_metadata = pending_handoff_valid_ ||
-        pending_recovery_step_valid_ || pending_recovery_source_pair_ ||
-        pending_recovery_execution_pair_ || pending_recovery_target_pair_;
-    const bool protected_pending_mode =
-        pending.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY ||
-        pending.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
-    if (protected_pending_mode) {
-      return false;
-    }
-    const bool normal_pending_mode =
-        pending.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
-        pending.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION;
-    if (recovery_or_handoff_metadata || !normal_pending_mode) {
-      // A mixed-mode pending slot is not NORMAL evidence.  Drop its future
-      // publication eligibility, then continue from committed authority.
-      clearPendingPositionCommandLocked();
-    } else {
-      const bool pending_neutral = exact_zero(pending.delta) &&
-          exact_zero(pending.proposed_next_delta) &&
-          exact_zero(pending.selected_u.u_w) &&
-          exact_zero(pending.selected_u.u_delta) &&
-          exact_zero(pending.selected_u_w) &&
-          exact_zero(pending.selected_u_delta) &&
-          exact_zero(pending_runtime_commit_.expected_delta) &&
-          exact_zero(pending_runtime_commit_.next_delta) &&
-          exact_zero(pending_runtime_commit_.next_previous_final_port.u_w) &&
-          exact_zero(pending_runtime_commit_.next_previous_final_port.u_delta);
-      if (!pending_neutral) {
-        // A current, exact, non-neutral pending NORMAL command retains the
-        // existing authority and remains eligible for its normal publication.
-        return false;
-      }
-      clearPendingPositionCommandLocked();
-    }
-  }
-
-  const std::shared_ptr<const PathTubePair> pair = capturePathTubePair();
-  const phase_offset_navigation::ActiveReferenceSnapshot authority =
-      execution_authority_.snapshot();
-  const std::uint64_t live_session =
-      authority_session_.load(std::memory_order_acquire);
-  const auto pair_lifecycle_matches = [&pair, live_session]() {
-    if (!pair || !pair->path_owner || !pair->frame_owner ||
-        !pair->active_profile || !pair->epoch_snapshot ||
-        pair->authority_session != live_session ||
-        pair->source_revision == 0U || pair->path_revision == 0U ||
-        pair->frame_revision == 0U) {
-      return false;
-    }
-    const phase_offset_navigation::TubeProfile& profile =
-        *pair->active_profile;
-    return profile.source_revision == pair->source_revision &&
-        profile.path_revision == pair->path_revision &&
-        profile.frame_revision == pair->frame_revision &&
-        pair->epoch_status.active_path_source_revision ==
-            pair->source_revision &&
-        pair->epoch_status.active_available &&
-        pair->epoch_status.active_current_validation_valid &&
-        pair->epoch_snapshot->source_revision == pair->source_revision &&
-        pair->epoch_snapshot->path_revision == pair->path_revision &&
-        pair->epoch_snapshot->frame_revision == pair->frame_revision &&
-        pair->epoch_snapshot->active_profile == pair->active_profile;
-  };
-  const auto pair_provenance_matches =
-      [&pair, &pair_lifecycle_matches](
-          const phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
-        if (!pair_lifecycle_matches()) return false;
-        const phase_offset_navigation::TubeProfile& profile =
-            *pair->active_profile;
-        return snapshot.authority_session == pair->authority_session &&
-            snapshot.planner_path_revision == pair->source_revision &&
-            snapshot.executed_path_revision == pair->path_revision &&
-            snapshot.frame_revision == pair->frame_revision &&
-            snapshot.tube_revision == profile.tube_revision &&
-            snapshot.profile_revision == profile.profile_revision &&
-            snapshot.map_revision == profile.map_revision &&
-            snapshot.executed_reference_query &&
-            snapshot.executed_reference_query->pathRevision() ==
-                pair->path_revision &&
-            snapshot.executed_reference_query->frameRevision() ==
-                pair->frame_revision &&
-            snapshot.executed_reference_query->ownerRevision() ==
-                pair->source_revision &&
-            snapshot.executed_reference_query->queryRevision() ==
-                snapshot.reference_query_revision &&
-            snapshot.governorViewValid();
-      };
-  const auto neutral_snapshot_matches =
-      [this, &authority, &pair_provenance_matches, exact_zero](
-          const bool require_zero_selected_u) {
-        if (!authority.valid || authority.stale ||
-            authority.current_state_unsafe || authority.planner_invalid ||
-            !pair_provenance_matches(authority) ||
-            !exact_zero(authority.delta) ||
-            !exact_zero(authority.proposed_next_delta) ||
-            !authority.selectedUConsistent(0.0) ||
-            !BitsEqual(authority.proposed_next_u_prev,
-                       authority.selected_u) ||
-            !std::isfinite(authority.delta) ||
-            !std::isfinite(authority.dt) || authority.dt <= 0.0 ||
-            std::abs(authority.delta + authority.dt *
-                         authority.selected_u.u_delta -
-                     authority.proposed_next_delta) >
-                execution_authority_.config().comparison_epsilon) {
-          return false;
-        }
-        if (require_zero_selected_u &&
-            (!exact_zero(authority.selected_u.u_w) ||
-             !exact_zero(authority.selected_u.u_delta) ||
-             !exact_zero(authority.selected_u_w) ||
-             !exact_zero(authority.selected_u_delta))) {
-          return false;
-        }
-        return true;
-      };
-
-  // Runtime's exact retained delta is the first neutral fact.  A started but
-  // incomplete profile remains an executed authority at its instantaneous
-  // zero crossing, so the existing predicate still blocks retirement there.
-  if (!exact_zero(runtime_->retainedDelta()) ||
-      runtime_->hasExecutedOffsetAuthority()) {
-    return false;
-  }
-  if (pair && !pair_lifecycle_matches()) {
-    return false;
-  }
-
-  bool safe_neutral = false;
-  if (!authority.valid) {
-    // No command/snapshot has executed yet.  This is the pending activation
-    // case: the Pair is still provisional ownership and may be retired while
-    // Runtime is exactly neutral.  The existing session retirement below
-    // invalidates any staged command/pending transaction atomically.
-    safe_neutral = true;
-  } else if (authority.owner_mode ==
-                 phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY) {
-    safe_neutral = authority.selected_u_owner == "PlannerOwner" &&
-        authority.handoff_state == "PLANNER_ONLY" &&
-        authority.provenance ==
-            "PhaseOffsetMatchedAdapter/atomic-neutral-handoff" &&
-        neutral_snapshot_matches(true);
-  } else if (authority.owner_mode ==
-                 phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
-             authority.owner_mode ==
-                 phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION) {
-    const bool allocator_owner = authority.selected_u_owner ==
-        phase_offset_navigation::PhaseOffsetAllocator::ownerName() &&
-        authority.handoff_state == "PATH_TUBE_PAIR" &&
-        authority.provenance ==
-            "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator";
-    safe_neutral = allocator_owner && neutral_snapshot_matches(true);
-  }
-  if (!safe_neutral) {
-    return false;
-  }
-
-  retired_session = retirePathTubeAuthorityLocked(authority_session);
-  execution_authority_.resetForNewTask(retired_session);
+  failure_latched_ = false;
+  control_failure_reason_ =
+      phase_offset_navigation::ControlFailureReason::NONE;
+  if (runtime_) runtime_->resetForNewNavigationTask();
+  recovery_owner_.reset(next_generation);
+  execution_authority_.resetForNewTask(next_generation);
   return true;
 }
 
 void PhaseOffsetMatchedAdapter::deactivate(const ros::Time& stamp) {
-  const std::uint64_t task_generation =
+  const std::uint64_t generation =
       task_generation_.load(std::memory_order_acquire);
-  if (deactivate_test_hook_) deactivate_test_hook_();
-  bool invalidate_pending = false;
-  {
-    // Keep the command/lifecycle boundary through the bounded worker-slot
-    // invalidation.  A stale deactivate may have paused before this lock,
-    // while reset+update have already installed a newer task/request; in that
-    // case it must be a complete no-op and cannot clear the newer pending B.
-    std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-    const bool current_generation =
-        !shutdown_requested_.load(std::memory_order_acquire) &&
-        task_generation == task_generation_.load(std::memory_order_acquire);
-    if (current_generation) {
-      deactivateLocked(stamp, task_generation);
-      std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
-      // A pending active request has been invalidated by the accepted
-      // inactive command; drop it before waking the worker so it cannot start
-      // an obsolete build.  The runtime lock remains held until this check
-      // and clear are complete, so no newer task can interleave here.
-      pending_request_.reset();
-      pending_permit_id_ = 0U;
-      pending_request_identity_ = RequestInstanceIdentity();
-      pending_work_identity_ = TubeWorkIdentity();
-      invalidate_pending = true;
-    }
-  }
-  if (invalidate_pending) {
-    // Wake a worker which is waiting on lifecycle state; actual inactive
-    // DELETE processing still requires the next Tube timer permit.
-    worker_condition_.notify_one();
-  }
+  std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
+  std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+  deactivateLocked(stamp, generation);
 }
 
 void PhaseOffsetMatchedAdapter::deactivateLocked(
-    const ros::Time& stamp, const std::uint64_t expected_task_generation) {
+    const ros::Time&, const std::uint64_t expected_task_generation) {
   if (shutdown_requested_.load(std::memory_order_acquire) ||
       expected_task_generation !=
           task_generation_.load(std::memory_order_acquire)) {
     return;
   }
-  // Deactivation invalidates any staged PositionCommand transaction.  In
-  // particular, a goal override or an explicit planner handoff may occur
-  // after the adapter prepared a recovery/runtime step but before the manager
-  // reaches publication.  Never let that stale staged step commit against the
-  // replacement command; retain only the last already-committed authority.
-  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
-  pending_authority_prepared_ =
-      phase_offset_navigation::AuthorityPreparedStep();
-  pending_authority_session_ = 0U;
-  pending_authority_valid_ = false;
-  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
-  pending_recovery_step_valid_ = false;
-  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
-  pending_handoff_valid_ = false;
-  pending_normal_source_pair_.reset();
-  pending_recovery_source_pair_.reset();
-  pending_recovery_execution_pair_.reset();
-  pending_recovery_target_pair_.reset();
-  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
-  recovery_deadline_session_ = 0U;
-  recovery_deadline_target_revision_ = 0U;
-  clearBootstrapRendezvousLocked();
-  if (!command_active_) return;
+  clearPendingPositionCommandLocked();
+  if (RuntimeExecutionExactlyNeutral(runtime_.get())) {
+    v2_execution_binding_.reset();
+  }
   command_active_ = false;
-  std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
+  std::shared_ptr<TubeBuildRequestV2> request(new TubeBuildRequestV2());
   request->active = false;
-  request->task_generation =
-      task_generation_.load(std::memory_order_acquire);
+  request->task_generation = expected_task_generation;
   request->control_sequence = ++control_sequence_;
-  request->stamp = stamp;
-  std::atomic_store(&latest_build_request_,
-                    std::shared_ptr<const TubeBuildRequest>(request));
-  std::atomic_store(&latest_candidate_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  std::atomic_store(&latest_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-
-  std::shared_ptr<ControlPublishSnapshot> control(new ControlPublishSnapshot());
-  control->active = false;
-  control->task_generation = request->task_generation;
-  control->control_sequence = request->control_sequence;
-  control->stamp = stamp;
-  std::atomic_store(&latest_control_snapshot_,
-                    std::shared_ptr<const ControlPublishSnapshot>(control));
+  std::atomic_store(
+      &latest_build_request_,
+      std::shared_ptr<const TubeBuildRequestV2>(std::move(request)));
+  std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+  if (v2_shadow_worker_) {
+    v2_shadow_worker_->cancel(TubeWorkerPurposeV2::CURRENT);
+    v2_shadow_worker_->cancel(TubeWorkerPurposeV2::SUCCESSOR);
+  }
+  pinned_current_cohort_.reset();
+  latest_v2_shadow_current_completion_.reset();
+  latest_v2_shadow_successor_completion_.reset();
 }
 
 bool PhaseOffsetMatchedAdapter::prepareDeactivationLocked(
-    const ros::Time& stamp, const std::uint64_t expected_task_generation,
+    const ros::Time&, const std::uint64_t expected_task_generation,
     DeactivationCommitToken& token) const {
   token = DeactivationCommitToken();
   if (shutdown_requested_.load(std::memory_order_acquire) ||
@@ -2718,21 +2622,12 @@ bool PhaseOffsetMatchedAdapter::prepareDeactivationLocked(
   token.command_active_before = command_active_;
   if (command_active_) {
     try {
-      std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
+      std::shared_ptr<TubeBuildRequestV2> request(new TubeBuildRequestV2());
       request->active = false;
       request->task_generation = expected_task_generation;
       request->control_sequence = token.next_control_sequence;
-      request->stamp = stamp;
       token.inactive_request =
-          std::shared_ptr<const TubeBuildRequest>(std::move(request));
-      std::shared_ptr<ControlPublishSnapshot> control(
-          new ControlPublishSnapshot());
-      control->active = false;
-      control->task_generation = expected_task_generation;
-      control->control_sequence = token.next_control_sequence;
-      control->stamp = stamp;
-      token.inactive_control =
-          std::shared_ptr<const ControlPublishSnapshot>(std::move(control));
+          std::shared_ptr<const TubeBuildRequestV2>(std::move(request));
     } catch (const std::bad_alloc&) {
       return false;
     }
@@ -2743,2335 +2638,617 @@ bool PhaseOffsetMatchedAdapter::prepareDeactivationLocked(
 
 void PhaseOffsetMatchedAdapter::commitDeactivationNoFailLocked(
     const DeactivationCommitToken& token) noexcept {
-  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
-  pending_authority_prepared_ =
-      phase_offset_navigation::AuthorityPreparedStep();
-  pending_authority_session_ = 0U;
-  pending_authority_valid_ = false;
-  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
-  pending_recovery_step_valid_ = false;
-  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
-  pending_handoff_valid_ = false;
-  pending_normal_source_pair_.reset();
-  pending_recovery_source_pair_.reset();
-  pending_recovery_execution_pair_.reset();
-  pending_recovery_target_pair_.reset();
-  recovery_deadline_ = std::numeric_limits<double>::quiet_NaN();
-  recovery_deadline_session_ = 0U;
-  recovery_deadline_target_revision_ = 0U;
+  clearPendingPositionCommandLocked();
+  if (RuntimeExecutionExactlyNeutral(runtime_.get())) {
+    v2_execution_binding_.reset();
+  }
   if (!token.command_active_before) return;
   command_active_ = false;
   control_sequence_ = token.next_control_sequence;
   std::atomic_store(&latest_build_request_, token.inactive_request);
-  std::atomic_store(&latest_candidate_epoch_snapshot_,
-                    token.inactive_candidate_snapshot);
-  std::atomic_store(&latest_epoch_snapshot_, token.inactive_epoch_snapshot);
-  std::atomic_store(&latest_control_snapshot_, token.inactive_control);
 }
+
 void PhaseOffsetMatchedAdapter::advertise(ros::NodeHandle& nh) {
-  if (!configuration_valid_ || advertised_ ||
-      shutdown_requested_.load(std::memory_order_acquire)) return;
-  // Advertisement wires publishers and the timer worker only.  Session
-  // ownership remains with the manager's existing new-task reset / H2 pair
-  // lifecycle; there is no duplicate advertise-time initialization.
-  execution_authority_.setTestOnlyRuntimeOwnerAllowed(false);
+  if (!configuration_valid_ ||
+      shutdown_requested_.load(std::memory_order_acquire)) {
+    return;
+  }
   if (config_.mode == PhaseOffsetMatchedMode::ACTIVE) {
-    active_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>("phase_offset_active/diagnostics", 1);
-  } else {
-    manual_base_path_pub_ = nh.advertise<visualization_msgs::Marker>("phase_offset_manual/base_path", 1, true);
-    manual_active_path_pub_ = nh.advertise<visualization_msgs::Marker>("phase_offset_manual/active_path", 1, true);
-    manual_frame_pub_ = nh.advertise<visualization_msgs::MarkerArray>("phase_offset_manual/frame", 1);
-    manual_tube_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
-        "phase_offset_manual/tube", kManualEvidenceQueueSize);
-    manual_tube_candidate_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
-        "phase_offset_manual/tube_candidate", kManualEvidenceQueueSize);
-    manual_tube_certified_geometry_pub_ =
-        nh.advertise<visualization_msgs::MarkerArray>(
-            "phase_offset_manual/tube_certified_geometry",
-            kManualEvidenceQueueSize);
-    manual_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>(
-        "phase_offset_manual/diagnostics", kManualEvidenceQueueSize);
-    manual_tube_epoch_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>(
-        "phase_offset_manual/tube_epoch_diagnostics", kManualEvidenceQueueSize);
-    if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-      manual_raw_candidate_diagnostics_pub_ = nh.advertise<std_msgs::Float64MultiArray>(
-          "phase_offset_manual/tube_raw_candidate_diagnostics", kManualEvidenceQueueSize);
-      manual_cloud_snapshot_diagnostics_pub_ =
+    if (!active_diagnostics_pub_) {
+      active_diagnostics_pub_ =
           nh.advertise<std_msgs::Float64MultiArray>(
-              "phase_offset_manual/tube_cloud_snapshot_diagnostics",
-              kManualEvidenceQueueSize);
+              "phase_offset_active/diagnostics", 1);
     }
+    return;
   }
-  advertised_ = true;
-  if (requiresTubeTimer()) {
-    {
-      std::lock_guard<std::mutex> lock(worker_state_mutex_);
-      worker_stop_requested_ = false;
-      worker_started_ = true;
+  {
+    std::lock_guard<std::mutex> marker_lock(marker_publication_mutex_);
+    if (!manual_tube_pub_) {
+      manual_tube_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
+          "phase_offset_manual/tube", 1, true);
     }
-    try {
-      tube_worker_ = std::thread(&PhaseOffsetMatchedAdapter::tubeWorkerMain,
-                                 this);
-    } catch (...) {
-      std::lock_guard<std::mutex> lock(worker_state_mutex_);
-      worker_started_ = false;
-      worker_stop_requested_ = true;
-      advertised_ = false;
-      throw;
+    if (!manual_tube_candidate_pub_) {
+      manual_tube_candidate_pub_ =
+          nh.advertise<visualization_msgs::MarkerArray>(
+              "phase_offset_manual/tube_candidate", 1, true);
     }
+    marker_snapshot_published_ = false;
   }
+  std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+  worker_stop_requested_ = false;
+  worker_started_ = static_cast<bool>(v2_shadow_worker_);
 }
-bool PhaseOffsetMatchedAdapter::collectSamples(const TubeBuildRequest& request,
-                                               PathSamples& full_path) const {
-  full_path.clear();
-  if (request.supplied_path_samples) {
-    full_path = *request.supplied_path_samples;
-  }
-  if (!full_path.empty()) return true;
-  if (!request.semantic_path_owner || request.semantic_path_owner->empty()) {
-    return false;
-  }
-  std::vector<double> w; std::vector<ContinuousPhasePathState> states;
-  const double tube_sample_step = std::min(
-      0.10, std::min(config_.tube.sample_step_w, config_.preflight_sample_step_w));
-  if (!request.semantic_path_owner->sample(tube_sample_step, w, states) ||
-      w.size() != states.size()) return false;
-  for (std::size_t index = 0U; index < w.size(); ++index) {
-    full_path.push_back(ConvertContinuousPhasePathStateForActive(states[index], w[index]));
-  }
-  return !full_path.empty();
-}
-bool PhaseOffsetMatchedAdapter::makePreview(const PathSamples& full_path,
-                                            const phase_offset_core::PathDifferentialState& current,
-                                            PathSamples& preview) const {
-  preview.clear();
-  const double lower = current.w - config_.tube.back_w;
-  const double upper = current.w + config_.tube.lookahead_w;
-  for (const auto& state : full_path) {
-    if (state.w >= lower - 1e-12 && state.w <= upper + 1e-12) preview.push_back(state);
-  }
-  preview.push_back(current);
-  std::sort(preview.begin(), preview.end(), [](const auto& a, const auto& b) { return a.w < b.w; });
-  preview.erase(std::unique(preview.begin(), preview.end(), [](const auto& a, const auto& b) {
-    return std::abs(a.w - b.w) <= 1e-12;
-  }), preview.end());
-  return !preview.empty();
-}
-std::uint64_t PhaseOffsetMatchedAdapter::sourceRevision(const MatchedAdapterInput& input) {
-  const void* identity = input.semantic_path_owner
-      ? static_cast<const void*>(input.semantic_path_owner.get())
-      : (input.semantic_path ? static_cast<const void*>(input.semantic_path)
-                             : input.semantic_path_identity);
-  if (!have_source_identity_ || identity != source_identity_ ||
-      std::abs(input.semantic_path_start_w - source_start_w_) > 1e-12 ||
-      std::abs(input.semantic_path_end_w - source_end_w_) > 1e-12) {
-    have_source_identity_ = true; source_identity_ = identity;
-    source_start_w_ = input.semantic_path_start_w; source_end_w_ = input.semantic_path_end_w;
-    ++source_revision_;
-  }
-  return source_revision_ == 0U ? ++source_revision_ : source_revision_;
-}
-bool PhaseOffsetMatchedAdapter::makeAuthorityRequest(
-    const double retained_delta,
-    phase_offset_navigation::TubeBounds& authority_request) const {
-  authority_request = phase_offset_navigation::TubeBounds();
-  const double amplitude = std::abs(config_.amplitude);
-  const double interior_margin = config_.tube.interior_margin;
-  if (!IsFinite(amplitude) || !IsFinite(retained_delta) ||
-      !IsFinite(interior_margin) || interior_margin < 0.0) {
-    return false;
-  }
-  const double requested_lower =
-      std::min(std::min(-amplitude, retained_delta), 0.0) - interior_margin;
-  const double requested_upper =
-      std::max(std::max(amplitude, retained_delta), 0.0) + interior_margin;
-  if (!IsFinite(requested_lower) || !IsFinite(requested_upper) ||
-      requested_lower > requested_upper || requested_lower > 0.0 ||
-      requested_upper < 0.0) {
-    return false;
-  }
-  authority_request.lower = requested_lower;
-  authority_request.upper = requested_upper;
-  authority_request.valid = true;
-  return true;
-}
-std::shared_ptr<const TubeBuildRequest> PhaseOffsetMatchedAdapter::makeBuildRequest(
-    const MatchedAdapterInput& input, const std::uint64_t source_revision,
-    const double retained_delta) {
-  std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
+
+std::shared_ptr<const TubeBuildRequestV2>
+PhaseOffsetMatchedAdapter::makeBuildRequestV2(
+    const MatchedAdapterInput& input) {
+  std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+  std::shared_ptr<TubeBuildRequestV2> request(new TubeBuildRequestV2());
   request->active = true;
   request->task_generation =
       task_generation_.load(std::memory_order_acquire);
   request->control_sequence = ++control_sequence_;
-  request->source_revision = source_revision;
-  // Ordinary (non-pair) requests still belong to the adapter's current
-  // authority session.  Without carrying this private session token, any
-  // planner-owned C2 retirement increments authority_session_ while leaving
-  // request->authority_session at its default zero, so every timer build is
-  // rejected by requestSourceStillCurrent() before Candidate/epoch
-  // publication.  Pair requests set the same field explicitly in update().
-  request->authority_session = authority_session_.load(
-      std::memory_order_acquire);
-  request->stamp = input.stamp;
-  request->semantic_path_owner = input.semantic_path_owner;
-  request->frame_owner = input.frame_owner;
-  if (!request->frame_owner && request->semantic_path_owner &&
-      source_revision != 0U) {
-    const std::shared_ptr<const TubeBuildRequest> latest =
-        std::atomic_load(&latest_build_request_);
-    if (latest && latest->semantic_path_owner == request->semantic_path_owner &&
-        latest->source_revision == source_revision &&
-        FrameMatchesRevision(latest->frame_owner, source_revision)) {
-      request->frame_owner = latest->frame_owner;
-    } else {
-      const std::shared_ptr<const PathTubePair> pair =
-          std::atomic_load(&authoritative_path_tube_pair_);
-      if (pair && pair->path_owner == request->semantic_path_owner &&
-          pair->source_revision == source_revision &&
-          FrameMatchesRevision(pair->frame_owner, source_revision)) {
-        request->frame_owner = pair->frame_owner;
-      }
-    }
-    if (!request->frame_owner) {
-      request->frame_owner = std::shared_ptr<const ContinuousPhaseNormalFrame>(
-          new ContinuousPhaseNormalFrame(request->semantic_path_owner,
-                                         source_revision, source_revision));
+  request->current_w = input.path.w;
+  request->tube_worker_input_v2 = input.tube_worker_input_v2;
+  request->tube_worker_purpose_v2 = input.tube_worker_purpose_v2;
+  if (pinned_current_cohort_) {
+    if (v2_shadow_worker_ && !v2_shadow_worker_->running()) {
+      const auto stats = v2_shadow_worker_->stats();
+      const bool delivered = latest_v2_shadow_current_completion_ &&
+          latest_v2_shadow_current_completion_->request_id ==
+              pinned_current_cohort_->tube_worker_input_v2->request_id;
+      if (stats.pending_current == 0U && stats.retained_current == 0U && !delivered)
+        pinned_current_cohort_.reset();  // Cancelled/discarded job has no result.
     }
   }
-  request->semantic_path_start_w = input.semantic_path_start_w;
-  request->semantic_path_end_w = input.semantic_path_end_w;
-  request->path_revision = request->semantic_path_owner
-      ? request->semantic_path_owner->pathRevision() : 0U;
-  request->frame_revision = request->frame_owner
-      ? request->frame_owner->frameRevision() : 0U;
-  if (!input.sampled_path.empty()) {
-    request->supplied_path_samples =
-        std::make_shared<const PathSamples>(input.sampled_path);
+  if (pinned_current_cohort_) {
+    const auto& pinned = pinned_current_cohort_->tube_worker_input_v2;
+    const auto& incoming = input.tube_worker_input_v2;
+    if (pinned_current_cohort_->task_generation != request->task_generation ||
+        (incoming && incoming->path_key != pinned->path_key)) {
+      if (v2_shadow_worker_) v2_shadow_worker_->invalidatePath(pinned->path_key);
+      pinned_current_cohort_.reset();
+      latest_v2_shadow_current_completion_.reset();
+    } else if (input.tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT) {
+      request->tube_worker_input_v2 = pinned;
+    }
   }
-  request->current_path = input.path;
-  request->position = input.position;
-  request->gains = input.gains;
-  request->dt = input.dt;
-  request->retained_delta = retained_delta;
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    makeAuthorityRequest(retained_delta, request->authority_request);
-  }
-  request->cloud_snapshot = input.cloud_occupancy_snapshot;
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    request->map_observation_is_snapshot = true;
-    request->map_observation_sequence = request->cloud_snapshot
-        ? request->cloud_snapshot->observation_sequence : 0U;
-  }
-  return std::shared_ptr<const TubeBuildRequest>(request);
+  std::atomic_store(&latest_build_request_,
+      std::shared_ptr<const TubeBuildRequestV2>(request));
+  command_active_ = true;
+  return std::shared_ptr<const TubeBuildRequestV2>(std::move(request));
 }
 
-bool PhaseOffsetMatchedAdapter::requestSourceStillCurrent(
-    const TubeBuildRequest& request) const {
-  const std::shared_ptr<const TubeBuildRequest> latest =
-      std::atomic_load(&latest_build_request_);
-  if (!latest || !latest->active ||
-      latest->task_generation != request.task_generation ||
-      latest->source_revision != request.source_revision ||
-      latest->path_revision != request.path_revision ||
-      latest->frame_revision != request.frame_revision ||
-      latest->authority_session != request.authority_session ||
-      latest->semantic_path_owner != request.semantic_path_owner ||
-      latest->frame_owner != request.frame_owner ||
-      task_generation_.load(std::memory_order_acquire) !=
-          request.task_generation ||
-      authority_session_.load(std::memory_order_acquire) !=
-          request.authority_session) {
-    return false;
-  }
-  if (request.semantic_path_owner &&
-      !FrameMatchesRevision(request.frame_owner, request.source_revision)) {
-    return false;
-  }
-  if (request.base_path_tube_pair) {
-    const std::shared_ptr<const PathTubePair> live =
-        std::atomic_load(&authoritative_path_tube_pair_);
-    if (live != request.base_path_tube_pair ||
-        live->generation != request.base_path_tube_pair_generation) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::requestCloudSnapshotUsable(
-    const TubeBuildRequest& request) const {
-  return config_.tube_source != phase_offset_navigation::TubeSource::ESDF ||
-      inspectCloudOccupancyQuery(request.cloud_snapshot,
-                                 cloud_occupancy_query_config_).usable;
-}
-
-std::shared_ptr<const TubeEpochSnapshot>
-PhaseOffsetMatchedAdapter::makeCandidateOnlyEpoch(
-    const TubeEpochSnapshot& epoch) const {
-  // A map-lag Candidate remains useful provenance-bound geometry evidence,
-  // but it must not resemble a current active certificate.  Keep only the
-  // Candidate facts/key and erase every Active/current-execution witness.
-  std::shared_ptr<TubeEpochSnapshot> masked(new TubeEpochSnapshot(epoch));
-  masked->active_profile.reset();
-  phase_offset_navigation::TubeEpochStatus& status = masked->epoch_status;
-  status.state = phase_offset_navigation::TubeEpochState::WAITING_FOR_CANDIDATE;
-  status.disposition = phase_offset_navigation::TubeInstallDisposition::NONE;
-  status.current_safety_status =
-      phase_offset_navigation::CurrentSafetyStatus::NOT_EVALUATED;
-  status.active_available = false;
-  status.active_current_validation_valid = false;
-  status.active_tube_epoch = 0U;
-  status.active_path_source_revision = 0U;
-  status.active_map_observation_sequence = 0U;
-  status.current_geometry_valid = false;
-  status.current_bounds_valid = false;
-  status.current_interval_nonempty = false;
-  status.current_interval_contains_zero = false;
-  status.current_interval_contains_retained_delta = false;
-  status.base_centerline_clearance_sufficient = false;
-  status.retained_delta_current_inside = false;
-  status.current_state_admissible = false;
-  status.reference_clearance_sufficient = false;
-  status.actual_clearance_sufficient = false;
-  status.tracking_within_bound = false;
-  status.forward_horizon_sufficient = false;
-  status.certificate_denied = false;
-  status.transient_blocked = true;
-  status.genuine_fatal_invariant = false;
-  status.control_failure_reason =
-      phase_offset_navigation::ControlFailureReason::NONE;
-  status.retained_delta = 0.0;
-  status.tracking_error_norm = 0.0;
-  status.tracking_error_bound = 0.0;
-  status.reference_signed_distance = 0.0;
-  status.actual_signed_distance = 0.0;
-  status.required_reference_clearance = 0.0;
-  status.required_actual_clearance = 0.0;
-  status.certified_forward_w = 0.0;
-  status.reason = phase_offset_navigation::TubeEpochReason::NONE;
-  status.reason_text = "historical map candidate; active view masked";
-  return std::shared_ptr<const TubeEpochSnapshot>(masked);
-}
-
-bool PhaseOffsetMatchedAdapter::epochMatchesRequest(
-    const TubeEpochSnapshot& epoch, const TubeBuildRequest& request) const {
-  if (!epoch.active || epoch.task_generation != request.task_generation ||
-      task_generation_.load(std::memory_order_acquire) !=
-          request.task_generation ||
-      epoch.source_revision != request.source_revision ||
-      epoch.request_control_sequence > request.control_sequence) {
-    return false;
-  }
-  // Legacy deterministic fixtures may construct an epoch without the newer
-  // explicit owner/frame provenance fields.  Production-built epochs always
-  // populate them; compare populated fields strictly and retain the old
-  // compatibility behavior for an all-zero fixture value.
-  if ((epoch.path_revision != 0U &&
-       epoch.path_revision != request.path_revision) ||
-      (epoch.frame_revision != 0U &&
-       epoch.frame_revision != request.frame_revision) ||
-      (epoch.semantic_path_owner &&
-       epoch.semantic_path_owner != request.semantic_path_owner) ||
-      (epoch.frame_owner && epoch.frame_owner != request.frame_owner)) {
-    return false;
-  }
-  const auto& status = epoch.epoch_status;
-  if (config_.tube_source != phase_offset_navigation::TubeSource::NONE &&
-      status.candidate_path_source_revision != request.source_revision) {
-    return false;
-  }
-  if (status.active_available != static_cast<bool>(epoch.active_profile)) {
-    return false;
-  }
-  if (status.active_available &&
-      status.active_path_source_revision != request.source_revision) {
-    return false;
-  }
-  if (config_.tube_source != phase_offset_navigation::TubeSource::ESDF) {
-    return true;
-  }
-  // A build owns one immutable, self-consistent snapshot.  Later observations
-  // are not an equality key: S3 hands a completed same-source profile to the
-  // command thread by sample-and-hold until a later epoch replaces it.
-  if (!requestCloudSnapshotUsable(request) ||
-      !epoch.map_observation_is_snapshot ||
-      status.candidate_map_observation_sequence !=
-          epoch.map_observation_sequence) {
-    return false;
-  }
-  // The manager's Active provenance must agree with the frozen epoch that
-  // produced it.  This is not compared with a later command snapshot.
-  return !status.active_available ||
-      status.active_map_observation_sequence == epoch.map_observation_sequence;
-}
-
-std::shared_ptr<const TubeEpochSnapshot>
-PhaseOffsetMatchedAdapter::matchingEpochForRequest(
-    const std::shared_ptr<const TubeBuildRequest>& request) const {
-  const std::shared_ptr<const TubeEpochSnapshot> epoch =
-      std::atomic_load(&latest_epoch_snapshot_);
-  return request && epoch && epochMatchesRequest(*epoch, *request)
-      ? epoch : std::shared_ptr<const TubeEpochSnapshot>();
-}
-
-bool PhaseOffsetMatchedAdapter::refreshPairFromTimerEpoch(
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    const std::shared_ptr<const TubeEpochSnapshot>& epoch) {
-  TimerPairRefreshPreparation preparation;
-  if (!prepareTimerPairRefresh(request, epoch, preparation)) return false;
-  std::shared_ptr<const PathTubePair> refreshed;
-  return finalizePreparedTimerPairRefresh(preparation, refreshed);
-}
-
-bool PhaseOffsetMatchedAdapter::prepareTimerPairRefresh(
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    const std::shared_ptr<const TubeEpochSnapshot>& epoch,
-    TimerPairRefreshPreparation& preparation) {
-  preparation = TimerPairRefreshPreparation();
-  const phase_offset_navigation::PhaseOffsetRuntimeConfig runtime_config =
-      MakeRuntimeConfig(config_);
-  if (!request || !epoch || !request->base_path_tube_pair ||
-      !epochMatchesRequest(*epoch, *request) || !epoch->full_path_samples ||
-      !IsOffsetCertifiedProfile(epoch->active_profile) || epoch->source_revision !=
-          request->base_path_tube_pair->source_revision ||
-      epoch->epoch_status.active_path_source_revision !=
-          request->base_path_tube_pair->source_revision ||
-      !PreparedSamplesMatchOwner(*epoch->full_path_samples,
-                                 request->base_path_tube_pair->path_owner,
-                                 request->base_path_tube_pair->frame_owner) ||
-      !ProfileSamplesMatchOwner(*epoch->active_profile,
-                                request->base_path_tube_pair->path_owner,
-                                runtime_config.tube.regularity_margin,
-                                runtime_config.tube.minimum_reference_speed,
-                                request->base_path_tube_pair->frame_owner)) {
-    return false;
-  }
-
-  // The completed epoch retains the build request's immutable profile/map
-  // provenance.  Its installation, however, is evaluated against the newest
-  // command that still names this exact same authority; a normal selected
-  // command may legitimately advance Runtime during construction.
-  const std::shared_ptr<const TubeBuildRequest> latest_request =
-      std::atomic_load(&latest_build_request_);
-  if (!latest_request || !latest_request->active ||
-      latest_request->task_generation != request->task_generation ||
-      latest_request->source_revision != request->source_revision ||
-      latest_request->path_revision != request->path_revision ||
-      latest_request->frame_revision != request->frame_revision ||
-      latest_request->authority_session != request->authority_session ||
-      latest_request->base_path_tube_pair != request->base_path_tube_pair ||
-      latest_request->base_path_tube_pair_generation !=
-          request->base_path_tube_pair_generation ||
-      latest_request->semantic_path_owner !=
-          request->base_path_tube_pair->path_owner ||
-      latest_request->frame_owner != request->base_path_tube_pair->frame_owner ||
-      !PathStateMatchesOwner(latest_request->current_path,
-                             request->base_path_tube_pair->path_owner) ||
-      !IsFinite(latest_request->position) ||
-      !std::isfinite(latest_request->dt) || latest_request->dt <= 0.0) {
-    return false;
-  }
-
-  // A transaction pin deliberately does not block tube construction or
-  // evidence publication.  The timer never waits for it: a contended command
-  // boundary or active H2 lease simply skips this refresh attempt.
-  std::unique_lock<std::mutex> lock(runtime_command_mutex_, std::try_to_lock);
-  if (!lock.owns_lock()) return false;
-  if (path_tube_pin_registry_) {
-    std::lock_guard<std::mutex> pin_lock(path_tube_pin_registry_->mutex);
-    if (path_tube_pin_registry_->active_lease_id != 0U) return false;
-  }
-  const std::shared_ptr<const PathTubePair> live =
-      std::atomic_load(&authoritative_path_tube_pair_);
-  if (live != request->base_path_tube_pair ||
-      live->generation != request->base_path_tube_pair_generation ||
-      live->authority_session != request->authority_session ||
-      authority_session_.load(std::memory_order_acquire) !=
-          request->authority_session) {
-    return false;
-  }
-  phase_offset_navigation::PhaseOffsetRuntime runtime_snapshot(*runtime_);
-  const double expected_retained_delta = runtime_->retainedDelta();
-  const phase_offset_core::PortCommand expected_previous_final_port =
-      runtime_->previousFinalPort();
-  lock.unlock();
-
-  // This is the existing Runtime exact-PWL witness, applied to a local copy.
-  // It neither writes live Runtime nor alters the completed epoch/profile.
-  phase_offset_navigation::RuntimeDryRunInput dry_run_input;
-  dry_run_input.preflight.path = *epoch->full_path_samples;
-  dry_run_input.preflight.position = latest_request->position;
-  dry_run_input.preflight.path_source_revision = request->source_revision;
-  dry_run_input.prepare.current_path = latest_request->current_path;
-  dry_run_input.prepare.position = latest_request->position;
-  dry_run_input.prepare.tube_view.active_profile = epoch->active_profile;
-  dry_run_input.prepare.tube_view.epoch_status = epoch->epoch_status;
-  dry_run_input.prepare.dt = latest_request->dt;
-  dry_run_input.prepare.future_step = MakeFutureStepContract(
-      request->base_path_tube_pair->path_owner, epoch->full_path_samples,
-      epoch->active_profile, latest_request->gains,
-      runtime_snapshot.config().tube.regularity_margin,
-      runtime_snapshot.config().tube.minimum_reference_speed,
-      config_.tube_update_period, config_.tube.min_certified_forward_w);
-  // The proof checks existing port viability independently of control arming;
-  // the following normal command retains the only selection decision.
-  dry_run_input.prepare.zero_gate_open = false;
-  phase_offset_core::GeometryParams geometry_params;
-  geometry_params.regularity_margin =
-      runtime_snapshot.config().tube.regularity_margin;
-  geometry_params.minimum_reference_speed =
-      runtime_snapshot.config().tube.minimum_reference_speed;
-  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
-  phase_offset_core::PhaseOffsetGeometryState geometry;
-  guidance::ReferenceGeometry reference;
-  guidance::IsfGuidance base;
-  if (!evaluator.evaluate(latest_request->current_path,
-                          latest_request->position,
-                          runtime_snapshot.retainedDelta(), geometry) ||
-      !geometry.valid) {
-    return false;
-  }
-  reference.point = geometry.r;
-  reference.tangent = geometry.T;
-  reference.derivative_norm = geometry.r_w.norm();
-  reference.valid = geometry.valid;
-  if (!guidance::IsfReferenceKernel::evaluate(latest_request->position,
-                                               reference,
-                                               latest_request->gains,
-                                               base) ||
-      !base.valid) {
-    return false;
-  }
-  dry_run_input.base_guidance_valid = true;
-  dry_run_input.base_v_cmd = base.v_cmd;
-  dry_run_input.base_w_dot = base.w_dot;
-  phase_offset_navigation::RuntimeDryRunResult dry_run;
-  if (!runtime_snapshot.dryRun(dry_run_input, dry_run) || !dry_run.valid) {
-    return false;
-  }
-  // Preserve the H2 install boundary for a newer explicit categorical map
-  // fact.  The epoch's frozen snapshot remains its construction provenance;
-  // this is only the existing current-reference/actual OCCUPIED/OUT_OF_MAP
-  // veto against the latest immutable command observation.
-  if (LatestCategoricalUnsafe(config_, cloud_occupancy_query_config_,
-                              latest_request->cloud_snapshot,
-                              latest_request->current_path,
-                              latest_request->position,
-                              runtime_snapshot.retainedDelta())) {
-    return false;
-  }
-
-  preparation.build_request = request;
-  preparation.latest_request = latest_request;
-  preparation.epoch = epoch;
-  preparation.expected_pair = live;
-  preparation.authority_session = request->authority_session;
-  preparation.expected_retained_delta = expected_retained_delta;
-  preparation.expected_previous_final_port = expected_previous_final_port;
-  preparation.valid = true;
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::finalizePreparedTimerPairRefresh(
-    const TimerPairRefreshPreparation& preparation,
-    std::shared_ptr<const PathTubePair>& refreshed_pair) {
-  refreshed_pair.reset();
-  if (!preparation.valid || !preparation.build_request ||
-      !preparation.latest_request || !preparation.epoch ||
-      !preparation.expected_pair) {
-    return false;
-  }
-  const std::shared_ptr<const TubeBuildRequest>& request =
-      preparation.build_request;
-  const std::shared_ptr<const TubeEpochSnapshot>& epoch = preparation.epoch;
-
-  std::unique_lock<std::mutex> lock(runtime_command_mutex_, std::try_to_lock);
-  if (!lock.owns_lock()) return false;
-  if (path_tube_pin_registry_) {
-    std::lock_guard<std::mutex> pin_lock(path_tube_pin_registry_->mutex);
-    if (path_tube_pin_registry_->active_lease_id != 0U) return false;
-  }
-  const std::shared_ptr<const PathTubePair> live =
-      std::atomic_load(&authoritative_path_tube_pair_);
-  const std::shared_ptr<const TubeBuildRequest> latest_request =
-      std::atomic_load(&latest_build_request_);
-  if (live != preparation.expected_pair ||
-      live != request->base_path_tube_pair ||
-      live->generation != request->base_path_tube_pair_generation ||
-      live->authority_session != preparation.authority_session ||
-      authority_session_.load(std::memory_order_acquire) !=
-          preparation.authority_session ||
-      request->task_generation !=
-          task_generation_.load(std::memory_order_acquire) ||
-      preparation.latest_request->task_generation != request->task_generation ||
-      latest_request != preparation.latest_request ||
-      !BitsEqual(runtime_->retainedDelta(),
-                 preparation.expected_retained_delta) ||
-      !BitsEqual(runtime_->previousFinalPort(),
-                 preparation.expected_previous_final_port)) {
-    return false;
-  }
-  std::shared_ptr<PathTubePair> refreshed(new PathTubePair(*live));
-  refreshed->generation = ++next_path_tube_pair_generation_;
-  refreshed->authority_session = preparation.authority_session;
-  refreshed->map_observation_sequence = epoch->map_observation_sequence;
-  refreshed->map_observation_is_snapshot = epoch->map_observation_is_snapshot;
-  refreshed->frozen_cloud_occupancy_snapshot = request->cloud_snapshot;
-  refreshed->full_path_samples = epoch->full_path_samples;
-  refreshed->active_profile = epoch->active_profile;
-  refreshed->epoch_status = epoch->epoch_status;
-  std::shared_ptr<TubeEpochSnapshot> refreshed_epoch(
-      new TubeEpochSnapshot(*epoch));
-  refreshed->epoch_snapshot =
-      std::shared_ptr<const TubeEpochSnapshot>(refreshed_epoch);
-  const std::shared_ptr<const PathTubePair> immutable_refreshed(refreshed);
-  std::shared_ptr<const PathTubePair> expected = live;
-  if (!std::atomic_compare_exchange_strong(&authoritative_path_tube_pair_,
-                                           &expected,
-                                           immutable_refreshed)) {
-    return false;
-  }
-  refreshed_pair = immutable_refreshed;
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    TubeEpochSnapshot& snapshot) {
-  return buildTubeEpoch(request, snapshot, nullptr);
-}
-
-bool PhaseOffsetMatchedAdapter::buildTubeEpoch(
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    TubeEpochSnapshot& snapshot, TubeJobLocalState* const job_state) {
-  snapshot = TubeEpochSnapshot();
-  // A request anchored to an installed H2 pair is a same-path refresh.  It
-  // must not change the persistent timer manager: a stale completion can be
-  // discarded by the pair CAS, but its local construction must also be unable
-  // to perturb the next current request's Candidate/Active/counter state.
-  const bool pair_refresh = request && request->base_path_tube_pair;
-  if (!request || !request->active ||
-      request->task_generation != timer_task_generation_ ||
-      request->task_generation !=
-          task_generation_.load(std::memory_order_acquire) ||
-      (request->semantic_path_owner &&
-       !FrameMatchesRevision(request->frame_owner,
-                             request->source_revision)) ||
-      (!pair_refresh && !tube_epoch_manager_)) {
-    return false;
-  }
-  snapshot.active = true;
-  snapshot.task_generation = request->task_generation;
-  snapshot.request_control_sequence = request->control_sequence;
-  snapshot.build_sequence = job_state
-      ? job_state->timer_build_sequence : ++timer_build_sequence_;
-  snapshot.path_revision = request->path_revision;
-  snapshot.frame_revision = request->frame_revision;
-  snapshot.semantic_path_owner = request->semantic_path_owner;
-  snapshot.frame_owner = request->frame_owner;
-  snapshot.source_revision = request->source_revision;
-  snapshot.map_observation_sequence = request->map_observation_sequence;
-  snapshot.map_observation_is_snapshot = request->map_observation_is_snapshot;
-  snapshot.request_stamp = request->stamp;
-  snapshot.candidate_build_w = request->current_path.w;
-
-  PathSamples sampled;
-  const bool sampled_ok = collectSamples(*request, sampled);
-  if (sampled_ok) {
-    if (pair_refresh) {
-      snapshot.full_path_samples =
-          std::make_shared<const PathSamples>(sampled);
-    } else {
-      PathSamples& cached_samples = job_state
-          ? job_state->cached_full_path_samples : cached_full_path_samples_;
-      std::uint64_t& cached_revision = job_state
-          ? job_state->cached_path_source_revision : cached_path_source_revision_;
-      bool& have_cached = job_state ? job_state->have_cached_path
-                                    : have_cached_path_;
-      cached_samples = sampled;
-      cached_revision = request->source_revision;
-      have_cached = true;
-      snapshot.full_path_samples =
-          std::make_shared<const PathSamples>(cached_samples);
-    }
-  }
-  PathSamples preview;
-  if (sampled_ok) {
-    // Ordinary epochs use the same immutable semantic owner as H2 prepared
-    // epochs.  Partition this local preview at every owner segment boundary
-    // before adaptive refinement; otherwise a midpoint-adaptive cell can
-    // straddle the old-prefix/C2/tail seam and the exact owner cell query
-    // correctly fails closed, forcing the historical resolution inset.
-    bool owner_aligned_preview = false;
-    if (request->semantic_path_owner &&
-        !request->semantic_path_owner->empty()) {
-      const double preview_start = std::max(
-          request->semantic_path_owner->startW(),
-          request->current_path.w - config_.tube.back_w);
-      const double preview_end = std::min(
-          request->semantic_path_owner->endW(),
-          request->current_path.w + config_.tube.lookahead_w);
-      MatchedAdapterPathSamples aligned_preview;
-      if (BuildOwnerAlignedTubePreview(
-              request->semantic_path_owner, request->frame_owner, sampled,
-              preview_start,
-              preview_end, request->current_path.w, aligned_preview)) {
-        preview = std::move(aligned_preview);
-        owner_aligned_preview = true;
-      }
-    }
-    if (!owner_aligned_preview) {
-      makePreview(sampled, request->current_path, preview);
-    }
-  }
-
-  phase_offset_navigation::TubeEpochUpdateInput epoch_input;
-  epoch_input.source = config_.tube_source;
-  epoch_input.current_path = request->current_path;
-  epoch_input.preview_path = preview;
-  epoch_input.actual_position = request->position;
-  epoch_input.retained_delta = request->retained_delta;
-  epoch_input.authority_request = request->authority_request;
-  epoch_input.path_source_revision = request->source_revision;
-  epoch_input.path_state_query = MakeTimerPathStateQuery(
-      request->semantic_path_owner, snapshot.full_path_samples,
-      request->frame_owner);
-  epoch_input.path_cell_bound_query = MakeTimerPathCellBoundQuery(
-      request->semantic_path_owner, request->frame_owner);
-
-  bool raw_query_injected = false;
-  phase_offset_navigation::RawOccupancyQuery categorical_query;
-  CloudOccupancyQueryStatus cloud_status;
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    cloud_status = inspectCloudOccupancyQuery(
-        request->cloud_snapshot, cloud_occupancy_query_config_);
-    snapshot.cloud_status = cloud_status;
-    if (!pair_refresh) {
-      if (job_state) {
-        job_state->latest_cloud_occupancy_query_status = cloud_status;
-      } else {
-        latest_cloud_occupancy_query_status_ = cloud_status;
-      }
-    }
-    categorical_query = makeCloudOccupancyQuery(
-        request->cloud_snapshot, cloud_occupancy_query_config_);
-    epoch_input.cloud_clearance_query = makeCloudOccupancyClearanceQuery(
-        request->cloud_snapshot, cloud_occupancy_query_config_);
-    epoch_input.cloud_snapshot_resolution = request->cloud_snapshot &&
-        std::isfinite(request->cloud_snapshot->resolution)
-        ? request->cloud_snapshot->resolution : 0.0;
-    epoch_input.map_observation_sequence = request->map_observation_sequence;
-    epoch_input.map_observation_is_snapshot = true;
-    raw_query_injected = true;
-  }
-
-  // The stack-local manager is deliberately selected before update rather
-  // than copied from the persistent one: copying would retain Candidate /
-  // Active history and make a stale base request influence a later refresh.
-  phase_offset_navigation::TubeEpochManager local_manager(
-      MakeEpochConfig(config_));
-  phase_offset_navigation::TubeEpochManager* manager = nullptr;
-  if (job_state && job_state->tube_epoch_manager) {
-    manager = job_state->tube_epoch_manager.get();
-  } else {
-    manager = pair_refresh ? &local_manager : tube_epoch_manager_.get();
-  }
-  phase_offset_navigation::TubeEpochUpdateResult result;
-  const bool update_result = manager->update(epoch_input, result);
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    LogZeroBaselineAttribution(result);
-  }
-  snapshot.epoch_status = result.status;
-  snapshot.candidate_profile =
-      std::make_shared<const phase_offset_navigation::TubeProfile>(
-          result.candidate_profile);
-  if (result.status.active_available) {
-    if (pair_refresh) {
-      snapshot.active_profile =
-          std::make_shared<const phase_offset_navigation::TubeProfile>(
-              result.active_profile);
-    } else {
-      std::shared_ptr<const phase_offset_navigation::TubeProfile>&
-          active_profile = job_state ? job_state->timer_active_profile
-                                     : timer_active_profile_;
-      std::uint64_t& installed_epoch = job_state
-          ? job_state->timer_installed_active_epoch
-          : timer_installed_active_epoch_;
-      if (active_profile && installed_epoch == result.status.active_tube_epoch) {
-        snapshot.active_profile = active_profile;
-      } else {
-        std::shared_ptr<const phase_offset_navigation::TubeProfile> next_profile =
-            std::make_shared<const phase_offset_navigation::TubeProfile>(
-                result.active_profile);
-        active_profile = next_profile;
-        installed_epoch = result.status.active_tube_epoch;
-        snapshot.active_profile = next_profile;
-      }
-    }
-  } else if (!pair_refresh) {
-    if (job_state) {
-      job_state->timer_active_profile.reset();
-      job_state->timer_installed_active_epoch = 0U;
-    } else {
-      timer_active_profile_.reset();
-      timer_installed_active_epoch_ = 0U;
-    }
-  }
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    RawCandidateDiagnosticsInput diagnostics_input;
-    diagnostics_input.raw_source_configured = true;
-    diagnostics_input.raw_storage_ready = false;
-    diagnostics_input.raw_query_injected = raw_query_injected;
-    diagnostics_input.tube_update_due = true;
-    diagnostics_input.epoch_status = result.status;
-    diagnostics_input.candidate_profile = &result.candidate_profile;
-    diagnostics_input.current_path = request->current_path;
-    diagnostics_input.current_w = request->current_path.w;
-    diagnostics_input.actual_position = request->position;
-    diagnostics_input.raw_occupancy_query = categorical_query;
-    diagnostics_input.raw_ray_step = config_.tube.cross_section.ray_step;
-    snapshot.raw_candidate_diagnostics =
-        makeRawCandidateDiagnostics(diagnostics_input);
-    snapshot.raw_candidate_diagnostics_generated = true;
-
-    CloudSnapshotDiagnosticsInput cloud_diagnostics_input;
-    cloud_diagnostics_input.query_status = cloud_status;
-    cloud_diagnostics_input.query_config = cloud_occupancy_query_config_;
-    cloud_diagnostics_input.margins = config_.tube.cross_section.margins;
-    cloud_diagnostics_input.candidate_profile = &result.candidate_profile;
-    cloud_diagnostics_input.current_w = request->current_path.w;
-    cloud_diagnostics_input.current_path = request->current_path;
-    cloud_diagnostics_input.actual_position = request->position;
-    cloud_diagnostics_input.categorical_query = categorical_query;
-    cloud_diagnostics_input.ray_step = config_.tube.cross_section.ray_step;
-    snapshot.cloud_snapshot_diagnostics =
-        makeCloudSnapshotDiagnostics(cloud_diagnostics_input);
-    snapshot.cloud_snapshot_diagnostics_generated = true;
-  }
-  snapshot.completion_stamp = ros::Time::isValid()
-      ? ros::Time::now() : request->stamp;
-  return update_result;
-}
-
-bool PhaseOffsetMatchedAdapter::buildPreparedTubeEpoch(
-    const TubeBuildRequest& request,
-    const MatchedAdapterPathSamples& prepared_path,
-    const double prepared_start_w,
-    const double prepared_end_w,
-    const double future_seam_w,
-    const double existing_future_horizon_end_w,
-    PreparedTubeBuildResult& result,
-    phase_offset_navigation::TubeEpochUpdateResult*
-        temporary_epoch_result,
-    std::string* const temporary_failure_layer,
-    const CanonicalOwnerStateReuse* const canonical_owner_state) const {
-  result = PreparedTubeBuildResult();
-  if (temporary_failure_layer) temporary_failure_layer->clear();
-  if (temporary_epoch_result) {
-    *temporary_epoch_result = phase_offset_navigation::TubeEpochUpdateResult();
-  }
-  const double captured_w0 = request.current_path.w;
-  phase_offset_core::PathDifferentialState owner_current_path;
-  if (!request.active || !StateFiniteAndValid(request.current_path) ||
-      !IsFinite(request.position) || !IsFinite(request.retained_delta) ||
-      request.source_revision == 0U || !request.semantic_path_owner ||
-      request.semantic_path_owner->empty() ||
-      !IsFinite(prepared_start_w) || !IsFinite(prepared_end_w) ||
-      !IsFinite(future_seam_w) || !IsFinite(existing_future_horizon_end_w) ||
-      !NearlyEqual(prepared_path.front().w, prepared_start_w) ||
-      !NearlyEqual(prepared_path.back().w, prepared_end_w) ||
-      prepared_end_w < prepared_start_w ||
-      captured_w0 < prepared_start_w - kPreparedCoverageTolerance ||
-      captured_w0 > prepared_end_w + kPreparedCoverageTolerance ||
-      future_seam_w <= captured_w0 + kPreparedCoverageTolerance ||
-      future_seam_w < prepared_start_w - kPreparedCoverageTolerance ||
-      future_seam_w > prepared_end_w + kPreparedCoverageTolerance ||
-      existing_future_horizon_end_w < future_seam_w -
-          kPreparedCoverageTolerance ||
-      existing_future_horizon_end_w > prepared_end_w +
-          kPreparedCoverageTolerance ||
-      (request.semantic_path_owner &&
-       !FrameMatchesRevision(request.frame_owner, request.source_revision))) {
-    if (temporary_failure_layer) {
-      *temporary_failure_layer = "tube_build_input_precondition";
-    }
-    return false;
-  }
-  const bool canonical_reuse_valid = canonical_owner_state &&
-      canonical_owner_state->valid &&
-      canonical_owner_state->owner == request.semantic_path_owner &&
-      canonical_owner_state->verified_samples == &prepared_path &&
-      canonical_owner_state->task_generation == request.task_generation &&
-      canonical_owner_state->source_revision == request.source_revision &&
-      canonical_owner_state->authority_session == request.authority_session &&
-      canonical_owner_state->map_observation_sequence ==
-          request.map_observation_sequence &&
-      canonical_owner_state->map_observation_is_snapshot ==
-          request.map_observation_is_snapshot &&
-      ExactDoubleBits(canonical_owner_state->state.w, captured_w0) &&
-      PathStatesEquivalent(request.current_path,
-                           canonical_owner_state->state);
-  if (canonical_owner_state && !canonical_reuse_valid) {
-    if (temporary_failure_layer) {
-      *temporary_failure_layer = "tube_build_owner_evaluate";
-    }
-    return false;
-  }
-  if (canonical_reuse_valid) {
-    owner_current_path = canonical_owner_state->state;
-  } else if (!EvaluateOwnerState(request.semantic_path_owner, captured_w0,
-                                 owner_current_path, request.frame_owner) ||
-             !PathStatesEquivalent(request.current_path,
-                                   owner_current_path)) {
-    if (temporary_failure_layer) {
-      *temporary_failure_layer = "tube_build_owner_evaluate";
-    }
-    return false;
-  }
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    const CloudOccupancyQueryStatus cloud = inspectCloudOccupancyQuery(
-        request.cloud_snapshot, cloud_occupancy_query_config_);
-    if (!request.map_observation_is_snapshot || !cloud.usable ||
-        cloud.observation_sequence != request.map_observation_sequence) {
-      if (temporary_failure_layer) {
-        *temporary_failure_layer = "tube_build_map_precondition";
-      }
-      return false;
-    }
-  } else if (request.map_observation_is_snapshot ||
-             request.map_observation_sequence != 0U) {
-    if (temporary_failure_layer) {
-      *temporary_failure_layer = "tube_build_map_precondition";
-    }
-    return false;
-  }
-
-  CanonicalOwnerStateReuse local_owner_reuse;
-  const CanonicalOwnerStateReuse* preview_owner_reuse =
-      canonical_reuse_valid ? canonical_owner_state : nullptr;
-  if (!canonical_reuse_valid) {
-    if (!PreparedSamplesMatchOwner(prepared_path,
-                                   request.semantic_path_owner,
-                                   request.frame_owner)) {
-      if (temporary_failure_layer) {
-        *temporary_failure_layer = "tube_build_owner_evaluate";
-      }
-      return false;
-    }
-    local_owner_reuse.owner = request.semantic_path_owner;
-    local_owner_reuse.state = owner_current_path;
-    local_owner_reuse.verified_samples = &prepared_path;
-    local_owner_reuse.task_generation = request.task_generation;
-    local_owner_reuse.source_revision = request.source_revision;
-    local_owner_reuse.authority_session = request.authority_session;
-    local_owner_reuse.map_observation_sequence =
-        request.map_observation_sequence;
-    local_owner_reuse.map_observation_is_snapshot =
-        request.map_observation_is_snapshot;
-    local_owner_reuse.valid = true;
-    preview_owner_reuse = &local_owner_reuse;
-  }
-
-  // Retain the complete sampled owner in the pair, but build the expensive
-  // tube only over this transaction's required executable range.  Requiring
-  // the filter to certify the unrelated remainder of a long path would
-  // silently replace the existing lookahead semantics with a whole-path one.
-  MatchedAdapterPathSamples prepared_preview;
-  if (!BuildOwnerAlignedTubePreview(
-          request.semantic_path_owner, request.frame_owner, prepared_path,
-          captured_w0,
-          existing_future_horizon_end_w, captured_w0, prepared_preview,
-          preview_owner_reuse)) {
-    if (temporary_failure_layer) {
-      *temporary_failure_layer = "tube_build_owner_evaluate";
-    }
-    return false;
-  }
-
-  // The prepared range is transaction input, not a configuration override.
-  // Each preview sample has been evaluated by the new immutable owner.
-  phase_offset_navigation::TubeEpochUpdateInput epoch_input;
-  epoch_input.source = config_.tube_source;
-  epoch_input.current_path = owner_current_path;
-  epoch_input.preview_path = prepared_preview;
-  epoch_input.actual_position = request.position;
-  epoch_input.retained_delta = request.retained_delta;
-  epoch_input.authority_request = request.authority_request;
-  epoch_input.path_source_revision = request.source_revision;
-  epoch_input.map_observation_sequence = request.map_observation_sequence;
-  epoch_input.map_observation_is_snapshot = request.map_observation_is_snapshot;
-  const std::shared_ptr<const MatchedAdapterPathSamples> owned_samples(
-      new MatchedAdapterPathSamples(prepared_path));
-  epoch_input.path_state_query = MakeTimerPathStateQuery(
-      request.semantic_path_owner, owned_samples, request.frame_owner);
-  epoch_input.path_cell_bound_query = MakeTimerPathCellBoundQuery(
-      request.semantic_path_owner, request.frame_owner);
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    epoch_input.cloud_clearance_query = makeCloudOccupancyClearanceQuery(
-        request.cloud_snapshot, cloud_occupancy_query_config_);
-    epoch_input.cloud_snapshot_resolution = request.cloud_snapshot &&
-        std::isfinite(request.cloud_snapshot->resolution)
-        ? request.cloud_snapshot->resolution : 0.0;
-  }
-
-  // A fresh stack manager is the isolation boundary: it cannot alter the
-  // timer-owned Candidate/Active slots or any of their counters.
-  phase_offset_navigation::TubeEpochManager staged_manager(MakeEpochConfig(config_));
-  phase_offset_navigation::TubeEpochUpdateResult staged;
-  const bool staged_update_ok = staged_manager.update(epoch_input, staged);
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    LogZeroBaselineAttribution(staged);
-  }
-  if (temporary_epoch_result) *temporary_epoch_result = staged;
-  const bool update_status_ok =
-      staged_update_ok &&
-      staged.status.candidate_complete &&
-      staged.status.active_available &&
-      staged.status.active_current_validation_valid &&
-      staged.status.candidate_path_source_revision == request.source_revision &&
-      staged.status.active_path_source_revision == request.source_revision &&
-      staged.status.candidate_map_observation_sequence ==
-          request.map_observation_sequence &&
-      staged.status.active_map_observation_sequence ==
-          request.map_observation_sequence &&
-      staged.status.map_observation_is_snapshot ==
-          request.map_observation_is_snapshot &&
-      staged.active_profile.classification ==
-          phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED &&
-      staged.active_profile.source_revision == request.source_revision &&
-      staged.active_profile.source == config_.tube_source &&
-      ProfileStructurallyCoversPreparedRange(
-          staged.active_profile, captured_w0, future_seam_w,
-          existing_future_horizon_end_w) &&
-      ProfileSamplesMatchOwner(
-          staged.active_profile, request.semantic_path_owner,
-          MakeRuntimeConfig(config_).tube.regularity_margin,
-          MakeRuntimeConfig(config_).tube.minimum_reference_speed,
-          request.frame_owner);
-  if (!update_status_ok) {
-    if (temporary_failure_layer) {
-      if (!staged_update_ok || !staged.status.candidate_complete ||
-          !staged.status.active_available ||
-          !staged.status.active_current_validation_valid ||
-          staged.status.candidate_path_source_revision != request.source_revision ||
-          staged.status.active_path_source_revision != request.source_revision ||
-          staged.status.candidate_map_observation_sequence !=
-              request.map_observation_sequence ||
-          staged.status.active_map_observation_sequence !=
-              request.map_observation_sequence ||
-          staged.status.map_observation_is_snapshot !=
-              request.map_observation_is_snapshot ||
-          staged.active_profile.classification !=
-              phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED ||
-          staged.active_profile.source_revision != request.source_revision ||
-          staged.active_profile.source != config_.tube_source) {
-        *temporary_failure_layer = "tube_update_status";
-      } else if (!ProfileStructurallyCoversPreparedRange(
-                     staged.active_profile, captured_w0, future_seam_w,
-                     existing_future_horizon_end_w)) {
-        *temporary_failure_layer = "tube_profile_coverage";
-      } else {
-        *temporary_failure_layer = "tube_profile_owner_match";
-      }
-    }
-    return false;
-  }
-
-  result.complete = true;
-  result.source_revision = request.source_revision;
-  result.map_observation_sequence = request.map_observation_sequence;
-  result.map_observation_is_snapshot = request.map_observation_is_snapshot;
-  result.semantic_path_owner = request.semantic_path_owner;
-  result.frame_owner = request.frame_owner;
-  result.frozen_cloud_occupancy_snapshot = request.cloud_snapshot;
-  result.prepared_start_w = prepared_path.front().w;
-  result.prepared_end_w = prepared_path.back().w;
-  result.captured_w0 = captured_w0;
-  result.future_seam_w = future_seam_w;
-  result.existing_future_horizon_end_w = existing_future_horizon_end_w;
-  result.full_path_samples = owned_samples;
-  result.active_profile = std::make_shared<const phase_offset_navigation::TubeProfile>(
-      staged.active_profile);
-  result.epoch_status = staged.status;
-  return true;
-}
-
-PathTubePairStageFailure
-PhaseOffsetMatchedAdapter::classifyTubeUpdateStatusStageFailure(
-    const phase_offset_navigation::TubeEpochUpdateResult& staged) {
-  // The epoch result is already a frozen local staging value.  The manager's
-  // first-false contract classifies *only* the three candidate completion
-  // bits emitted by that update, in build-pipeline order.  Profile pointer,
-  // provenance, current validation, classification and all other status
-  // denials remain coverage/precondition attribution at their existing
-  // callers; none may be relabelled as a raw/filter/validator failure.
-  if (!staged.status.candidate_raw_complete) {
-    return PathTubePairStageFailure::TUBE_RAW_BUILD;
-  }
-  if (!staged.status.candidate_filtered_complete) {
-    return PathTubePairStageFailure::TUBE_FILTER;
-  }
-  if (!staged.status.candidate_complete) {
-    return PathTubePairStageFailure::TUBE_SURFACE_VALIDATOR;
-  }
-  return PathTubePairStageFailure::TUBE_BUILD_PRECONDITION;
-}
-
-bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
-    const PreparedTubeBuildResult& prepared_tube,
-    const phase_offset_core::PathDifferentialState& current_path,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    phase_offset_navigation::RuntimeDryRunResult& result) const {
-  if (!runtime_) return false;
-  phase_offset_navigation::PhaseOffsetRuntime runtime_snapshot(
-      MakeRuntimeConfig(config_));
-  {
-    std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-    if (!runtime_) return false;
-    runtime_snapshot = *runtime_;
-  }
-  return dryRunPreparedRuntime(runtime_snapshot, prepared_tube, current_path,
-                               position, gains, dt, result);
-}
-
-bool PhaseOffsetMatchedAdapter::dryRunPreparedRuntime(
-    phase_offset_navigation::PhaseOffsetRuntime& runtime_snapshot,
-    const PreparedTubeBuildResult& prepared_tube,
-    const phase_offset_core::PathDifferentialState& current_path,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    phase_offset_navigation::RuntimeDryRunResult& result) const {
-  result = phase_offset_navigation::RuntimeDryRunResult();
-  phase_offset_core::PathDifferentialState owner_current_path;
-  if (!runtime_snapshot.configurationValid() || !prepared_tube.complete ||
-      !prepared_tube.full_path_samples ||
-      !prepared_tube.active_profile || !prepared_tube.semantic_path_owner ||
-      ((prepared_tube.frame_owner == nullptr) &&
-       (prepared_tube.active_profile->frame_revision != 0U)) ||
-      (prepared_tube.frame_owner &&
-       !FrameMatchesRevision(prepared_tube.frame_owner,
-                             prepared_tube.source_revision)) ||
-      current_path.w < prepared_tube.prepared_start_w -
-          kPreparedCoverageTolerance ||
-      current_path.w >= prepared_tube.future_seam_w ||
-      !position.allFinite() ||
-      !std::isfinite(dt) || dt <= 0.0) {
-    return false;
-  }
-  if (!EvaluateOwnerState(prepared_tube.semantic_path_owner, current_path.w,
-                          owner_current_path, prepared_tube.frame_owner) ||
-      !PathStatesEquivalent(current_path, owner_current_path)) {
-    return false;
-  }
-  if (prepared_tube.source_revision == 0U ||
-      prepared_tube.epoch_status.candidate_path_source_revision !=
-          prepared_tube.source_revision ||
-      prepared_tube.epoch_status.active_path_source_revision !=
-          prepared_tube.source_revision ||
-      !prepared_tube.epoch_status.active_available ||
-      !prepared_tube.epoch_status.active_current_validation_valid ||
-      prepared_tube.active_profile->source_revision !=
-          prepared_tube.source_revision ||
-      !ProfileStructurallyCoversPreparedRange(
-          *prepared_tube.active_profile, prepared_tube.captured_w0,
-          prepared_tube.future_seam_w,
-          prepared_tube.existing_future_horizon_end_w) ||
-      !ProfileSamplesMatchOwner(*prepared_tube.active_profile,
-                                prepared_tube.semantic_path_owner,
-                                runtime_snapshot.config().tube.regularity_margin,
-                                runtime_snapshot.config().tube.minimum_reference_speed,
-                                prepared_tube.frame_owner)) {
-    return false;
-  }
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    const CloudOccupancyQueryStatus cloud = inspectCloudOccupancyQuery(
-        prepared_tube.frozen_cloud_occupancy_snapshot,
-        cloud_occupancy_query_config_);
-    if (!prepared_tube.map_observation_is_snapshot || !cloud.usable ||
-        cloud.observation_sequence != prepared_tube.map_observation_sequence ||
-        prepared_tube.epoch_status.candidate_map_observation_sequence !=
-            prepared_tube.map_observation_sequence ||
-        prepared_tube.epoch_status.active_map_observation_sequence !=
-            prepared_tube.map_observation_sequence ||
-        !prepared_tube.epoch_status.map_observation_is_snapshot) {
-      return false;
-    }
-  } else if (prepared_tube.map_observation_is_snapshot ||
-             prepared_tube.map_observation_sequence != 0U ||
-             prepared_tube.frozen_cloud_occupancy_snapshot) {
-    return false;
-  }
-  phase_offset_navigation::RuntimeDryRunInput input;
-  input.preflight.path = *prepared_tube.full_path_samples;
-  input.preflight.position = position;
-  input.preflight.path_source_revision = prepared_tube.source_revision;
-  input.prepare.current_path = owner_current_path;
-  input.prepare.position = position;
-  input.prepare.tube_view.active_profile = prepared_tube.active_profile;
-  input.prepare.tube_view.epoch_status = prepared_tube.epoch_status;
-  input.prepare.dt = dt;
-  input.prepare.future_step = MakeFutureStepContract(
-      prepared_tube.semantic_path_owner, prepared_tube.full_path_samples,
-      prepared_tube.active_profile, gains,
-      runtime_snapshot.config().tube.regularity_margin,
-      runtime_snapshot.config().tube.minimum_reference_speed,
-      config_.tube_update_period, config_.tube.min_certified_forward_w);
-  // Staging must evaluate the exact existing port independently of selection;
-  // the caller performs the real gate/commit decision later.
-  input.prepare.zero_gate_open = false;
-  guidance::ReferenceGeometry reference;
-  phase_offset_core::PhaseOffsetGeometryState geometry;
-  phase_offset_core::GeometryParams geometry_params;
-  geometry_params.regularity_margin =
-      runtime_snapshot.config().tube.regularity_margin;
-  geometry_params.minimum_reference_speed =
-      runtime_snapshot.config().tube.minimum_reference_speed;
-  phase_offset_core::GeometryEvaluator evaluator(geometry_params);
-  if (!evaluator.evaluate(owner_current_path, position,
-                          runtime_snapshot.retainedDelta(), geometry)) {
-    return false;
-  }
-  reference.point = geometry.r;
-  reference.tangent = geometry.T;
-  reference.derivative_norm = geometry.r_w.norm();
-  reference.valid = geometry.valid;
-  guidance::IsfGuidance base;
-  input.base_guidance_valid = guidance::IsfReferenceKernel::evaluate(
-      position, reference, gains, base) && base.valid;
-  input.base_v_cmd = base.v_cmd;
-  input.base_w_dot = base.w_dot;
-  return runtime_snapshot.dryRun(input, result);
-}
-
-bool PhaseOffsetMatchedAdapter::stagePathTubePair(
-    const std::shared_ptr<const PathTubePair>& expected_pair,
-    const std::shared_ptr<const ContinuousPhasePath>& new_path_owner,
-    const MatchedAdapterPathSamples& new_path_samples,
-    const double captured_w0,
-    const double future_seam_w,
-    const double existing_future_horizon_end_w,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        frozen_cloud_occupancy_snapshot,
-    PathTubePairTransaction& transaction,
-    const std::uint64_t authority_session,
-    const PathTubePairPinCapture* const expected_capture,
-    const std::uint64_t pin_lease_id,
-    PathTubePairStageFailure* const temporary_failure) {
-  transaction = PathTubePairTransaction();
-  if (temporary_failure) *temporary_failure = PathTubePairStageFailure::NONE;
-  const auto stage_first_false =
-      [](const char* const,
-         const phase_offset_navigation::TubeEpochUpdateResult* const) {
-        return false;
-      };
-  const bool prepared_samples_owner_valid = new_path_owner &&
-      !new_path_owner->empty() &&
-      PreparedSamplesMatchOwner(new_path_samples, new_path_owner);
-  if (!runtime_ || !new_path_owner || new_path_owner->empty() ||
-      !prepared_samples_owner_valid ||
-      !IsFinite(captured_w0) || !IsFinite(future_seam_w) ||
-      !IsFinite(existing_future_horizon_end_w) ||
-      future_seam_w <= captured_w0 + kPreparedCoverageTolerance ||
-      existing_future_horizon_end_w + kPreparedCoverageTolerance <
-          future_seam_w ||
-      new_path_samples.front().w > captured_w0 +
-          kPreparedCoverageTolerance ||
-      new_path_samples.back().w + kPreparedCoverageTolerance <
-          existing_future_horizon_end_w) {
-    if (temporary_failure) {
-      *temporary_failure = PathTubePairStageFailure::INPUT_PRECONDITION;
-    }
-    return stage_first_false("input_precondition", nullptr);
-  }
-  // Bootstrap has no old authority and therefore no pin.  Every replacement
-  // must bind to the capture and monotonic lease obtained before seam work.
-  if (expected_pair) {
-    if (!expected_capture || !CaptureMatchesPair(*expected_capture,
-                                                 expected_pair) ||
-        !ActiveLeaseMatchesCapture(path_tube_pin_registry_,
-                                   *expected_capture, pin_lease_id)) {
-      if (temporary_failure) {
-        *temporary_failure = PathTubePairStageFailure::TRANSACTION_PRECONDITION;
-      }
-      return stage_first_false("transaction_precondition", nullptr);
-    }
-  } else if (expected_capture || pin_lease_id != 0U) {
-    if (temporary_failure) {
-      *temporary_failure = PathTubePairStageFailure::TRANSACTION_PRECONDITION;
-    }
-    return stage_first_false("transaction_precondition", nullptr);
-  }
-
-  // Capture Runtime state once under its command boundary.  The local staged
-  // manager below owns all expensive work and never observes/mutates live
-  // source bookkeeping or Runtime state.
-  phase_offset_core::PortCommand previous_port;
-  double retained_delta = 0.0;
-  phase_offset_navigation::TubeBounds authority_request;
-  std::uint64_t captured_task_generation = 0U;
-  std::uint64_t captured_authority_session = 0U;
-  std::uint64_t staged_revision = 0U;
-  phase_offset_navigation::PhaseOffsetRuntime runtime_snapshot(
-      MakeRuntimeConfig(config_));
-  // Horizontal-N successor frames are determined exclusively by the
-  // successor path derivatives.  The predecessor snapshot is retained only
-  // for exact transaction/revision provenance; executed_N is never projected,
-  // sign-aligned, or used as a frame seed.
-  std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>
-      successor_seed_authority;
-  {
-    std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-    const std::shared_ptr<const PathTubePair> live =
-        std::atomic_load(&authoritative_path_tube_pair_);
-    if (live != expected_pair) {
-      if (temporary_failure) {
-        *temporary_failure =
-            PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-      }
-      return stage_first_false("pair_session_runtime_snapshot", nullptr);
-    }
-    if (expected_pair &&
-        (!CaptureMatchesPair(*expected_capture, live) ||
-         !ActiveLeaseMatchesCapture(path_tube_pin_registry_,
-                                    *expected_capture, pin_lease_id))) {
-      if (temporary_failure) {
-        *temporary_failure =
-            PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-      }
-      return stage_first_false("pair_session_runtime_snapshot", nullptr);
-    }
-    if (!expected_pair && runtime_->hasExecutedOffsetAuthority()) {
-      if (temporary_failure) {
-        *temporary_failure =
-            PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-      }
-      return stage_first_false("pair_session_runtime_snapshot", nullptr);
-    }
-    const std::uint64_t live_session =
-        authority_session_.load(std::memory_order_acquire);
-    if (authority_session != 0U && live_session != authority_session) {
-      if (temporary_failure) {
-        *temporary_failure =
-            PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-      }
-      return stage_first_false("pair_session_runtime_snapshot", nullptr);
-    }
-    captured_task_generation =
-        task_generation_.load(std::memory_order_acquire);
-    captured_authority_session = authority_session == 0U
-        ? live_session : authority_session;
-    // The pin protects exact pair ownership, not an obsolete Runtime sample.
-    // A normal selected command can legally advance Runtime while C2/tube
-    // construction runs.  Build/dry-run from the latest state observed under
-    // this mutex; final commit will independently require its own latest bits.
-    retained_delta = runtime_->retainedDelta();
-    if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
-        !makeAuthorityRequest(retained_delta, authority_request)) {
-      if (temporary_failure) {
-        *temporary_failure = PathTubePairStageFailure::TUBE_BUILD_PRECONDITION;
-      }
-      return stage_first_false("tube_build_input_precondition", nullptr);
-    }
-    previous_port = runtime_->previousFinalPort();
-    runtime_snapshot = *runtime_;
-    if (expected_pair) {
-      successor_seed_authority = execution_authority_.snapshotPtr();
-      const bool authority_is_active = successor_seed_authority &&
-          successor_seed_authority->valid &&
-          successor_seed_authority->owner_mode !=
-              phase_offset_navigation::ActiveReferenceOwnerMode::NONE &&
-          successor_seed_authority->owner_mode !=
-              phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
-      // Bootstrap and planner-only replacement have no active predecessor.
-      // Active snapshots are checked only for transaction identity and exact
-      // predecessor state; their observed executed_N is not frame authority.
-      if (authority_is_active) {
-        if (successor_seed_authority->authority_session !=
-                captured_authority_session ||
-            successor_seed_authority->sequence == 0U ||
-            successor_seed_authority->planner_path_revision !=
-                expected_pair->source_revision ||
-            successor_seed_authority->executed_path_revision !=
-                expected_pair->path_revision ||
-            successor_seed_authority->frame_revision !=
-                expected_pair->frame_revision ||
-            std::abs(successor_seed_authority->proposed_next_w - captured_w0) >
-                1e-12 ||
-            !(std::abs(successor_seed_authority->delta - retained_delta) <=
-                  1e-12 ||
-              std::abs(successor_seed_authority->proposed_next_delta -
-                       retained_delta) <= 1e-12) ||
-            !(std::abs(successor_seed_authority->u_prev.u_w -
-                       previous_port.u_w) <= 1e-12 ||
-              std::abs(successor_seed_authority->proposed_next_u_prev.u_w -
-                       previous_port.u_w) <= 1e-12) ||
-            !(std::abs(successor_seed_authority->u_prev.u_delta -
-                       previous_port.u_delta) <= 1e-12 ||
-              std::abs(successor_seed_authority->proposed_next_u_prev.u_delta -
-                       previous_port.u_delta) <= 1e-12)) {
-          if (temporary_failure) *temporary_failure =
-              PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-          return stage_first_false("successor_frame_seed_provenance", nullptr);
-        }
-        ContinuousPhasePathState predecessor_state;
-        phase_offset_core::NormalFrameQuery predecessor_frame;
-        ContinuousPhasePathState authority_predecessor_state;
-        phase_offset_core::NormalFrameQuery authority_predecessor_frame;
-        if (!expected_pair->path_owner->evaluate(captured_w0,
-                                                 predecessor_state, false) ||
-            !expected_pair->frame_owner->query(captured_w0, predecessor_frame) ||
-            !expected_pair->path_owner->evaluate(
-                successor_seed_authority->w, authority_predecessor_state,
-                false) ||
-            !expected_pair->frame_owner->query(
-                successor_seed_authority->w, authority_predecessor_frame) ||
-            !predecessor_state.valid || !predecessor_frame.valid ||
-            !authority_predecessor_state.valid ||
-            !authority_predecessor_frame.valid ||
-            (authority_predecessor_state.p + authority_predecessor_frame.N *
-                 successor_seed_authority->delta -
-             successor_seed_authority->r).norm() > 1e-8 ||
-            (authority_predecessor_state.dp_dw +
-                 authority_predecessor_frame.N_w *
-                 successor_seed_authority->delta -
-             successor_seed_authority->r_w).norm() > 1e-8 ||
-            !successor_seed_authority->r.allFinite() ||
-            !successor_seed_authority->r_w.allFinite()) {
-          if (temporary_failure) *temporary_failure =
-              PathTubePairStageFailure::PAIR_SESSION_RUNTIME_SNAPSHOT;
-          return stage_first_false("successor_frame_predecessor_state", nullptr);
-        }
-      }
-    }
-    // This is transaction-local provenance only.  It becomes live source
-    // bookkeeping exclusively in commitPathTubePair after the same CAS.
-    staged_revision = std::max(source_revision_,
-        expected_pair ? expected_pair->source_revision : 0U) + 1U;
-  }
-
-  const std::shared_ptr<const ContinuousPhaseNormalFrame> new_frame_owner(
-      new ContinuousPhaseNormalFrame(new_path_owner, staged_revision,
-                                     staged_revision));
-  phase_offset_core::PathDifferentialState captured_path;
-  if (!EvaluateOwnerState(new_path_owner, captured_w0, captured_path,
-                          new_frame_owner)) {
-    if (temporary_failure) {
-      *temporary_failure = PathTubePairStageFailure::OWNER_EVALUATE;
-    }
-    return stage_first_false("owner_evaluate", nullptr);
-  }
-  TubeBuildRequest request;
-  request.active = true;
-  request.task_generation = captured_task_generation;
-  request.authority_session = captured_authority_session;
-  request.source_revision = staged_revision;
-  request.path_revision = new_path_owner->pathRevision();
-  request.frame_revision = new_frame_owner->frameRevision();
-  request.semantic_path_owner = new_path_owner;
-  request.frame_owner = new_frame_owner;
-  request.semantic_path_start_w = new_path_owner->startW();
-  request.semantic_path_end_w = new_path_owner->endW();
-  request.current_path = captured_path;
-  request.position = position;
-  request.retained_delta = retained_delta;
-  request.authority_request = authority_request;
-  if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-    request.cloud_snapshot = frozen_cloud_occupancy_snapshot;
-    request.map_observation_is_snapshot = true;
-    request.map_observation_sequence = frozen_cloud_occupancy_snapshot
-        ? frozen_cloud_occupancy_snapshot->observation_sequence : 0U;
-  }
-
-  CanonicalOwnerStateReuse canonical_owner_state;
-  canonical_owner_state.owner = new_path_owner;
-  canonical_owner_state.state = captured_path;
-  canonical_owner_state.verified_samples = &new_path_samples;
-  canonical_owner_state.task_generation = request.task_generation;
-  canonical_owner_state.source_revision = request.source_revision;
-  canonical_owner_state.authority_session = request.authority_session;
-  canonical_owner_state.map_observation_sequence =
-      request.map_observation_sequence;
-  canonical_owner_state.map_observation_is_snapshot =
-      request.map_observation_is_snapshot;
-  canonical_owner_state.valid = prepared_samples_owner_valid;
-
-  PreparedTubeBuildResult prepared;
-  phase_offset_navigation::TubeEpochUpdateResult prepared_epoch;
-  std::string prepared_build_failure_layer;
-  if (!buildPreparedTubeEpoch(request, new_path_samples,
-                              new_path_samples.front().w,
-                              new_path_samples.back().w, future_seam_w,
-                              existing_future_horizon_end_w, prepared,
-                              &prepared_epoch,
-                              &prepared_build_failure_layer,
-                              &canonical_owner_state)) {
-    PathTubePairStageFailure failure =
-        PathTubePairStageFailure::TUBE_BUILD_PRECONDITION;
-    const char* layer = "tube_build_precondition";
-    if (prepared_build_failure_layer == "tube_build_owner_evaluate") {
-      failure = PathTubePairStageFailure::OWNER_EVALUATE;
-      layer = "tube_build_owner_evaluate";
-    } else if (prepared_build_failure_layer == "tube_profile_coverage" ||
-               prepared_build_failure_layer == "tube_profile_owner_match") {
-      failure = prepared_build_failure_layer == "tube_profile_coverage"
-          ? PathTubePairStageFailure::TUBE_PROFILE_COVERAGE
-          : PathTubePairStageFailure::TUBE_PROFILE_OWNER_MATCH;
-      layer = prepared_build_failure_layer.c_str();
-    } else if (prepared_build_failure_layer == "tube_update_status") {
-      failure = classifyTubeUpdateStatusStageFailure(prepared_epoch);
-      layer = PathTubePairStageFailureName(failure);
-    }
-    if (temporary_failure) *temporary_failure = failure;
-    return stage_first_false(layer, &prepared_epoch);
-  }
-  // The staging dry run uses the captured w0 and retained port state through
-  // a local Runtime copy; it cannot refresh live preflight or mutate delta.
-  phase_offset_navigation::RuntimeDryRunResult dry_run;
-  if (!dryRunPreparedRuntime(runtime_snapshot, prepared, captured_path,
-                             position, gains, dt, dry_run) || !dry_run.valid) {
-    if (temporary_failure) {
-      *temporary_failure = PathTubePairStageFailure::STAGING_DRY_RUN;
-    }
-    const std::string& invalid_reason =
-        !dry_run.step.invalid_reason.empty()
-        ? dry_run.step.invalid_reason : dry_run.prepared.invalid_reason;
-    ROS_WARN(
-        "[PHASE_OFFSET][H2][STAGING_DRY_RUN] identity=%s "
-        "result_valid=%d step_valid=%d step_selected=%d projection_valid=%d "
-        "runtime_mode=%d certificate_denied=%d fatal_control_failure=%d "
-        "retained_delta=%.9f previous_final_port=(%.9f,%.9f) "
-        "current_w=%.9f seam_w=%.9f owner_end_w=%.9f "
-        "invalid_reason=\"%s\"",
-        expected_pair ? "replacement" : "bootstrap",
-        dry_run.valid ? 1 : 0, dry_run.step.valid ? 1 : 0,
-        dry_run.step.selected ? 1 : 0,
-        dry_run.step.projection.valid ? 1 : 0,
-        static_cast<int>(dry_run.step.execution.mode),
-        dry_run.step.execution.certificate_denied ? 1 : 0,
-        dry_run.step.execution.fatal_control_failure ? 1 : 0,
-        retained_delta, previous_port.u_w, previous_port.u_delta,
-        captured_w0, future_seam_w, new_path_owner->endW(),
-        invalid_reason.c_str());
-    return stage_first_false("staging_dry_run", &prepared_epoch);
-  }
-
-  std::shared_ptr<PathTubePair> candidate(new PathTubePair());
-  candidate->source_revision = prepared.source_revision;
-  candidate->path_revision = prepared.active_profile
-      ? prepared.active_profile->path_revision : prepared.source_revision;
-  candidate->frame_revision = prepared.active_profile
-      ? prepared.active_profile->frame_revision : 0U;
-  candidate->authority_session = request.authority_session;
-  candidate->map_observation_sequence = prepared.map_observation_sequence;
-  candidate->map_observation_is_snapshot =
-      prepared.map_observation_is_snapshot;
-  candidate->path_owner = prepared.semantic_path_owner;
-  candidate->frame_owner = prepared.frame_owner;
-  candidate->frozen_cloud_occupancy_snapshot =
-      prepared.frozen_cloud_occupancy_snapshot;
-  candidate->full_path_samples = prepared.full_path_samples;
-  candidate->active_profile = prepared.active_profile;
-  candidate->executed_reference_query =
-      std::shared_ptr<const phase_offset_navigation::ImmutableExecutedReferenceQuery>(
-          new PhaseOffsetExecutedReferenceQuery(
-              candidate->path_owner, retained_delta,
-              candidate->frame_owner,
-              candidate->active_profile
-                  ? candidate->active_profile->path_revision
-                  : candidate->source_revision,
-              candidate->active_profile
-                  ? candidate->active_profile->frame_revision : 0U,
-              candidate->source_revision, candidate->source_revision));
-  candidate->successor_seed_authority = successor_seed_authority;
-  candidate->epoch_status = prepared.epoch_status;
-  candidate->captured_w0 = captured_w0;
-  candidate->future_seam_w = future_seam_w;
-  candidate->existing_future_horizon_end_w = existing_future_horizon_end_w;
-  candidate->captured_retained_delta = retained_delta;
-  candidate->captured_previous_final_port = previous_port;
-  std::shared_ptr<TubeEpochSnapshot> epoch(new TubeEpochSnapshot());
-  epoch->active = true;
-  epoch->task_generation = request.task_generation;
-  epoch->source_revision = candidate->source_revision;
-  epoch->path_revision = candidate->path_revision;
-  epoch->frame_revision = candidate->frame_revision;
-  epoch->semantic_path_owner = candidate->path_owner;
-  epoch->frame_owner = candidate->frame_owner;
-  epoch->map_observation_sequence = candidate->map_observation_sequence;
-  epoch->map_observation_is_snapshot = candidate->map_observation_is_snapshot;
-  epoch->candidate_build_w = request.current_path.w;
-  epoch->full_path_samples = candidate->full_path_samples;
-  // The pair branch exposes this prepared profile as both Candidate and Active
-  // evidence.  Keep its immutable epoch snapshot consistent for the existing
-  // command-to-timer publication check; this is the same owner/profile pointer.
-  epoch->candidate_profile = candidate->active_profile;
-  epoch->active_profile = candidate->active_profile;
-  epoch->epoch_status = candidate->epoch_status;
-  candidate->epoch_snapshot = std::shared_ptr<const TubeEpochSnapshot>(epoch);
-  transaction.expected_pair = expected_pair;
-  transaction.candidate_pair = std::shared_ptr<const PathTubePair>(candidate);
-  if (expected_capture) transaction.expected_capture = *expected_capture;
-  transaction.pin_lease_id = pin_lease_id;
-  transaction.authority_session = candidate->authority_session;
-  transaction.captured_retained_delta = retained_delta;
-  transaction.captured_previous_final_port = previous_port;
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::preparePathTubePairCommit(
-    const PathTubePairTransaction& transaction,
-    const double current_w,
-    const Eigen::Vector3d& position,
-    const guidance::IsfGains& gains,
-    const double dt,
-    const std::shared_ptr<const plan_env::CloudOccupancySnapshot>&
-        latest_cloud_occupancy_snapshot,
-    PathTubePairCommitPreparation& preparation) {
-  preparation = PathTubePairCommitPreparation();
-  const std::shared_ptr<const PathTubePair>& candidate =
-      transaction.candidate_pair;
-  const bool replacement = static_cast<bool>(transaction.expected_pair);
-  if (!runtime_ || !candidate || !candidate->path_owner ||
-      !candidate->full_path_samples || !candidate->active_profile ||
-      candidate->source_revision == 0U ||
-      candidate->authority_session != transaction.authority_session ||
-      !IsFinite(current_w) ||
-      current_w < candidate->captured_w0 -
-          kPreparedCoverageTolerance ||
-      current_w >= candidate->future_seam_w ||
-      !ProfileStructurallyCoversPreparedRange(
-          *candidate->active_profile, candidate->captured_w0,
-          candidate->future_seam_w,
-          candidate->existing_future_horizon_end_w) ||
-      !ProfileSamplesMatchOwner(
-          *candidate->active_profile, candidate->path_owner,
-          MakeRuntimeConfig(config_).tube.regularity_margin,
-          MakeRuntimeConfig(config_).tube.minimum_reference_speed,
-          candidate->frame_owner)) {
-    return false;
-  }
-  if (replacement &&
-      (!CaptureMatchesPair(transaction.expected_capture,
-                           transaction.expected_pair) ||
-       !ActiveLeaseMatchesCapture(path_tube_pin_registry_,
-                                  transaction.expected_capture,
-                                  transaction.pin_lease_id))) {
-    return false;
-  }
-  if (!replacement &&
-      (transaction.expected_capture.pair || transaction.pin_lease_id != 0U)) {
-    return false;
-  }
-
-  // Short snapshot: the exact port trial below runs on this local copy, never
-  // while Runtime mutation is blocked.
-  phase_offset_navigation::PhaseOffsetRuntime runtime_snapshot(
-      MakeRuntimeConfig(config_));
-  {
-    std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-    const std::shared_ptr<const PathTubePair> live =
-        std::atomic_load(&authoritative_path_tube_pair_);
-    if (live != transaction.expected_pair ||
-        authority_session_.load(std::memory_order_acquire) !=
-            transaction.authority_session ||
-        (live && live->authority_session != transaction.authority_session)) {
-      return false;
-    }
-    if (replacement &&
-        (!CaptureMatchesPair(transaction.expected_capture, live) ||
-         !ActiveLeaseMatchesCapture(path_tube_pin_registry_,
-                                    transaction.expected_capture,
-                                    transaction.pin_lease_id))) {
-      return false;
-    }
-    if (!replacement && runtime_->hasExecutedOffsetAuthority()) {
-      return false;
-    }
-    runtime_snapshot = *runtime_;
-  }
-  // The old immutable pair need only remain executable at the live CAS
-  // phase.  It is intentionally not required to certify the future geometric
-  // seam: that copied-prefix/connector obligation belongs to `candidate`.
-  if (replacement) {
-    const std::shared_ptr<const PathTubePair>& old_pair =
-        transaction.expected_pair;
-    phase_offset_core::PathDifferentialState old_current;
-    phase_offset_navigation::TubeBounds old_bounds;
-    const double retained_delta = runtime_snapshot.retainedDelta();
-    if (!old_pair || !old_pair->path_owner || !old_pair->active_profile ||
-        !old_pair->epoch_status.active_available ||
-        !old_pair->epoch_status.active_current_validation_valid ||
-        old_pair->epoch_status.active_path_source_revision !=
-            old_pair->source_revision ||
-        old_pair->active_profile->source_revision !=
-            old_pair->source_revision ||
-        current_w < old_pair->active_profile->certified_segment_start_w -
-            kPreparedCoverageTolerance ||
-        current_w > old_pair->active_profile->certified_segment_end_w +
-            kPreparedCoverageTolerance ||
-        !EvaluateOwnerState(old_pair->path_owner, current_w, old_current) ||
-        !phase_offset_navigation::TubeFilter::query(
-            *old_pair->active_profile, current_w, old_bounds) ||
-        !old_bounds.valid ||
-        retained_delta < old_bounds.lower + config_.tube.interior_margin -
-            kPreparedCoverageTolerance ||
-        retained_delta > old_bounds.upper - config_.tube.interior_margin +
-            kPreparedCoverageTolerance) {
-      return false;
-    }
-  }
-  // Current w must be evaluated by the newly built owner, never accepted from
-  // a stale old-path state with coincident phase alone.
-  phase_offset_core::PathDifferentialState owner_current;
-  if (!EvaluateOwnerState(candidate->path_owner, current_w,
-                          owner_current, candidate->frame_owner)) {
-    return false;
-  }
-  PreparedTubeBuildResult prepared;
-  prepared.complete = true;
-  prepared.source_revision = candidate->source_revision;
-  prepared.map_observation_sequence = candidate->map_observation_sequence;
-  prepared.map_observation_is_snapshot = candidate->map_observation_is_snapshot;
-  prepared.semantic_path_owner = candidate->path_owner;
-  prepared.frame_owner = candidate->frame_owner;
-  prepared.frozen_cloud_occupancy_snapshot =
-      candidate->frozen_cloud_occupancy_snapshot;
-  prepared.prepared_start_w = candidate->full_path_samples->front().w;
-  prepared.prepared_end_w = candidate->full_path_samples->back().w;
-  prepared.captured_w0 = candidate->captured_w0;
-  prepared.future_seam_w = candidate->future_seam_w;
-  prepared.existing_future_horizon_end_w =
-      candidate->existing_future_horizon_end_w;
-  prepared.full_path_samples = candidate->full_path_samples;
-  prepared.active_profile = candidate->active_profile;
-  prepared.epoch_status = candidate->epoch_status;
-  phase_offset_navigation::RuntimeDryRunResult dry_run;
-  if (!dryRunPreparedRuntime(runtime_snapshot, prepared, owner_current,
-                             position, gains, dt, dry_run) || !dry_run.valid) {
-    return false;
-  }
-
-  // The frozen snapshot proves construction provenance.  A newer categorical
-  // observation that explicitly says OCCUPIED/OUT_OF_MAP at the current base
-  // reference or actual position must still deny an install.
-  if (LatestCategoricalUnsafe(config_, cloud_occupancy_query_config_,
-                              latest_cloud_occupancy_snapshot, owner_current,
-                              position, runtime_snapshot.retainedDelta())) {
-    return false;
-  }
-
-  preparation.transaction = transaction;
-  preparation.current_w = current_w;
-  preparation.expected_retained_delta = runtime_snapshot.retainedDelta();
-  preparation.expected_previous_final_port =
-      runtime_snapshot.previousFinalPort();
-  preparation.valid = true;
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::finalizePreparedPathTubePairCommit(
-    const PathTubePairCommitPreparation& preparation,
-    std::shared_ptr<const PathTubePair>& committed_pair,
-    const BootstrapRendezvousTicket* const rendezvous_ticket) {
-  committed_pair.reset();
-  if (!preparation.valid || !preparation.transaction.candidate_pair) {
-    return false;
-  }
-  const PathTubePairTransaction& transaction = preparation.transaction;
-  const std::shared_ptr<const PathTubePair>& candidate =
-      transaction.candidate_pair;
-  const bool replacement = static_cast<bool>(transaction.expected_pair);
-  if (replacement &&
-      (!CaptureMatchesPair(transaction.expected_capture,
-                           transaction.expected_pair) ||
-       !ActiveLeaseMatchesCapture(path_tube_pin_registry_,
-                                  transaction.expected_capture,
-                                  transaction.pin_lease_id))) {
-    return false;
-  }
-  if (!replacement &&
-      (transaction.expected_capture.pair || transaction.pin_lease_id != 0U)) {
-    return false;
-  }
-
-  // Short revalidation/CAS: no tube build, preflight, or port enumeration is
-  // allowed in this lock.
-  std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  const std::shared_ptr<const PathTubePair> live =
-      std::atomic_load(&authoritative_path_tube_pair_);
-  if (rendezvous_ticket) {
-    // A bootstrap claim is a one-shot identity token, not a cached authority.
-    // Revalidate every lifecycle edge at the same lock boundary as the sole
-    // Pair CAS so a failure/reset/deactivate/revision change cannot slip in
-    // between the manager's last lock-free validation and publication.
-    if (replacement ||
-        !claimMatchesBootstrapRendezvousLocked(*rendezvous_ticket) ||
-        shutdown_requested_.load(std::memory_order_acquire) ||
-        failure_latched_ || !zero_gate_open_ || !command_active_ ||
-        !runtime_ || !std::isfinite(runtime_->retainedDelta()) ||
-        runtime_->retainedDelta() != 0.0 ||
-        runtime_->hasExecutedOffsetAuthority() || live ||
-        authority_session_.load(std::memory_order_acquire) !=
-            rendezvous_ticket->authority_session ||
-        candidate->authority_session != rendezvous_ticket->authority_session ||
-        candidate->path_owner.get() !=
-            rendezvous_ticket->semantic_path_owner) {
-      return false;
-    }
-    const std::shared_ptr<const TubeBuildRequest> latest =
-        std::atomic_load(&latest_build_request_);
-    if (!latest || !latest->active || latest->base_path_tube_pair ||
-        latest->task_generation != rendezvous_ticket->task_generation ||
-        latest->authority_session != rendezvous_ticket->authority_session ||
-        latest->source_revision != rendezvous_ticket->source_revision ||
-        latest->path_revision != rendezvous_ticket->path_revision ||
-        latest->frame_revision != rendezvous_ticket->frame_revision ||
-        latest->semantic_path_owner.get() !=
-            rendezvous_ticket->semantic_path_owner ||
-        latest->frame_owner.get() != rendezvous_ticket->frame_owner ||
-        task_generation_.load(std::memory_order_acquire) !=
-            rendezvous_ticket->task_generation) {
-      return false;
-    }
-    BootstrapRendezvousIdentity ticket_identity;
-    ticket_identity.task_generation = rendezvous_ticket->task_generation;
-    ticket_identity.authority_session = rendezvous_ticket->authority_session;
-    ticket_identity.source_revision = rendezvous_ticket->source_revision;
-    ticket_identity.path_revision = rendezvous_ticket->path_revision;
-    ticket_identity.frame_revision = rendezvous_ticket->frame_revision;
-    ticket_identity.semantic_path_owner =
-        rendezvous_ticket->semantic_path_owner;
-    ticket_identity.frame_owner = rendezvous_ticket->frame_owner;
-    if (!bootstrapReadyEpochMatchesLocked(
-            ticket_identity, rendezvous_ticket->build_sequence)) {
-      return false;
-    }
-  }
-  if (live != transaction.expected_pair ||
-      authority_session_.load(std::memory_order_acquire) !=
-          transaction.authority_session ||
-      candidate->authority_session != transaction.authority_session ||
-      (live && live->authority_session != transaction.authority_session) ||
-      (!replacement && runtime_->hasExecutedOffsetAuthority()) ||
-      !BitsEqual(runtime_->retainedDelta(),
-                 preparation.expected_retained_delta) ||
-      !BitsEqual(runtime_->previousFinalPort(),
-                 preparation.expected_previous_final_port)) {
-    return false;
-  }
-  if (replacement &&
-      (!CaptureMatchesPair(transaction.expected_capture, live) ||
-         !ActiveLeaseMatchesCapture(path_tube_pin_registry_,
-                                  transaction.expected_capture,
-                                  transaction.pin_lease_id))) {
-    return false;
-  }
-  std::shared_ptr<PathTubePair> installed(new PathTubePair(*candidate));
-  installed->generation = ++next_path_tube_pair_generation_;
-  installed->authority_session = transaction.authority_session;
-  const std::shared_ptr<const PathTubePair> immutable_installed(installed);
-  // Atomic shared_ptr CAS is the one authority publication.  Only after it
-  // succeeds may legacy source bookkeeping reflect the new owner.
-  std::shared_ptr<const PathTubePair> expected = transaction.expected_pair;
-  if (!std::atomic_compare_exchange_strong(&authoritative_path_tube_pair_,
-                                           &expected,
-                                           immutable_installed)) {
-    return false;
-  }
-  source_identity_ = installed->path_owner.get();
-  source_start_w_ = installed->path_owner->startW();
-  source_end_w_ = installed->path_owner->endW();
-  have_source_identity_ = true;
-  source_revision_ = installed->source_revision;
-  have_preflight_revision_ = false;
-  // Installing any non-bootstrap Pair invalidates an armed/ready rendezvous.
-  // For the claimed first-bootstrap CAS, retain the matching claim until the
-  // manager reports completion so the ABA-safe release API can linearize it.
-  if (!bootstrap_rendezvous_claim_active_ || transaction.expected_pair) {
-    clearBootstrapRendezvousLocked();
-  }
-  committed_pair = immutable_installed;
-  return true;
-}
-
-void PhaseOffsetMatchedAdapter::makeControlPublishSnapshot(
-    const MatchedAdapterInput& input,
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    const std::shared_ptr<const TubeEpochSnapshot>& epoch,
-    const bool candidate_only,
-    const MatchedAdapterOutput& output) {
-  std::shared_ptr<ControlPublishSnapshot> control(new ControlPublishSnapshot());
-  control->active = request && request->active;
-  control->task_generation = request ? request->task_generation : 0U;
-  control->control_sequence = request ? request->control_sequence : 0U;
-  control->source_revision = request ? request->source_revision : 0U;
-  control->map_observation_sequence =
-      request ? request->map_observation_sequence : 0U;
-  control->map_observation_is_snapshot =
-      request && request->map_observation_is_snapshot;
-  control->candidate_epoch_source_revision =
-      epoch ? epoch->source_revision : 0U;
-  control->candidate_epoch_map_observation_sequence =
-      epoch ? epoch->map_observation_sequence : 0U;
-  control->candidate_epoch_map_observation_is_snapshot =
-      epoch && epoch->map_observation_is_snapshot;
-  control->candidate_only = candidate_only;
-  control->epoch_build_sequence = epoch ? epoch->build_sequence : 0U;
-  control->stamp = input.stamp;
-  control->current_w = input.path.w;
-  control->position = input.position;
-  control->epoch_snapshot = epoch;
-  control->full_path_samples = epoch ? epoch->full_path_samples
-                                     : std::shared_ptr<const PathSamples>();
-  control->authority_snapshot = execution_authority_.snapshotPtr();
-  control->output = output;
-  std::atomic_store(&latest_control_snapshot_,
-                    std::shared_ptr<const ControlPublishSnapshot>(control));
-}
-
-bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    const TubeEpochSnapshot& built) {
-  return finalizeTubeEpoch(request, built, nullptr);
-}
-
-bool PhaseOffsetMatchedAdapter::finalizeTubeEpoch(
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    const TubeEpochSnapshot& built, TubeJobLocalState* const job_state) {
-  if (!request || !request->active) return false;
-  // Publication, including the raw/cloud and marker paths, is serialized with
-  // task reset.  The expensive build happened before this function, so this
-  // short boundary never holds the barrier across geometry/tube construction.
-  // ROS Publisher::publish is non-callback dispatch and reset never publishes
-  // while holding this lock, so this lock adds no ROS callback inversion.
-  std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
-  // Ordinary same-task stale builds still publish their raw/cloud provenance
-  // below.  A task boundary is different: no old-task completion may publish
-  // or repopulate an evidence slot for the new owner.
-  if (shutdown_requested_.load(std::memory_order_acquire) ||
-      built.task_generation != request->task_generation ||
-      task_generation_.load(std::memory_order_acquire) !=
-          request->task_generation) {
-    return false;
-  }
-  if (finalize_publication_test_hook_) finalize_publication_test_hook_();
-  // Raw/cloud payloads are per-timer-build provenance, including a path that
-  // became stale while the build ran.  They never authorize Candidate,
-  // Runtime, or Certified exposure, so emit them before the source gate.
-  if (shutdown_requested_.load(std::memory_order_acquire)) return false;
-  const bool forward_log_due =
-      config_.mode == PhaseOffsetMatchedMode::MANUAL &&
-      config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
-      built.raw_candidate_diagnostics_generated &&
-      timer_last_raw_diagnostic_build_sequence_ != built.build_sequence;
-  if (forward_log_due) {
-    TubeSurfaceForwardExcludedLogInput log_input;
-    log_input.build_sequence = built.build_sequence;
-    log_input.candidate_sequence = built.epoch_status.candidate_sequence;
-    log_input.task_generation = request->task_generation;
-    log_input.authority_session = request->authority_session;
-    log_input.source_revision = request->source_revision;
-    log_input.path_revision = request->path_revision;
-    log_input.frame_revision = request->frame_revision;
-    log_input.map_observation_sequence = request->map_observation_sequence;
-    log_input.current_w = request->current_path.w;
-    log_input.certified_segment_end_w = built.candidate_profile
-        ? built.candidate_profile->certified_segment_end_w : 0.0;
-    log_input.evidence = built.candidate_profile
-        ? &built.candidate_profile->forward_excluded_evidence : nullptr;
-    log_input.snapshot = request->cloud_snapshot.get();
-    log_input.cloud_status = built.cloud_status;
-    ROS_INFO_STREAM(formatTubeSurfaceForwardExcludedLog(log_input));
-  }
-  publishBuildDiagnostics(built);
-  // Serialize the currentness check/ordinary-state commit with the command
-  // writer.  This closes the owner/frame replacement race between
-  // requestSourceStillCurrent() and the publication stores while retaining
-  // the fixed publication->Runtime lock order used by reset/publication.
-  std::unique_lock<std::mutex> runtime_lock(runtime_command_mutex_);
-  if (!requestSourceStillCurrent(*request)) {
-    // A timer build is only evidence.  If its source is stale, discard it;
-    // never reset/clear a newer pair or timer manager that may already own a
-    // later Runtime-eligible epoch.
-    return false;
-  }
-  // Commit the transactional ordinary worker state only after the same
-  // currentness gate that protects Candidate/Active publication.  Pair
-  // refresh jobs intentionally retain their fresh config-only manager as
-  // staging and never overwrite ordinary rolling state.
-  if (job_state) {
-    std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
-    commitTubeJobLocalState(*job_state);
-  }
-  // Test-only barrier for the final request-identity race.  This point is
-  // after currentness and ordinary-state commit but before either immutable
-  // Candidate/Epoch exposure store, and runtime_command_mutex_ is still held.
-  // A concurrent command replacement therefore cannot pass update() until the
-  // barrier is released and this complete publication boundary has finished.
-  if (finalize_before_epoch_store_test_hook_) {
-    finalize_before_epoch_store_test_hook_();
-  }
-  const std::shared_ptr<const TubeEpochSnapshot> epoch(
-      new TubeEpochSnapshot(built));
-  // Every completed Candidate is retained with the snapshot that built it.
-  // A new observation sequence alone does not discard an immutable, complete
-  // same-source epoch: the command thread sample-and-holds it until the next
-  // completed epoch atomically replaces it.  Path revision and the existing
-  // cloud usable contract remain fail-closed in epochMatchesRequest().
-  std::atomic_store(&latest_candidate_epoch_snapshot_, epoch);
-  const std::shared_ptr<const TubeBuildRequest> latest =
-      std::atomic_load(&latest_build_request_);
-  if (latest && epochMatchesRequest(*epoch, *latest)) {
-    std::atomic_store(&latest_epoch_snapshot_, epoch);
-  } else {
-    std::atomic_store(&latest_epoch_snapshot_,
-                      std::shared_ptr<const TubeEpochSnapshot>());
-  }
-  // This is the latest finalized (currentness-gated) sequence.  Bootstrap
-  // arming snapshots it, and only a strictly newer, fully certified epoch may
-  // become READY.  Marker publication has an independent watermark below.
-  std::uint64_t finalized_sequence =
-      timer_last_finalized_build_sequence_.load(std::memory_order_acquire);
-  while (finalized_sequence < built.build_sequence &&
-         !timer_last_finalized_build_sequence_.compare_exchange_weak(
-             finalized_sequence, built.build_sequence,
-             std::memory_order_acq_rel, std::memory_order_acquire)) {
-  }
-  if (capturePathTubePair()) {
-    clearBootstrapRendezvousLocked();
-  } else if (!request->base_path_tube_pair) {
-    recordBootstrapReadyLocked(*request, *epoch);
-  }
-  // Keep the short command/runtime lock through the immutable Candidate and
-  // Epoch stores.  A source/frame replacement can therefore occur only
-  // before the currentness check (and be rejected) or after this complete
-  // publication boundary; it cannot be inserted between commit and stores.
-  runtime_lock.unlock();
-  // Timer evidence may refresh a same-owner pair, but only by comparing the
-  // captured base pair/generation and Runtime bits under the short authority
-  // lock.  A stale completion is discarded above and cannot clear/replace a
-  // newer pair.
-  refreshPairFromTimerEpoch(request, epoch);
-
-  // The 83/50 payload still comes from a command-owned snapshot; raw/cloud
-  // build facts above are timer-owned and must not wait for that handshake.
-  const std::shared_ptr<const ControlPublishSnapshot> control =
-      std::atomic_load(&latest_control_snapshot_);
-  if (control && control->active) publishManual(*control);
-  return true;
-}
-
-void PhaseOffsetMatchedAdapter::consumeTimerTaskGeneration(
-    const std::uint64_t task_generation) {
-  // This function is called only by timerTick after it owns timer_inflight_.
-  // It is the sole writer for persistent timer state; command-side task reset
-  // only publishes task_generation_ and clears cross-thread snapshots.
-  cached_full_path_samples_.clear();
-  cached_path_source_revision_ = 0U;
-  have_cached_path_ = false;
-  timer_active_profile_.reset();
-  timer_installed_active_epoch_ = 0U;
-  timer_last_deactivate_sequence_ = 0U;
-  timer_last_publish_delete_source_revision_ = 0U;
-  timer_last_publish_delete_map_observation_sequence_ = 0U;
-  timer_last_published_epoch_build_sequence_ = 0U;
-  {
-    std::lock_guard<std::mutex> runtime_lock(runtime_command_mutex_);
-    timer_last_finalized_build_sequence_.store(0U, std::memory_order_release);
-  }
-  timer_last_raw_diagnostic_build_sequence_ = 0U;
-  timer_last_cloud_diagnostic_build_sequence_ = 0U;
-  latest_cloud_occupancy_query_status_ = CloudOccupancyQueryStatus();
-  if (config_.mode == PhaseOffsetMatchedMode::MANUAL) {
-    tube_epoch_manager_.reset(new phase_offset_navigation::TubeEpochManager(
-        MakeEpochConfig(config_)));
-  }
-  std::atomic_store(&latest_candidate_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  std::atomic_store(&latest_epoch_snapshot_,
-                    std::shared_ptr<const TubeEpochSnapshot>());
-  timer_task_generation_ = task_generation;
-}
-
-bool PhaseOffsetMatchedAdapter::processInactiveTubeRequest(
-    const std::shared_ptr<const TubeBuildRequest>& request) {
-  if (!request || request->active ||
-      shutdown_requested_.load(std::memory_order_acquire)) {
-    return false;
-  }
-  // An inactive request may publish DELETE markers and clear timer evidence.
-  // Treat those as task publication, not as an unguarded timer-local cleanup:
-  // an old A DELETE must never erase B after reset/reactivation.
-  if (inactive_publication_test_hook_) inactive_publication_test_hook_();
-  std::lock_guard<std::mutex> publication_lock(task_publication_mutex_);
-  if (shutdown_requested_.load(std::memory_order_acquire) ||
-      request->task_generation != timer_task_generation_ ||
-      request->task_generation !=
-          task_generation_.load(std::memory_order_acquire) ||
-      std::atomic_load(&latest_build_request_) != request) {
-    return false;
-  }
-  if (request->control_sequence != timer_last_deactivate_sequence_) {
-    cached_full_path_samples_.clear();
-    cached_path_source_revision_ = 0U;
-    have_cached_path_ = false;
-    timer_active_profile_.reset();
-    timer_installed_active_epoch_ = 0U;
-    tube_epoch_manager_.reset(new phase_offset_navigation::TubeEpochManager(
-        MakeEpochConfig(config_)));
-    std::atomic_store(&latest_candidate_epoch_snapshot_,
-                      std::shared_ptr<const TubeEpochSnapshot>());
-    const std::shared_ptr<const ControlPublishSnapshot> control =
-        std::atomic_load(&latest_control_snapshot_);
-    if (control && !control->active) publishManualDelete(*control);
-    timer_last_deactivate_sequence_ = request->control_sequence;
-  }
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::runTubeBuildJob(const SchedulePermit& permit) {
-  const std::shared_ptr<const TubeBuildRequest>& request = permit.request;
-  if (!request || shutdown_requested_.load(std::memory_order_acquire)) {
-    return false;
-  }
-  const std::uint64_t current_task_generation =
-      task_generation_.load(std::memory_order_acquire);
-  if (timer_task_generation_ != current_task_generation) {
-    consumeTimerTaskGeneration(current_task_generation);
-  }
-  if (request->task_generation != timer_task_generation_ ||
-      request->task_generation != current_task_generation) {
-    return false;
-  }
-  if (!request->active) return processInactiveTubeRequest(request);
-
-  // A request can become obsolete after the timer permit captured it but
-  // before the worker gets scheduled.  Reject it before copying committed
-  // state or consuming timer_build_sequence_: stale pending work is not an
-  // attempted Tube build and must not perturb Candidate/cache/profile state.
-  if (!requestSourceStillCurrent(*request)) return false;
-
-  TubeJobLocalState job_state;
-  prepareTubeJobLocalState(permit, job_state);
-  const bool measure_tube_due = measurement_tube_due_enabled_;
-  const auto tube_due_start = measure_tube_due
-      ? std::chrono::steady_clock::now()
-      : std::chrono::steady_clock::time_point();
-  TubeEpochSnapshot built;
-  const bool built_ok = buildTubeEpoch(request, built, &job_state);
-  std::uint64_t tube_due_duration_ns = 0U;
-  if (measure_tube_due) {
-    const auto tube_due_end = std::chrono::steady_clock::now();
-    tube_due_duration_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            tube_due_end - tube_due_start).count());
-  }
-
-  // An incomplete Candidate is still required evidence.  Finalize it before
-  // reporting the manager's build result so WAITING/diagnostic semantics do
-  // not disappear merely because installation was correctly rejected.
-  const bool finalized = finalizeTubeEpoch(request, built, &job_state);
-  if (measure_tube_due) {
-    const bool raw_cloud_publish_attempted =
-        config_.tube_source == phase_offset_navigation::TubeSource::ESDF &&
-        built.raw_candidate_diagnostics_generated &&
-        built.cloud_snapshot_diagnostics_generated;
-    const phase_offset_navigation::TubeBuildDiagnostics* diagnostics = nullptr;
-    if (built.candidate_profile) {
-      diagnostics = &built.candidate_profile->diagnostics;
-    }
-    recordTubeDueTiming(tube_due_duration_ns, request->stamp.toNSec(),
-                        finalized, raw_cloud_publish_attempted, diagnostics);
-  }
-  return finalized && built_ok;
-}
-
-void PhaseOffsetMatchedAdapter::tubeWorkerMain() {
-  for (;;) {
-    SchedulePermit permit;
-    {
-      std::unique_lock<std::mutex> lock(worker_state_mutex_);
-      worker_condition_.wait(lock, [this]() {
-        return worker_stop_requested_ ||
-            static_cast<bool>(pending_request_);
-      });
-      if (!pending_request_) {
-        if (worker_stop_requested_) break;
-        continue;
-      }
-      permit.permit_id = pending_permit_id_;
-      permit.request = pending_request_;
-      permit.request_identity = pending_request_identity_;
-      permit.work_identity = pending_work_identity_;
-      pending_request_.reset();
-      pending_permit_id_ = 0U;
-      pending_request_identity_ = RequestInstanceIdentity();
-      pending_work_identity_ = TubeWorkIdentity();
-      running_request_ = permit.request;
-      running_permit_id_ = permit.permit_id;
-      running_request_identity_ = permit.request_identity;
-      running_work_identity_ = permit.work_identity;
-      last_started_request_identity_ = permit.request_identity;
-      last_started_work_identity_ = permit.work_identity;
-    }
-
-    runTubeBuildJob(permit);
-
-    {
-      std::lock_guard<std::mutex> lock(worker_state_mutex_);
-      last_completed_request_identity_ = permit.request_identity;
-      last_completed_work_identity_ = permit.work_identity;
-      running_request_.reset();
-      running_permit_id_ = 0U;
-      running_request_identity_ = RequestInstanceIdentity();
-      running_work_identity_ = TubeWorkIdentity();
-      if (worker_stop_requested_) {
-        // Shutdown never starts a second job from an already-populated slot.
-        pending_request_.reset();
-        pending_permit_id_ = 0U;
-        pending_request_identity_ = RequestInstanceIdentity();
-        pending_work_identity_ = TubeWorkIdentity();
-        break;
-      }
-    }
-  }
+void PhaseOffsetMatchedAdapter::releaseCurrentCohort(const std::uint64_t request_id) {
+  std::lock_guard<std::mutex> lock(worker_state_mutex_);
+  if (pinned_current_cohort_ && pinned_current_cohort_->tube_worker_input_v2 &&
+      pinned_current_cohort_->tube_worker_input_v2->request_id == request_id)
+    pinned_current_cohort_.reset();
 }
 
 void PhaseOffsetMatchedAdapter::joinTubeWorker() {
-  if (tube_worker_.joinable()) tube_worker_.join();
   std::lock_guard<std::mutex> lock(worker_state_mutex_);
+  if (v2_shadow_worker_) v2_shadow_worker_->shutdown();
+  latest_v2_shadow_current_completion_.reset();
+  latest_v2_shadow_successor_completion_.reset();
+  v2_shadow_last_current_identity_ = V2ShadowRequestIdentity();
+  v2_shadow_last_successor_identity_ = V2ShadowRequestIdentity();
+  v2_shadow_last_current_path_key_ =
+      phase_offset_navigation::TubePathKey();
+  v2_shadow_last_successor_path_key_ =
+      phase_offset_navigation::TubePathKey();
+  v2_shadow_have_current_path_key_ = false;
+  v2_shadow_have_successor_path_key_ = false;
   worker_started_ = false;
-  running_request_.reset();
-  running_permit_id_ = 0U;
-  running_request_identity_ = RequestInstanceIdentity();
-  running_work_identity_ = TubeWorkIdentity();
-  pending_request_.reset();
-  pending_permit_id_ = 0U;
-  pending_request_identity_ = RequestInstanceIdentity();
-  pending_work_identity_ = TubeWorkIdentity();
+}
+bool PhaseOffsetMatchedAdapter::scheduleTubeBuild() {
+  const bool scheduled = scheduleV2ShadowBuild();
+  // Direct deterministic fixtures intentionally construct the adapter
+  // without starting ROS.  Marker publication is a production observation,
+  // so do not introduce a ros::Time global-state requirement into the worker
+  // scheduler when no NodeHandle can have advertised these topics.
+  bool markers_advertised = false;
+  {
+    std::lock_guard<std::mutex> marker_lock(marker_publication_mutex_);
+    markers_advertised = manual_tube_pub_ && manual_tube_candidate_pub_;
+  }
+  if (markers_advertised) {
+    publishV2TubeMarkers(ros::Time::now());
+  }
+  return scheduled;
+}
+std::uint64_t PhaseOffsetMatchedAdapter::executionGenerationV2() const {
+  return shutdown_requested_.load(std::memory_order_acquire)
+      ? 0U : task_generation_.load(std::memory_order_acquire);
+}
+bool PhaseOffsetMatchedAdapter::captureV2SuccessorSource(
+    phase_offset_navigation::TubePathKey& source_path_key,
+    std::uint64_t& execution_generation,
+    std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
+        source_input) const {
+  source_path_key = phase_offset_navigation::TubePathKey();
+  execution_generation = 0U;
+  source_input.reset();
+  std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL || !v2_shadow_worker_ ||
+      shutdown_requested_.load(std::memory_order_acquire) ||
+      !v2_execution_binding_ || !v2_execution_binding_->complete()) {
+    return false;
+  }
+  const std::uint64_t generation =
+      task_generation_.load(std::memory_order_acquire);
+  if (v2_execution_binding_->profile->path_key.execution_generation !=
+      generation) {
+    return false;
+  }
+  source_path_key = v2_execution_binding_->profile->path_key;
+  execution_generation = generation;
+  source_input = v2_execution_binding_->source_input;
+  return true;
 }
 
-bool PhaseOffsetMatchedAdapter::scheduleTubeBuild() {
-  const std::shared_ptr<const TubeBuildRequest> request =
-      std::atomic_load(&latest_build_request_);
+std::shared_ptr<const TubeV2ExecutionBinding>
+PhaseOffsetMatchedAdapter::captureV2ExecutionBinding() const {
+  std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+  return v2_execution_binding_ && v2_execution_binding_->complete()
+      ? v2_execution_binding_
+      : std::shared_ptr<const TubeV2ExecutionBinding>();
+}
+
+bool PhaseOffsetMatchedAdapter::enqueueV2SuccessorRequest(
+    const phase_offset_navigation::TubePathKey& source_path_key,
+    const phase_offset_navigation::TubeBuildInputV2& successor_input) {
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL || !v2_shadow_worker_ ||
+      shutdown_requested_.load(std::memory_order_acquire) ||
+      !source_path_key.complete() || !successor_input.complete() ||
+      successor_input.path_key == source_path_key ||
+      successor_input.configuration_key !=
+          config_.tube_certificate_v2.key()) {
+    return false;
+  }
+
+  // Match update()/reset lock ordering: Runtime/source ownership first,
+  // then bounded worker transport.  No path/map callback or builder executes
+  // under either adapter mutex.
+  std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+  const std::uint64_t generation =
+      task_generation_.load(std::memory_order_acquire);
+  if (successor_input.path_key.execution_generation != generation ||
+      source_path_key.execution_generation != generation ||
+      !v2_execution_binding_ || !v2_execution_binding_->complete() ||
+      v2_execution_binding_->profile->path_key != source_path_key ||
+      v2_execution_binding_->profile->configuration_key !=
+          successor_input.configuration_key) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+  if (worker_stop_requested_ ||
+      shutdown_requested_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  TubeWorkerCompletionV2 delivered;
+  while (v2_shadow_worker_->tryTakeAny(delivered)) {
+    retainV2ShadowCompletionLocked(delivered);
+    delivered = TubeWorkerCompletionV2();
+  }
+
+  const V2ShadowRequestIdentity identity = makeV2ShadowRequestIdentity(
+      TubeWorkerPurposeV2::SUCCESSOR, successor_input);
+  if (!identity.valid() ||
+      (v2_shadow_last_successor_identity_.valid() &&
+       v2_shadow_last_successor_identity_ == identity)) {
+    return false;
+  }
+  if (v2_shadow_have_successor_path_key_ &&
+      v2_shadow_last_successor_path_key_ != successor_input.path_key) {
+    // Purpose-local cancellation cannot disturb a CURRENT refresh.  The
+    // worker's global invalidatePath primitive is intentionally not used at
+    // this copied-prefix enqueue seam.
+    v2_shadow_worker_->cancel(TubeWorkerPurposeV2::SUCCESSOR);
+    latest_v2_shadow_successor_completion_.reset();
+  }
+
+  TubeWorkerRequestV2 request;
+  request.purpose = TubeWorkerPurposeV2::SUCCESSOR;
+  request.request_id = successor_input.request_id;
+  request.execution_generation = generation;
+  request.accepted_state_demand =
+      successor_input.map_capture_key.accepted_sequence;
+  request.useful_start = successor_input.requested_start;
+  request.useful_end = successor_input.requested_end;
+  request.input = successor_input;
+  const bool accepted = v2_shadow_worker_->submit(request);
+  v2_shadow_last_successor_identity_ = identity;
+  v2_shadow_last_successor_path_key_ = successor_input.path_key;
+  v2_shadow_have_successor_path_key_ = true;
+  while (v2_shadow_worker_->tryTakeAny(delivered)) {
+    retainV2ShadowCompletionLocked(delivered);
+    delivered = TubeWorkerCompletionV2();
+  }
+  return accepted;
+}
+
+void PhaseOffsetMatchedAdapter::consumeV2ShadowCompletions() {
+  if (!v2_shadow_worker_) return;
   std::lock_guard<std::mutex> lock(worker_state_mutex_);
-  const std::uint64_t permit_id = ++schedule_permit_id_;
-  if (worker_stop_requested_ || shutdown_requested_.load(
-          std::memory_order_acquire) || !request ||
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      worker_stop_requested_) return;
+  TubeWorkerCompletionV2 completion;
+  // The worker retains at most one useful completion per purpose.  Drain both
+  // bounded slots without touching Runtime, Pair, epoch, or publication
+  // state; this channel is observational evidence only.
+  while (v2_shadow_worker_->tryTakeAny(completion)) {
+    retainV2ShadowCompletionLocked(completion);
+    completion = TubeWorkerCompletionV2();
+  }
+}
+
+bool PhaseOffsetMatchedAdapter::scheduleV2ShadowBuild() {
+  if (config_.mode != PhaseOffsetMatchedMode::MANUAL || !v2_shadow_worker_ ||
+      shutdown_requested_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(worker_state_mutex_);
+  // Consume both worker purpose slots while holding the adapter worker-state
+  // mutex.  Completion delivery, dedup identity and path retirement therefore
+  // have one linearization domain with reset/shutdown/join.
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      worker_stop_requested_) return false;
+  TubeWorkerCompletionV2 delivered;
+  while (v2_shadow_worker_->tryTakeAny(delivered)) {
+    retainV2ShadowCompletionLocked(delivered);
+    delivered = TubeWorkerCompletionV2();
+  }
+  const std::shared_ptr<const TubeBuildRequestV2> request =
+      std::atomic_load(&latest_build_request_);
+  if (!request || !request->active || !request->tube_worker_input_v2 ||
       request->task_generation !=
           task_generation_.load(std::memory_order_acquire)) {
     return false;
   }
-  const RequestInstanceIdentity identity =
-      makeRequestInstanceIdentity(request);
-  if ((running_request_identity_.valid() &&
-       running_request_identity_ == identity) ||
-      (pending_request_identity_.valid() &&
-       pending_request_identity_ == identity) ||
-      (last_completed_request_identity_.valid() &&
-       last_completed_request_identity_ == identity)) {
+  const phase_offset_navigation::TubeBuildInputV2& source =
+      *request->tube_worker_input_v2;
+  const V2ShadowRequestIdentity identity = makeV2ShadowRequestIdentity(
+      request->tube_worker_purpose_v2, source);
+  V2ShadowRequestIdentity& last_identity =
+      request->tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT
+      ? v2_shadow_last_current_identity_ : v2_shadow_last_successor_identity_;
+  std::shared_ptr<const TubeWorkerCompletionV2>& retained_completion =
+      request->tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT
+      ? latest_v2_shadow_current_completion_
+      : latest_v2_shadow_successor_completion_;
+  phase_offset_navigation::TubePathKey& last_path_key =
+      request->tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT
+      ? v2_shadow_last_current_path_key_ : v2_shadow_last_successor_path_key_;
+  bool& have_path_key = request->tube_worker_purpose_v2 ==
+      TubeWorkerPurposeV2::CURRENT ? v2_shadow_have_current_path_key_
+                                   : v2_shadow_have_successor_path_key_;
+  if (last_identity.valid() && last_identity == identity) {
     return false;
   }
-  pending_request_ = request;
-  pending_permit_id_ = permit_id;
-  pending_request_identity_ = identity;
-  pending_work_identity_ = makeTubeWorkIdentity(request);
-  worker_condition_.notify_one();
-  return true;
+  // The supplied input is one immutable coherent capture.  Reject a stale
+  // generation rather than relabelling it with the adapter's current task.
+  if (source.path_key.execution_generation != request->task_generation ||
+      source.request_id == 0U || !source.complete()) {
+    last_identity = identity;
+    return false;
+  }
+  // A consumed successful completion remains a bounded retention record at
+  // the adapter transport boundary.  Preserve it across delayed command/map
+  // notifications so a narrower request for the exact same authority does
+  // not recertify.  Failed completions deliberately do not suppress retry.
+  if (retained_completion) {
+    const TubeWorkerCompletionV2& retained = *retained_completion;
+    const bool retained_covers = retained.built() &&
+        retained.purpose == request->tube_worker_purpose_v2 &&
+        retained.execution_generation == source.path_key.execution_generation &&
+        retained.path_key == source.path_key &&
+        retained.configuration_key == source.configuration_key &&
+        retained.map_capture_key == source.map_capture_key &&
+        retained.accepted_state_demand >=
+            source.map_capture_key.accepted_sequence &&
+        retained.useful_start <= source.requested_start &&
+        retained.useful_end >= source.requested_end;
+    if (retained_covers) {
+      last_identity = identity;
+      return false;
+    }
+  }
+  const bool incoming_path_replaced = have_path_key &&
+      last_path_key != source.path_key;
+  if (incoming_path_replaced) {
+    // Retire only the incoming purpose's old path.  The worker has one global
+    // path-invalidation primitive, so do not call it when the other purpose
+    // still uses that exact key; otherwise a successor request could cancel
+    // a useful current request (or vice versa).
+    const phase_offset_navigation::TubePathKey retired_key = last_path_key;
+    const bool other_purpose_uses_key =
+        (request->tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT)
+        ? (v2_shadow_have_successor_path_key_ &&
+           v2_shadow_last_successor_path_key_ == retired_key)
+        : (v2_shadow_have_current_path_key_ &&
+           v2_shadow_last_current_path_key_ == retired_key);
+    if (!other_purpose_uses_key) {
+      v2_shadow_worker_->invalidatePath(retired_key);
+    } else {
+      // invalidatePath() is intentionally global to both worker purpose
+      // slots, so it cannot be used while the other purpose still owns this
+      // path key.  Retire only the incoming purpose's old pending/running
+      // request instead; the other purpose remains eligible and retained.
+      v2_shadow_worker_->cancel(request->tube_worker_purpose_v2);
+    }
+    if (request->tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT) {
+      if (latest_v2_shadow_current_completion_ &&
+          latest_v2_shadow_current_completion_->path_key == retired_key) {
+        latest_v2_shadow_current_completion_.reset();
+      }
+      v2_shadow_last_current_identity_ = V2ShadowRequestIdentity();
+      v2_shadow_have_current_path_key_ = false;
+      // Retire only a binding that still belongs to the old path.  A command
+      // update can prepare the new path while the scheduler is retiring the
+      // previous worker key; compare-exchange prevents that newer binding
+      // from being cleared by this old-path lifecycle event.
+      std::shared_ptr<const TubeV2ShadowAdmissionCandidate> retired_admission =
+          std::atomic_load_explicit(
+              &retained_v2_shadow_admission_candidate_,
+              std::memory_order_acquire);
+      if (retired_admission && retired_admission->path_key == retired_key) {
+        std::atomic_compare_exchange_strong_explicit(
+            &retained_v2_shadow_admission_candidate_, &retired_admission,
+            std::shared_ptr<const TubeV2ShadowAdmissionCandidate>(),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+      }
+    } else {
+      if (latest_v2_shadow_successor_completion_ &&
+          latest_v2_shadow_successor_completion_->path_key == retired_key) {
+        latest_v2_shadow_successor_completion_.reset();
+      }
+      v2_shadow_last_successor_identity_ = V2ShadowRequestIdentity();
+      v2_shadow_have_successor_path_key_ = false;
+    }
+  }
+  TubeWorkerRequestV2 worker_request;
+  worker_request.purpose = request->tube_worker_purpose_v2;
+  worker_request.request_id = source.request_id;
+  worker_request.execution_generation = source.path_key.execution_generation;
+  worker_request.accepted_state_demand = source.map_capture_key.accepted_sequence;
+  worker_request.useful_start = source.requested_start;
+  worker_request.useful_end = source.requested_end;
+  worker_request.input = source;
+  const bool accepted = v2_shadow_worker_->submit(worker_request);
+  if (accepted && worker_request.purpose == TubeWorkerPurposeV2::CURRENT)
+    pinned_current_cohort_ = request;
+  // Mark the immutable request identity even when worker-level high-water or
+  // coverage dedup rejects it, preventing repeated timer permits from
+  // creating a second transport attempt.
+  last_identity = identity;
+  last_path_key = source.path_key;
+  have_path_key = true;
+  while (v2_shadow_worker_->tryTakeAny(delivered)) {
+    retainV2ShadowCompletionLocked(delivered);
+    delivered = TubeWorkerCompletionV2();
+  }
+  return accepted;
 }
 
 bool PhaseOffsetMatchedAdapter::timerTick() {
-  // Once advertise() has started the joined production worker, this legacy
-  // entry point is scheduler-only and cannot execute a second synchronous
-  // Tube implementation on the callback thread.
-  bool production_worker_started = false;
-  {
-    std::lock_guard<std::mutex> lock(worker_state_mutex_);
-    production_worker_started = worker_started_;
-  }
-  if (production_worker_started) return scheduleTubeBuild();
-  if (shutdown_requested_.load(std::memory_order_acquire)) return false;
-  bool expected = false;
-  if (!timer_inflight_.compare_exchange_strong(expected, true,
-                                                std::memory_order_acq_rel)) {
-    return false;
-  }
-  struct TimerExit {
-    std::atomic<bool>& inflight;
-    ~TimerExit() { inflight.store(false, std::memory_order_release); }
-  } exit {timer_inflight_};
-  if (shutdown_requested_.load(std::memory_order_acquire)) return false;
-
-  bool have_pending = false;
-  {
-    std::lock_guard<std::mutex> lock(worker_state_mutex_);
-    have_pending = static_cast<bool>(pending_request_);
-  }
-  if (!have_pending && !scheduleTubeBuild()) {
-    // Repeated compatibility ticks for an already-consumed inactive request
-    // are harmless no-ops.  Preserve the historical timerTick() success
-    // result without rebuilding or republishing the same DELETE transition.
-    const std::shared_ptr<const TubeBuildRequest> latest =
-        std::atomic_load(&latest_build_request_);
-    std::lock_guard<std::mutex> lock(worker_state_mutex_);
-    if (latest && !latest->active &&
-        last_completed_request_identity_ ==
-            makeRequestInstanceIdentity(latest)) {
-      return true;
-    }
-    return false;
-  }
-
-  SchedulePermit permit;
-  {
-    std::lock_guard<std::mutex> lock(worker_state_mutex_);
-    if (!pending_request_) return false;
-    permit.permit_id = pending_permit_id_;
-    permit.request = pending_request_;
-    permit.request_identity = pending_request_identity_;
-    permit.work_identity = pending_work_identity_;
-    pending_request_.reset();
-    pending_permit_id_ = 0U;
-    pending_request_identity_ = RequestInstanceIdentity();
-    pending_work_identity_ = TubeWorkIdentity();
-    running_request_ = permit.request;
-    running_permit_id_ = permit.permit_id;
-    running_request_identity_ = permit.request_identity;
-    running_work_identity_ = permit.work_identity;
-    last_started_request_identity_ = permit.request_identity;
-    last_started_work_identity_ = permit.work_identity;
-  }
-  const bool result = runTubeBuildJob(permit);
-  {
-    std::lock_guard<std::mutex> lock(worker_state_mutex_);
-    last_completed_request_identity_ = permit.request_identity;
-    last_completed_work_identity_ = permit.work_identity;
-    running_request_.reset();
-    running_permit_id_ = 0U;
-    running_request_identity_ = RequestInstanceIdentity();
-    running_work_identity_ = TubeWorkIdentity();
-  }
-  return result;
+  return scheduleTubeBuild();
 }
 
+bool PhaseOffsetMatchedAdapter::candidateMarkerApplicableV2(
+    const TubeWorkerCompletionV2& completion, const TubeBuildRequestV2& request,
+    const std::uint64_t generation, const std::uint64_t now_ticks) {
+  const auto& profile = completion.build.profile;
+  return completion.built() && request.active && request.tube_worker_input_v2 &&
+      request.task_generation == generation && completion.execution_generation == generation &&
+      profile.path_key == request.tube_worker_input_v2->path_key &&
+      profile.configuration_key == request.tube_worker_input_v2->configuration_key &&
+      profile.map_capture_key.map_instance_id == request.tube_worker_input_v2->map_capture_key.map_instance_id &&
+      profile.map_capture_key.configuration_generation == request.tube_worker_input_v2->map_capture_key.configuration_generation &&
+      profile.map_capture_key.configuration_id == request.tube_worker_input_v2->map_capture_key.configuration_id &&
+      profile.map_capture_key.frame_provenance == request.tube_worker_input_v2->map_capture_key.frame_provenance &&
+      std::isfinite(request.current_w) && request.current_w >= profile.certified_start &&
+      request.current_w < profile.certified_end &&
+      (profile.applicability_deadline_timeless || now_ticks <= profile.applicability_deadline_ticks);
+}
+
+void PhaseOffsetMatchedAdapter::publishV2TubeMarkers(
+    const ros::Time& stamp) {
+  std::shared_ptr<const TubeV2ExecutionBinding> active_binding;
+  {
+    std::lock_guard<std::mutex> command_lock(runtime_command_mutex_);
+    if (v2_execution_binding_ && v2_execution_binding_->complete()) {
+      active_binding = v2_execution_binding_;
+    }
+  }
+
+  std::shared_ptr<const TubeWorkerCompletionV2> current_completion;
+  std::shared_ptr<const TubeWorkerCompletionV2> successor_completion;
+  {
+    std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+    current_completion = latest_v2_shadow_current_completion_;
+    successor_completion = latest_v2_shadow_successor_completion_;
+  }
+
+  const auto same_as_active = [&active_binding](
+      const std::shared_ptr<const TubeWorkerCompletionV2>& completion) {
+    if (!active_binding || !completion || !completion->built()) return false;
+    const phase_offset_navigation::TubeProfileV2& profile =
+        completion->build.profile;
+    return profile.profile_id == active_binding->profile->profile_id &&
+        profile.request_id == active_binding->profile->request_id &&
+        profile.path_key == active_binding->profile->path_key &&
+        profile.configuration_key == active_binding->profile->configuration_key &&
+        profile.map_capture_key == active_binding->profile->map_capture_key;
+  };
+  const auto display_request = std::atomic_load(&latest_build_request_);
+  const auto generation = task_generation_.load(std::memory_order_acquire);
+  const std::uint64_t now_ticks = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  if (active_binding && (!display_request || !display_request->active ||
+      display_request->task_generation != generation ||
+      active_binding->profile->path_key.execution_generation != generation ||
+      !std::isfinite(display_request->current_w) ||
+      display_request->current_w < active_binding->profile->certified_start ||
+      display_request->current_w >= active_binding->profile->certified_end ||
+      (!active_binding->profile->applicability_deadline_timeless &&
+       now_ticks > active_binding->profile->applicability_deadline_ticks))) {
+    active_binding.reset();  // Display only; never changes the execution binding.
+  }
+  const auto eligible = [&](
+      const std::shared_ptr<const TubeWorkerCompletionV2>& completion) {
+    return completion && display_request && !same_as_active(completion) &&
+        candidateMarkerApplicableV2(*completion, *display_request, generation, now_ticks);
+  };
+  std::shared_ptr<const TubeWorkerCompletionV2> candidate_completion;
+  if (eligible(current_completion)) candidate_completion = current_completion;
+  if (eligible(successor_completion) &&
+      (!candidate_completion ||
+       successor_completion->build_end_ticks >
+           candidate_completion->build_end_ticks ||
+       (successor_completion->build_end_ticks ==
+            candidate_completion->build_end_ticks &&
+        successor_completion->request_id > candidate_completion->request_id))) {
+    candidate_completion = successor_completion;
+  }
+
+  std::shared_ptr<const phase_offset_navigation::TubeProfileV2> active_profile;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> active_frame;
+  if (active_binding) {
+    active_profile = active_binding->profile;
+    active_frame = active_binding->frame_owner;
+  }
+  std::shared_ptr<const phase_offset_navigation::TubeProfileV2>
+      candidate_profile;
+  std::shared_ptr<const ContinuousPhaseNormalFrame> candidate_frame;
+  if (candidate_completion) {
+    candidate_profile =
+        std::shared_ptr<const phase_offset_navigation::TubeProfileV2>(
+            candidate_completion, &candidate_completion->build.profile);
+    try {
+      const std::shared_ptr<const ContinuousPhasePath> path_owner =
+          std::static_pointer_cast<const ContinuousPhasePath>(
+              candidate_profile->path_owner);
+      if (path_owner && !path_owner->empty() &&
+          path_owner->pathRevision() ==
+              candidate_profile->path_key.path_revision &&
+          path_owner->startW() == candidate_profile->path_key.domain_start &&
+          path_owner->endW() == candidate_profile->path_key.domain_end) {
+        candidate_frame =
+            std::make_shared<const ContinuousPhaseNormalFrame>(
+                path_owner, candidate_profile->path_key.path_revision,
+                candidate_profile->path_key.frame_revision);
+      }
+    } catch (const std::exception&) {
+      candidate_profile.reset();
+      candidate_frame.reset();
+    }
+  }
+
+  const auto marker_identity = [](
+      const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>&
+          profile) {
+    TubeMarkerIdentityV2 identity;
+    if (profile) {
+      identity.execution_generation = profile->path_key.execution_generation;
+      identity.path_instance_id = profile->path_key.path_instance_id;
+      identity.profile_id = profile->profile_id;
+      identity.request_id = profile->request_id;
+      identity.map_state_id = profile->map_capture_key.state_id;
+      identity.valid = true;
+    }
+    return identity;
+  };
+  const TubeMarkerIdentityV2 active_identity = marker_identity(active_profile);
+  const TubeMarkerIdentityV2 candidate_identity =
+      marker_identity(candidate_profile);
+  // A short visualization-only lifetime also clears the last latched ADD if
+  // the publisher stops. Refresh cached geometry at the existing Tube timer;
+  // this neither rebuilds a proof nor grants execution authority.
+  const auto publish_cached = [&]() {
+    const auto trim_passed_samples = [&](visualization_msgs::MarkerArray& array,
+        const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>& profile,
+        std::size_t& first) {
+      if (!profile || !display_request || profile->knots.size() < 2U) return;
+      const auto next = std::upper_bound(profile->knots.begin(), profile->knots.end(),
+          display_request->current_w, [](double w, const phase_offset_navigation::TubePwlKnotV2& knot) {
+            return w < knot.w;
+          });
+      if (next == profile->knots.begin()) return;
+      const std::size_t desired = std::min(profile->knots.size() - 2U,
+          static_cast<std::size_t>(next - profile->knots.begin() - 1));
+      if (desired <= first) return;
+      // Keep the cell containing live w and all remaining certified cells.
+      // Erase only old display vertices/triangles: no new geometry queries,
+      // no proof/profile mutation, and no extrapolation beyond certification.
+      for (auto& marker : array.markers) {
+        if (marker.action != visualization_msgs::Marker::ADD) continue;
+        const std::size_t per_cell = marker.type == visualization_msgs::Marker::TRIANGLE_LIST ? 6U : 1U;
+        const std::size_t removed = std::min(marker.points.size(), per_cell * (desired - first));
+        marker.points.erase(marker.points.begin(), marker.points.begin() + removed);
+      }
+      first = desired;
+    };
+    trim_passed_samples(cached_active_markers_v2_, active_profile, cached_active_first_knot_v2_);
+    trim_passed_samples(cached_candidate_markers_v2_, candidate_profile, cached_candidate_first_knot_v2_);
+    for (auto* array : {&cached_active_markers_v2_, &cached_candidate_markers_v2_}) {
+      for (auto& marker : array->markers) {
+        marker.header.stamp = stamp;
+        if (marker.action == visualization_msgs::Marker::ADD)
+          marker.lifetime = ros::Duration(2.0 * config_.tube_update_period);
+      }
+    }
+    if (manual_tube_pub_) manual_tube_pub_.publish(cached_active_markers_v2_);
+    if (manual_tube_candidate_pub_) manual_tube_candidate_pub_.publish(cached_candidate_markers_v2_);
+  };
+  {
+    std::lock_guard<std::mutex> marker_lock(marker_publication_mutex_);
+    if (shutdown_requested_.load(std::memory_order_acquire) ||
+        generation != task_generation_.load(std::memory_order_acquire)) return;
+    if (marker_snapshot_published_ &&
+        published_active_marker_identity_ == active_identity &&
+        published_candidate_marker_identity_ == candidate_identity) {
+      publish_cached();
+      return;
+    }
+  }
+
+  visualization_msgs::MarkerArray active_markers;
+  visualization_msgs::MarkerArray candidate_markers;
+  try {
+    active_markers = MakeCertifiedTubeMarkersV2(
+        stamp, config_.frame_id, active_profile, active_frame);
+    candidate_markers = MakeCandidateTubeMarkersV2(
+        stamp, config_.frame_id, candidate_profile, candidate_frame);
+  } catch (const std::exception&) {
+    // Allocation/serialization preparation failure is visualization-only.
+    // Keep the previous identity so the next Tube timer retries; execution
+    // authority and the 50 Hz command path remain untouched.
+    return;
+  }
+
+  std::lock_guard<std::mutex> marker_lock(marker_publication_mutex_);
+  if (shutdown_requested_.load(std::memory_order_acquire) ||
+      generation != task_generation_.load(std::memory_order_acquire)) {
+    return;
+  }
+  cached_active_markers_v2_ = std::move(active_markers);
+  cached_candidate_markers_v2_ = std::move(candidate_markers);
+  cached_active_first_knot_v2_ = cached_candidate_first_knot_v2_ = 0U;
+  publish_cached();
+  published_active_marker_identity_ = active_identity;
+  published_candidate_marker_identity_ = candidate_identity;
+  marker_snapshot_published_ = true;
+}
 void PhaseOffsetMatchedAdapter::latchFailure(
     const phase_offset_navigation::ControlFailureReason reason) {
   if (!failure_latched_) {
-    ++manual_invalid_count_;
-    ++manual_fallback_count_;
     control_failure_reason_ = reason;
   }
   failure_latched_ = true;
-  // A fatal command-side invariant invalidates any neutral bootstrap claim;
-  // a late timer completion must not resurrect offset authority.
-  clearBootstrapRendezvousLocked();
+  clearPendingPositionCommandLocked();
 }
 
 bool PhaseOffsetMatchedAdapter::updateGate(const MatchedAdapterInput& input,
@@ -5112,1757 +3289,19 @@ bool PhaseOffsetMatchedAdapter::updateGate(const MatchedAdapterInput& input,
   return true;
 }
 
-void PhaseOffsetMatchedAdapter::fillLegacyTubeStatus(MatchedAdapterOutput& output) const {
-  const auto& epoch = output.tube_epoch_status;
-  const auto& execution = output.runtime_execution;
-  const auto& profile = output.tube_profile;
-  auto& status = output.tube_status;
-  status = phase_offset_navigation::TubeRuntimeStatus();
-  status.source = config_.tube_source;
-  status.readiness_evaluated = status.source != phase_offset_navigation::TubeSource::NONE &&
-      epoch.candidate_sequence > 0U;
-  status.source_ready = epoch.active_current_validation_valid;
-  status.raw_complete = profile.raw_complete; status.filtered_complete = profile.filtered_complete;
-  status.profile_complete = profile.complete; status.obstacle_certified = profile.obstacle_certified;
-  status.current_inside = execution.retained_delta_current_inside;
-  status.next_inside = output.tube_next_bounds.valid && output.projection.valid &&
-      output.projection.next_delta >= output.tube_next_bounds.lower + config_.tube.interior_margin - 1e-10 &&
-      output.projection.next_delta <= output.tube_next_bounds.upper - config_.tube.interior_margin + 1e-10;
-  status.tracking_within_bound = execution.tracking_within_bound;
-  status.tube_violation = execution.certificate_denied;
-  status.failure_latched = output.failure_latched;
-  status.rebuild_count = CountAsInt(epoch.candidate_sequence);
-  status.reject_count = CountAsInt(epoch.reject_count);
-  status.violation_count = status.tube_violation ? 1 : 0;
-  status.certified_forward_w = epoch.certified_forward_w;
-  status.reference_signed_distance = epoch.reference_signed_distance;
-  status.actual_signed_distance = epoch.actual_signed_distance;
-  status.tracking_error_norm = execution.tracking_error_norm;
-}
-
-bool PhaseOffsetMatchedAdapter::tubeDisplayCertified(const MatchedAdapterOutput& output) const {
-  const auto& epoch = output.tube_epoch_status;
-  const auto& runtime = output.runtime_execution;
-  const auto* active = output.active_profile.get();
-  const bool current_runtime_port_set = runtime.mode ==
-          phase_offset_navigation::RuntimeExecutionMode::NORMAL ||
-      runtime.mode == phase_offset_navigation::RuntimeExecutionMode::SAFETY_PRIORITY;
-  const bool current_exact_nonnegative_port = output.valid && output.projection.valid &&
-      output.matched.valid && current_runtime_port_set;
-  const bool current_map_safe = config_.tube_source ==
-      phase_offset_navigation::TubeSource::FIXED ||
-      epoch.current_safety_status ==
-          phase_offset_navigation::CurrentSafetyStatus::SAFE;
-  return config_.mode == PhaseOffsetMatchedMode::MANUAL && active != nullptr && active->complete &&
-      epoch.active_current_validation_valid &&
-      runtime.current_geometry_valid && runtime.current_bounds_valid &&
-      runtime.retained_delta_current_inside && runtime.tracking_within_bound &&
-      current_map_safe && !runtime.certificate_denied &&
-      !runtime.fatal_control_failure && !output.failure_latched &&
-      current_exact_nonnegative_port &&
-      (config_.tube_source == phase_offset_navigation::TubeSource::FIXED ||
-       active->obstacle_certified);
-}
-
-void PhaseOffsetMatchedAdapter::fillManualDiagnostics(MatchedAdapterOutput& output) const {
-  output.diagnostics.fill(0.0);
-  const auto& status = output.tube_status; const auto& profile = output.tube_profile;
-  const auto& erosion = config_.tube.erosion; auto& d = output.diagnostics;
-  const bool raw_occupancy = output.tube_epoch_status.raw_cross_section_path_used;
-  const double base_speed = output.geometry.valid && output.base_guidance.valid ?
-      output.geometry.T.dot(output.base_guidance.v_cmd) : 0.0;
-  const double r_z = output.geometry.valid ? std::abs(output.geometry.r.z() - output.geometry.p.z()) : 0.0;
-  const double upper_h = output.tube_current_bounds.valid ? output.tube_current_bounds.upper -
-      config_.tube.interior_margin - output.delta : 0.0;
-  const double lower_h = output.tube_current_bounds.valid ? output.delta -
-      output.tube_current_bounds.lower - config_.tube.interior_margin : 0.0;
-  d[kModeManual] = 1.0; d[kZeroGateOpen] = output.zero_gate_open; d[kZeroGateConsecutiveCount] = output.zero_gate_consecutive_count;
-  d[kFailureLatched] = output.failure_latched; d[kProfileActive] = output.profile_active; d[kPreflightComplete] = output.preflight.complete;
-  d[kConfiguredAmplitude] = output.preflight.configured_amplitude; d[kAcceptedAmplitude] = output.preflight.accepted_amplitude;
-  d[kDeltaRef] = output.delta_ref; d[kDelta] = output.delta; d[kDeltaTrackingError] = output.delta_ref - output.delta;
-  d[kUWRaw] = output.raw_port.u_w; d[kUDeltaRaw] = output.raw_port.u_delta; d[kUWFinal] = output.projection.final_port.u_w;
-  d[kUDeltaFinal] = output.projection.final_port.u_delta; d[kUWLimited] = output.projection.u_w_limited; d[kUDeltaLimited] = output.projection.u_delta_limited;
-  d[kBaseWDot] = output.base_guidance.w_dot; d[kFinalWDot] = output.guidance.w_dot; d[kBaseTangentSpeed] = base_speed;
-  d[kFinalTangentSpeed] = output.projection.final_tangent_speed; d[kCurrentRegularity] = output.geometry.regularity;
-  d[kNextRegularity] = output.projection.next_regularity; d[kMatchedResidualNorm] = output.matched.matched_residual_norm;
-  d[kPhysicalPortNorm] = output.matched.physical_port.norm(); d[kRMinusPNorm] = output.geometry.valid ? (output.geometry.r - output.geometry.p).norm() : 0.0;
-  d[kRZMinusPZ] = r_z; d[kSelectedManual] = output.selected; d[kManualValid] = output.valid;
-  d[kPreflightSampleCount] = output.preflight.sample_count; d[kPreflightInvalidSampleCount] = output.preflight.invalid_sample_count;
-  d[kPreflightMinRegularity] = output.preflight.min_regularity; d[kManualInvalidCount] = manual_invalid_count_; d[kManualFallbackCount] = manual_fallback_count_;
-  d[kTubeSource] = static_cast<int>(status.source); d[kTubeSourceReady] = status.source_ready;
-  d[kTubeRawComplete] = status.raw_complete; d[kTubeFilteredComplete] = status.filtered_complete; d[kTubeProfileComplete] = status.profile_complete;
-  d[kTubeObstacleCertified] = status.obstacle_certified; d[kTubeSourceRevision] = profile.source_revision; d[kTubeRevision] = profile.tube_revision;
-  d[kTubeSampleCount] = profile.diagnostics.sample_count; d[kTubeInvalidCount] = profile.diagnostics.invalid_count;
-  d[kTubeUnavailableCount] = profile.diagnostics.unavailable_count; d[kTubeOutOfMapCount] = profile.diagnostics.out_of_map_count;
-  d[kTubeUnknownCount] = profile.diagnostics.unknown_count; d[kTubeOccupiedCount] = profile.diagnostics.occupied_count;
-  d[kTubePreviewStart] = profile.preview_start_w; d[kTubePreviewEnd] = profile.preview_end_w; d[kTubeCertifiedForward] = status.certified_forward_w;
-  d[kTubeLower] = output.tube_current_bounds.lower; d[kTubeUpper] = output.tube_current_bounds.upper;
-  d[kTubeLowerW] = output.tube_current_bounds.lower_w; d[kTubeUpperW] = output.tube_current_bounds.upper_w;
-  d[kTubeNextLower] = output.tube_next_bounds.lower; d[kTubeNextUpper] = output.tube_next_bounds.upper;
-  d[kTubeCurrentInside] = status.current_inside; d[kTubeNextInside] = status.next_inside; d[kTubeUpperH] = upper_h; d[kTubeLowerH] = lower_h;
-  d[kTubeUpperInvariant] = output.projection.upper_invariant_residual; d[kTubeLowerInvariant] = output.projection.lower_invariant_residual;
-  d[kTubeRequiredReferenceClearance] = output.tube_epoch_status.required_reference_clearance;
-  d[kTubeRequiredActualClearance] = output.tube_epoch_status.required_actual_clearance;
-  d[kTubeReferenceDistance] = status.reference_signed_distance; d[kTubeActualDistance] = status.actual_signed_distance;
-  d[kTubeTrackingNorm] = status.tracking_error_norm; d[kTubeTrackingBound] = raw_occupancy
-      ? config_.tube.cross_section.margins.tracking_error_bound
-      : erosion.tracking_error_bound;
-  d[kTubeViolation] = status.tube_violation; d[kTubeRebuildCount] = status.rebuild_count; d[kTubeRejectCount] = status.reject_count; d[kTubeViolationCount] = status.violation_count;
-  d[kTubeReadinessEvaluated] = status.readiness_evaluated; d[kTubeDisplayCertified] = tubeDisplayCertified(output);
-  d[kPreflightFirstInvalidW] = output.preflight.first_invalid_w; d[kPreflightFirstInvalidSide] = output.preflight.first_invalid_side;
-  d[kTubeFirstInvalidW] = profile.diagnostics.first_invalid_w; d[kTubeFirstInvalidSide] = profile.diagnostics.first_invalid_side;
-  d[kTubeFirstStopReason] = profile.diagnostics.first_stop_reason; d[kTubeInsufficientClearanceCount] = profile.diagnostics.insufficient_clearance_count;
-  d[kTubeMinWidth] = profile.diagnostics.min_width; d[kTubeMinSafetyMargin] = profile.diagnostics.min_safety_margin;
-  for (double& value : d) value = FiniteOrZero(value);
-}
-
-bool PhaseOffsetMatchedAdapter::evaluateNormalAllocator(
-    const MatchedAdapterInput& input,
-    const phase_offset_navigation::RuntimePreparedStep& prepared,
-    const double base_w_dot,
-    phase_offset_navigation::NormalPreviewResult& preview,
-    phase_offset_navigation::PhaseOffsetAllocatorResult& allocator,
-    Eigen::Vector3d& g_des,
-    std::string& failure_reason) const {
-  preview = phase_offset_navigation::NormalPreviewResult();
-  allocator = phase_offset_navigation::PhaseOffsetAllocatorResult();
-  g_des = Eigen::Vector3d::Zero();
-  failure_reason.clear();
-
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile =
-      prepared.active_profile;
-  if (!profile || !profile->complete || profile->samples.size() < 2U) {
-    failure_reason = "NORMAL Preview profile is unavailable";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        PREVIEW_INFEASIBLE;
-    allocator.reason = failure_reason;
-    return false;
-  }
-  if (!prepared.geometry.valid || !prepared.geometry.r_w.allFinite() ||
-      !prepared.geometry.N.allFinite() || !std::isfinite(base_w_dot) ||
-      !std::isfinite(prepared.dt) || prepared.dt <= 0.0) {
-    failure_reason = "NORMAL allocator geometry or tick is invalid";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        INVALID_INPUT;
-    allocator.reason = failure_reason;
-    return false;
-  }
-
-  // The immutable policy is the sole source of the common phase-rate
-  // envelope and W-domain horizon/sampling/beta thresholds.  C3 does not
-  // derive any of these values from geometry, the current command or Tube
-  // sample density.
-  const phase_offset_navigation::NormalPreviewProductionPolicy& policy =
-      config_.normal_preview_policy;
-  if (!config_.normal_preview_policy_explicit || !policy.valid()) {
-    failure_reason = "NORMAL Preview production policy is unavailable";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        INVALID_INPUT;
-    allocator.reason = failure_reason;
-    return false;
-  }
-
-  phase_offset_navigation::NormalPreviewInput preview_input;
-  preview_input.profile = profile.get();
-  preview_input.current_w = prepared.geometry.w;
-  preview_input.current_delta = prepared.delta;
-  preview_input.policy = policy;
-  preview_input.upper_u_delta = std::max(0.0, config_.u_delta_abs_max);
-  preview_input.boundary_tolerance = 1e-10;
-  preview_input.path_revision = profile->path_revision;
-  preview_input.frame_revision = profile->frame_revision;
-  preview_input.profile_revision = profile->profile_revision;
-  preview_input.expected_path_revision = profile->path_revision;
-  preview_input.expected_frame_revision = profile->frame_revision;
-  preview_input.expected_profile_revision = profile->profile_revision;
-  if (!phase_offset_navigation::NormalPreview::evaluate(
-          preview_input, preview)) {
-    failure_reason = preview.reason.empty() ?
-        "NORMAL Preview evaluation failed" : preview.reason;
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        PREVIEW_INFEASIBLE;
-    allocator.reason = failure_reason;
-    return false;
-  }
-
-  // Coordination is composed only after the same-tick NORMAL Preview has
-  // succeeded.  SPH uses exactly one immutable bridge capture and resolves
-  // source/receipt freshness here; missing, stale, or accepted-invalid data
-  // contributes a zero swarm term and therefore leaves recentering intact.
-  const Eigen::Vector3d recenter = -config_.delta_tracking_gain *
-      prepared.delta * prepared.geometry.N;
-  if (!recenter.allFinite()) {
-    failure_reason = "NORMAL desired active-reference motion is invalid";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        INVALID_INPUT;
-    allocator.reason = failure_reason;
-    return false;
-  }
-  Eigen::Vector3d g_swarm = Eigen::Vector3d::Zero();
-  switch (config_.coordination_backend) {
-    case PhaseOffsetCoordinationBackend::SPH: {
-      if (input.sph_bridge != nullptr) {
-        const bspline_race::integration::GCoordResolveResult resolved =
-            input.sph_bridge->resolveGCoord(
-                input.captured_gcoord, ros::Time::now().toSec(),
-                ros::SteadyTime::now().toSec());
-        if (resolved.usable()) {
-          g_swarm = Eigen::Vector3d(resolved.sample.g_coord.x,
-                                    resolved.sample.g_coord.y, 0.0);
-        }
-      }
-      break;
-    }
-    case PhaseOffsetCoordinationBackend::D1B:
-      // Preserve the existing complete-g_des compatibility path when D1B is
-      // explicitly selected.  This branch is never consulted for SPH.
-      if (input.g_des_valid) {
-        g_des = input.g_des;
-      } else {
-        g_des = recenter;
-      }
-      break;
-    case PhaseOffsetCoordinationBackend::DISABLED:
-      g_des = recenter;
-      break;
-  }
-  if (!g_swarm.allFinite() || !std::isfinite(prepared.delta)) {
-    failure_reason = "NORMAL desired active-reference motion is invalid";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        INVALID_INPUT;
-    allocator.reason = failure_reason;
-    return false;
-  }
-  if (config_.coordination_backend == PhaseOffsetCoordinationBackend::SPH) {
-    g_des = g_swarm + recenter;
-  }
-  if (!g_des.allFinite()) {
-    failure_reason = "NORMAL desired active-reference motion is invalid";
-    allocator.status = phase_offset_navigation::PhaseOffsetAllocatorStatus::
-        INVALID_INPUT;
-    allocator.reason = failure_reason;
-    return false;
-  }
-
-  phase_offset_navigation::PhaseOffsetAllocatorInput allocator_input;
-  allocator_input.geometry = prepared.geometry;
-  allocator_input.preview = &preview;
-  allocator_input.g_des = g_des;
-  allocator_input.f_w0 = base_w_dot;
-  allocator_input.previous_u = runtime_->previousFinalPort();
-  allocator_input.dt = prepared.dt;
-  allocator_input.bounds.lower_nu = policy.lower_nu;
-  allocator_input.bounds.upper_nu = policy.upper_nu;
-  allocator_input.bounds.u_w_abs_max = std::max(0.0, config_.u_w_abs_max);
-  allocator_input.bounds.upper_u_delta =
-      std::max(0.0, config_.u_delta_abs_max);
-  allocator_input.bounds.u_w_slew_rate =
-      std::max(0.0, config_.u_w_rate_max);
-  allocator_input.bounds.u_delta_slew_rate =
-      std::max(0.0, config_.u_delta_rate_max);
-  allocator_input.bounds.zoh_dt = prepared.dt;
-  allocator_input.expected_path_revision = profile->path_revision;
-  allocator_input.expected_frame_revision = profile->frame_revision;
-  allocator_input.expected_profile_revision = profile->profile_revision;
-  allocator_input.expected_source_revision = profile->source_revision;
-  allocator_input.expected_tube_revision = profile->tube_revision;
-  allocator_input.expected_map_revision = profile->map_revision;
-  allocator_input.expected_obstacle_contract_id =
-      profile->obstacle_contract_id;
-  if (!phase_offset_navigation::PhaseOffsetAllocator::allocate(
-          allocator_input, allocator)) {
-    failure_reason = allocator.reason.empty()
-        ? "NORMAL PhaseOffsetAllocator rejected the value"
-        : allocator.reason;
-    return false;
-  }
-  if (!allocator.valid || !allocator.feasible ||
-      allocator.selected_u_owner !=
-          phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
-      !allocator.selectedUConsistent(0.0)) {
-    failure_reason = "NORMAL PhaseOffsetAllocator returned inconsistent selected-u";
-    allocator.valid = false;
-    allocator.feasible = false;
-    allocator.reason = failure_reason;
-    return false;
-  }
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::completeThroughExecutionAuthority(
-    const MatchedAdapterInput& input,
-    const std::shared_ptr<const PathTubePair>& pair,
-    const std::shared_ptr<const TubeBuildRequest>& request,
-    const std::shared_ptr<const TubeEpochSnapshot>& epoch,
-    const phase_offset_navigation::RuntimePreparedStep& prepared,
-    const Eigen::Vector3d& base_v_cmd,
-    const double base_w_dot,
-    const bool base_guidance_valid,
-    phase_offset_navigation::RuntimeStepOutput& output,
-    const phase_offset_navigation::PhaseOffsetAllocatorResult*
-        allocator_result) {
-  output = phase_offset_navigation::RuntimeStepOutput();
-  if (!runtime_) return false;
-
-  // `prepare` is side-effect free.  Complete the exact port only on a local
-  // value copy; the live Runtime is replaced inside the authority publisher
-  // callback after selected-u/revision validation succeeds.
-  phase_offset_navigation::PhaseOffsetRuntime staged_runtime(*runtime_);
-  const phase_offset_core::PortCommand previous_final_port =
-      staged_runtime.previousFinalPort();
-  if (allocator_result != nullptr) {
-    // The allocator already emitted the exact NORMAL selected-u.  Do not
-    // route it through Runtime's legacy manual waveform or PortProjector,
-    // either of which could replace the value before matched execution.
-    output = phase_offset_navigation::RuntimeStepOutput();
-    if (!allocator_result->valid || !allocator_result->feasible ||
-        allocator_result->selected_u_owner !=
-            phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
-        !allocator_result->selectedUConsistent(0.0) ||
-        !prepared.valid || !prepared.requires_base_guidance ||
-        !base_guidance_valid || !base_v_cmd.allFinite() ||
-        !std::isfinite(base_w_dot) || !std::isfinite(prepared.dt) ||
-        prepared.dt <= 0.0) {
-      output.selected = false;
-      output.valid = false;
-      output.invalid_reason =
-          "NORMAL allocator selected-u is invalid at execution boundary";
-      return false;
-    }
-    const phase_offset_core::PortCommand selected_u =
-        allocator_result->selected_u;
-    phase_offset_core::MatchedPortInput matched_input;
-    matched_input.geometry = prepared.geometry;
-    matched_input.base_v_cmd = base_v_cmd;
-    matched_input.base_w_dot = base_w_dot;
-    matched_input.final_port = selected_u;
-    if (!phase_offset_core::MatchedPort::evaluate(
-            matched_input, output.matched) || !output.matched.valid) {
-      output.selected = false;
-      output.valid = false;
-      output.invalid_reason = output.matched.invalid_reason.empty()
-          ? "NORMAL allocator matched output is invalid"
-          : output.matched.invalid_reason;
-      return false;
-    }
-    output.geometry = prepared.geometry;
-    output.raw_port = selected_u;
-    output.projection.final_port = selected_u;
-    output.projection.final_w_dot = base_w_dot + selected_u.u_w;
-    output.projection.final_tangent_speed =
-        prepared.geometry.T.dot(output.matched.v_cmd);
-    output.projection.next_delta = prepared.delta +
-        prepared.dt * selected_u.u_delta;
-    output.projection.next_regularity = prepared.geometry.regularity;
-    output.projection.u_w_limited = allocator_result->u_w.amplitude_limited ||
-        allocator_result->u_w.envelope_limited ||
-        allocator_result->u_w.slew_limited;
-    output.projection.u_delta_limited =
-        allocator_result->u_delta.amplitude_limited ||
-        allocator_result->u_delta.envelope_limited ||
-        allocator_result->u_delta.slew_limited;
-    output.projection.valid = std::isfinite(output.projection.final_w_dot) &&
-        std::isfinite(output.projection.final_tangent_speed) &&
-        std::isfinite(output.projection.next_delta) &&
-        std::isfinite(output.projection.next_regularity);
-    output.current_bounds = prepared.current_bounds;
-    output.next_bounds = prepared.current_bounds;
-    if (prepared.active_profile && prepared.active_profile->complete) {
-      phase_offset_navigation::TubeBounds queried_next;
-      const double next_w = prepared.geometry.w + prepared.dt *
-          output.projection.final_w_dot;
-      if (phase_offset_navigation::TubeFilter::query(
-              *prepared.active_profile, next_w, queried_next)) {
-        output.next_bounds = queried_next;
-      }
-    }
-    output.active_profile = prepared.active_profile;
-    output.preflight = prepared.preflight;
-    output.epoch_status = prepared.epoch_status;
-    output.execution = prepared.execution;
-    output.execution.mode = phase_offset_navigation::RuntimeExecutionMode::
-        NORMAL;
-    output.execution.executable = output.projection.valid;
-    output.delta = prepared.delta;
-    output.delta_ref = 0.0;
-    output.profile_active = false;
-    output.selected = output.projection.valid;
-    output.valid = output.projection.valid;
-    output.exact_terminal_predicate = output.projection.valid &&
-        output.projection.next_delta == 0.0;
-    if (!output.valid) {
-      output.invalid_reason = "NORMAL allocator selected-u recurrence is invalid";
-      return false;
-    }
-  } else if (!staged_runtime.complete(prepared, base_v_cmd, base_w_dot,
-                                      base_guidance_valid, output)) {
-    return false;
-  }
-  if (!output.selected) {
-    // A gate-closed but otherwise valid step has no execution-state mutation.
-    return true;
-  }
-  if (!output.valid || !output.projection.valid || !output.matched.valid) {
-    output.selected = false;
-    output.valid = false;
-    if (output.invalid_reason.empty()) {
-      output.invalid_reason = "selected runtime output is invalid";
-    }
-    return false;
-  }
-
-  const std::shared_ptr<const ContinuousPhasePath> path_owner = pair
-      ? pair->path_owner
-      : (request ? request->semantic_path_owner : input.semantic_path_owner);
-  const std::shared_ptr<const ContinuousPhaseNormalFrame> frame_owner = pair
-      ? pair->frame_owner
-      : (request ? request->frame_owner : input.frame_owner);
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile> profile =
-      pair ? pair->active_profile : (epoch ? epoch->active_profile
-                                           : std::shared_ptr<const phase_offset_navigation::TubeProfile>());
-  const std::uint64_t source_revision = request
-      ? request->source_revision
-      : (pair ? pair->source_revision : prepared.geometry.path_revision);
-  if (!IsFinite(source_revision) || source_revision == 0U ||
-      !IsFinite(prepared.geometry.w) || !IsFinite(prepared.dt) ||
-      prepared.dt <= 0.0) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = "execution authority input provenance is invalid";
-    return false;
-  }
-
-  const std::uint64_t path_revision = profile && profile->path_revision != 0U
-      ? profile->path_revision
-      : (prepared.geometry.path_revision != 0U
-          ? prepared.geometry.path_revision : source_revision);
-  const std::uint64_t frame_revision = profile && profile->frame_revision != 0U
-      ? profile->frame_revision
-      : (frame_owner ? frame_owner->frameRevision()
-                     : prepared.geometry.frame_revision);
-  const std::uint64_t query_revision = profile && profile->profile_revision != 0U
-      ? profile->profile_revision : source_revision;
-
-  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr reference_query;
-  if (path_owner) {
-    reference_query =
-        phase_offset_navigation::ImmutableExecutedReferenceQueryPtr(
-            new PhaseOffsetExecutedReferenceQuery(
-                path_owner, prepared.delta, frame_owner, path_revision,
-                frame_revision, source_revision, query_revision));
-  } else if (input.path_state_query) {
-    // Legacy synthetic adapter callers have no ContinuousPhasePath owner, but
-    // still provide the same immutable path-state query used by Runtime.
-    // Bind that query into the authority-facing reference view rather than
-    // weakening the execution contract or fabricating a path owner.
-    const phase_offset_navigation::PathStateQuery path_query =
-        input.path_state_query;
-    const phase_offset_core::GeometryParams geometry_params = [&]() {
-      phase_offset_core::GeometryParams params;
-      params.regularity_margin = runtime_->config().tube.regularity_margin;
-      params.minimum_reference_speed =
-          runtime_->config().tube.minimum_reference_speed;
-      return params;
-    }();
-    const double domain_start = input.semantic_path_start_w;
-    const double domain_end = input.semantic_path_end_w;
-    reference_query =
-        phase_offset_navigation::ImmutableExecutedReferenceQueryPtr(
-            new phase_offset_navigation::CallbackExecutedReferenceQuery(
-                [path_query, geometry_params,
-                 delta = prepared.delta](
-                    const double w,
-                    phase_offset_navigation::ExecutedReferenceQueryResult& result) {
-                  phase_offset_core::PathDifferentialState state;
-                  if (!path_query(w, state) || !state.valid) return false;
-                  if (state.frame_valid && state.N.allFinite() &&
-                      state.N_w.allFinite()) {
-                    result.r = state.p + state.N * delta;
-                    result.r_w = state.p_w + state.N_w * delta;
-                  } else {
-                    phase_offset_core::GeometryEvaluator evaluator(
-                        geometry_params);
-                    phase_offset_core::PhaseOffsetGeometryState geometry;
-                    if (!evaluator.evaluate(state, Eigen::Vector3d::Zero(),
-                                            delta, geometry) || !geometry.valid) {
-                      return false;
-                    }
-                    result.r = geometry.r;
-                    result.r_w = geometry.r_w;
-                  }
-                  result.r_ww.setZero();
-                  result.r_ww_valid = false;
-                  result.valid = result.r.allFinite() && result.r_w.allFinite();
-                  return result.valid;
-                },
-                domain_start, domain_end, path_revision, frame_revision,
-                source_revision, query_revision,
-                "PhaseOffsetMatchedAdapter/runtime-path-query"));
-  }
-  if (!reference_query) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason =
-        "immutable executed-reference query is unavailable";
-    return false;
-  }
-
-  phase_offset_navigation::ExecutedReferenceQueryResult reference_result;
-  if (!reference_query->query(prepared.geometry.w, reference_result) ||
-      !reference_result.valid) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = "immutable executed-reference query failed";
-    return false;
-  }
-
-  phase_offset_navigation::ActiveReferenceSnapshot candidate;
-  const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
-      execution_authority_.snapshot();
-  candidate.authority_session = current_authority.valid
-      ? current_authority.authority_session
-      : authority_session_.load(std::memory_order_acquire);
-  candidate.planner_path_revision = source_revision;
-  candidate.executed_path_revision = reference_query->pathRevision();
-  candidate.frame_revision = reference_query->frameRevision();
-  candidate.tube_revision = profile ? profile->tube_revision : 0U;
-  candidate.profile_revision = profile ? profile->profile_revision : 0U;
-  candidate.map_revision = profile ? profile->map_revision : 0U;
-  candidate.obstacle_contract_id = profile ? profile->obstacle_contract_id
-                                           : std::string();
-  candidate.owner_mode =
-      phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL;
-  candidate.selected_u_owner = allocator_result != nullptr
-      ? phase_offset_navigation::PhaseOffsetAllocator::ownerName()
-      : "PhaseOffsetMatchedAdapterRuntime";
-  candidate.w = prepared.geometry.w;
-  candidate.delta = prepared.delta;
-  candidate.dt = prepared.dt;
-  candidate.u_prev = previous_final_port;
-  candidate.selected_u = output.projection.final_port;
-  candidate.proposed_next_w =
-      prepared.geometry.w + prepared.dt * output.projection.final_w_dot;
-  candidate.proposed_next_delta = output.projection.next_delta;
-  candidate.proposed_next_u_prev = output.projection.final_port;
-  candidate.r = prepared.geometry.r;
-  candidate.r_w = prepared.geometry.r_w;
-  candidate.r_ww = prepared.geometry.p_ww;
-  candidate.r_ww_valid = false;
-  candidate.matched_base_v_cmd = base_v_cmd;
-  candidate.matched_base_w_dot = base_w_dot;
-  candidate.executed_N = prepared.geometry.N;
-  candidate.executed_reference_query = reference_query;
-  candidate.reference_query_revision = reference_query->queryRevision();
-  candidate.provenance = allocator_result != nullptr
-      ? "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator"
-      : (pair ? "PhaseOffsetMatchedAdapter/path-tube-runtime"
-              : "PhaseOffsetMatchedAdapter/planner-runtime");
-  candidate.safety_status = output.execution.certificate_denied
-      ? "CERTIFICATE_DENIED" : "SAFE";
-  candidate.handoff_state = pair ? "PATH_TUBE_PAIR" : "PLANNER_ONLY";
-  candidate.valid = true;
-  candidate.selected_u_w = candidate.selected_u.u_w;
-  candidate.selected_u_delta = candidate.selected_u.u_delta;
-
-  phase_offset_navigation::AuthorityPrepareInput authority_input;
-  authority_input.candidate = candidate;
-  if (current_authority.valid) {
-    authority_input.expected_authority_session =
-        current_authority.authority_session;
-    authority_input.expected_sequence = current_authority.sequence;
-  }
-  authority_input.matched_output_valid = output.valid && output.matched.valid;
-  authority_input.reference_valid = candidate.governorViewValid();
-  authority_input.provenance = candidate.provenance;
-  phase_offset_navigation::AuthorityPreparedStep authority_prepared;
-  if (!execution_authority_.prepare(authority_input, authority_prepared)) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = authority_prepared.failure_reason.empty()
-        ? "execution authority rejected selected runtime step"
-        : authority_prepared.failure_reason;
-    return false;
-  }
-
-  // Production publication is performed by gvf_manager after the governor
-  // has emitted the local PositionCommand.  Keep both the exact prepared
-  // snapshot and the staged Runtime private until that publication reports
-  // success; no authority or live Runtime state is changed here.
-  if (advertised_) {
-    if (pending_authority_valid_) {
-      output.selected = false;
-      output.valid = false;
-      output.invalid_reason =
-          "previous PositionCommand transaction is still pending";
-      return false;
-    }
-    if (!staged_runtime.makeCommitToken(prepared, output,
-                                        pending_runtime_commit_)) {
-      output.selected = false;
-      output.valid = false;
-      output.invalid_reason =
-          "selected Runtime step cannot form a bounded commit token";
-      return false;
-    }
-    if (allocator_result != nullptr) {
-      // NORMAL allocator execution updates only the exact selected-u ZOH
-      // state.  Runtime's manual profile lifecycle is not a second owner.
-      pending_runtime_commit_.should_start_profile = false;
-      pending_runtime_commit_.profile_active = false;
-      pending_runtime_commit_.safety_priority = false;
-      pending_runtime_commit_.complete_profile = false;
-    }
-    pending_authority_prepared_ = authority_prepared;
-    pending_normal_source_pair_ = allocator_result != nullptr ? pair
-        : std::shared_ptr<const PathTubePair>();
-    pending_authority_session_ = authority_prepared.candidate.authority_session;
-    pending_authority_valid_ = true;
-    return true;
-  }
-
-  phase_offset_navigation::AuthorityCommitResult authority_result;
-  const bool committed = execution_authority_.commit(
-      authority_prepared,
-      [this, &staged_runtime, &output](
-          const phase_offset_navigation::ActiveReferenceSnapshot& snapshot) {
-        const double epsilon = execution_authority_.config().comparison_epsilon;
-        if (!snapshot.selectedUConsistent(epsilon) ||
-            std::abs(snapshot.selected_u.u_w - output.projection.final_port.u_w) >
-                epsilon ||
-            std::abs(snapshot.selected_u.u_delta -
-                     output.projection.final_port.u_delta) > epsilon ||
-            std::abs(snapshot.proposed_next_delta -
-                     output.projection.next_delta) > epsilon) {
-          return false;
-        }
-        *runtime_ = staged_runtime;
-        return true;
-      },
-      authority_result);
-  if (!committed) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = authority_result.failure_reason.empty()
-        ? "execution authority commit failed" : authority_result.failure_reason;
-    return false;
-  }
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::completeAtomicNeutralHandoff(
-    const MatchedAdapterInput& input,
-    const std::shared_ptr<const PathTubePair>& pair,
-    const phase_offset_navigation::RuntimePreparedStep& prepared,
-    const Eigen::Vector3d& base_v_cmd,
-    const double base_w_dot,
-    const bool base_guidance_valid,
-    phase_offset_navigation::RuntimeStepOutput& output) {
-  output = phase_offset_navigation::RuntimeStepOutput();
-  const phase_offset_navigation::ActiveReferenceSnapshot current =
-      execution_authority_.snapshot();
-  if (!runtime_ || !pair || !pair->path_owner || !pair->frame_owner ||
-      !base_guidance_valid || !prepared.geometry.valid ||
-      !current.valid ||
-      current.owner_mode !=
-          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY ||
-      prepared.delta != 0.0 ||
-      !recovery_owner_.status().exact_terminal_predicate ||
-      current.proposed_next_delta != 0.0) {
-    return false;
-  }
-  phase_offset_core::PathDifferentialState neutral_path;
-  phase_offset_core::PhaseOffsetGeometryState neutral_geometry;
-  if (!EvaluateOwnerState(pair->path_owner, prepared.geometry.w,
-                          neutral_path, pair->frame_owner)) {
-    return false;
-  }
-  phase_offset_core::GeometryParams neutral_params;
-  neutral_params.regularity_margin = runtime_->config().tube.regularity_margin;
-  neutral_params.minimum_reference_speed =
-      runtime_->config().tube.minimum_reference_speed;
-  phase_offset_core::GeometryEvaluator neutral_evaluator(neutral_params);
-  if (!neutral_evaluator.evaluate(neutral_path, input.position, 0.0,
-                                  neutral_geometry) ||
-      !neutral_geometry.valid) {
-    return false;
-  }
-  const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr query(
-      new PhaseOffsetExecutedReferenceQuery(
-          pair->path_owner, 0.0, pair->frame_owner, pair->path_revision,
-          pair->frame_revision, pair->source_revision, pair->source_revision));
-  phase_offset_navigation::ExecutedReferenceQueryResult reference;
-  if (!query->query(prepared.geometry.w, reference) || !reference.valid) {
-    return false;
-  }
-  phase_offset_core::MatchedPortInput matched_input;
-  matched_input.geometry = neutral_geometry;
-  matched_input.base_v_cmd = base_v_cmd;
-  matched_input.base_w_dot = base_w_dot;
-  matched_input.final_port = phase_offset_core::PortCommand();
-  if (!phase_offset_core::MatchedPort::evaluate(matched_input,
-                                                 output.matched) ||
-      !output.matched.valid) {
-    return false;
-  }
-  output.geometry = neutral_geometry;
-  output.raw_port = phase_offset_core::PortCommand();
-  output.projection.final_port = phase_offset_core::PortCommand();
-  output.projection.final_w_dot = base_w_dot;
-  output.projection.next_delta = 0.0;
-  output.projection.valid = true;
-  output.current_bounds = prepared.current_bounds;
-  output.next_bounds = prepared.current_bounds;
-  output.execution = prepared.execution;
-  output.execution.mode = phase_offset_navigation::RuntimeExecutionMode::NO_TUBE_REQUIRED;
-  output.execution.executable = true;
-  output.delta = 0.0;
-  output.delta_ref = 0.0;
-  output.profile_active = false;
-  output.selected = true;
-  output.valid = true;
-
-  phase_offset_navigation::ActiveReferenceSnapshot candidate;
-  candidate.authority_session = current.authority_session;
-  candidate.planner_path_revision = pair->source_revision;
-  candidate.executed_path_revision = pair->path_revision;
-  candidate.frame_revision = pair->frame_revision;
-  candidate.tube_revision = pair->active_profile
-      ? pair->active_profile->tube_revision : 0U;
-  candidate.profile_revision = pair->active_profile
-      ? pair->active_profile->profile_revision : 0U;
-  candidate.map_revision = pair->active_profile
-      ? pair->active_profile->map_revision : 0U;
-  candidate.owner_mode = phase_offset_navigation::ActiveReferenceOwnerMode::PLANNER_ONLY;
-  candidate.selected_u_owner = "PlannerOwner";
-  candidate.w = prepared.geometry.w;
-  candidate.delta = 0.0;
-  candidate.dt = prepared.dt;
-  candidate.u_prev = runtime_->previousFinalPort();
-  candidate.selected_u = phase_offset_core::PortCommand();
-  candidate.selected_u_w = 0.0;
-  candidate.selected_u_delta = 0.0;
-  candidate.proposed_next_w = prepared.geometry.w + prepared.dt * base_w_dot;
-  candidate.proposed_next_delta = 0.0;
-  candidate.proposed_next_u_prev = candidate.selected_u;
-  candidate.r = reference.r;
-  candidate.r_w = reference.r_w;
-  candidate.r_ww = reference.r_ww;
-  candidate.r_ww_valid = reference.r_ww_valid;
-  candidate.matched_base_v_cmd = base_v_cmd;
-  candidate.matched_base_w_dot = base_w_dot;
-  phase_offset_core::NormalFrameQuery neutral_frame;
-  if (!pair->frame_owner->query(prepared.geometry.w, neutral_frame) ||
-      !neutral_frame.valid) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = "neutral handoff frame query failed";
-    return false;
-  }
-  candidate.executed_N = neutral_frame.N;
-  candidate.executed_reference_query = query;
-  candidate.reference_query_revision = query->queryRevision();
-  candidate.provenance = "PhaseOffsetMatchedAdapter/atomic-neutral-handoff";
-  candidate.safety_status = "NEUTRAL_HANDOFF";
-  candidate.handoff_state = "PLANNER_ONLY";
-  candidate.valid = true;
-  phase_offset_navigation::AuthorityPrepareInput authority_input;
-  authority_input.candidate = candidate;
-  authority_input.expected_authority_session = current.authority_session;
-  authority_input.expected_sequence = current.sequence;
-  authority_input.matched_output_valid = true;
-  authority_input.reference_valid = candidate.governorViewValid();
-  authority_input.provenance = candidate.provenance;
-  phase_offset_navigation::AuthorityPreparedStep prepared_authority;
-  if (!execution_authority_.prepare(authority_input, prepared_authority)) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = prepared_authority.failure_reason;
-    return false;
-  }
-  phase_offset_navigation::RuntimeCommitToken token;
-  token.expected_previous_final_port = runtime_->previousFinalPort();
-  token.expected_delta = runtime_->retainedDelta();
-  token.next_previous_final_port = phase_offset_core::PortCommand();
-  token.next_delta = 0.0;
-  token.dt = prepared.dt;
-  token.selected = true;
-  token.valid = true;
-  token.complete_profile = true;
-  // The neutral planner-only publication is reached only after the preceding
-  // RecoveryOwner step proved an exact selected-ZOH arrival.  Carry that
-  // immutable terminal proof into Runtime's no-fail commit token so the
-  // profile lifecycle retires together with the authority handoff.
-  token.exact_terminal_predicate = true;
-  if (advertised_) {
-    if (pending_authority_valid_) return false;
-    pending_runtime_commit_ = token;
-    pending_authority_prepared_ = prepared_authority;
-    pending_authority_session_ = prepared_authority.candidate.authority_session;
-    pending_authority_valid_ = true;
-    pending_recovery_step_valid_ = false;
-    pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-    pending_handoff_input_.owner_mode =
-        phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
-    pending_handoff_input_.delta = 0.0;
-    pending_handoff_input_.neutral_handoff_committed = true;
-    pending_handoff_input_.event =
-        phase_offset_navigation::HandoffEvent::ATOMIC_NEUTRAL_HANDOFF;
-    if (!handoff_state_machine_.evaluate(
-            pending_handoff_input_, pending_handoff_decision_)) {
-      clearPendingPositionCommandLocked();
-      return false;
-    }
-    pending_handoff_valid_ = true;
-    return true;
-  }
-  phase_offset_navigation::AuthorityCommitResult authority_result;
-  if (!execution_authority_.commit(
-          prepared_authority,
-          [this, token](const phase_offset_navigation::ActiveReferenceSnapshot&) {
-            runtime_->commitTokenNoFail(token);
-            phase_offset_navigation::HandoffStateInput handoff_input;
-            handoff_input.owner_mode =
-                phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
-            handoff_input.delta = 0.0;
-            handoff_input.neutral_handoff_committed = true;
-            handoff_input.event =
-                phase_offset_navigation::HandoffEvent::ATOMIC_NEUTRAL_HANDOFF;
-            phase_offset_navigation::HandoffDecision decision;
-            return handoff_state_machine_.transition(handoff_input, decision);
-          },
-          authority_result)) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = authority_result.failure_reason;
-    return false;
-  }
-  return true;
-}
-
-bool PhaseOffsetMatchedAdapter::completeThroughRecoveryOwner(
-    const MatchedAdapterInput& input,
-    const std::shared_ptr<const PathTubePair>& pair,
-    const std::shared_ptr<const PathTubePair>& successor_pair,
-    const phase_offset_navigation::RuntimePreparedStep& prepared,
-    const Eigen::Vector3d& base_v_cmd,
-    const double base_w_dot,
-    const bool base_guidance_valid,
-    phase_offset_navigation::RuntimeStepOutput& output) {
-  output = phase_offset_navigation::RuntimeStepOutput();
-  const auto fail = [&output](const char* reason) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = reason ? reason : "recovery transaction rejected";
-    return false;
-  };
-  const bool has_staged_successor = successor_pair && successor_pair != pair;
-  const std::shared_ptr<const PathTubePair>& target_pair =
-      has_staged_successor ? successor_pair : pair;
-  if (!runtime_ || !pair || !pair->active_profile || !pair->path_owner ||
-      !pair->frame_owner || !target_pair || !target_pair->active_profile ||
-      !target_pair->path_owner || !target_pair->frame_owner ||
-      !base_guidance_valid ||
-      !prepared.geometry.valid || !IsFinite(prepared.delta) ||
-      prepared.delta == 0.0) {
-    return fail("recovery precondition is invalid");
-  }
-  const auto horizontal_frame_matches_pair =
-      [](const std::shared_ptr<const PathTubePair>& candidate) {
-        return candidate && candidate->frame_owner &&
-            candidate->frame_owner->pathRevision() == candidate->path_revision &&
-            candidate->frame_owner->frameRevision() == candidate->frame_revision;
-      };
-  if (!horizontal_frame_matches_pair(pair) ||
-      !horizontal_frame_matches_pair(target_pair)) {
-    output.recovery_replan_required = true;
-    output.recovery_status =
-        phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
-    return fail("recovery Horizontal-N frame provenance is invalid");
-  }
-
-  // A production RECOVERY step is a continuation of an already committed
-  // authority.  It may not use the pair/session itself as a hidden bootstrap
-  // seed: doing so would let Runtime (or a freshly installed pair) mint a
-  // RECOVERY owner without an authoritative predecessor.  Unadvertised
-  // fixtures retain the explicit seed-only setup used by unit tests.
-  const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
-      execution_authority_.snapshot();
-  if (advertised_) {
-    const double epsilon = execution_authority_.config().comparison_epsilon;
-    const std::uint64_t live_session =
-        authority_session_.load(std::memory_order_acquire);
-    const bool owner_mode_compatible =
-        current_authority.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
-        current_authority.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION ||
-        current_authority.owner_mode ==
-            phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
-    const phase_offset_core::PortCommand runtime_previous =
-        runtime_->previousFinalPort();
-    const bool runtime_state_compatible =
-        std::abs(current_authority.proposed_next_delta - prepared.delta) <=
-            epsilon &&
-        std::abs(current_authority.proposed_next_u_prev.u_w -
-                 runtime_previous.u_w) <= epsilon &&
-        std::abs(current_authority.proposed_next_u_prev.u_delta -
-                 runtime_previous.u_delta) <= epsilon;
-    const auto pair_revision_matches =
-        [&current_authority, &pair](
-            const std::shared_ptr<const PathTubePair>& candidate_pair) {
-      return candidate_pair && candidate_pair->active_profile &&
-          candidate_pair->frame_owner &&
-          candidate_pair->frame_owner->pathRevision() ==
-              candidate_pair->path_revision &&
-          candidate_pair->frame_owner->frameRevision() ==
-              candidate_pair->frame_revision &&
-          current_authority.planner_path_revision == pair->source_revision &&
-          current_authority.executed_path_revision == candidate_pair->path_revision &&
-          current_authority.frame_revision == candidate_pair->frame_revision &&
-          current_authority.tube_revision == candidate_pair->active_profile->tube_revision &&
-          current_authority.profile_revision ==
-              candidate_pair->active_profile->profile_revision &&
-          current_authority.map_revision == candidate_pair->active_profile->map_revision;
-    };
-    // After the first staged-successor tick, the target pair is the actual
-    // execution frame even though the old pair remains live until the CAS.
-    // Accept either exact immutable pair identity; never accept independent
-    // revisions assembled from unrelated slots.
-    const bool pair_revision_compatible = pair_revision_matches(pair) ||
-        pair_revision_matches(successor_pair);
-    if (!current_authority.valid ||
-        current_authority.authority_session == 0U ||
-        pair->authority_session == 0U ||
-        current_authority.authority_session != pair->authority_session ||
-        live_session != pair->authority_session || !owner_mode_compatible ||
-        !current_authority.governorViewValid() ||
-        !pair_revision_compatible || !runtime_state_compatible) {
-      return fail("recovery predecessor authority is stale or incompatible");
-    }
-  }
-
-  // Preview and Handoff are observational/lifecycle inputs only.  They do
-  // not choose a command or clear the existing owner.
-  phase_offset_navigation::PreviewFeasibilityInput preview_input;
-  preview_input.profile = target_pair->active_profile.get();
-  preview_input.current_w = prepared.geometry.w;
-  preview_input.current_delta = prepared.delta;
-  preview_input.target_w = prepared.geometry.w;
-  preview_input.target_delta = 0.0;
-  preview_input.dt = prepared.dt;
-  preview_input.horizon = std::max(prepared.dt, config_.tube_update_period);
-  preview_input.max_phase_rate = std::max(0.0, base_w_dot) +
-      config_.u_w_abs_max;
-  preview_input.max_delta_rate = config_.u_delta_abs_max;
-  preview_input.max_delta_slew = config_.u_delta_rate_max;
-  preview_input.previous_u = runtime_->previousFinalPort();
-  preview_input.path_revision = target_pair->path_revision;
-  preview_input.frame_revision = target_pair->frame_revision;
-  preview_input.profile_revision = target_pair->active_profile->profile_revision;
-  preview_input.expected_path_revision = target_pair->path_revision;
-  preview_input.expected_frame_revision = target_pair->frame_revision;
-  preview_input.expected_profile_revision =
-      target_pair->active_profile->profile_revision;
-  phase_offset_navigation::PreviewFeasibilityResult preview;
-  const bool preview_evaluated =
-      phase_offset_navigation::PreviewFeasibility::evaluate(
-          preview_input, preview);
-  if (!preview_evaluated &&
-      (preview.status == phase_offset_navigation::PreviewStatus::STALE ||
-       preview.status == phase_offset_navigation::PreviewStatus::CURRENT_STATE_UNSAFE)) {
-    return fail("recovery preview or handoff was vetoed");
-  }
-  phase_offset_navigation::TubeBounds target_bounds;
-  const bool target_contains_current =
-      phase_offset_navigation::TubeFilter::query(
-          *target_pair->active_profile, prepared.geometry.w, target_bounds) &&
-      target_bounds.valid &&
-      prepared.delta >= target_bounds.lower + config_.tube.interior_margin -
-          1e-10 &&
-      prepared.delta <= target_bounds.upper - config_.tube.interior_margin +
-          1e-10;
-  const bool target_zero_only = target_pair->active_profile->classification ==
-      phase_offset_navigation::TubeProfileClassification::ZERO_ONLY_PLANNER_BASELINE;
-  const bool target_disconnected = has_staged_successor &&
-      (!target_pair->path_owner ||
-       prepared.geometry.w < target_pair->path_owner->startW() - 1e-10 ||
-       prepared.geometry.w > target_pair->path_owner->endW() + 1e-10 ||
-       !target_contains_current);
-  const bool target_domain_contains_current = target_pair->path_owner &&
-      prepared.geometry.w >= target_pair->path_owner->startW() - 1e-10 &&
-      prepared.geometry.w <= target_pair->path_owner->endW() + 1e-10;
-  // An in-domain staged successor is admissible only when its own immutable
-  // frame can provide Horizontal-N capability at the current recovery phase.
-  // Merely matching frame/path revisions is insufficient: a successor whose
-  // horizontal speed is at or below the sole production threshold must not
-  // become the execution owner, nor may it be silently replaced by a
-  // centerline/neutral command.  A disconnected successor is still lifecycle
-  // evidence for the existing old-owner recenter path and is queried at its
-  // validated seam instead.  Route an in-domain capability failure through
-  // the existing recovery-replan mailbox while retaining the current owner.
-  if (has_staged_successor && target_domain_contains_current) {
-    phase_offset_core::NormalFrameQuery successor_frame;
-    if (!target_pair->frame_owner->query(prepared.geometry.w,
-                                         successor_frame) ||
-        !successor_frame.valid ||
-        !phase_offset_core::isWorldHorizontalCrossProductProvenance(
-            successor_frame.provenance)) {
-      output.recovery_replan_required = true;
-      output.recovery_status =
-          phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
-      return fail("successor Horizontal-N capability is unavailable; renewed evidence required");
-    }
-  }
-  // A staged ZERO_ONLY/disconnected successor is evidence for the handoff
-  // decision, not the geometry owner of the current recovery tick.  Recenter
-  // must stay inside the currently executed owner's connected component until
-  // a later tick can install a compatible successor.
-  const bool target_usable_for_current_tick = target_domain_contains_current &&
-      target_contains_current && !target_zero_only;
-  const std::shared_ptr<const PathTubePair> execution_pair =
-      target_usable_for_current_tick ? target_pair : pair;
-  phase_offset_navigation::HandoffStateInput handoff_input;
-  handoff_input.owner_mode =
-      phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
-  handoff_input.delta = prepared.delta;
-  handoff_input.target_delta = 0.0;
-  handoff_input.successor_available = target_pair != nullptr;
-  handoff_input.successor_zero_only = target_zero_only;
-  handoff_input.successor_contains_current_delta = target_contains_current;
-  handoff_input.successor_disconnected = target_disconnected;
-  handoff_input.preview_feasible = preview_evaluated && preview.valid;
-  handoff_input.preview_target_overlap = preview.target_overlap;
-  if (target_zero_only) {
-    handoff_input.event = phase_offset_navigation::HandoffEvent::SUCCESSOR_ZERO_ONLY;
-  } else if (target_disconnected) {
-    handoff_input.event = phase_offset_navigation::HandoffEvent::SUCCESSOR_DISCONNECTED;
-  } else if (!preview.valid) {
-    handoff_input.event = phase_offset_navigation::HandoffEvent::PREVIEW_INFEASIBLE;
-  } else if (has_staged_successor) {
-    handoff_input.event = phase_offset_navigation::HandoffEvent::SUCCESSOR_COMPATIBLE;
-  } else {
-    handoff_input.event = phase_offset_navigation::HandoffEvent::RECENTER_PROGRESS;
-  }
-  phase_offset_navigation::HandoffDecision handoff;
-  if (!handoff_state_machine_.evaluate(handoff_input, handoff) ||
-      handoff.planner_veto) {
-    return fail("recovery handoff decision was vetoed");
-  }
-  pending_handoff_input_ = handoff_input;
-  pending_handoff_decision_ = handoff;
-  pending_handoff_valid_ = true;
-
-  // A staged successor is real immutable evidence, not a fabricated
-  // availability flag.  When it differs from the current owner, validate the
-  // inherited base-path C2 seam and the required first-order executed
-  // reference seam through the one protected continuation provider.  The
-  // optional higher-order r_ww capability is deliberately not requested.
-  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr source_query(
-      new PhaseOffsetExecutedReferenceQuery(
-          pair->path_owner, prepared.delta, pair->frame_owner,
-          pair->path_revision, pair->frame_revision, pair->source_revision,
-          pair->source_revision));
-  phase_offset_navigation::ImmutableExecutedReferenceQueryPtr target_query(
-      new PhaseOffsetExecutedReferenceQuery(
-          target_pair->path_owner, prepared.delta, target_pair->frame_owner,
-          target_pair->path_revision, target_pair->frame_revision,
-          target_pair->source_revision, target_pair->source_revision));
-  if (!source_query || !target_query) return fail("recovery reference query unavailable");
-  PhaseOffsetRecoveryContinuationInput continuation_input;
-  bool continuation_input_valid = false;
-  if (has_staged_successor) {
-    const double seam_w = target_pair->future_seam_w;
-    if (!IsFinite(seam_w) || seam_w < pair->path_owner->startW() ||
-        seam_w > pair->path_owner->endW() ||
-        seam_w < target_pair->path_owner->startW() ||
-        seam_w > target_pair->path_owner->endW()) {
-      return fail("recovery seam is outside source/target domains");
-    }
-    phase_offset_navigation::RecoveryReferenceJet seam_jet;
-    if (!phase_offset_navigation::makeRecoveryReferenceJet(
-            *source_query, seam_w, prepared.delta, seam_jet)) {
-      return fail("recovery C2 seam proof failed");
-    }
-    continuation_input.source_path = pair->path_owner;
-    continuation_input.source_frame = pair->frame_owner;
-    continuation_input.target_path = target_pair->path_owner;
-    continuation_input.target_frame = target_pair->frame_owner;
-    continuation_input.source_jet = seam_jet;
-    continuation_input.source_w = seam_w;
-    continuation_input.target_w = seam_w;
-    continuation_input.delta = prepared.delta;
-    continuation_input.finite_domain_start_w =
-        target_pair->path_owner->startW();
-    continuation_input.finite_domain_end_w = target_pair->path_owner->endW();
-    continuation_input.recovery_session = pair->authority_session;
-    continuation_input.source_owner_revision = pair->source_revision;
-    continuation_input.target_owner_revision = target_pair->source_revision;
-    continuation_input.v_s_min = 1e-3;
-    continuation_input.min_time_progress = 0.0;
-    // The continuation provider validates immutable seam geometry here.  The
-    // actual selected-ZOH phase-rate witness is bound below, after
-    // RecoveryOwner has selected and PortProjector has reverified the command;
-    // a current/source guidance rate is never relabelled as target evidence.
-    continuation_input.validated_s_dot = 0.0;
-    continuation_input.s_dot_revision = 0U;
-    continuation_input.s_dot_provenance.clear();
-    continuation_input.actual_s_dot_valid = false;
-    continuation_input.require_time_progress = false;
-    continuation_input_valid = true;
-    PhaseOffsetRecoveryContinuationOutput continuation_output;
-    const bool continuation_valid =
-        PhaseOffsetRecoveryContinuationProvider::propose(
-            continuation_input, continuation_output);
-    if (!continuation_valid || !continuation_output.finite_domain) {
-      output.recovery_replan_required = true;
-      return fail(continuation_output.invalid_reason.empty()
-          ? "recovery continuation proof failed; renewed evidence required"
-          : continuation_output.invalid_reason.c_str());
-    }
-  }
-
-  phase_offset_core::PortProjectionInput projection_input;
-  projection_input.raw.u_w = 0.0;
-  projection_input.raw.u_delta = -prepared.delta / prepared.dt;
-  projection_input.previous_final = runtime_->previousFinalPort();
-  projection_input.dt = prepared.dt;
-  projection_input.delta = prepared.delta;
-  projection_input.curvature = prepared.geometry.curvature;
-  projection_input.r_w_norm = prepared.geometry.r_w.norm();
-  projection_input.phase = prepared.geometry.w;
-  projection_input.base_w_dot = base_w_dot;
-  projection_input.base_tangent_speed = prepared.geometry.T.dot(base_v_cmd);
-  const phase_offset_navigation::TubeBounds recovery_bounds =
-      target_usable_for_current_tick && target_bounds.valid
-          ? target_bounds : prepared.current_bounds;
-  projection_input.offset_constraint.lower = recovery_bounds.lower;
-  projection_input.offset_constraint.upper = recovery_bounds.upper;
-  projection_input.offset_constraint.lower_w = recovery_bounds.lower_w;
-  projection_input.offset_constraint.upper_w = recovery_bounds.upper_w;
-  projection_input.offset_constraint.invariant_gain = config_.tube.invariant_gain;
-  projection_input.offset_constraint.interior_margin = config_.tube.interior_margin;
-  projection_input.offset_constraint.enabled = recovery_bounds.valid;
-  projection_input.offset_constraint.valid = recovery_bounds.valid;
-  phase_offset_core::PortProjectionLimits limits;
-  limits.u_w_abs_max = config_.u_w_abs_max;
-  limits.u_delta_abs_max = config_.u_delta_abs_max;
-  limits.u_w_rate_max = config_.u_w_rate_max;
-  limits.u_delta_rate_max = config_.u_delta_rate_max;
-  limits.phase_dot_min = 0.0;
-  limits.tangent_speed_min = 0.0;
-  limits.regularity_margin = config_.tube.regularity_margin;
-  phase_offset_core::PortProjector::AdmissibleSet admissible;
-  if (!phase_offset_core::PortProjector::buildAdmissibleSet(
-          projection_input, limits, admissible) ||
-      !phase_offset_navigation::PhaseOffsetRecoveryOwner::verifyAdmissibleSet(
-          admissible)) {
-    return fail("recovery admissible set is not closed and bounded");
-  }
-
-  const phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
-      execution_query = target_usable_for_current_tick ? target_query
-                                                       : source_query;
-  phase_offset_navigation::ExecutedReferenceQueryResult reference_result;
-  if (!execution_query->query(prepared.geometry.w, reference_result) ||
-      !reference_result.valid) {
-    return fail("recovery reference jet proof failed");
-  }
-  phase_offset_navigation::RecoveryReferenceJet reference_jet;
-  if (!phase_offset_navigation::makeRecoveryReferenceJet(
-          *execution_query, prepared.geometry.w,
-          prepared.delta, reference_jet)) {
-    return fail("recovery reference jet construction failed");
-  }
-
-  phase_offset_navigation::RecoveryPrepareInput recovery_input;
-  recovery_input.recovery_session = pair->authority_session;
-  recovery_input.source_path_revision = pair->path_revision;
-  recovery_input.target_path_revision = execution_pair->path_revision;
-  recovery_input.source_frame_revision = pair->frame_revision;
-  recovery_input.target_frame_revision = execution_pair->frame_revision;
-  recovery_input.source_owner_revision = pair->source_revision;
-  recovery_input.target_owner_revision = execution_pair->source_revision;
-  recovery_input.reference_jet = reference_jet;
-  recovery_input.u_prev = runtime_->previousFinalPort();
-  recovery_input.current_w = prepared.geometry.w;
-  recovery_input.current_delta = prepared.delta;
-  // RECOVERY's immutable target is the planner centreline.  Bind the owner
-  // measure to this exact closed interval so forged next-measure/progress
-  // scalars cannot influence ranking or terminal handoff.
-  recovery_input.target_delta_lower = 0.0;
-  recovery_input.target_delta_upper = 0.0;
-  recovery_input.target_interval_valid = true;
-  recovery_input.base_w_dot = base_w_dot;
-  recovery_input.base_w_dot_valid = IsFinite(base_w_dot);
-  recovery_input.dt = prepared.dt;
-  recovery_input.measure = std::abs(prepared.delta);
-  recovery_input.now = input.stamp.toSec();
-  if (!IsFinite(recovery_input.now)) recovery_input.now = 0.0;
-  recovery_input.v_s_min = 1e-3;
-  recovery_input.max_slew_rate = config_.u_delta_rate_max;
-  recovery_input.phase_rate_upper_bound = std::max(0.0, base_w_dot) +
-      config_.u_w_abs_max;
-  recovery_input.phase_rate_upper_bound_valid =
-      IsFinite(recovery_input.phase_rate_upper_bound) &&
-      recovery_input.phase_rate_upper_bound > 0.0;
-  // The guaranteed recovery-rate lower bound is a measure-progress fact
-  // owned by RecoveryOwner.  u_delta_abs_max is only an actuator capability
-  // upper bound and cannot certify a lower bound on |delta| reduction.
-  recovery_input.certified_recovery_rate = recovery_owner_.config().v_rec_min;
-  recovery_input.certified_recovery_rate_valid =
-      IsFinite(recovery_input.certified_recovery_rate) &&
-      recovery_input.certified_recovery_rate > 0.0;
-  recovery_input.phase_domain_start = prepared.geometry.w;
-  recovery_input.phase_domain_end = execution_pair->path_owner
-      ? execution_pair->path_owner->endW() : prepared.geometry.w;
-  recovery_input.admissible_set_closed_bounded = true;
-  recovery_input.finite_domain_valid =
-      IsFinite(recovery_input.phase_domain_start) &&
-      IsFinite(recovery_input.phase_domain_end) &&
-      recovery_input.phase_domain_end > recovery_input.phase_domain_start;
-  const double bounded_ramp_time = config_.u_delta_rate_max > 0.0
-      ? config_.u_delta_abs_max / config_.u_delta_rate_max : 0.0;
-  const double certified_recovery_duration =
-      recovery_input.measure / recovery_input.certified_recovery_rate +
-      bounded_ramp_time + std::max(prepared.dt, config_.tube_update_period);
-  recovery_input.required_domain_duration = certified_recovery_duration;
-  recovery_input.require_time_progress = true;
-  recovery_input.time_progress_valid = IsFinite(base_w_dot) &&
-      recovery_input.phase_rate_upper_bound_valid;
-  const std::uint64_t recovery_session = pair->authority_session;
-  if (recovery_deadline_session_ == recovery_session &&
-      recovery_deadline_target_revision_ != 0U &&
-      recovery_deadline_target_revision_ != target_pair->path_revision) {
-    return fail("recovery deadline target revision changed; replan required");
-  }
-  if (recovery_deadline_session_ != recovery_session ||
-      !IsFinite(recovery_deadline_)) {
-    recovery_deadline_ =
-        phase_offset_navigation::PhaseOffsetRecoveryOwner::computeBoundedDeadline(
-            recovery_input.now, recovery_input.measure,
-            recovery_input.certified_recovery_rate, 0.0,
-            bounded_ramp_time,
-            prepared.dt, config_.u_delta_abs_max,
-            config_.u_delta_rate_max,
-            recovery_input.phase_domain_start,
-            recovery_input.phase_domain_end);
-    recovery_deadline_session_ = recovery_session;
-    recovery_deadline_target_revision_ = target_pair->path_revision;
-  }
-  recovery_input.deadline = recovery_deadline_;
-  recovery_input.source_reference_matches = true;
-  recovery_input.provenance = "PhaseOffsetMatchedAdapter/Preview-Handoff-Recovery";
-
-  // PortProjector's local 2-D polygon is intentionally tiny.  Keep an
-  // explicit bound here so a malformed/custom kernel cannot turn recovery
-  // into an unbounded search on the control callback.
-  constexpr std::size_t kMaxRecoveryVertices = 64U;
-  if (admissible.vertices.size() > kMaxRecoveryVertices) {
-    return fail("recovery admissible set exceeds bounded vertex budget");
-  }
-  recovery_input.candidates.reserve(kMaxRecoveryVertices);
-  for (const phase_offset_core::PortCommand& command : admissible.vertices) {
-    phase_offset_core::PortProjectionResult checked;
-    if (!phase_offset_core::PortProjector::verify(
-            projection_input, limits, command, checked) || !checked.valid) {
-      continue;
-    }
-    phase_offset_navigation::RecoveryCandidate candidate;
-    candidate.command = command;
-    candidate.next_w = prepared.geometry.w + prepared.dt * checked.final_w_dot;
-    candidate.next_delta = checked.next_delta;
-    candidate.measure = recovery_input.measure;
-    candidate.next_measure_upper_bound = std::abs(checked.next_delta);
-    candidate.progress = candidate.measure - candidate.next_measure_upper_bound;
-    candidate.progress_bound_valid = true;
-    candidate.forward_progress = checked.final_w_dot;
-    candidate.slew_cost = config_.u_w_rate_max *
-        std::pow(command.u_w - recovery_input.u_prev.u_w, 2.0) +
-        config_.u_delta_rate_max *
-            std::pow(command.u_delta - recovery_input.u_prev.u_delta, 2.0);
-    candidate.admissible_u_w_lower = admissible.u_w.lower;
-    candidate.admissible_u_w_upper = admissible.u_w.upper;
-    candidate.admissible_u_delta_lower = admissible.u_delta.lower;
-    candidate.admissible_u_delta_upper = admissible.u_delta.upper;
-    candidate.command_membership_valid = admissible.contains(command);
-    candidate.closed_bounded_set_valid = admissible.closed && admissible.bounded;
-    candidate.phase_domain_start = recovery_input.phase_domain_start;
-    candidate.phase_domain_end = recovery_input.phase_domain_end;
-    candidate.reference_jet = reference_jet;
-    const bool strict_exact_arrival = checked.next_delta == 0.0;
-    candidate.provenance = strict_exact_arrival
-        ? "PortProjector/exact-selected-ZOH-arrival"
-        : "PortProjector/closed-bounded-membership";
-    candidate.progress_provenance = "RecoveryOwner/P_k=recomputed";
-    candidate.s_dot = checked.final_w_dot;
-    candidate.v_s_min = recovery_input.v_s_min;
-    candidate.minimum_time_progress = recovery_input.v_s_min * prepared.dt;
-    candidate.s_dot_revision = recovery_input.target_owner_revision;
-    candidate.actual_s_dot_valid = IsFinite(candidate.s_dot);
-    candidate.require_time_progress = recovery_input.require_time_progress;
-    candidate.s_dot_provenance = recovery_input.provenance;
-    candidate.exact_terminal_predicate = strict_exact_arrival;
-    candidate.terminal_predicate = candidate.exact_terminal_predicate;
-    candidate.time_progress_valid = candidate.s_dot >=
-        recovery_input.v_s_min && candidate.s_dot * prepared.dt >=
-        candidate.minimum_time_progress;
-    candidate.finite_domain_valid = candidate.next_w <=
-        recovery_input.phase_domain_end + 1e-10;
-    if (candidate.progress >= 0.0 && candidate.time_progress_valid &&
-        candidate.finite_domain_valid) {
-      recovery_input.candidates.push_back(candidate);
-    }
-  }
-  // When the remaining residual is reachable in one selected ZOH interval,
-  // include the exact-arrival command in the same deterministic candidate
-  // set.  This is not a tolerance snap: the recurrence is verified with the
-  // exact command and only the ranked immutable candidate may become owner.
-  if (std::abs(prepared.delta) <= config_.u_delta_abs_max * prepared.dt) {
-    for (const phase_offset_core::PortCommand& base_command :
-         admissible.vertices) {
-      phase_offset_core::PortCommand exact_command = base_command;
-      exact_command.u_delta = -prepared.delta / prepared.dt;
-      if (!admissible.contains(exact_command)) continue;
-      phase_offset_core::PortProjectionResult checked;
-      if (!phase_offset_core::PortProjector::verify(
-              projection_input, limits, exact_command, checked) ||
-          !checked.valid || checked.next_delta != 0.0) {
-        continue;
-      }
-      phase_offset_navigation::RecoveryCandidate candidate;
-      candidate.command = exact_command;
-      candidate.next_w = prepared.geometry.w + prepared.dt * checked.final_w_dot;
-      candidate.next_delta = checked.next_delta;
-      candidate.measure = recovery_input.measure;
-      candidate.next_measure_upper_bound = 0.0;
-      candidate.progress = candidate.measure;
-      candidate.progress_bound_valid = true;
-      candidate.forward_progress = checked.final_w_dot;
-      candidate.slew_cost = config_.u_w_rate_max *
-          std::pow(exact_command.u_w - recovery_input.u_prev.u_w, 2.0) +
-          config_.u_delta_rate_max *
-          std::pow(exact_command.u_delta - recovery_input.u_prev.u_delta, 2.0);
-      candidate.admissible_u_w_lower = admissible.u_w.lower;
-      candidate.admissible_u_w_upper = admissible.u_w.upper;
-      candidate.admissible_u_delta_lower = admissible.u_delta.lower;
-      candidate.admissible_u_delta_upper = admissible.u_delta.upper;
-      candidate.command_membership_valid = admissible.contains(exact_command);
-      candidate.closed_bounded_set_valid = admissible.closed && admissible.bounded;
-      candidate.phase_domain_start = recovery_input.phase_domain_start;
-      candidate.phase_domain_end = recovery_input.phase_domain_end;
-      candidate.reference_jet = reference_jet;
-      candidate.provenance = "PortProjector/exact-selected-ZOH-arrival";
-      candidate.progress_provenance = "RecoveryOwner/P_k=recomputed";
-      candidate.s_dot = checked.final_w_dot;
-      candidate.v_s_min = recovery_input.v_s_min;
-      candidate.minimum_time_progress = recovery_input.v_s_min * prepared.dt;
-      candidate.s_dot_revision = recovery_input.target_owner_revision;
-      candidate.actual_s_dot_valid = IsFinite(candidate.s_dot);
-      candidate.require_time_progress = recovery_input.require_time_progress;
-      candidate.s_dot_provenance = recovery_input.provenance;
-      candidate.exact_terminal_predicate = true;
-      candidate.terminal_predicate = true;
-      candidate.time_progress_valid = candidate.s_dot >= recovery_input.v_s_min &&
-          candidate.s_dot * prepared.dt >= candidate.minimum_time_progress;
-      candidate.finite_domain_valid = candidate.next_w <=
-          recovery_input.phase_domain_end + 1e-10;
-      if (candidate.time_progress_valid && candidate.finite_domain_valid) {
-        recovery_input.candidates.push_back(candidate);
-      }
-      break;
-    }
-  }
-  phase_offset_navigation::RecoveryPreparedStep recovery_step;
-  if (!recovery_owner_.prepare(recovery_input, recovery_step)) {
-    output.recovery_status = recovery_step.status;
-    output.recovery_replan_required =
-        recovery_step.status ==
-        phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
-    return fail(recovery_step.proof.empty()
-        ? "recovery owner rejected progress/domain evidence"
-        : recovery_step.proof.c_str());
-  }
-  output.recovery_status = phase_offset_navigation::RecoveryStepStatus::PREPARED;
-
-  phase_offset_core::PortProjectionResult selected_projection;
-  if (!phase_offset_core::PortProjector::verify(
-          projection_input, limits, recovery_step.selected_u,
-          selected_projection) || !selected_projection.valid) {
-    return fail("recovery selected command failed exact projection verification");
-  }
-  if (has_staged_successor && execution_pair == target_pair &&
-      continuation_input_valid) {
-    // RecoveryOwner has now selected and PortProjector has reverified the
-    // exact ZOH command.  Close the time-progress contract with that actual
-    // selected s_dot and the target pair revision; the source guidance rate
-    // above was never accepted as target progress evidence.
-    const double selected_s_dot = selected_projection.final_w_dot;
-    PhaseOffsetRecoveryContinuationOutput selected_progress_output;
-    if (!PhaseOffsetRecoveryContinuationProvider::validateSelectedTimeProgress(
-            continuation_input, selected_s_dot,
-            execution_pair->source_revision, recovery_input.provenance,
-            selected_progress_output)) {
-      output.recovery_replan_required = true;
-      return fail(selected_progress_output.invalid_reason.empty()
-          ? "selected recovery time-progress proof failed"
-          : selected_progress_output.invalid_reason.c_str());
-    }
-  }
-  phase_offset_core::MatchedPortInput matched_input;
-  matched_input.geometry = prepared.geometry;
-  matched_input.base_v_cmd = base_v_cmd;
-  matched_input.base_w_dot = base_w_dot;
-  matched_input.final_port = recovery_step.selected_u;
-  if (!phase_offset_core::MatchedPort::evaluate(matched_input,
-                                                 output.matched) ||
-      !output.matched.valid) {
-    return fail("recovery matched output is invalid");
-  }
-  output.geometry = prepared.geometry;
-  output.projection = selected_projection;
-  output.current_bounds = recovery_bounds;
-  output.next_bounds = recovery_bounds;
-  output.execution = prepared.execution;
-  output.execution.mode = phase_offset_navigation::RuntimeExecutionMode::SAFETY_PRIORITY;
-  output.execution.executable = true;
-  output.delta = prepared.delta;
-  output.delta_ref = 0.0;
-  output.profile_active = false;
-  output.selected = true;
-  output.valid = true;
-
-  phase_offset_navigation::ActiveReferenceSnapshot candidate;
-  candidate.authority_session = current_authority.valid
-      ? current_authority.authority_session : pair->authority_session;
-  candidate.planner_path_revision = pair->source_revision;
-  candidate.executed_path_revision = execution_pair->path_revision;
-  candidate.frame_revision = execution_pair->frame_revision;
-  candidate.tube_revision = execution_pair->active_profile->tube_revision;
-  candidate.profile_revision = execution_pair->active_profile->profile_revision;
-  candidate.map_revision = execution_pair->active_profile->map_revision;
-  candidate.owner_mode =
-      phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
-  candidate.selected_u_owner = "PhaseOffsetRecoveryOwner";
-  candidate.w = prepared.geometry.w;
-  candidate.delta = prepared.delta;
-  candidate.dt = prepared.dt;
-  candidate.u_prev = recovery_input.u_prev;
-  candidate.selected_u = recovery_step.selected_u;
-  candidate.selected_u_w = candidate.selected_u.u_w;
-  candidate.selected_u_delta = candidate.selected_u.u_delta;
-  candidate.proposed_next_w = recovery_step.next_w;
-  candidate.proposed_next_delta = recovery_step.next_delta;
-  candidate.proposed_next_u_prev = candidate.selected_u;
-  candidate.r = reference_result.r;
-  candidate.r_w = reference_result.r_w;
-  candidate.r_ww = reference_result.r_ww;
-  candidate.r_ww_valid = reference_result.r_ww_valid;
-  candidate.matched_base_v_cmd = base_v_cmd;
-  candidate.matched_base_w_dot = base_w_dot;
-  phase_offset_core::NormalFrameQuery execution_frame_query;
-  if (!execution_pair->frame_owner->query(prepared.geometry.w,
-                                           execution_frame_query) ||
-      !execution_frame_query.valid ||
-      (execution_pair == pair &&
-       (execution_frame_query.N - prepared.geometry.N).norm() > 1e-6)) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason =
-        "recovery executed frame is not bound to the selected immutable owner";
-    return fail("recovery executed frame is not bound to selected owner");
-  }
-  candidate.executed_N = execution_frame_query.N;
-  candidate.executed_reference_query = execution_query;
-  candidate.reference_query_revision = execution_query->queryRevision();
-  candidate.provenance = recovery_input.provenance;
-  candidate.safety_status = "RECOVERY";
-  candidate.handoff_state = "RECOVERY_OWNER";
-  candidate.valid = true;
-
-  phase_offset_navigation::AuthorityPrepareInput authority_input;
-  authority_input.candidate = candidate;
-  if (current_authority.valid) {
-    authority_input.expected_authority_session =
-        current_authority.authority_session;
-    authority_input.expected_sequence = current_authority.sequence;
-  }
-  authority_input.matched_output_valid = output.valid && output.matched.valid;
-  authority_input.reference_valid = candidate.governorViewValid();
-  authority_input.provenance = recovery_input.provenance;
-  phase_offset_navigation::AuthorityPreparedStep authority_prepared;
-  if (!execution_authority_.prepare(authority_input, authority_prepared)) {
-    output.selected = false;
-    output.valid = false;
-    output.invalid_reason = authority_prepared.failure_reason;
-    return fail("recovery authority preparation failed");
-  }
-  // The unadvertised fixture path uses the same prepare-before-publication
-  // contract as the production pending transaction.  Validate every
-  // fallible seam before authority publication; the callback below performs
-  // only no-fail state writes.
-  if (!recovery_owner_.validateCommit(recovery_step)) {
-    return fail("recovery owner commit token validation failed");
-  }
-  const phase_offset_navigation::HandoffDecision prepared_handoff = handoff;
-  phase_offset_navigation::RuntimeCommitToken token;
-  token.expected_previous_final_port = recovery_input.u_prev;
-  token.expected_delta = prepared.delta;
-  token.next_previous_final_port = recovery_step.selected_u;
-  token.next_delta = recovery_step.next_delta;
-  token.dt = prepared.dt;
-  token.selected = true;
-  token.valid = true;
-  token.safety_priority = true;
-  if (advertised_) {
-    if (pending_authority_valid_) return fail("previous PositionCommand transaction is pending");
-    pending_runtime_commit_ = token;
-    pending_recovery_step_ = recovery_step;
-    pending_recovery_step_valid_ = true;
-    pending_recovery_source_pair_ = pair;
-    pending_recovery_execution_pair_ = execution_pair;
-    pending_recovery_target_pair_ = target_pair;
-    pending_authority_prepared_ = authority_prepared;
-    pending_authority_session_ = authority_prepared.candidate.authority_session;
-    pending_authority_valid_ = true;
-  } else {
-    phase_offset_navigation::AuthorityCommitResult authority_result;
-    if (!execution_authority_.commit(
-            authority_prepared,
-            [this, token, recovery_step, prepared_handoff](
-                const phase_offset_navigation::ActiveReferenceSnapshot&) {
-              recovery_owner_.commitNoFail(recovery_step);
-              handoff_state_machine_.commitNoFail(prepared_handoff);
-              runtime_->commitTokenNoFail(token);
-              return true;
-            }, authority_result)) {
-      output.selected = false;
-      output.valid = false;
-      output.invalid_reason = authority_result.failure_reason;
-      return fail("recovery authority commit failed");
-    }
-  }
-  return true;
-}
-
 bool PhaseOffsetMatchedAdapter::hasPendingPositionCommand() const {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  return pending_authority_valid_ && pending_runtime_commit_.valid;
+  return static_cast<bool>(pending_v2_shadow_bootstrap_candidate_);
 }
-
 void PhaseOffsetMatchedAdapter::clearPendingPositionCommandLocked() {
-  pending_runtime_commit_ = phase_offset_navigation::RuntimeCommitToken();
-  pending_recovery_step_ = phase_offset_navigation::RecoveryPreparedStep();
-  pending_recovery_step_valid_ = false;
-  pending_handoff_input_ = phase_offset_navigation::HandoffStateInput();
-  pending_handoff_decision_ = phase_offset_navigation::HandoffDecision();
-  pending_handoff_valid_ = false;
-  pending_normal_source_pair_.reset();
-  pending_recovery_source_pair_.reset();
-  pending_recovery_execution_pair_.reset();
-  pending_recovery_target_pair_.reset();
-  pending_authority_prepared_ =
-      phase_offset_navigation::AuthorityPreparedStep();
-  pending_authority_session_ = 0U;
-  pending_authority_valid_ = false;
+  pending_v2_shadow_bootstrap_candidate_.reset();
 }
-
 bool PhaseOffsetMatchedAdapter::validatePendingPositionCommandLocked(
     std::string* reason) const {
   if (reason) reason->clear();
-  const auto numerically_equal = [](const double first, const double second) {
-    return std::isfinite(first) && std::isfinite(second) && first == second;
-  };
-  const bool any_pending = pending_authority_valid_ ||
-      pending_runtime_commit_.valid || pending_authority_prepared_.valid ||
-      pending_authority_prepared_.candidate.valid ||
-      pending_authority_prepared_.expected.valid ||
-      pending_authority_prepared_.committed_snapshot ||
-      pending_authority_prepared_.expected_snapshot_id != 0U ||
-      pending_authority_prepared_.status !=
-          phase_offset_navigation::ExecutionAuthorityStatus::NONE ||
-      pending_authority_session_ != 0U || pending_runtime_commit_.selected ||
-      pending_runtime_commit_.safety_priority ||
-      pending_runtime_commit_.should_start_profile ||
-      pending_runtime_commit_.profile_active ||
-      pending_runtime_commit_.complete_profile ||
-      pending_runtime_commit_.exact_terminal_predicate ||
-      pending_runtime_commit_.dt != 0.0 ||
-      pending_runtime_commit_.expected_delta != 0.0 ||
-      pending_runtime_commit_.next_delta != 0.0 ||
-      !BitsEqual(pending_runtime_commit_.expected_previous_final_port,
-                 phase_offset_core::PortCommand()) ||
-      !BitsEqual(pending_runtime_commit_.next_previous_final_port,
-                 phase_offset_core::PortCommand()) ||
-      pending_normal_source_pair_ || pending_recovery_step_valid_ ||
-      pending_handoff_valid_ || pending_recovery_source_pair_ ||
-      pending_recovery_execution_pair_ || pending_recovery_target_pair_;
-  if (!any_pending) return true;
-  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
-    if (reason) *reason = "pending PositionCommand transaction is incomplete";
-    return false;
-  }
-  if (!pending_authority_prepared_.valid ||
-      !pending_authority_prepared_.side_effect_free ||
-      pending_authority_prepared_.status !=
-          phase_offset_navigation::ExecutionAuthorityStatus::PREPARED ||
-      !pending_authority_prepared_.committed_snapshot) {
-    if (reason) *reason = "pending authority preparation is invalid";
-    return false;
-  }
-  if (!pending_runtime_commit_.selected ||
-      !std::isfinite(pending_runtime_commit_.dt) ||
-      pending_runtime_commit_.dt <= 0.0) {
-    if (reason) *reason = "pending Runtime commit token is invalid";
-    return false;
-  }
-  if (!execution_authority_.finalValidate(pending_authority_prepared_, reason)) {
-    return false;
-  }
-  const phase_offset_navigation::ActiveReferenceSnapshot current =
-      execution_authority_.snapshot();
-  if (!pending_authority_prepared_.committed_snapshot) {
-    if (reason) *reason = "pending authority snapshot is unavailable";
-    return false;
-  }
-  const phase_offset_navigation::ActiveReferenceSnapshot& candidate =
-      *pending_authority_prepared_.committed_snapshot;
-  if (pending_authority_session_ == 0U ||
-      pending_authority_session_ !=
-          authority_session_.load(std::memory_order_acquire) ||
-      candidate.authority_session != pending_authority_session_) {
-    if (reason) *reason = "pending authority session is stale";
-    return false;
-  }
-  const std::shared_ptr<const PathTubePair> live_pair =
-      std::atomic_load(&authoritative_path_tube_pair_);
-  if (candidate.owner_mode ==
-          phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL ||
-      candidate.owner_mode ==
-          phase_offset_navigation::ActiveReferenceOwnerMode::COORDINATION) {
-    if (candidate.selected_u_owner !=
-            phase_offset_navigation::PhaseOffsetAllocator::ownerName() ||
-        candidate.handoff_state != "PATH_TUBE_PAIR" ||
-        candidate.provenance !=
-            "PhaseOffsetMatchedAdapter/PhaseOffsetAllocator") {
-      if (reason) *reason = "pending NORMAL owner/provenance is stale";
-      return false;
-    }
-    const std::shared_ptr<const PathTubePair>& source_pair =
-        pending_normal_source_pair_;
-    const bool source_pair_matches = source_pair &&
-        live_pair == source_pair &&
-        candidate.authority_session == source_pair->authority_session &&
-        source_pair->authority_session == pending_authority_session_ &&
-        source_pair->source_revision == candidate.planner_path_revision &&
-        source_pair->path_revision == candidate.executed_path_revision &&
-        source_pair->frame_revision == candidate.frame_revision &&
-        source_pair->active_profile &&
-        source_pair->active_profile->source_revision ==
-            candidate.planner_path_revision &&
-        source_pair->active_profile->path_revision ==
-            candidate.executed_path_revision &&
-        source_pair->active_profile->frame_revision ==
-            candidate.frame_revision &&
-        source_pair->active_profile->tube_revision == candidate.tube_revision &&
-        source_pair->active_profile->profile_revision ==
-            candidate.profile_revision &&
-        source_pair->active_profile->map_revision == candidate.map_revision &&
-        candidate.executed_reference_query &&
-        candidate.executed_reference_query->pathRevision() ==
-            source_pair->path_revision &&
-        candidate.executed_reference_query->frameRevision() ==
-            source_pair->frame_revision &&
-        candidate.executed_reference_query->ownerRevision() ==
-            source_pair->source_revision &&
-        candidate.executed_reference_query->queryRevision() ==
-            candidate.reference_query_revision &&
-        (!source_pair->epoch_snapshot ||
-         (source_pair->epoch_snapshot->source_revision ==
-              source_pair->source_revision &&
-          source_pair->epoch_snapshot->path_revision ==
-              source_pair->path_revision &&
-          source_pair->epoch_snapshot->frame_revision ==
-              source_pair->frame_revision &&
-          source_pair->epoch_snapshot->active_profile ==
-              source_pair->active_profile));
-    if (!source_pair_matches) {
-      if (reason) *reason = "pending NORMAL source Pair identity or revisions changed";
-      return false;
-    }
-  }
-  if (candidate.owner_mode ==
-          phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY) {
-    const auto pair_matches_candidate =
-        [&candidate, this](const std::shared_ptr<const PathTubePair>& pair) {
-          return pair && pair->authority_session == pending_authority_session_ &&
-              pair->path_revision == candidate.executed_path_revision &&
-              pair->frame_revision == candidate.frame_revision &&
-              pair->active_profile &&
-              pair->active_profile->profile_revision == candidate.profile_revision &&
-              pair->active_profile->tube_revision == candidate.tube_revision &&
-              pair->active_profile->map_revision == candidate.map_revision;
-        };
-    // The recovery candidate is bound to the exact immutable pair whose
-    // geometry/reference query produced it.  Revisions alone are not an
-    // identity: a same-revision clone in the live slot must fail closed.
-    if (!pending_recovery_execution_pair_ ||
-        !pair_matches_candidate(pending_recovery_execution_pair_) ||
-        !pending_recovery_source_pair_ ||
-        pending_recovery_source_pair_->authority_session !=
-            pending_authority_session_ ||
-        pending_recovery_source_pair_->source_revision !=
-            candidate.planner_path_revision) {
-      if (reason) *reason = "pending recovery execution pair is stale";
-      return false;
-    }
-    // A staged successor may not be live yet, so the exact source predecessor
-    // remains an allowed live identity.  No unrelated pair (including a clone
-    // with identical revisions) can satisfy this boundary.
-    if (live_pair != pending_recovery_execution_pair_ &&
-        live_pair != pending_recovery_source_pair_) {
-      if (reason) *reason = "pending recovery live pair identity changed";
-      return false;
-    }
-    if (live_pair == pending_recovery_source_pair_ &&
-        pending_recovery_execution_pair_ != pending_recovery_source_pair_ &&
-        pending_recovery_target_pair_ != pending_recovery_execution_pair_) {
-      if (reason) *reason = "pending recovery target identity changed";
-      return false;
-    }
-  }
-  if (current.snapshotId() != pending_authority_prepared_.expected_snapshot_id) {
-    if (reason) *reason = "pending authority snapshot changed";
-    return false;
-  }
-  if (!std::isfinite(pending_runtime_commit_.expected_delta) ||
-      !std::isfinite(pending_runtime_commit_.next_delta) ||
-      !std::isfinite(pending_runtime_commit_.dt) ||
-      !std::isfinite(pending_runtime_commit_.expected_previous_final_port.u_w) ||
-      !std::isfinite(pending_runtime_commit_.expected_previous_final_port.u_delta) ||
-      !std::isfinite(pending_runtime_commit_.next_previous_final_port.u_w) ||
-      !std::isfinite(pending_runtime_commit_.next_previous_final_port.u_delta) ||
-      !BitsEqual(runtime_->retainedDelta(),
-                 pending_runtime_commit_.expected_delta) ||
-      !BitsEqual(runtime_->previousFinalPort(),
-                 pending_runtime_commit_.expected_previous_final_port) ||
-      !BitsEqual(candidate.dt, pending_runtime_commit_.dt) ||
-      !BitsEqual(candidate.u_prev,
-                 pending_runtime_commit_.expected_previous_final_port) ||
-      !BitsEqual(candidate.delta, pending_runtime_commit_.expected_delta) ||
-      !BitsEqual(candidate.proposed_next_delta,
-                 pending_runtime_commit_.next_delta) ||
-      !BitsEqual(candidate.selected_u,
-                 pending_runtime_commit_.next_previous_final_port) ||
-      !numerically_equal(candidate.selected_u.u_w, candidate.selected_u_w) ||
-      !numerically_equal(candidate.selected_u.u_delta,
-                         candidate.selected_u_delta) ||
-      !BitsEqual(candidate.proposed_next_u_prev, candidate.selected_u)) {
-    if (reason) *reason = "pending Runtime state or exact selected-u changed";
-    return false;
-  }
-  return true;
+  if (!pending_v2_shadow_bootstrap_candidate_) return true;
+  return validatePendingV2ShadowBootstrapLocked(reason);
 }
-
 void PhaseOffsetMatchedAdapter::discardPendingPositionCommand() {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
   clearPendingPositionCommandLocked();
@@ -6877,161 +3316,100 @@ PendingPositionCommandCapture
 PhaseOffsetMatchedAdapter::capturePendingPositionCommand() const {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
   PendingPositionCommandCapture capture;
-  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
+  if (!pending_v2_shadow_bootstrap_candidate_) {
     capture.valid = true;
     return capture;
   }
   capture.pending = true;
-  if (pending_authority_prepared_.committed_snapshot) {
-    capture.identity =
-        pending_authority_prepared_.committed_snapshot->snapshotId();
-    capture.reference_query =
-        pending_authority_prepared_.committed_snapshot->executed_reference_query;
-  }
-  if (capture.identity == 0U) {
-    // Preserve the distinction between "no transaction" (identity zero) and
-    // a malformed/stale transaction that must suppress ordinary publication.
-    capture.identity = std::numeric_limits<std::uint64_t>::max();
-  }
+  const phase_offset_navigation::AuthorityPreparedStep& authority =
+      pending_v2_shadow_bootstrap_candidate_->authority_prepared;
+  capture.identity = authority.committed_snapshot
+      ? authority.committed_snapshot->snapshotId() : 0U;
+  capture.reference_query = authority.committed_snapshot
+      ? authority.committed_snapshot->executed_reference_query
+      : phase_offset_navigation::ImmutableExecutedReferenceQueryPtr();
   capture.valid = capture.identity != 0U &&
       static_cast<bool>(capture.reference_query) &&
       validatePendingPositionCommandLocked(nullptr);
+  capture.v2_binding_transition =
+      pending_v2_shadow_bootstrap_candidate_->purpose ==
+          TubeWorkerPurposeV2::SUCCESSOR &&
+      pending_v2_shadow_bootstrap_candidate_->prepared_step.binding_transition;
+  capture.proposed_v2_binding =
+      pending_v2_shadow_bootstrap_candidate_->proposed_binding;
   return capture;
 }
-
 phase_offset_navigation::ImmutableExecutedReferenceQueryPtr
 PhaseOffsetMatchedAdapter::pendingExecutedReferenceQuery() const {
   std::lock_guard<std::mutex> lock(runtime_command_mutex_);
-  if (!pending_authority_valid_ || !pending_runtime_commit_.valid ||
-      !pending_authority_prepared_.committed_snapshot) {
+  if (!pending_v2_shadow_bootstrap_candidate_ ||
+      !pending_v2_shadow_bootstrap_candidate_->authority_prepared
+           .committed_snapshot) {
     return phase_offset_navigation::ImmutableExecutedReferenceQueryPtr();
   }
-  const std::shared_ptr<const phase_offset_navigation::ActiveReferenceSnapshot>&
-      snapshot = pending_authority_prepared_.committed_snapshot;
-  return snapshot->executed_reference_query;
+  return pending_v2_shadow_bootstrap_candidate_->authority_prepared
+      .committed_snapshot->executed_reference_query;
 }
-
 bool PhaseOffsetMatchedAdapter::publishPendingPositionCommand(
     const std::function<bool()>& local_publish,
     const std::uint64_t expected_identity,
-    const bool cancel_pending_for_goal_override) {
-  // Reset/new-task and timer publication take task_publication_mutex_ before
-  // runtime_command_mutex_.  Holding both through the local publish closes
-  // the validate→publish→commit race without adding a TransactionManager.
+    const bool cancel_pending_for_goal_override,
+    const std::function<void()>& post_publish_no_fail) {
   std::unique_lock<std::mutex> task_lock(task_publication_mutex_);
   std::unique_lock<std::mutex> runtime_lock(runtime_command_mutex_);
-  if (!pending_authority_valid_ || !pending_runtime_commit_.valid) {
-    // A partially cleared or malformed transaction is not the same as an
-    // empty slot.  Invalidate it through the canonical pending seam before
-    // allowing any no-pending publication path to proceed.
-    if (!validatePendingPositionCommandLocked(nullptr)) {
-      clearPendingPositionCommandLocked();
+  if (pending_v2_shadow_bootstrap_candidate_) {
+    const std::shared_ptr<const TubeV2ShadowAdmissionCandidate> pending =
+        pending_v2_shadow_bootstrap_candidate_;
+    const std::uint64_t authority_id =
+        pending->authority_prepared.committed_snapshot
+            ? pending->authority_prepared.committed_snapshot->snapshotId()
+            : 0U;
+    if (cancel_pending_for_goal_override ||
+        !pending->profile || authority_id == 0U ||
+        expected_identity == 0U || expected_identity != authority_id ||
+        !validatePendingV2ShadowBootstrapLocked(nullptr) ||
+        (!pending->recovery_step.valid &&
+         (!pending->proposed_binding ||
+          !pending->proposed_binding->complete()))) {
       return false;
     }
-    // If a transaction was present before the governor ran, its disappearance
-    // is a fail-closed race outcome.  Ordinary publication is allowed only
-    // when the capture explicitly observed no pending transaction.
-    if (cancel_pending_for_goal_override) {
-      DeactivationCommitToken deactivation_token;
-      if (!prepareDeactivationLocked(
-              ros::Time::now(), task_generation_.load(std::memory_order_acquire),
-              deactivation_token)) {
-        return false;
-      }
-      if (!local_publish || !local_publish()) return false;
-      commitDeactivationNoFailLocked(deactivation_token);
-      return true;
-    }
-    return expected_identity == 0U && local_publish ? local_publish() : false;
-  }
-  if ((!cancel_pending_for_goal_override && expected_identity == 0U) ||
-      !pending_authority_prepared_.committed_snapshot ||
-      (!cancel_pending_for_goal_override &&
-       pending_authority_prepared_.committed_snapshot->snapshotId() !=
-           expected_identity)) {
-    clearPendingPositionCommandLocked();
-    return false;
-  }
-  std::string reason;
-  if (!validatePendingPositionCommandLocked(&reason)) {
-    clearPendingPositionCommandLocked();
-    return false;
-  }
-  if (pending_recovery_step_valid_ &&
-      !recovery_owner_.validateCommit(pending_recovery_step_)) {
-    clearPendingPositionCommandLocked();
-    return false;
-  }
-  if (pending_handoff_valid_ &&
-      (pending_handoff_decision_.previous_state !=
-           handoff_state_machine_.state() ||
-       pending_handoff_decision_.transition_sequence !=
-           handoff_state_machine_.transitionSequence() + 1U)) {
-    clearPendingPositionCommandLocked();
-    return false;
-  }
-
-  // Prepare the refreshed immutable control handoff before local publication.
-  // The post-publication path below performs only no-fail value/shared_ptr
-  // stores; it never allocates or copies strings after cmd_pub.publish().
-  std::shared_ptr<const ControlPublishSnapshot> refreshed_control;
-  const std::shared_ptr<const ControlPublishSnapshot> control =
-      std::atomic_load(&latest_control_snapshot_);
-  if (control && control->active &&
-      control->task_generation == task_generation_.load(
-          std::memory_order_acquire)) {
-    std::shared_ptr<ControlPublishSnapshot> refreshed(
-        new ControlPublishSnapshot(*control));
-    refreshed->authority_snapshot =
-        pending_authority_prepared_.committed_snapshot;
-    refreshed_control = std::shared_ptr<const ControlPublishSnapshot>(
-        refreshed);
-  }
-
-  const phase_offset_navigation::RuntimeCommitToken token =
-      pending_runtime_commit_;
-  const phase_offset_navigation::AuthorityPreparedStep prepared =
-      pending_authority_prepared_;
-  const phase_offset_navigation::RecoveryPreparedStep recovery_step =
-      pending_recovery_step_;
-  const bool recovery_step_valid = pending_recovery_step_valid_;
-  const bool handoff_input_valid = pending_handoff_valid_;
-  DeactivationCommitToken deactivation_token;
-  if (cancel_pending_for_goal_override) {
-    if (!prepareDeactivationLocked(
-            ros::Time::now(), task_generation_.load(std::memory_order_acquire),
-            deactivation_token)) {
+    std::string authority_reason;
+    if (!execution_authority_.finalValidate(
+            pending->authority_prepared, &authority_reason)) {
       return false;
     }
-  }
-  const bool published = local_publish && local_publish();
-  if (!published) {
-    // A failed goal-override publication must preserve the staged authority
-    // and deactivation state for a retry; no state is retired at this seam.
-    if (!cancel_pending_for_goal_override) clearPendingPositionCommandLocked();
-    return false;
-  }
-  if (cancel_pending_for_goal_override) {
-    commitDeactivationNoFailLocked(deactivation_token);
+    if (!local_publish || !local_publish()) return false;
+    execution_authority_.commitNoFail(pending->authority_prepared);
+    if (pending->recovery_step.valid) {
+      recovery_owner_.commitNoFail(pending->recovery_step);
+      runtime_->commitV2NoFail(pending->commit_token);
+    } else {
+      runtime_->commitV2NoFail(pending->commit_token);
+      v2_execution_binding_ = pending->proposed_binding;
+      if (pending->purpose == TubeWorkerPurposeV2::CURRENT)
+        releaseCurrentCohort(pending->request_id);
+    }
+    if (post_publish_no_fail) post_publish_no_fail();
+    clearPendingPositionCommandLocked();
     return true;
   }
-  // All fallible checks have completed before local publication.  The
-  // post-publication section is intentionally limited to no-fail value/state
-  // writes; it cannot allocate, revalidate, rank, or call a second owner.
-  execution_authority_.commitNoFail(prepared);
-  if (recovery_step_valid) recovery_owner_.commitNoFail(recovery_step);
-  if (handoff_input_valid) {
-    handoff_state_machine_.commitNoFail(pending_handoff_decision_);
+  if (expected_identity != 0U) return false;
+  if (cancel_pending_for_goal_override) {
+    DeactivationCommitToken token;
+    if (!prepareDeactivationLocked(
+            ros::Time::now(),
+            task_generation_.load(std::memory_order_acquire), token) ||
+        !local_publish || !local_publish()) {
+      return false;
+    }
+    commitDeactivationNoFailLocked(token);
+    if (post_publish_no_fail) post_publish_no_fail();
+    return true;
   }
-  runtime_->commitTokenNoFail(token);
-  const bool committed = true;
-  if (refreshed_control) {
-    std::atomic_store(&latest_control_snapshot_, refreshed_control);
-  }
-  clearPendingPositionCommandLocked();
-  return committed;
+  if (!local_publish || !local_publish()) return false;
+  if (post_publish_no_fail) post_publish_no_fail();
+  return true;
 }
-
 bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, MatchedAdapterOutput& output) {
   output = MatchedAdapterOutput();
   const std::uint64_t task_generation =
@@ -7047,20 +3425,10 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
   }
   const bool input_available = updateGate(input, output);
   if (!input_available) {
-    // Do not let an old complete request keep rebuilding while the command
-    // side has no valid path/legacy facts.  This only clears async exposure;
-    // updateGate deliberately left Runtime, gate count, and latch unchanged.
-    if (requiresTubeTimer()) {
-      deactivateLocked(input.stamp, task_generation);
-      {
-        std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
-        pending_request_.reset();
-        pending_permit_id_ = 0U;
-        pending_request_identity_ = RequestInstanceIdentity();
-        pending_work_identity_ = TubeWorkIdentity();
-      }
-      worker_condition_.notify_one();
-    }
+    // V2 shadow is strictly observational.  Invalid command input must not
+    // run deactivation/Runtime publication machinery or mutate any legacy
+    // epoch/control snapshot; the previously retained authority remains
+    // untouched while this tick simply reports the zero-port baseline.
     return false;
   }
   const bool equivalent = output.zero_comparison.valid && output.zero_comparison.equivalent;
@@ -7068,1094 +3436,265 @@ bool PhaseOffsetMatchedAdapter::update(const MatchedAdapterInput& input, Matched
     output.selected = zero_gate_open_ && !failure_latched_ && equivalent;
     output.valid = output.zero_port.valid && output.zero_comparison.valid;
     output.invalid_reason = output.selected ? std::string() : output.zero_comparison.invalid_reason;
-    if (advertised_) {
+    if (active_diagnostics_pub_) {
       const auto values = PhaseOffsetActiveAdapter::makeDiagnostics(output.zero_port, output.zero_comparison,
           zero_gate_open_, zero_gate_consecutive_count_, failure_latched_, output.selected);
       std_msgs::Float64MultiArray diagnostics; diagnostics.data.assign(values.begin(), values.end()); active_diagnostics_pub_.publish(diagnostics);
     }
     return output.selected;
   }
-  // A captured H2 pair is the exclusive Runtime authority.  The async epoch
-  // slots below remain display/evidence only and are deliberately not read by
-  // this branch.  Pair revision was assigned only by a successful CAS.
-  if (input.path_tube_pair) {
-    const std::shared_ptr<const PathTubePair>& pair = input.path_tube_pair;
-    // Retirement is distinct from malformed pair evidence: reset advances
-    // this private ownership session while a command may still hold an old
-    // immutable shared_ptr.  Reject it before publishing a timer request or
-    // touching Runtime so that the captured authority cannot be revived.
-    if (pair->authority_session !=
-        authority_session_.load(std::memory_order_acquire)) {
-      output.invalid_reason = "captured path-tube pair retired";
-      return false;
-    }
-    if (!pair->path_owner || !pair->full_path_samples ||
-        !pair->active_profile || pair->source_revision == 0U ||
-        pair->epoch_status.candidate_path_source_revision !=
-            pair->source_revision ||
-        pair->epoch_status.active_path_source_revision !=
-            pair->source_revision ||
-        !pair->epoch_status.active_available ||
-        !pair->epoch_status.active_current_validation_valid ||
-        pair->active_profile->source_revision != pair->source_revision ||
-        !PathStateMatchesOwner(input.path, pair->path_owner,
-                               pair->frame_owner)) {
-      output.invalid_reason = "captured path-tube pair is invalid";
-      return false;
-    }
-    phase_offset_core::PathDifferentialState authoritative_current_path;
-    if (!EvaluateOwnerState(pair->path_owner, input.path.w,
-                            authoritative_current_path, pair->frame_owner)) {
-      output.invalid_reason = "captured immutable pair frame query failed";
-      return false;
-    }
-    // A same-path timer refresh is evidence-only until it atomically replaces
-    // this exact pair.  Publish the immutable owner and captured Runtime bits
-    // as a lightweight request; the timer never reads/mutates Runtime.
-    std::shared_ptr<TubeBuildRequest> request(new TubeBuildRequest());
-    request->active = true;
-    request->task_generation =
-        task_generation_.load(std::memory_order_acquire);
-    request->control_sequence = ++control_sequence_;
-    request->source_revision = pair->source_revision;
-    request->path_revision = pair->path_revision;
-    request->frame_revision = pair->frame_revision;
-    request->authority_session = pair->authority_session;
-    request->stamp = input.stamp;
-    request->semantic_path_owner = pair->path_owner;
-    request->frame_owner = pair->frame_owner;
-    request->base_path_tube_pair = pair;
-    request->base_path_tube_pair_generation = pair->generation;
-    request->base_retained_delta = runtime_->retainedDelta();
-    request->base_previous_final_port = runtime_->previousFinalPort();
-    request->semantic_path_start_w = pair->path_owner->startW();
-    request->semantic_path_end_w = pair->path_owner->endW();
-    request->supplied_path_samples = pair->full_path_samples;
-    request->current_path = authoritative_current_path;
-    request->position = input.position;
-    request->gains = input.gains;
-    request->dt = input.dt;
-    request->retained_delta = request->base_retained_delta;
-    if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-      makeAuthorityRequest(request->retained_delta,
-                           request->authority_request);
-    }
-    request->cloud_snapshot = input.cloud_occupancy_snapshot;
-    if (config_.tube_source == phase_offset_navigation::TubeSource::ESDF) {
-      request->map_observation_is_snapshot = true;
-      request->map_observation_sequence = request->cloud_snapshot
-          ? request->cloud_snapshot->observation_sequence : 0U;
-    }
-    command_active_ = true;
-    std::atomic_store(&latest_build_request_,
-        std::shared_ptr<const TubeBuildRequest>(request));
-    output.candidate_profile = pair->epoch_snapshot &&
-        pair->epoch_snapshot->candidate_profile
-        ? pair->epoch_snapshot->candidate_profile : pair->active_profile;
-    output.active_profile = pair->active_profile;
-    output.tube_epoch_status = pair->epoch_status;
-    // Per-command categorical evidence is intentionally not persisted into
-    // the immutable pair.  It masks only this Runtime input so an explicit
-    // latest OCCUPIED/OUT_OF_MAP fact reaches the existing certificate-denied
-    // fail-closed path without creating a new state/reason/schema.
-    if (LatestCategoricalUnsafe(config_, cloud_occupancy_query_config_,
-                                input.cloud_occupancy_snapshot, input.path,
-                                input.position, runtime_->retainedDelta())) {
-      output.tube_epoch_status.active_current_validation_valid = false;
-      output.tube_epoch_status.certificate_denied = true;
-      output.tube_epoch_status.current_safety_status =
-          phase_offset_navigation::CurrentSafetyStatus::UNSAFE;
-    }
-    phase_offset_navigation::RuntimePreflightInput preflight;
-    preflight.position = input.position;
-    preflight.path_source_revision = pair->source_revision;
-    preflight.path = *pair->full_path_samples;
-    if (!have_preflight_revision_ || last_preflight_revision_ !=
-        pair->source_revision) {
-      runtime_->refreshPreflight(preflight);
-      have_preflight_revision_ = true;
-      last_preflight_revision_ = pair->source_revision;
-    }
-    phase_offset_navigation::RuntimePrepareInput runtime_input;
-    runtime_input.current_path = authoritative_current_path;
-    runtime_input.position = input.position;
-    runtime_input.tube_view.active_profile = pair->active_profile;
-    runtime_input.tube_view.epoch_status = output.tube_epoch_status;
-    runtime_input.dt = input.dt;
-    runtime_input.future_step = MakeFutureStepContract(
-        pair->path_owner, pair->full_path_samples, pair->active_profile,
-        input.gains,
-        runtime_->config().tube.regularity_margin,
-        runtime_->config().tube.minimum_reference_speed,
-        config_.tube_update_period,
-        config_.tube.min_certified_forward_w);
-    // A pending manual profile may execute only through a matching immutable
-    // pair.  If the pair was retired during a neutral planner handoff, keep
-    // the sidecar Tube observable but do not let Runtime start a nonzero
-    // profile from an unowned epoch.
-    const bool pair_available = static_cast<bool>(capturePathTubePair());
-    runtime_input.zero_gate_open = zero_gate_open_ && !failure_latched_ &&
-        !config_.observe_only &&
-        (!requiresPathTubePairBootstrapLocked() || pair_available);
-    runtime_input.fatal_adapter_failure_latched = failure_latched_;
-    phase_offset_navigation::RuntimePreparedStep prepared;
-    runtime_->prepare(runtime_input, prepared);
-    output.geometry = prepared.geometry.valid ? prepared.geometry : output.geometry;
-    output.preflight = prepared.preflight;
-    output.raw_port = prepared.raw_port;
-    output.delta = prepared.delta;
-    output.delta_ref = prepared.delta_ref;
-    output.profile_active = prepared.profile_active;
-    output.tube_current_bounds = prepared.current_bounds;
-    output.runtime_execution = prepared.execution;
-    phase_offset_navigation::RuntimeStepOutput runtime_output;
-    bool completed = false;
-    if (prepared.requires_base_guidance) {
-      guidance::ReferenceGeometry reference;
-      reference.point = prepared.geometry.r;
-      reference.tangent = prepared.geometry.T;
-      reference.derivative_norm = prepared.geometry.r_w.norm();
-      reference.valid = prepared.geometry.valid;
-      guidance::IsfGuidance base;
-      const bool base_ok = guidance::IsfReferenceKernel::evaluate(
-          input.position, reference, input.gains, base);
-      const phase_offset_navigation::ActiveReferenceSnapshot current_authority =
-          execution_authority_.snapshot();
-      bool authority_step_completed = false;
-      phase_offset_navigation::NormalPreviewResult normal_preview;
-      phase_offset_navigation::PhaseOffsetAllocatorResult normal_allocator;
-      Eigen::Vector3d normal_g_des = Eigen::Vector3d::Zero();
-      std::string normal_allocator_failure;
-      const bool recovery_authority = current_authority.valid &&
-          current_authority.owner_mode ==
-              phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY;
-      const bool active_nonzero_authority = current_authority.valid &&
-          !recovery_authority && runtime_->hasExecutedOffsetAuthority() &&
-          prepared.delta != 0.0;
-      // C3 production path: consume the current valid NORMAL Preview value,
-      // invoke the sole NoQP allocator, and pass its exact selected-u through
-      // the existing authority/matched transaction.  Recovery remains owned
-      // by the existing RecoveryOwner path below.
-      if (advertised_ && !recovery_authority && !config_.observe_only &&
-          pair && prepared.requires_base_guidance &&
-          prepared.execution.mode ==
-              phase_offset_navigation::RuntimeExecutionMode::NORMAL) {
-        const bool allocator_ok = evaluateNormalAllocator(
-            input, prepared, base.w_dot, normal_preview, normal_allocator,
-            normal_g_des, normal_allocator_failure);
-        output.g_des = normal_g_des;
-        output.g_des_valid = allocator_ok &&
-            normal_g_des.allFinite();
-        output.normal_preview = normal_preview;
-        output.allocator = normal_allocator;
-        output.allocator_evaluated = true;
-        if (allocator_ok) {
-          authority_step_completed = completeThroughExecutionAuthority(
-              input, pair, request, pair->epoch_snapshot, prepared,
-              base.v_cmd, base.w_dot, base_ok && base.valid, runtime_output,
-              &normal_allocator);
-        } else {
-          // Preview/allocator failure is value-only for a neutral planner
-          // baseline.  Once an authoritative nonzero NORMAL state exists,
-          // fail this tick closed so the manager cannot publish nominal
-          // centerline guidance; all committed authority/runtime state stays
-          // untouched in either case.
-          runtime_output = phase_offset_navigation::RuntimeStepOutput();
-          runtime_output.geometry = prepared.geometry;
-          runtime_output.active_profile = prepared.active_profile;
-          runtime_output.current_bounds = prepared.current_bounds;
-          runtime_output.preflight = prepared.preflight;
-          runtime_output.epoch_status = prepared.epoch_status;
-          runtime_output.execution = prepared.execution;
-          runtime_output.execution.mode =
-              phase_offset_navigation::RuntimeExecutionMode::NORMAL;
-          runtime_output.execution.executable = true;
-          runtime_output.delta = prepared.delta;
-          runtime_output.delta_ref = 0.0;
-          runtime_output.profile_active = false;
-          runtime_output.selected = false;
-          runtime_output.valid = active_nonzero_authority
-              ? false : (base_ok && base.valid);
-          runtime_output.execution.executable = !active_nonzero_authority;
-          runtime_output.invalid_reason = normal_allocator_failure;
-          output.allocator_value_failure = true;
-        }
-      } else if (current_authority.valid &&
-          current_authority.owner_mode ==
-              phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY &&
-          prepared.delta == 0.0 &&
-          recovery_owner_.status().exact_terminal_predicate) {
-        authority_step_completed = completeAtomicNeutralHandoff(
-            input, pair, prepared, base.v_cmd, base.w_dot,
-            base_ok && base.valid, runtime_output);
-      } else {
-        authority_step_completed = completeThroughExecutionAuthority(
-            input, pair, request, pair->epoch_snapshot, prepared, base.v_cmd,
-            base.w_dot, base_ok && base.valid, runtime_output);
-      }
-      // Any active nonzero failure (including Preview/allocator failure) uses
-      // the existing Preview -> Handoff -> RecoveryOwner chain.  RecoveryOwner
-      // remains the sole owner for that mode; no C3-local HOLD is created.
-      if (!authority_step_completed && advertised_ && pair &&
-          prepared.delta != 0.0) {
-      authority_step_completed = completeThroughRecoveryOwner(
-            input, pair, input.successor_path_tube_pair, prepared,
-            base.v_cmd, base.w_dot,
-            base_ok && base.valid, runtime_output);
-      }
-      completed = true;
-      output.base_guidance = base;
-      output.geometry = runtime_output.geometry;
-      output.raw_port = runtime_output.raw_port;
-      output.projection = runtime_output.projection;
-      output.matched = runtime_output.matched;
-      output.tube_current_bounds = runtime_output.current_bounds;
-      output.tube_next_bounds = runtime_output.next_bounds;
-      output.preflight = runtime_output.preflight;
-      output.runtime_execution = runtime_output.execution;
-      output.delta = runtime_output.delta;
-      output.delta_ref = runtime_output.delta_ref;
-      output.profile_active = runtime_output.profile_active;
-      output.selected = runtime_output.selected;
-      output.valid = runtime_output.valid;
-      output.recovery_status = runtime_output.recovery_status;
-      output.recovery_replan_required =
-          runtime_output.recovery_replan_required;
-      output.invalid_reason = runtime_output.invalid_reason;
-      if (output.allocator_value_failure &&
-          !runtime_output.execution.executable) {
-        // Keep the nominal base guidance available as evidence only; the
-        // active-authority failure path must not expose it as executable
-        // matched guidance or allow a caller to publish a centerline command.
-        output.guidance = guidance::IsfGuidance();
-      }
-      if (output.selected) SetGuidance(base, output.matched, output.guidance);
-    } else {
-      output.valid = prepared.valid;
-      output.invalid_reason = prepared.invalid_reason;
-    }
-    const auto& execution = completed ? runtime_output.execution
-                                      : prepared.execution;
-    if (execution.fatal_control_failure && execution.genuine_fatal_invariant) {
-      latchFailure(execution.failure_reason);
-    }
-    output.failure_latched = failure_latched_;
-    output.control_failure_reason = control_failure_reason_;
-    if (failure_latched_) { output.selected = false; output.valid = false; }
-    output.tube_profile = *pair->active_profile;
-    fillLegacyTubeStatus(output);
-    fillManualDiagnostics(output);
-    // Pair-owned control has the same command-owned publication contract as
-    // the no-pair path.  This snapshots only the final facts already produced
-    // above; it neither authorizes nor mutates Runtime/pair state.
-    makeControlPublishSnapshot(input, request, pair->epoch_snapshot, false,
-                               output);
-    return output.selected;
-  }
-
-  const std::uint64_t revision = sourceRevision(input);
-  if (!have_preflight_revision_ || revision != last_preflight_revision_) {
-    phase_offset_navigation::RuntimePreflightInput preflight;
-    preflight.position = input.position;
-    preflight.path_source_revision = revision;
-    preflight.path = input.sampled_path;
-    if (preflight.path.empty() && input.semantic_path_owner &&
-        !input.semantic_path_owner->empty()) {
-      std::vector<double> sample_w;
-      std::vector<ContinuousPhasePathState> sample_states;
-      if (input.semantic_path_owner->sample(sampleStepW(), sample_w,
-                                            sample_states) &&
-          sample_w.size() == sample_states.size()) {
-        for (std::size_t index = 0U; index < sample_w.size(); ++index) {
-          preflight.path.push_back(ConvertContinuousPhasePathStateForActive(
-              sample_states[index], sample_w[index]));
-        }
-      }
-    }
-    // An empty sample set is intentionally committed once for this revision:
-    // Runtime then reports an invalid preflight rather than reusing an older
-    // path's certificate or trying a callback-owned sampling function.
-    runtime_->refreshPreflight(preflight);
-    have_preflight_revision_ = true;
-    last_preflight_revision_ = revision;
-  }
-  const std::shared_ptr<const TubeBuildRequest> previous_request =
-      std::atomic_load(&latest_build_request_);
-  const std::shared_ptr<const TubeBuildRequest> request =
-      makeBuildRequest(input, revision, runtime_->retainedDelta());
-  if (previous_request && previous_request->active &&
-      (previous_request->source_revision != request->source_revision ||
-       previous_request->path_revision != request->path_revision ||
-       previous_request->frame_revision != request->frame_revision ||
-       previous_request->semantic_path_owner != request->semantic_path_owner ||
-       previous_request->frame_owner != request->frame_owner)) {
-    // A changed path or frame owner never inherits a visual Candidate from
-    // the old path.  Frame identity is checked explicitly because a planner
-    // may replace the frame while retaining its numeric source revision.
-    std::atomic_store(&latest_candidate_epoch_snapshot_,
-                      std::shared_ptr<const TubeEpochSnapshot>());
-    std::atomic_store(&latest_epoch_snapshot_,
-                      std::shared_ptr<const TubeEpochSnapshot>());
-  }
-  command_active_ = true;
-  // Required ordering: publish the complete current request before reading a
-  // timer result.  The timer coalesces same-source control updates.
-  std::atomic_store(&latest_build_request_, request);
-  // Production neutral navigation arms the rendezvous only after the full
-  // immutable request is visible.  This is a short identity-only operation;
-  // no Tube/profile/cloud work and no wait occur under the command mutex.
-  armBootstrapRendezvousLocked(request);
-  const std::shared_ptr<const TubeEpochSnapshot> latest_candidate =
-      std::atomic_load(&latest_candidate_epoch_snapshot_);
-  const bool candidate_source_matches = latest_candidate &&
-      latest_candidate->active &&
-      latest_candidate->task_generation == request->task_generation &&
-      latest_candidate->source_revision == request->source_revision &&
-      latest_candidate->path_revision == request->path_revision &&
-      latest_candidate->frame_revision == request->frame_revision &&
-      latest_candidate->semantic_path_owner == request->semantic_path_owner &&
-      latest_candidate->frame_owner == request->frame_owner &&
-      (config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
-       latest_candidate->epoch_status.candidate_path_source_revision ==
-           request->source_revision);
-  const std::shared_ptr<const TubeEpochSnapshot> runtime_epoch =
-      matchingEpochForRequest(request);
-  std::shared_ptr<const TubeEpochSnapshot> exposure_epoch;
-  bool candidate_only = false;
-  if (candidate_source_matches) {
-    const bool candidate_is_current_runtime_epoch =
-        epochMatchesRequest(*latest_candidate, *request) && runtime_epoch &&
-        runtime_epoch->build_sequence == latest_candidate->build_sequence;
-    if (candidate_is_current_runtime_epoch) {
-      exposure_epoch = runtime_epoch;
-    } else {
-      // A Candidate whose current request fails the existing cloud contract
-      // remains observable, but cannot cross the Runtime/Certified boundary.
-      exposure_epoch = makeCandidateOnlyEpoch(*latest_candidate);
-      candidate_only = true;
-    }
-  }
-
-  if (exposure_epoch) {
-    output.candidate_profile = exposure_epoch->candidate_profile;
-    output.tube_epoch_status = exposure_epoch->epoch_status;
-    output.tube_update_due_this_cycle =
-        exposure_epoch->build_sequence != last_consumed_epoch_build_sequence_;
-    if (output.tube_update_due_this_cycle) {
-      last_consumed_epoch_build_sequence_ = exposure_epoch->build_sequence;
-      output.raw_candidate_diagnostics_generated =
-          exposure_epoch->raw_candidate_diagnostics_generated;
-      output.raw_candidate_diagnostics = exposure_epoch->raw_candidate_diagnostics;
-      output.cloud_snapshot_diagnostics_generated =
-          exposure_epoch->cloud_snapshot_diagnostics_generated;
-      output.cloud_snapshot_diagnostics =
-          exposure_epoch->cloud_snapshot_diagnostics;
-    }
-  }
-
-  // Runtime receives an empty installed-tube view unless the epoch matches
-  // the current path source and its current request satisfies the existing
-  // cloud-observation contract.  Map sequence is provenance, not a gate.
-  if (runtime_epoch) {
-    output.active_profile = runtime_epoch->active_profile;
-    output.tube_epoch_status = runtime_epoch->epoch_status;
-  }
-
-  // Advertised production NORMAL has exactly one entry point: an installed
-  // H2 PathTubePair.  Before the existing timer-side stage/prepare/final CAS
-  // publishes that pair, keep the planner/zero-port baseline and publish only
-  // immutable request/evidence.  In particular, do not run Runtime::complete,
-  // Preview, Allocator, PortProjector or ExecutionAuthority on a no-pair tick.
-  // Unadvertised fixtures retain the legacy Runtime compatibility path below.
-  if (advertised_) {
+  {
+    consumeV2ShadowCompletions();
+    // The shadow seam transports one immutable builder request only.  It
+    // never exposes legacy Candidate/Epoch evidence or mutates Pair/beta;
+    // NORMAL stays observational, while an installed incumbent may stage its
+    // already-certified reserve through the existing publish-first seam.
+    const std::shared_ptr<const TubeBuildRequestV2> request =
+        makeBuildRequestV2(input);
+    // Never erase the sole committed binding merely because incoming
+    // capture/path evidence is missing, incompatible, or expired.  The
+    // applicability path below either executes the incumbent under its exact
+    // still-valid contract, consumes its committed reserve, or fails closed;
+    // only a publish-first replacement or an exactly neutral task retirement
+    // changes ownership.
     output.base_guidance = output.zero_port.guidance;
     output.guidance = output.zero_port.guidance;
-    output.delta = runtime_->retainedDelta();
+    output.delta = runtime_ ? runtime_->retainedDelta() : 0.0;
     output.delta_ref = 0.0;
     output.profile_active = false;
     output.selected = false;
     output.valid = output.zero_port.valid && output.zero_comparison.valid &&
         !failure_latched_;
-    output.invalid_reason = output.valid ? "PathTubePair activation pending"
+    output.invalid_reason = output.valid ? std::string()
                                          : output.zero_comparison.invalid_reason;
     output.failure_latched = failure_latched_;
     output.control_failure_reason = control_failure_reason_;
-    output.tube_profile = output.active_profile ? *output.active_profile
-        : phase_offset_navigation::TubeProfile();
-    fillLegacyTubeStatus(output);
-    fillManualDiagnostics(output);
-    makeControlPublishSnapshot(input, request, exposure_epoch, candidate_only,
-                               output);
-    return false;
-  }
-
-  {
-    phase_offset_navigation::RuntimePrepareInput runtime_input;
-    runtime_input.current_path = input.path;
-    runtime_input.position = input.position;
-    if (runtime_epoch) {
-      runtime_input.tube_view.active_profile = runtime_epoch->active_profile;
-      runtime_input.tube_view.epoch_status = runtime_epoch->epoch_status;
-      runtime_input.future_step = MakeFutureStepContract(
-          request->semantic_path_owner, runtime_epoch->full_path_samples,
-          runtime_epoch->active_profile, input.gains,
-          runtime_->config().tube.regularity_margin,
-          runtime_->config().tube.minimum_reference_speed,
-          config_.tube_update_period, config_.tube.min_certified_forward_w);
-    }
-    runtime_input.dt = input.dt;
-    // The unadvertised compatibility path retains the historical Runtime
-    // gate semantics.  Advertised production has already returned above
-    // unless it carries an exact installed PathTubePair.
-    runtime_input.zero_gate_open = zero_gate_open_ && !failure_latched_ &&
-        !config_.observe_only &&
-        (config_.tube_source == phase_offset_navigation::TubeSource::NONE);
-    runtime_input.fatal_adapter_failure_latched = failure_latched_;
-    phase_offset_navigation::RuntimePreparedStep prepared;
-    runtime_->prepare(runtime_input, prepared);
-    output.geometry = prepared.geometry.valid ? prepared.geometry : output.geometry;
-    output.preflight = prepared.preflight;
-    output.raw_port = prepared.raw_port;
-    output.delta = prepared.delta;
-    output.delta_ref = prepared.delta_ref;
-    output.profile_active = prepared.profile_active;
-    output.tube_current_bounds = prepared.current_bounds;
-    output.runtime_execution = prepared.execution;
-    phase_offset_navigation::RuntimeStepOutput runtime_output;
-    bool completed = false;
-    if (prepared.requires_base_guidance) {
-      guidance::ReferenceGeometry reference;
-      reference.point = prepared.geometry.r;
-      reference.tangent = prepared.geometry.T;
-      reference.derivative_norm = prepared.geometry.r_w.norm();
-      reference.valid = prepared.geometry.valid;
-      guidance::IsfGuidance base;
-      const bool base_ok = guidance::IsfReferenceKernel::evaluate(
-          input.position, reference, input.gains, base);
-      completeThroughExecutionAuthority(
-          input, std::shared_ptr<const PathTubePair>(), request,
-          runtime_epoch, prepared, base.v_cmd, base.w_dot,
-          base_ok && base.valid, runtime_output);
-      completed = true;
-      output.base_guidance = base;
-      output.geometry = runtime_output.geometry;
-      output.raw_port = runtime_output.raw_port;
-      output.projection = runtime_output.projection;
-      output.matched = runtime_output.matched;
-      output.tube_current_bounds = runtime_output.current_bounds;
-      output.tube_next_bounds = runtime_output.next_bounds;
-      output.preflight = runtime_output.preflight;
-      output.runtime_execution = runtime_output.execution;
-      output.delta = runtime_output.delta;
-      output.delta_ref = runtime_output.delta_ref;
-      output.profile_active = runtime_output.profile_active;
-      output.selected = runtime_output.selected;
-      output.valid = runtime_output.valid;
-      output.invalid_reason = runtime_output.invalid_reason;
-      if (output.allocator_value_failure &&
-          !runtime_output.execution.executable) {
-        output.guidance = guidance::IsfGuidance();
+    // A failed local publication retains the exact immutable recovery
+    // transaction.  Re-expose that command for retry without admitting a
+    // newer completion or advancing either owner in update().
+    if (pending_v2_shadow_bootstrap_candidate_ &&
+        pending_v2_shadow_bootstrap_candidate_->recovery_step.valid) {
+      const std::shared_ptr<const TubeV2ShadowAdmissionCandidate> pending =
+          pending_v2_shadow_bootstrap_candidate_;
+      if (PendingV2ApplicabilityEvidenceMatches(input, *pending) &&
+          validatePendingV2ShadowBootstrapLocked(nullptr) &&
+          PopulateV2RecoveryOutput(config_, input, *pending, output)) {
+        latest_v2_shadow_admission_candidate_ = pending;
+        output.v2_shadow_admission_candidate = pending;
+        return true;
       }
-      if (output.selected) SetGuidance(base, output.matched, output.guidance);
-    } else {
-      output.valid = prepared.valid;
-      output.invalid_reason = prepared.invalid_reason;
+      pending_v2_shadow_bootstrap_candidate_.reset();
     }
-    const auto& execution = completed ? runtime_output.execution : prepared.execution;
-    if (execution.fatal_control_failure && execution.genuine_fatal_invariant) {
-      latchFailure(execution.failure_reason);
+    if (pending_v2_shadow_bootstrap_candidate_ &&
+        pending_v2_shadow_bootstrap_candidate_->purpose ==
+            TubeWorkerPurposeV2::SUCCESSOR) {
+      const std::shared_ptr<const TubeV2ShadowAdmissionCandidate> pending =
+          pending_v2_shadow_bootstrap_candidate_;
+      if (PendingV2ApplicabilityEvidenceMatches(input, *pending) &&
+          validatePendingV2ShadowBootstrapLocked(nullptr) &&
+          PopulateV2SuccessorOutput(config_, input, *pending, output)) {
+        latest_v2_shadow_admission_candidate_ = pending;
+        output.v2_shadow_admission_candidate = pending;
+        return true;
+      }
+      pending_v2_shadow_bootstrap_candidate_.reset();
     }
-  }
-  output.failure_latched = failure_latched_;
-  output.control_failure_reason = control_failure_reason_;
-  if (failure_latched_) { output.selected = false; output.valid = false; }
-  output.tube_profile = output.active_profile ? *output.active_profile
-      : phase_offset_navigation::TubeProfile();
-  fillLegacyTubeStatus(output);
-  fillManualDiagnostics(output);
-  makeControlPublishSnapshot(input, request, exposure_epoch, candidate_only,
-                             output);
-  return output.selected;
-}
-
-bool PhaseOffsetMatchedAdapter::buildMarkers(const MatchedAdapterInput& input,
-                                             const MatchedAdapterOutput& output,
-                                             MatchedAdapterMarkerBundle& markers) const {
-  // Compatibility/test helper.  Production publication uses the immutable
-  // ControlPublishSnapshot overload below from the timer only.
-  ControlPublishSnapshot control;
-  control.active = true;
-  control.stamp = input.stamp;
-  control.current_w = input.path.w;
-  control.position = input.position;
-  control.output = output;
-  if (!input.sampled_path.empty()) {
-    control.full_path_samples =
-        std::make_shared<const PathSamples>(input.sampled_path);
-  }
-  return buildMarkers(control, markers);
-}
-
-bool PhaseOffsetMatchedAdapter::buildMarkers(
-    const ControlPublishSnapshot& control,
-    MatchedAdapterMarkerBundle& markers) const {
-  return buildMarkers(control, control.output.candidate_profile, markers);
-}
-
-bool PhaseOffsetMatchedAdapter::buildMarkers(
-    const ControlPublishSnapshot& control,
-    const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
-        candidate_marker_profile,
-    MatchedAdapterMarkerBundle& markers) const {
-  return buildMarkers(control, candidate_marker_profile, control.current_w,
-                      markers);
-}
-
-bool PhaseOffsetMatchedAdapter::buildMarkers(
-    const ControlPublishSnapshot& control,
-    const std::shared_ptr<const phase_offset_navigation::TubeProfile>&
-        candidate_marker_profile,
-    const double candidate_anchor_w,
-    MatchedAdapterMarkerBundle& markers) const {
-  markers = MatchedAdapterMarkerBundle();
-  const MatchedAdapterOutput& output = control.output;
-  markers.base_path = MakeLine(control.stamp, config_.frame_id,
-      "phase_offset_manual_base", 0, 0.0F, 0.3F, 1.0F);
-  markers.active_path = MakeLine(control.stamp, config_.frame_id,
-      "phase_offset_manual_active", 0, 1.0F, 0.0F, 1.0F);
-  if (!control.full_path_samples || control.full_path_samples->empty()) {
-    markers.base_path = MakeDelete(control.stamp, config_.frame_id,
-                                   "phase_offset_manual_base", 0);
-    markers.active_path = MakeDelete(control.stamp, config_.frame_id,
-                                     "phase_offset_manual_active", 0);
-  } else {
-    phase_offset_core::GeometryParams geometry_params;
-    geometry_params.regularity_margin = config_.tube.regularity_margin;
-    geometry_params.minimum_reference_speed =
-        config_.tube.cross_section.minimum_reference_speed;
-    phase_offset_core::GeometryEvaluator evaluator(geometry_params);
-    bool active_complete = true;
-    for (const auto& path : *control.full_path_samples) {
-      markers.base_path.points.push_back(ToPoint(path.p));
-      phase_offset_core::PhaseOffsetGeometryState geometry;
-      if (!evaluator.evaluate(path, control.position, output.delta, geometry)) active_complete = false;
-      else markers.active_path.points.push_back(ToPoint(geometry.r));
+    if (pending_v2_shadow_bootstrap_candidate_ &&
+        pending_v2_shadow_bootstrap_candidate_->purpose ==
+            TubeWorkerPurposeV2::CURRENT &&
+        !pending_v2_shadow_bootstrap_candidate_->recovery_step.valid) {
+      const std::shared_ptr<const TubeV2ShadowAdmissionCandidate> pending =
+          pending_v2_shadow_bootstrap_candidate_;
+      if (PendingV2ApplicabilityEvidenceMatches(input, *pending) &&
+          validatePendingV2ShadowBootstrapLocked(nullptr) &&
+          PopulateV2NormalOutput(config_, input, *pending, output)) {
+        latest_v2_shadow_admission_candidate_ = pending;
+        output.v2_shadow_admission_candidate = pending;
+        return true;
+      }
+      releaseCurrentCohort(pending->request_id);
+      pending_v2_shadow_bootstrap_candidate_.reset();
     }
-    if (!active_complete || markers.active_path.points.size() != markers.base_path.points.size()) {
-      markers.active_path = MakeDelete(control.stamp, config_.frame_id,
-                                       "phase_offset_manual_active", 0);
+    // Completed CURRENT profiles and the still-applicable incumbent share the
+    // same live NORMAL preparation and publish-first transaction.  Neither
+    // path creates legacy Candidate/Active authority.
+    std::shared_ptr<const TubeV2ShadowAdmissionCandidate> admission_candidate;
+    std::shared_ptr<const TubeV2ShadowAdmissionCandidate>
+        successor_admission_candidate;
+    phase_offset_navigation::RecoveryPreparedStep incumbent_recovery_step;
+    const phase_offset_navigation::RecoveryOwnerStatus& recovery_status =
+        recovery_owner_.status();
+    const bool recovery_running = recovery_status.active &&
+        recovery_status.proof_kind ==
+            phase_offset_navigation::RecoveryStepProofKind::FINITE_RESERVE_V2 &&
+        recovery_status.reserve_cursor < recovery_status.reserve_size;
+    if (!recovery_running && input.tube_v2_successor_handoff) {
+      std::shared_ptr<const TubeWorkerCompletionV2> completion;
+      {
+        std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+        completion = latest_v2_shadow_successor_completion_;
+      }
+      if (completion) {
+        prepareV2ShadowSuccessorAdmission(
+            input, *input.tube_v2_successor_handoff, completion,
+            successor_admission_candidate);
+      }
     }
-  }
-  if (output.geometry.valid) {
-    visualization_msgs::Marker frame; frame.header.stamp = control.stamp; frame.header.frame_id = config_.frame_id;
-    frame.ns = "phase_offset_manual_frame"; frame.id = 0; frame.type = visualization_msgs::Marker::SPHERE;
-    frame.action = visualization_msgs::Marker::ADD; frame.pose.position = ToPoint(output.geometry.r); frame.pose.orientation.w = 1.0;
-    frame.scale.x = frame.scale.y = frame.scale.z = 0.16; frame.color.r = 1.0F; frame.color.b = 1.0F; frame.color.a = 1.0F;
-    markers.frame.markers.push_back(frame);
-  } else {
-    for (int id = 0; id < 4; ++id) markers.frame.markers.push_back(
-        MakeDelete(control.stamp, config_.frame_id, "phase_offset_manual_frame", id));
-  }
-  const phase_offset_navigation::TubeProfile empty;
-  const auto& candidate = candidate_marker_profile
-      ? *candidate_marker_profile : empty;
-  const auto& active = output.active_profile ? *output.active_profile : empty;
-  markers.tube_candidate = MakeCandidateTubeMarkers(control.stamp, config_.frame_id, candidate,
-      config_.mode == PhaseOffsetMatchedMode::MANUAL, candidate_anchor_w);
-  markers.tube = MakeCertifiedTubeMarkers(control.stamp, config_.frame_id, active,
-      tubeDisplayCertified(output));
-  // This compatibility helper has no immutable Candidate epoch/request
-  // authority, so the R3 topic must fail closed here.  Production
-  // publishManual() overwrites this field with the full atomic
-  // request/Candidate decision below; existing /tube and /tube_candidate
-  // construction remains unchanged.
-  markers.tube_certified_geometry = MakeCertifiedGeometryTubeMarkers(
-      control.stamp, config_.frame_id, empty, false);
-  return output.geometry.valid;
-}
-
-bool PhaseOffsetMatchedAdapter::buildMarkers(
-    const ControlPublishSnapshot& control,
-    const std::shared_ptr<const TubeEpochSnapshot>& candidate_epoch,
-    MatchedAdapterMarkerBundle& markers) const {
-  // Production publication must keep Candidate profile and build anchor
-  // under one immutable epoch.  If that provenance is unavailable or not a
-  // finite build phase, fail closed to DELETE rather than guessing from the
-  // later command-cycle phase.
-  if (!candidate_epoch || !candidate_epoch->active ||
-      !candidate_epoch->candidate_profile ||
-      !std::isfinite(candidate_epoch->candidate_build_w)) {
-    return buildMarkers(
-        control, std::shared_ptr<const phase_offset_navigation::TubeProfile>(),
-        std::numeric_limits<double>::quiet_NaN(), markers);
-  }
-
-  return buildMarkers(control, candidate_epoch->candidate_profile,
-                      candidate_epoch->candidate_build_w, markers);
-}
-
-void PhaseOffsetMatchedAdapter::publishManualDelete(
-    const ControlPublishSnapshot& control) {
-  if (!advertised_ || config_.mode != PhaseOffsetMatchedMode::MANUAL) return;
-  MatchedAdapterMarkerBundle markers;
-  markers.base_path = MakeDelete(control.stamp, config_.frame_id,
-                                 "phase_offset_manual_base", 0);
-  markers.active_path = MakeDelete(control.stamp, config_.frame_id,
-                                   "phase_offset_manual_active", 0);
-  for (int id = 0; id < 4; ++id) {
-    markers.frame.markers.push_back(MakeDelete(
-        control.stamp, config_.frame_id, "phase_offset_manual_frame", id));
-  }
-  const phase_offset_navigation::TubeProfile empty;
-  markers.tube = MakeCertifiedTubeMarkers(control.stamp, config_.frame_id,
-                                           empty, false);
-  markers.tube_candidate = MakeCandidateTubeMarkers(control.stamp,
-      config_.frame_id, empty, false);
-  markers.tube_certified_geometry = MakeCertifiedGeometryTubeMarkers(
-      control.stamp, config_.frame_id, empty, false);
-  manual_base_path_pub_.publish(markers.base_path); manual_active_path_pub_.publish(markers.active_path);
-  manual_frame_pub_.publish(markers.frame); manual_tube_pub_.publish(markers.tube);
-  manual_tube_candidate_pub_.publish(markers.tube_candidate);
-  manual_tube_certified_geometry_pub_.publish(markers.tube_certified_geometry);
-}
-
-bool PhaseOffsetMatchedAdapter::markEpochBuildPublished(
-    const std::uint64_t build_sequence) {
-  const bool due =
-      timer_last_published_epoch_build_sequence_ != build_sequence;
-  timer_last_published_epoch_build_sequence_ = build_sequence;
-  return due;
-}
-
-void PhaseOffsetMatchedAdapter::publishBuildDiagnostics(
-    const TubeEpochSnapshot& epoch) {
-  // 49/18 are build provenance, not control-state facts.  Publish them from
-  // the timer exactly once at completion so a rapidly advancing map cannot
-  // erase a completed observation before the next 50 Hz control handshake.
-  if (config_.mode != PhaseOffsetMatchedMode::MANUAL ||
-      config_.tube_source != phase_offset_navigation::TubeSource::ESDF) {
-    return;
-  }
-  const bool raw_due = epoch.raw_candidate_diagnostics_generated &&
-      timer_last_raw_diagnostic_build_sequence_ != epoch.build_sequence;
-  const bool cloud_due = epoch.cloud_snapshot_diagnostics_generated &&
-      timer_last_cloud_diagnostic_build_sequence_ != epoch.build_sequence;
-  if (raw_due) {
-    timer_last_raw_diagnostic_build_sequence_ = epoch.build_sequence;
-  }
-  if (cloud_due) {
-    timer_last_cloud_diagnostic_build_sequence_ = epoch.build_sequence;
-  }
-  // Production advertising precedes the timer.  Retaining the one-shot state
-  // even in a non-advertised deterministic test lets the test prove that a
-  // source-stale completion has exactly one raw/cloud emission decision.
-  if (!advertised_) return;
-  if (raw_due) {
-    std_msgs::Float64MultiArray raw_candidate_diagnostics;
-    raw_candidate_diagnostics.data.assign(
-        epoch.raw_candidate_diagnostics.begin(),
-        epoch.raw_candidate_diagnostics.end());
-    manual_raw_candidate_diagnostics_pub_.publish(raw_candidate_diagnostics);
-  }
-  if (cloud_due) {
-    std_msgs::Float64MultiArray cloud_snapshot_diagnostics;
-    cloud_snapshot_diagnostics.data.assign(
-        epoch.cloud_snapshot_diagnostics.begin(),
-        epoch.cloud_snapshot_diagnostics.end());
-    manual_cloud_snapshot_diagnostics_pub_.publish(cloud_snapshot_diagnostics);
-  }
-}
-
-bool PhaseOffsetMatchedAdapter::exactLivePairPublicationControl(
-    const ControlPublishSnapshot& control,
-    const TubeBuildRequest& request,
-    const std::shared_ptr<const PathTubePair>& live_pair,
-    const std::uint64_t current_task_generation,
-    const std::uint64_t current_authority_session) {
-  if (!request.active || !control.active || control.candidate_only ||
-      control.task_generation != request.task_generation ||
-      control.control_sequence != request.control_sequence ||
-      control.source_revision != request.source_revision ||
-      control.map_observation_sequence != request.map_observation_sequence ||
-      control.map_observation_is_snapshot !=
-          request.map_observation_is_snapshot ||
-      !request.base_path_tube_pair || !live_pair ||
-      request.base_path_tube_pair != live_pair ||
-      request.base_path_tube_pair_generation != live_pair->generation ||
-      request.authority_session != live_pair->authority_session ||
-      current_authority_session != live_pair->authority_session ||
-      request.task_generation != current_task_generation ||
-      control.task_generation != current_task_generation ||
-      control.source_revision != live_pair->source_revision ||
-      request.source_revision != live_pair->source_revision ||
-      request.semantic_path_owner != live_pair->path_owner ||
-      !live_pair->epoch_snapshot || !live_pair->active_profile ||
-      control.epoch_snapshot != live_pair->epoch_snapshot ||
-      !live_pair->epoch_snapshot->active ||
-      live_pair->epoch_snapshot->task_generation != current_task_generation ||
-      live_pair->epoch_snapshot->source_revision != live_pair->source_revision ||
-      control.output.active_profile != live_pair->active_profile ||
-      live_pair->epoch_snapshot->active_profile != live_pair->active_profile ||
-      live_pair->epoch_snapshot->candidate_profile !=
-          control.output.candidate_profile) {
+    if (!recovery_running && request->tube_worker_input_v2 &&
+        request->tube_worker_purpose_v2 == TubeWorkerPurposeV2::CURRENT) {
+      std::shared_ptr<const TubeWorkerCompletionV2> completion;
+      {
+        std::lock_guard<std::mutex> worker_lock(worker_state_mutex_);
+        completion = latest_v2_shadow_current_completion_;
+      }
+      if (completion && completion->request_id == request->tube_worker_input_v2->request_id) {
+        const bool admitted = prepareV2ShadowAdmission(
+            input, request->tube_worker_input_v2, completion, admission_candidate);
+        if (!admitted && completion->request_id == request->tube_worker_input_v2->request_id)
+          releaseCurrentCohort(completion->request_id);
+      }
+    }
+    if (successor_admission_candidate &&
+        successor_admission_candidate->applicable &&
+        input.tube_v2_successor_handoff) {
+      MatchedAdapterOutput selected_output = output;
+      TubeV2ShadowAdmissionCandidate enriched =
+          *successor_admission_candidate;
+      std::string authority_reason;
+      if (PopulateV2SuccessorOutput(
+              config_, input, enriched, selected_output) &&
+          prepareV2ExecutionAuthorityLocked(
+              input, selected_output,
+              phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL,
+              enriched.proposed_binding, enriched, &authority_reason)) {
+        successor_admission_candidate =
+            std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+                std::move(enriched));
+      }
+      if (successor_admission_candidate->authority_prepared.valid &&
+          stageV2ShadowSuccessorLocked(
+              input, *input.tube_v2_successor_handoff,
+              successor_admission_candidate)) {
+        output = selected_output;
+        latest_v2_shadow_admission_candidate_ =
+            successor_admission_candidate;
+        output.v2_shadow_admission_candidate =
+            successor_admission_candidate;
+        return true;
+      }
+      pending_v2_shadow_bootstrap_candidate_.reset();
+    }
+    // A refresh gap or failed replacement must still re-check the installed
+    // immutable profile against the whole next ZOH command and its exact
+    // successor reserve.  If that command is unavailable, prepare the first
+    // step of the already committed finite reserve through the existing
+    // RecoveryOwner seam; its commit remains publish-gated.
+    const bool successor_prefix_expired = successor_admission_candidate &&
+        !successor_admission_candidate->applicable &&
+        successor_admission_candidate->status ==
+            phase_offset_navigation::TubeExecutionStatusV2::RANGE_UNAVAILABLE;
+    if (v2_execution_binding_ &&
+        (recovery_running || !admission_candidate ||
+         !admission_candidate->applicable || successor_prefix_expired)) {
+      std::shared_ptr<const TubeV2ShadowAdmissionCandidate> incumbent_candidate;
+      const bool incumbent_applicable =
+          prepareV2ShadowIncumbentApplicability(
+              input, v2_execution_binding_->profile, incumbent_candidate,
+              &incumbent_recovery_step, successor_prefix_expired);
+      if (incumbent_applicable) {
+        admission_candidate = incumbent_candidate;
+      } else if (incumbent_candidate && incumbent_candidate->recovery_step.valid) {
+        // Keep the exact finite-reserve step and its preallocated Runtime
+        // successor together; the existing pending PositionCommand seam is
+        // the only place allowed to publish and advance either owner.
+        admission_candidate = incumbent_candidate;
+      } else if (incumbent_candidate &&
+                 incumbent_candidate->status ==
+                     phase_offset_navigation::TubeExecutionStatusV2::
+                         TRACKING_UNAVAILABLE) {
+        // Tracking/physical applicability failure is still useful
+        // value-only evidence.  Retain the immutable incumbent so this
+        // categorical denial cannot be mistaken for profile loss or cause
+        // an unrelated retirement; no certified recovery is attached.
+        admission_candidate = incumbent_candidate;
+      }
+    }
+    if (incumbent_recovery_step.status ==
+        phase_offset_navigation::RecoveryStepStatus::PREPARED) {
+      output.recovery_status = incumbent_recovery_step.status;
+      output.recovery_replan_required = false;
+    } else if (v2_execution_binding_ && admission_candidate &&
+               !admission_candidate->applicable &&
+               input.tube_v2_admission.valid) {
+      output.recovery_status =
+          phase_offset_navigation::RecoveryStepStatus::RECOVERY_REPLAN_REQUIRED;
+      output.recovery_replan_required = true;
+    }
+    if (admission_candidate &&
+        admission_candidate->recovery_step.valid) {
+      MatchedAdapterOutput selected_output = output;
+      TubeV2ShadowAdmissionCandidate enriched = *admission_candidate;
+      std::string authority_reason;
+      if (PopulateV2RecoveryOutput(
+              config_, input, enriched, selected_output) &&
+          prepareV2ExecutionAuthorityLocked(
+              input, selected_output,
+              phase_offset_navigation::ActiveReferenceOwnerMode::RECOVERY,
+              v2_execution_binding_, enriched, &authority_reason)) {
+        admission_candidate =
+            std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+                std::move(enriched));
+      }
+      if (admission_candidate->authority_prepared.valid &&
+          stageV2ShadowRecoveryLocked(input, admission_candidate)) {
+        output = selected_output;
+        latest_v2_shadow_admission_candidate_ = admission_candidate;
+        output.v2_shadow_admission_candidate = admission_candidate;
+        return true;
+      }
+      output.selected = false;
+      output.valid = false;
+      output.recovery_status =
+          phase_offset_navigation::RecoveryStepStatus::
+              RECOVERY_REPLAN_REQUIRED;
+      output.recovery_replan_required = true;
+      output.invalid_reason = "V2 recovery publication transaction is unavailable";
+    }
+    if (admission_candidate && admission_candidate->applicable &&
+        !admission_candidate->recovery_step.valid &&
+        admission_candidate->proposed_binding &&
+        admission_candidate->proposed_binding->source_input) {
+      MatchedAdapterOutput selected_output = output;
+      TubeV2ShadowAdmissionCandidate enriched = *admission_candidate;
+      std::string authority_reason;
+      if (PopulateV2NormalOutput(config_, input, enriched, selected_output) &&
+          prepareV2ExecutionAuthorityLocked(
+              input, selected_output,
+              phase_offset_navigation::ActiveReferenceOwnerMode::NORMAL,
+              enriched.proposed_binding, enriched, &authority_reason)) {
+        admission_candidate =
+            std::make_shared<const TubeV2ShadowAdmissionCandidate>(
+                std::move(enriched));
+      }
+      if (admission_candidate->authority_prepared.valid &&
+          stageV2ShadowBootstrapLocked(
+              input, *admission_candidate->proposed_binding->source_input,
+              admission_candidate)) {
+        output = selected_output;
+        latest_v2_shadow_admission_candidate_ = admission_candidate;
+        output.v2_shadow_admission_candidate = admission_candidate;
+        return true;
+      }
+      if (!admission_candidate->nonselecting)
+        releaseCurrentCohort(admission_candidate->request_id);
+      pending_v2_shadow_bootstrap_candidate_.reset();
+    }
+    const std::shared_ptr<const TubeV2ShadowAdmissionCandidate>& reported =
+        successor_admission_candidate ? successor_admission_candidate
+                                      : admission_candidate;
+    latest_v2_shadow_admission_candidate_ = reported;
+    output.v2_shadow_admission_candidate = reported;
     return false;
   }
-  const TubeEpochSnapshot& epoch = *live_pair->epoch_snapshot;
-  return control.epoch_build_sequence == epoch.build_sequence &&
-      control.candidate_epoch_source_revision == epoch.source_revision &&
-      control.candidate_epoch_map_observation_sequence ==
-          epoch.map_observation_sequence &&
-      control.candidate_epoch_map_observation_is_snapshot ==
-          epoch.map_observation_is_snapshot &&
-      control.output.tube_epoch_status.candidate_sequence ==
-          epoch.epoch_status.candidate_sequence &&
-      control.output.tube_epoch_status.active_tube_epoch ==
-          epoch.epoch_status.active_tube_epoch &&
-      control.output.tube_epoch_status.candidate_path_source_revision ==
-          epoch.epoch_status.candidate_path_source_revision &&
-      control.output.tube_epoch_status.candidate_map_observation_sequence ==
-          epoch.epoch_status.candidate_map_observation_sequence &&
-      live_pair->epoch_status.candidate_sequence ==
-          epoch.epoch_status.candidate_sequence &&
-      live_pair->epoch_status.active_tube_epoch ==
-          epoch.epoch_status.active_tube_epoch &&
-      live_pair->epoch_status.candidate_path_source_revision ==
-          epoch.epoch_status.candidate_path_source_revision &&
-      live_pair->epoch_status.candidate_map_observation_sequence ==
-          epoch.epoch_status.candidate_map_observation_sequence;
 }
-
-std::shared_ptr<const TubeEpochSnapshot>
-PhaseOffsetMatchedAdapter::selectCandidateEpochForPublication(
-    const bool exact_live_pair_control,
-    const std::shared_ptr<const TubeEpochSnapshot>& authoritative_candidate,
-    const std::shared_ptr<const TubeEpochSnapshot>& control_epoch) {
-  // A newer authoritative Candidate wins when exact-live-pair publication has
-  // one.  Otherwise the exact live pair epoch remains the Candidate owner;
-  // never substitute the later command-cycle phase for either epoch.
-  return exact_live_pair_control && authoritative_candidate
-      ? authoritative_candidate
-      : control_epoch;
-}
-
-bool PhaseOffsetMatchedAdapter::certifiedGeometryCandidateEligible(
-    const TubeBuildRequest& request,
-    const TubeEpochSnapshot& candidate,
-    const std::uint64_t current_task_generation) {
-  // R3 is a display-only predicate.  It deliberately does not call
-  // epochMatchesRequest(), inspect Pair/Active ownership, or consult Runtime
-  // and ExecutionAuthority state.
-  if (!request.active ||
-      request.task_generation != current_task_generation ||
-      request.source_revision == 0U || !request.semantic_path_owner ||
-      request.semantic_path_owner->empty() ||
-      !FrameMatchesRevision(request.frame_owner, request.source_revision)) {
-    return false;
-  }
-  if (!candidate.active || candidate.task_generation != request.task_generation ||
-      candidate.task_generation != current_task_generation ||
-      candidate.source_revision == 0U ||
-      candidate.source_revision != request.source_revision ||
-      candidate.request_control_sequence > request.control_sequence ||
-      candidate.map_observation_sequence == 0U ||
-      !candidate.map_observation_is_snapshot) {
-    return false;
-  }
-
-  const phase_offset_navigation::TubeEpochStatus& status =
-      candidate.epoch_status;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfile>& profile =
-      candidate.candidate_profile;
-  if (!profile || profile->source != phase_offset_navigation::TubeSource::ESDF ||
-      profile->source_revision == 0U ||
-      profile->source_revision != candidate.source_revision ||
-      status.candidate_path_source_revision != candidate.source_revision ||
-      status.candidate_map_observation_sequence !=
-          candidate.map_observation_sequence ||
-      !status.map_observation_is_snapshot ||
-      status.map_observation_is_snapshot != candidate.map_observation_is_snapshot) {
-    return false;
-  }
-
-  const bool profile_complete = profile->raw_complete &&
-      profile->filtered_complete && profile->complete;
-  const bool status_complete = status.candidate_raw_complete &&
-      status.candidate_filtered_complete && status.candidate_complete;
-  if (!profile_complete || !status_complete ||
-      profile->raw_complete != status.candidate_raw_complete ||
-      profile->filtered_complete != status.candidate_filtered_complete ||
-      profile->complete != status.candidate_complete ||
-      profile->classification !=
-          phase_offset_navigation::TubeProfileClassification::OFFSET_CERTIFIED ||
-      status.candidate_classification != profile->classification ||
-      profile->zero_only || status.candidate_zero_only ||
-      !profile->obstacle_certified) {
-    return false;
-  }
-
-  if (profile->path_revision == 0U || profile->frame_revision == 0U ||
-      profile->path_revision != request.frame_owner->pathRevision() ||
-      profile->path_revision != request.source_revision ||
-      profile->frame_revision != request.frame_owner->frameRevision() ||
-      profile->tube_revision == 0U ||
-      profile->tube_revision != profile->profile_revision ||
-      profile->tube_revision != status.candidate_sequence ||
-      profile->map_revision == 0U ||
-      profile->map_revision != profile->snapshot_sequence ||
-      profile->map_revision != candidate.map_observation_sequence ||
-      profile->map_revision != status.candidate_map_observation_sequence ||
-      !profile->snapshot_provenance_is_immutable) {
-    return false;
-  }
-
-  return CertifiedGeometryProfileSamplesValid(*profile);
-}
-
-visualization_msgs::MarkerArray
-PhaseOffsetMatchedAdapter::certifiedGeometryMarkers(const ros::Time& stamp) const {
-
-  // Frozen Candidate/request linearization protocol:
-  //   request A -> Candidate -> request B -> require A == B
-  //   -> full stateless predicate -> final request identity reread -> ADD.
-  // Any failed check is one all-DELETE bundle.  The Candidate slot itself is
-  // never an authority and is never retried or replaced by Pair/Active data.
-  if (config_.mode != PhaseOffsetMatchedMode::MANUAL ||
-      config_.tube_source != phase_offset_navigation::TubeSource::ESDF) {
-    const phase_offset_navigation::TubeProfile empty;
-    return MakeCertifiedGeometryTubeMarkers(stamp, config_.frame_id, empty,
-                                            false);
-  }
-  const std::shared_ptr<const TubeBuildRequest> request_a =
-      std::atomic_load(&latest_build_request_);
-  const std::shared_ptr<const TubeEpochSnapshot> candidate =
-      std::atomic_load(&latest_candidate_epoch_snapshot_);
-  const std::shared_ptr<const TubeBuildRequest> request_b =
-      std::atomic_load(&latest_build_request_);
-
-  bool eligible = request_a && request_b && request_a == request_b &&
-      candidate && certifiedGeometryCandidateEligible(
-          *request_b, *candidate,
-          task_generation_.load(std::memory_order_acquire));
-  if (eligible) {
-    if (certified_geometry_linearization_test_hook_) {
-      certified_geometry_linearization_test_hook_();
-    }
-    const std::shared_ptr<const TubeBuildRequest> request_final =
-        std::atomic_load(&latest_build_request_);
-    eligible = request_final == request_b;
-  }
-
-  const phase_offset_navigation::TubeProfile empty;
-  const phase_offset_navigation::TubeProfile& profile =
-      eligible && candidate && candidate->candidate_profile
-      ? *candidate->candidate_profile : empty;
-  const visualization_msgs::MarkerArray markers =
-      MakeCertifiedGeometryTubeMarkers(stamp, config_.frame_id, profile,
-                                       eligible);
-  return markers;
-}
-
-void PhaseOffsetMatchedAdapter::publishManual(
-    const ControlPublishSnapshot& control) {
-  if (!advertised_ || config_.mode != PhaseOffsetMatchedMode::MANUAL) return;
-  const std::shared_ptr<const TubeBuildRequest> request =
-      std::atomic_load(&latest_build_request_);
-  const std::shared_ptr<const TubeEpochSnapshot> candidate_before_publish =
-      std::atomic_load(&latest_candidate_epoch_snapshot_);
-  // R3 geometric publication is bound to the independent atomic
-  // Candidate/request protocol and remains meaningful even when this
-  // command snapshot is stale or execution-side identity is not current.
-  // An empty lifecycle has its one DELETE emitted by publishManualDelete().
-  const bool needs_certified_geometry_decision =
-      control.active && (control.epoch_snapshot || candidate_before_publish);
-  // Marker ownership follows the complete command identity.  A timer
-  // completion from an older task/source/control/map must not clear or
-  // overwrite a newer namespace, even when its source revision happens to
-  // compare equal.
-  const bool current_control_identity = request && request->active &&
-      control.active &&
-      control.task_generation == request->task_generation &&
-      control.control_sequence == request->control_sequence &&
-      control.source_revision == request->source_revision &&
-      control.map_observation_sequence == request->map_observation_sequence &&
-      control.map_observation_is_snapshot ==
-          request->map_observation_is_snapshot &&
-      task_generation_.load(std::memory_order_acquire) ==
-          request->task_generation;
-  if (!current_control_identity) {
-    // A stale timer completion must not republish its old ordinary markers,
-    // but it still owns one independent R3 decision.  Loading the current
-    // request/Candidate here yields DELETE after source replacement (or ADD
-    // for an already-completed replacement Candidate) without touching the
-    // existing topic semantics.
-    if (control.active &&
-        (control.epoch_snapshot || candidate_before_publish)) {
-      manual_tube_certified_geometry_pub_.publish(
-          certifiedGeometryMarkers(control.stamp));
-    }
-    return;
-  }
-
-  const std::shared_ptr<const TubeEpochSnapshot> latest_candidate =
-      std::atomic_load(&latest_candidate_epoch_snapshot_);
-  const std::shared_ptr<const TubeEpochSnapshot> authoritative_candidate =
-      latest_candidate && latest_candidate->active &&
-      latest_candidate->task_generation == request->task_generation &&
-      latest_candidate->source_revision == request->source_revision &&
-      (config_.tube_source == phase_offset_navigation::TubeSource::NONE ||
-       latest_candidate->epoch_status.candidate_path_source_revision ==
-           request->source_revision)
-      ? latest_candidate : std::shared_ptr<const TubeEpochSnapshot>();
-  const bool candidate_epoch_keys_match = control.epoch_snapshot &&
-      control.task_generation == control.epoch_snapshot->task_generation &&
-      control.epoch_build_sequence == control.epoch_snapshot->build_sequence &&
-      control.candidate_epoch_source_revision ==
-          control.epoch_snapshot->source_revision &&
-      control.candidate_epoch_map_observation_sequence ==
-          control.epoch_snapshot->map_observation_sequence &&
-      control.candidate_epoch_map_observation_is_snapshot ==
-          control.epoch_snapshot->map_observation_is_snapshot;
-  const bool regular_epoch_is_current =
-      candidate_epoch_keys_match && !control.candidate_only &&
-      epochMatchesRequest(*control.epoch_snapshot, *request);
-  // A current request that fails the existing cloud contract may still display
-  // a same-source historical Candidate because it has no Active/Certified
-  // ownership whatsoever.
-  const bool historical_candidate_is_publishable =
-      control.candidate_only && candidate_epoch_keys_match &&
-      control.candidate_epoch_source_revision == control.source_revision &&
-      !control.epoch_snapshot->active_profile &&
-      !control.output.active_profile &&
-      !control.output.tube_epoch_status.active_available;
-  const bool control_keys_match = regular_epoch_is_current ||
-      historical_candidate_is_publishable;
-  const bool output_matches_epoch = control.epoch_snapshot &&
-      control.output.candidate_profile == control.epoch_snapshot->candidate_profile &&
-      control.output.active_profile == control.epoch_snapshot->active_profile &&
-      control.output.tube_epoch_status.candidate_sequence ==
-          control.epoch_snapshot->epoch_status.candidate_sequence &&
-      control.output.tube_epoch_status.active_tube_epoch ==
-          control.epoch_snapshot->epoch_status.active_tube_epoch &&
-      control.output.tube_epoch_status.candidate_path_source_revision ==
-          control.epoch_snapshot->epoch_status.candidate_path_source_revision &&
-      control.output.tube_epoch_status.candidate_map_observation_sequence ==
-          control.epoch_snapshot->epoch_status.candidate_map_observation_sequence;
-  const std::shared_ptr<const PathTubePair> live_pair =
-      std::atomic_load(&authoritative_path_tube_pair_);
-  const bool exact_live_pair_control = current_control_identity &&
-      output_matches_epoch &&
-      exactLivePairPublicationControl(
-          control, *request, live_pair,
-          task_generation_.load(std::memory_order_acquire),
-          authority_session_.load(std::memory_order_acquire));
-
-  // A current lifecycle with no authoritative epoch owns a one-shot DELETE
-  // for both topics.  This is distinct from a stale callback above.
-  if (!control.epoch_snapshot && !authoritative_candidate) {
-    if (timer_last_publish_delete_source_revision_ != request->source_revision ||
-        timer_last_publish_delete_map_observation_sequence_ !=
-            request->map_observation_sequence) {
-      publishManualDelete(control);
-      timer_last_publish_delete_source_revision_ = request->source_revision;
-      timer_last_publish_delete_map_observation_sequence_ =
-          request->map_observation_sequence;
-    }
-    return;
-  }
-
-  // An epoch/profile/status mismatch is a current-identity integrity failure,
-  // not ordinary staleness.  Certified visibility fails closed; candidate
-  // geometry may come only from the current authoritative epoch, never from
-  // the mismatched callback payload.
-  const bool authoritative_epoch_matches_control =
-      authoritative_candidate && control.epoch_snapshot == authoritative_candidate;
-  const bool regular_control_owner = control_keys_match &&
-      output_matches_epoch && authoritative_epoch_matches_control;
-  if (!regular_control_owner && !exact_live_pair_control) {
-    MatchedAdapterMarkerBundle markers;
-    ControlPublishSnapshot authoritative_control = control;
-    if (authoritative_candidate) {
-      authoritative_control.epoch_snapshot = authoritative_candidate;
-      authoritative_control.epoch_build_sequence =
-          authoritative_candidate->build_sequence;
-      authoritative_control.candidate_epoch_source_revision =
-          authoritative_candidate->source_revision;
-      authoritative_control.candidate_epoch_map_observation_sequence =
-          authoritative_candidate->map_observation_sequence;
-      authoritative_control.candidate_epoch_map_observation_is_snapshot =
-          authoritative_candidate->map_observation_is_snapshot;
-      authoritative_control.output.candidate_profile =
-          authoritative_candidate->candidate_profile;
-      authoritative_control.output.tube_epoch_status =
-          authoritative_candidate->epoch_status;
-    } else {
-      authoritative_control.output.candidate_profile.reset();
-      authoritative_control.output.active_profile.reset();
-    }
-    buildMarkers(authoritative_control, authoritative_candidate, markers);
-    markers.tube = MakeCertifiedTubeMarkers(
-        control.stamp, config_.frame_id,
-        phase_offset_navigation::TubeProfile(), false);
-    manual_base_path_pub_.publish(markers.base_path);
-    manual_active_path_pub_.publish(markers.active_path);
-    manual_frame_pub_.publish(markers.frame);
-    manual_tube_pub_.publish(markers.tube);
-    manual_tube_candidate_pub_.publish(markers.tube_candidate);
-    if (needs_certified_geometry_decision) {
-      markers.tube_certified_geometry = certifiedGeometryMarkers(control.stamp);
-      manual_tube_certified_geometry_pub_.publish(
-          markers.tube_certified_geometry);
-    }
-    return;
-  }
-
-  MatchedAdapterMarkerBundle markers;
-  const std::shared_ptr<const TubeEpochSnapshot> candidate_epoch =
-      selectCandidateEpochForPublication(
-          exact_live_pair_control, authoritative_candidate,
-          control.epoch_snapshot);
-  if (candidate_epoch) {
-    buildMarkers(control, candidate_epoch, markers);
-  } else {
-    // No exact immutable Candidate epoch is available; retain the existing
-    // fail-closed DELETE behavior without using ControlPublishSnapshot::current_w.
-    buildMarkers(
-        control,
-        std::shared_ptr<const phase_offset_navigation::TubeProfile>(),
-        std::numeric_limits<double>::quiet_NaN(), markers);
-  }
-  // Publication owns the one-shot 50-field "tube due" fact.  A later 50 Hz
-  // command may overwrite its control snapshot before this tick, so command
-  // output cannot be the authoritative pending bit.
-  MatchedAdapterOutput output = control.output;
-  if (needs_certified_geometry_decision) {
-    markers.tube_certified_geometry = certifiedGeometryMarkers(control.stamp);
-  }
-  output.tube_update_due_this_cycle =
-      markEpochBuildPublished(control.epoch_build_sequence);
-  manual_base_path_pub_.publish(markers.base_path); manual_active_path_pub_.publish(markers.active_path);
-  manual_frame_pub_.publish(markers.frame); manual_tube_pub_.publish(markers.tube);
-  manual_tube_candidate_pub_.publish(markers.tube_candidate);
-  if (needs_certified_geometry_decision) {
-    manual_tube_certified_geometry_pub_.publish(
-        markers.tube_certified_geometry);
-  }
-  std_msgs::Float64MultiArray diagnostics;
-  diagnostics.data.assign(output.diagnostics.begin(), output.diagnostics.end());
-  manual_diagnostics_pub_.publish(diagnostics);
-  TubeEpochDiagnosticsInput epoch_input;
-  epoch_input.source = config_.tube_source; epoch_input.epoch = output.tube_epoch_status;
-  epoch_input.runtime = output.runtime_execution; epoch_input.candidate_profile = output.candidate_profile.get();
-  epoch_input.active_profile = output.active_profile.get(); epoch_input.retained_delta = output.delta;
-  epoch_input.active_display_certified = tubeDisplayCertified(output);
-  epoch_input.tube_update_due_this_cycle = output.tube_update_due_this_cycle;
-  epoch_input.control_selected = output.selected;
-  epoch_input.failure_latched = output.failure_latched;
-  epoch_input.control_failure_reason = output.control_failure_reason;
-  const auto epoch_values = makeTubeEpochDiagnostics(epoch_input);
-  std_msgs::Float64MultiArray epoch_diagnostics;
-  epoch_diagnostics.data.assign(epoch_values.begin(), epoch_values.end());
-  manual_tube_epoch_diagnostics_pub_.publish(epoch_diagnostics);
-}
-
 }  // namespace FLAG_Race

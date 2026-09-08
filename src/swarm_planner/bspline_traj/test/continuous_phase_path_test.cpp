@@ -3,11 +3,20 @@
 #include <bspline_race/continuous_phase_path.h>
 #include <bspline_race/continuous_phase_normal_frame.h>
 
+#include <cfenv>
 #include <cmath>
 #include <limits>
 
+#if defined(__i386__) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 namespace
 {
+
+using FLAG_Race::ContinuousPhasePath;
+using FLAG_Race::ContinuousPhasePathState;
+using FLAG_Race::UniformBspline;
 
 void expectVectorNear(const Eigen::Vector3d& actual,
                       const Eigen::Vector3d& expected,
@@ -515,6 +524,17 @@ TEST(ContinuousPhasePath,
                             pathCellGeometryCertificateIsComplete(certificate));
             }
 
+            phase_offset_core::CertifiedPathCellV2 v2_certificate;
+            const bool v2_ok = path.tubeCellBoundsV2(
+                0.25 * span, 0.75 * span, v2_certificate);
+            EXPECT_EQ(v2_ok, q > epsilon);
+            if (v2_ok) {
+                EXPECT_GT(v2_certificate.inf_horizontal_p_w_norm.lower,
+                          epsilon);
+                EXPECT_TRUE(phase_offset_core::
+                            certifiedPathCellV2IsComplete(v2_certificate));
+            }
+
             const auto path_owner =
                 std::make_shared<FLAG_Race::ContinuousPhasePath>(path);
             FLAG_Race::ContinuousPhaseNormalFrame frame(path_owner, 7U, 11U);
@@ -607,6 +627,394 @@ TEST(ContinuousPhasePath,
     phase_offset_core::PathCellGeometryCertificate certificate;
     EXPECT_FALSE(path.cellBounds(0.25 * span, 0.75 * span, certificate));
     EXPECT_FALSE(certificate.complete);
+    phase_offset_core::CertifiedPathCellV2 v2_certificate;
+    EXPECT_FALSE(path.tubeCellBoundsV2(0.25 * span, 0.75 * span,
+                                       v2_certificate));
+    EXPECT_FALSE(v2_certificate.complete);
+}
+
+TEST(ContinuousPhasePath, V2QuinticRegularSubcellIsCertified)
+{
+    const double segment_w0 = 2.0;
+    const double segment_w1 = 5.0;
+    ContinuousPhasePathState start;
+    start.p = Eigen::Vector3d(0.0, 0.0, 0.0);
+    start.dp_dw = Eigen::Vector3d(2.0, 0.0, 1.0);
+    start.d2p_dw2 = Eigen::Vector3d::Zero();
+    start.vel = start.dp_dw;
+    start.valid = true;
+    ContinuousPhasePathState end = start;
+    end.p = (segment_w1 - segment_w0) * start.dp_dw;
+
+    const auto evaluator =
+        ContinuousPhasePath::makeQuinticHermite(
+            segment_w0, segment_w1, start, end);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+    ContinuousPhasePath path;
+    path.setPathRevision(17U);
+    ASSERT_TRUE(path.appendSegment(segment_w0, segment_w1,
+                                   "v2_quintic", evaluator));
+
+    const double cell_w0 = 2.5;
+    const double cell_w1 = 4.5;
+    phase_offset_core::CertifiedPathCellV2 certificate;
+    ASSERT_TRUE(path.tubeCellBoundsV2(cell_w0, cell_w1, certificate));
+    ASSERT_TRUE(phase_offset_core::certifiedPathCellV2IsComplete(certificate));
+    EXPECT_DOUBLE_EQ(certificate.w0, cell_w0);
+    EXPECT_DOUBLE_EQ(certificate.w1, cell_w1);
+    EXPECT_DOUBLE_EQ(certificate.anchor_w, 3.5);
+    EXPECT_GT(certificate.inf_horizontal_p_w_norm.lower,
+              phase_offset_core::kHorizontalNormalSpeedEpsilon);
+    const double expected_constant_speed = std::sqrt(5.0);
+    EXPECT_LE(certificate.inf_p_w_norm.lower, expected_constant_speed);
+    EXPECT_GE(certificate.sup_p_w_norm.upper, expected_constant_speed);
+    EXPECT_DOUBLE_EQ(certificate.sup_p_ww_norm.upper, 0.0);
+
+    ContinuousPhasePathState anchor;
+    ASSERT_TRUE(path.evaluate(certificate.anchor_w, anchor, false));
+    for (int component = 0; component < 3; ++component) {
+        EXPECT_LE(certificate.anchor_position.component[component].lower,
+                  anchor.p(component));
+        EXPECT_LE(anchor.p(component),
+                  certificate.anchor_position.component[component].upper);
+        EXPECT_LE(certificate.anchor_p_w.component[component].lower,
+                  anchor.dp_dw(component));
+        EXPECT_LE(anchor.dp_dw(component),
+                  certificate.anchor_p_w.component[component].upper);
+        EXPECT_LE(certificate.anchor_p_ww.component[component].lower,
+                  anchor.d2p_dw2(component));
+        EXPECT_LE(anchor.d2p_dw2(component),
+                  certificate.anchor_p_ww.component[component].upper);
+    }
+    EXPECT_LE(certificate.inf_p_w_norm.lower, anchor.dp_dw.norm());
+    EXPECT_LE(anchor.dp_dw.norm(), certificate.sup_p_w_norm.upper);
+
+}
+
+TEST(ContinuousPhasePath, V2AnchorEnclosesUnrepresentableMathematicalMidpoint)
+{
+    // At 2^53 the mathematical midpoint of [A,A+2] is A+1, which rounds to
+    // A as a binary64 phase value.  The proof anchor must still enclose p(c)
+    // at c=A+1 rather than silently certifying only the rounded query phase.
+    const double A = std::ldexp(1.0, 53);
+    ContinuousPhasePathState start;
+    start.p = Eigen::Vector3d::Zero();
+    start.dp_dw = Eigen::Vector3d(1.0, 0.0, 0.0);
+    start.d2p_dw2 = Eigen::Vector3d::Zero();
+    start.vel = start.dp_dw;
+    start.valid = true;
+    ContinuousPhasePathState end = start;
+    end.p = Eigen::Vector3d(4.0, 0.0, 0.0);
+    const auto evaluator = ContinuousPhasePath::makeQuinticHermite(
+        A, A + 4.0, start, end);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+    ContinuousPhasePath path;
+    ASSERT_TRUE(path.appendSegment(A, A + 4.0, "large_phase", evaluator));
+    phase_offset_core::CertifiedPathCellV2 certificate;
+    ASSERT_TRUE(path.tubeCellBoundsV2(A, A + 2.0, certificate));
+    ASSERT_TRUE(phase_offset_core::certifiedPathCellV2IsComplete(certificate));
+    const double mathematical_midpoint_position = 1.0;
+    EXPECT_LE(certificate.anchor_position.component[0].lower,
+              mathematical_midpoint_position);
+    EXPECT_LE(mathematical_midpoint_position,
+              certificate.anchor_position.component[0].upper);
+}
+
+TEST(ContinuousPhasePath, V2MappedBsplineRegularCellIsCertified)
+{
+    Eigen::MatrixXd control_points(8, 3);
+    control_points <<
+        0.0, 0.0, 1.0,
+        0.3, 0.0, 1.0,
+        0.7, 0.3, 1.0,
+        1.0, 0.8, 1.0,
+        1.3, 1.1, 1.0,
+        1.7, 1.0, 1.0,
+        2.1, 0.6, 1.0,
+        2.5, 0.5, 1.0;
+    UniformBspline spline;
+    ASSERT_TRUE(spline.setControlPointsAndInterval(control_points, 3, 0.2));
+    const auto evaluator = ContinuousPhasePath::makeMappedBspline(
+        spline, spline.t_range(0), spline.t_range(1), 2.0, 5.0);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+
+    ContinuousPhasePath path;
+    path.setPathRevision(23U);
+    ASSERT_TRUE(path.appendSegment(2.0, 5.0, "v2_mapped", evaluator));
+    phase_offset_core::CertifiedPathCellV2 certificate;
+    ASSERT_TRUE(path.tubeCellBoundsV2(2.2, 2.8, certificate));
+    ASSERT_TRUE(phase_offset_core::certifiedPathCellV2IsComplete(certificate));
+    EXPECT_EQ(certificate.segment_identity, 1U);
+    EXPECT_EQ(certificate.path_revision, 23U);
+    EXPECT_EQ(certificate.frame_revision, 23U);
+    EXPECT_TRUE(path.certificateBreakpointsV2().size() > 2U);
+
+    ContinuousPhasePathState anchor;
+    ASSERT_TRUE(path.evaluate(certificate.anchor_w, anchor, false));
+    for (int component = 0; component < 3; ++component) {
+        EXPECT_LE(certificate.anchor_position.component[component].lower,
+                  anchor.p(component));
+        EXPECT_LE(anchor.p(component),
+                  certificate.anchor_position.component[component].upper);
+        EXPECT_LE(certificate.anchor_p_w.component[component].lower,
+                  anchor.dp_dw(component));
+        EXPECT_LE(anchor.dp_dw(component),
+                  certificate.anchor_p_w.component[component].upper);
+        EXPECT_LE(certificate.anchor_p_ww.component[component].lower,
+                  anchor.d2p_dw2(component));
+        EXPECT_LE(anchor.d2p_dw2(component),
+                  certificate.anchor_p_ww.component[component].upper);
+    }
+    EXPECT_LE(certificate.inf_p_w_norm.lower, anchor.dp_dw.norm());
+    EXPECT_LE(anchor.dp_dw.norm(), certificate.sup_p_w_norm.upper);
+
+    ContinuousPhasePath source;
+    ASSERT_TRUE(source.appendSegment(2.0, 5.0, "v2_mapped_source",
+                                     evaluator));
+    ContinuousPhasePath slice;
+    ASSERT_TRUE(slice.appendSlice(source, 2.2, 2.8));
+    phase_offset_core::CertifiedPathCellV2 sliced_certificate;
+    ASSERT_TRUE(slice.tubeCellBoundsV2(2.3, 2.7, sliced_certificate));
+    EXPECT_DOUBLE_EQ(sliced_certificate.w0, 2.3);
+    EXPECT_DOUBLE_EQ(sliced_certificate.w1, 2.7);
+    EXPECT_EQ(sliced_certificate.segment_identity, 1U);
+}
+
+TEST(ContinuousPhasePath, V2AnchorCoversSignedSecondDerivativeAndSlices)
+{
+    ContinuousPhasePathState start;
+    start.p = Eigen::Vector3d(0.0, 0.0, 0.0);
+    start.dp_dw = Eigen::Vector3d(1.0, 0.4, 0.8);
+    start.d2p_dw2 = Eigen::Vector3d(0.7, -0.2, 0.3);
+    start.vel = start.dp_dw;
+    start.valid = true;
+    ContinuousPhasePathState end = start;
+    end.p = Eigen::Vector3d(1.4, 0.2, 1.0);
+    end.dp_dw = Eigen::Vector3d(0.5, 0.9, 0.6);
+    end.d2p_dw2 = Eigen::Vector3d(-0.8, 0.3, -0.4);
+    const auto evaluator = ContinuousPhasePath::makeQuinticHermite(
+        0.0, 1.0, start, end);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+
+    ContinuousPhasePath path;
+    ASSERT_TRUE(path.appendSegment(0.0, 1.0, "signed_anchor", evaluator));
+    phase_offset_core::CertifiedPathCellV2 certificate;
+    ASSERT_TRUE(path.tubeCellBoundsV2(0.2, 0.8, certificate));
+    ASSERT_TRUE(phase_offset_core::certifiedPathCellV2IsComplete(certificate));
+    ContinuousPhasePathState anchor;
+    ASSERT_TRUE(path.evaluate(certificate.anchor_w, anchor, false));
+    for (int component = 0; component < 3; ++component) {
+        EXPECT_LE(certificate.anchor_p_ww.component[component].lower,
+                  anchor.d2p_dw2(component));
+        EXPECT_LE(anchor.d2p_dw2(component),
+                  certificate.anchor_p_ww.component[component].upper);
+    }
+
+    Eigen::MatrixXd control_points(8, 3);
+    control_points <<
+        0.0, 0.0, 1.0,
+        0.3, 0.0, 1.0,
+        0.7, 0.3, 1.0,
+        1.0, 0.8, 1.0,
+        1.3, 1.1, 1.0,
+        1.7, 1.0, 1.0,
+        2.1, 0.6, 1.0,
+        2.5, 0.5, 1.0;
+    UniformBspline spline;
+    ASSERT_TRUE(spline.setControlPointsAndInterval(control_points, 3, 0.2));
+    const auto mapped = ContinuousPhasePath::makeMappedBspline(
+        spline, spline.t_range(0), spline.t_range(1), 2.0, 5.0);
+    ASSERT_TRUE(static_cast<bool>(mapped));
+    ContinuousPhasePath source;
+    ASSERT_TRUE(source.appendSegment(2.0, 5.0, "mapped_source", mapped));
+    ContinuousPhasePath slice;
+    ASSERT_TRUE(slice.appendSlice(source, 2.2, 2.8));
+    std::vector<double> breakpoints;
+    ASSERT_TRUE(slice.certificateBreakpointsV2(breakpoints));
+    ASSERT_GE(breakpoints.size(), 2U);
+    EXPECT_DOUBLE_EQ(breakpoints.front(), 2.2);
+    EXPECT_DOUBLE_EQ(breakpoints.back(), 2.8);
+    for (const double value : breakpoints) {
+        EXPECT_GE(value, 2.2);
+        EXPECT_LE(value, 2.8);
+    }
+}
+
+TEST(ContinuousPhasePath, V2RejectsMalformedQueriesAndUnsupportedEvaluator)
+{
+    ContinuousPhasePathState state;
+    state.p = Eigen::Vector3d::Zero();
+    state.dp_dw = Eigen::Vector3d(1.0, 0.0, 0.2);
+    state.d2p_dw2 = Eigen::Vector3d::Zero();
+    state.vel = state.dp_dw;
+    state.valid = true;
+    ContinuousPhasePath path;
+    const auto evaluator = ContinuousPhasePath::makeQuinticHermite(
+        0.0, 1.0, state, state);
+    ASSERT_TRUE(path.appendSegment(0.0, 1.0, "malformed", evaluator));
+    phase_offset_core::CertifiedPathCellV2 certificate;
+    EXPECT_FALSE(path.tubeCellBoundsV2(
+        std::numeric_limits<double>::quiet_NaN(), 0.5, certificate));
+    EXPECT_FALSE(path.tubeCellBoundsV2(0.5,
+                                       std::numeric_limits<double>::infinity(),
+                                       certificate));
+    EXPECT_FALSE(path.tubeCellBoundsV2(0.8, 0.2, certificate));
+    EXPECT_FALSE(path.tubeCellBoundsV2(0.5, 0.5, certificate));
+
+    ContinuousPhasePath unsupported;
+    const ContinuousPhasePath::Evaluator point_only(
+        [](double, ContinuousPhasePathState& point) {
+            point = ContinuousPhasePathState();
+            point.valid = true;
+            return true;
+        });
+    ASSERT_TRUE(unsupported.appendSegment(0.0, 1.0, "point_only",
+                                          point_only));
+    EXPECT_FALSE(unsupported.tubeCellBoundsV2(0.2, 0.8, certificate));
+    std::vector<double> unsupported_breakpoints;
+    EXPECT_FALSE(unsupported.certificateBreakpointsV2(
+        unsupported_breakpoints));
+    EXPECT_TRUE(unsupported_breakpoints.empty());
+
+    ContinuousPhasePath near_equal_seams;
+    const ContinuousPhasePath::PointEvaluator finite_point =
+        [](double, ContinuousPhasePathState& point) {
+            point = ContinuousPhasePathState();
+            point.valid = true;
+            return true;
+        };
+    const ContinuousPhasePath::CertificateBreakpointsV2Evaluator seam_points =
+        [](std::vector<double>& points) {
+            points = {0.0, 0.5,
+                      std::nextafter(0.5, std::numeric_limits<double>::infinity()),
+                      1.0};
+            return true;
+        };
+    ASSERT_TRUE(near_equal_seams.appendSegment(
+        0.0, 1.0, "near_equal_seams",
+        ContinuousPhasePath::Evaluator(
+            finite_point, ContinuousPhasePath::CellBoundEvaluator(),
+            ContinuousPhasePath::TubeCellBoundsV2Evaluator(), seam_points)));
+    std::vector<double> seams;
+    ASSERT_TRUE(near_equal_seams.certificateBreakpointsV2(seams));
+    ASSERT_EQ(seams.size(), 4U);
+    EXPECT_LT(seams[1], seams[2]);
+
+    ContinuousPhasePath huge;
+    ContinuousPhasePathState huge_state;
+    huge_state.p = Eigen::Vector3d::Constant(std::numeric_limits<double>::max());
+    huge_state.dp_dw = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::max());
+    huge_state.d2p_dw2 = Eigen::Vector3d::Zero();
+    huge_state.vel = huge_state.dp_dw;
+    huge_state.valid = true;
+    const auto huge_evaluator = ContinuousPhasePath::makeQuinticHermite(
+        0.0, 1.0, huge_state, huge_state);
+    ASSERT_TRUE(static_cast<bool>(huge_evaluator));
+    ASSERT_TRUE(huge.appendSegment(0.0, 1.0, "overflow", huge_evaluator));
+    EXPECT_FALSE(huge.tubeCellBoundsV2(0.2, 0.8, certificate));
+
+    Eigen::MatrixXd control_points(8, 3);
+    control_points <<
+        0.0, 0.0, 1.0,
+        0.3, 0.0, 1.0,
+        0.7, 0.3, 1.0,
+        1.0, 0.8, 1.0,
+        1.3, 1.1, 1.0,
+        1.7, 1.0, 1.0,
+        2.1, 0.6, 1.0,
+        2.5, 0.5, 1.0;
+    UniformBspline malformed_spline;
+    ASSERT_TRUE(malformed_spline.setControlPointsAndInterval(
+        control_points, 3, 0.2));
+    // The unchanged derivative evaluator assumes unit-spaced knots.  Keep
+    // nominal point construction available, but V2 must reject this mutated
+    // representation rather than prove a mismatched derivative chain.
+    malformed_spline.u_(4) = malformed_spline.u_(3);
+    const auto malformed_evaluator = ContinuousPhasePath::makeMappedBspline(
+        malformed_spline, malformed_spline.t_range(0),
+        malformed_spline.t_range(1), 2.0, 5.0);
+    ASSERT_TRUE(static_cast<bool>(malformed_evaluator));
+    ContinuousPhasePath malformed_path;
+    ASSERT_TRUE(malformed_path.appendSegment(2.0, 5.0, "bad_knots",
+                                             malformed_evaluator));
+    EXPECT_FALSE(malformed_path.tubeCellBoundsV2(2.2, 2.8, certificate));
+    std::vector<double> malformed_breakpoints;
+    EXPECT_FALSE(malformed_path.certificateBreakpointsV2(
+        malformed_breakpoints));
+
+    UniformBspline regular_spline;
+    ASSERT_TRUE(regular_spline.setControlPointsAndInterval(
+        control_points, 3, 0.2));
+    const auto oversized_evaluator = ContinuousPhasePath::makeMappedBspline(
+        regular_spline, regular_spline.t_range(0) - 0.1,
+        regular_spline.t_range(1) + 0.1, 2.0, 5.0);
+    ASSERT_TRUE(static_cast<bool>(oversized_evaluator));
+    ContinuousPhasePath oversized_path;
+    ASSERT_TRUE(oversized_path.appendSegment(2.0, 5.0, "oversized_domain",
+                                             oversized_evaluator));
+    EXPECT_FALSE(oversized_path.tubeCellBoundsV2(2.2, 2.8, certificate));
+
+    UniformBspline ratio_spline;
+    ASSERT_TRUE(ratio_spline.setControlPointsAndInterval(
+        control_points, 3, 1.0 / 3.0));
+    double upward_endpoint = ratio_spline.t_range(1);
+    int upward_steps = 0;
+    while (phase_offset_core::binary64ProductLeq(
+               upward_endpoint, ratio_spline.beta_, 5.0) &&
+           upward_steps++ < 8) {
+        upward_endpoint = std::nextafter(
+            upward_endpoint, std::numeric_limits<double>::infinity());
+    }
+    ASSERT_FALSE(phase_offset_core::binary64ProductLeq(
+        upward_endpoint, ratio_spline.beta_, 5.0));
+    const auto upward_evaluator = ContinuousPhasePath::makeMappedBspline(
+        ratio_spline, ratio_spline.t_range(0), upward_endpoint, 2.0, 5.0);
+    ASSERT_TRUE(static_cast<bool>(upward_evaluator));
+    ContinuousPhasePath upward_path;
+    ASSERT_TRUE(upward_path.appendSegment(2.0, 5.0, "upward_domain",
+                                          upward_evaluator));
+    EXPECT_FALSE(upward_path.tubeCellBoundsV2(2.2, 2.8, certificate));
+}
+
+TEST(ContinuousPhasePath, V2RejectsUnsupportedFloatingPointModes)
+{
+    ContinuousPhasePathState start;
+    start.p = Eigen::Vector3d::Zero();
+    start.dp_dw = Eigen::Vector3d(2.0, 0.0, 1.0);
+    start.d2p_dw2 = Eigen::Vector3d::Zero();
+    start.vel = start.dp_dw;
+    start.valid = true;
+    ContinuousPhasePathState end = start;
+    end.p = Eigen::Vector3d(3.0, 0.0, 1.5);
+    const auto evaluator = ContinuousPhasePath::makeQuinticHermite(
+        2.0, 5.0, start, end);
+    ASSERT_TRUE(static_cast<bool>(evaluator));
+    ContinuousPhasePath path;
+    ASSERT_TRUE(path.appendSegment(2.0, 5.0, "fp_environment", evaluator));
+    phase_offset_core::CertifiedPathCellV2 certificate;
+
+    const int original_rounding = std::fegetround();
+    ASSERT_EQ(original_rounding, FE_TONEAREST);
+    ASSERT_EQ(std::fesetround(FE_DOWNWARD), 0);
+    EXPECT_FALSE(path.tubeCellBoundsV2(2.2, 2.8, certificate));
+    ASSERT_EQ(std::fesetround(original_rounding), 0);
+    ASSERT_TRUE(path.tubeCellBoundsV2(2.2, 2.8, certificate));
+
+#if defined(__i386__) || defined(__x86_64__)
+    const unsigned int original_csr = _mm_getcsr();
+    unsigned int unsupported_csr = original_csr;
+#ifdef _MM_FLUSH_ZERO_ON
+    unsupported_csr |= _MM_FLUSH_ZERO_ON;
+#endif
+#ifdef _MM_DENORMALS_ZERO_ON
+    unsupported_csr |= _MM_DENORMALS_ZERO_ON;
+#endif
+    _mm_setcsr(unsupported_csr);
+    EXPECT_FALSE(path.tubeCellBoundsV2(2.2, 2.8, certificate));
+    _mm_setcsr(original_csr);
+    ASSERT_TRUE(path.tubeCellBoundsV2(2.2, 2.8, certificate));
+#endif
 }
 
 }  // namespace
