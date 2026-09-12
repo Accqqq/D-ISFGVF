@@ -1,0 +1,64 @@
+<launch>
+  <!--
+    Convenience single command for the two-launch workflow.  The agent count
+    belongs to the swarm launch (phase_offset_swarm.launch); this entry merely
+    forwards it.  The separate launches remain the supported way to start
+    things, e.g.:
+
+      roslaunch phase_offset_sim_bringup phase_offset_world.launch
+      roslaunch phase_offset_sim_bringup phase_offset_swarm.launch agent_count:=15
+
+    This wrapper is equivalent to those two commands.
+  -->
+  <arg name="agent_count" default="15"/>
+  <arg name="scenario_file" default=""/>
+  <arg name="formation_spacing" default="1.5"/>
+  <arg name="formation_shape" default="disk"/>
+  <arg name="formation_axis" default="y"/>
+  <arg name="formation_goal_translation_y" default="-38.0"/>
+  <arg name="formation_goal_translation_x" default="0.0"/>
+  <arg name="formation_goal_base_y" default=""/>
+  <arg name="enable_rviz" default="true"/>
+  <arg name="enable_follow_rviz" default="true"/>
+  <arg name="rviz_follow_agent" default="0"/>
+  <arg name="init_x" default="0.0"/>
+  <arg name="init_y" default="20.0"/>
+  <arg name="init_z" default="1.0"/>
+  <arg name="map_size_x" default="20.0"/>
+  <arg name="map_size_y" default="50.0"/>
+  <arg name="map_size_z" default="2.5"/>
+  <arg name="local_update_range_x" default="4.0"/>
+  <arg name="local_update_range_y" default="4.0"/>
+  <arg name="local_update_range_z" default="2.5"/>
+  <arg name="map_resolution" default="0.10"/>
+  <arg name="publish_goals" default="true"/>
+
+  <include file="$(find phase_offset_sim_bringup)/launch/phase_offset_world.launch">
+    <arg name="scenario_file" value="$(arg scenario_file)"/>
+    <arg name="enable_rviz" value="$(arg enable_rviz)"/>
+    <arg name="enable_follow_rviz" value="$(arg enable_follow_rviz)"/>
+  </include>
+
+  <include file="$(find phase_offset_sim_bringup)/launch/phase_offset_swarm.launch">
+    <arg name="scenario_file" value="$(arg scenario_file)"/>
+    <arg name="rviz_follow_agent" value="$(arg rviz_follow_agent)"/>
+    <arg name="agent_count" value="$(arg agent_count)"/>
+    <arg name="formation_spacing" value="$(arg formation_spacing)"/>
+    <arg name="formation_shape" value="$(arg formation_shape)"/>
+    <arg name="formation_axis" value="$(arg formation_axis)"/>
+    <arg name="formation_goal_translation_y" value="$(arg formation_goal_translation_y)"/>
+    <arg name="formation_goal_translation_x" value="$(arg formation_goal_translation_x)"/>
+    <arg name="formation_goal_base_y" value="$(arg formation_goal_base_y)"/>
+    <arg name="init_x" value="$(arg init_x)"/>
+    <arg name="init_y" value="$(arg init_y)"/>
+    <arg name="init_z" value="$(arg init_z)"/>
+    <arg name="map_size_x" value="$(arg map_size_x)"/>
+    <arg name="map_size_y" value="$(arg map_size_y)"/>
+    <arg name="map_size_z" value="$(arg map_size_z)"/>
+    <arg name="local_update_range_x" value="$(arg local_update_range_x)"/>
+    <arg name="local_update_range_y" value="$(arg local_update_range_y)"/>
+    <arg name="local_update_range_z" value="$(arg local_update_range_z)"/>
+    <arg name="map_resolution" value="$(arg map_resolution)"/>
+    <arg name="publish_goals" value="$(arg publish_goals)"/>
+  </include>
+</launch>

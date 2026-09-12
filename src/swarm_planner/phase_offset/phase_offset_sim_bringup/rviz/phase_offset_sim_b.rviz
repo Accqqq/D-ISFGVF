@@ -1,313 +1,2621 @@
 Panels:
   - Class: rviz/Displays
+    Help Height: 70
     Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /UAV0 ESDF occupancy inflated1
+      Splitter Ratio: 0.5
+    Tree Height: 445
   - Class: rviz/Views
+    Expanded:
+      - /Current View1
     Name: Views
+    Splitter Ratio: 0.5
   - Class: rviz/Time
     Name: Time
+    SyncMode: 0
+    SyncSource: Common open map
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
 Visualization Manager:
   Class: ""
   Displays:
-    - Class: rviz/Grid
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 160; 160; 164
       Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
       Name: World grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
       Plane: XY
       Plane Cell Count: 30
-      Cell Size: 1
       Reference Frame: world
       Value: true
-    - Class: rviz/PointCloud2
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 2.9600000381469727
+        Min Value: -0.9399999976158142
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 136; 138; 133
+      Color Transformer: FlatColor
+      Decay Time: 0
       Enabled: true
+      Invert Rainbow: false
+      Max Color: 186; 189; 182
+      Min Color: 136; 138; 133
       Name: Common open map
-      Topic: /mock_map
+      Position Transformer: XYZ
       Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.029999999329447746
       Style: Flat Squares
-      Size (Pixels): 2
+      Topic: /mock_map
+      Unreliable: false
       Use Fixed Frame: true
+      Use rainbow: true
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Name: UAV bodies and labels
       Marker Topic: /phase_offset_swarm/vis/uavs
+      Name: UAV bodies and labels
+      Namespaces:
+        uav_0/body: false
+        uav_0/id: true
+        uav_1/body: false
+        uav_1/id: true
+        uav_10/body: false
+        uav_10/id: true
+        uav_11/body: false
+        uav_11/id: true
+        uav_12/body: false
+        uav_12/id: true
+        uav_13/body: false
+        uav_13/id: true
+        uav_14/body: false
+        uav_14/id: true
+        uav_2/body: false
+        uav_2/id: true
+        uav_3/body: false
+        uav_3/id: true
+        uav_4/body: false
+        uav_4/id: true
+        uav_5/body: false
+        uav_5/id: true
+        uav_6/body: false
+        uav_6/id: true
+        uav_7/body: false
+        uav_7/id: true
+        uav_8/body: false
+        uav_8/id: true
+        uav_9/body: false
+        uav_9/id: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Name: UAV trajectories
       Marker Topic: /phase_offset_swarm/vis/trajectories
+      Name: UAV trajectories
+      Namespaces:
+        uav_0/trajectory: true
+        uav_1/trajectory: true
+        uav_10/trajectory: true
+        uav_11/trajectory: true
+        uav_12/trajectory: true
+        uav_13/trajectory: true
+        uav_14/trajectory: true
+        uav_2/trajectory: true
+        uav_3/trajectory: true
+        uav_4/trajectory: true
+        uav_5/trajectory: true
+        uav_6/trajectory: true
+        uav_7/trajectory: true
+        uav_8/trajectory: true
+        uav_9/trajectory: true
       Queue Size: 100
       Value: true
-    - Class: rviz/PointCloud2
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 2.440000057220459
+        Min Value: 0.03999999910593033
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: true
+      Invert Rainbow: true
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
       Name: UAV0 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
       Topic: /uav_0/particle0sdf_map/occupancy_inflate
-      Queue Size: 10
-      Style: Points
-      Size (Pixels): 2
+      Unreliable: false
       Use Fixed Frame: true
+      Use rainbow: false
       Value: true
-    - Class: rviz/PointCloud2
-      Enabled: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
       Name: UAV0 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
       Topic: /uav_0/particle0sdf_map/esdf
-      Queue Size: 10
-      Style: Points
-      Size (Pixels): 2
+      Unreliable: false
       Use Fixed Frame: true
-      Value: true
-    - Class: rviz/Path
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
       Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
       Name: UAV0 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /uav_0/particle0/path
-      Queue Size: 10
+      Unreliable: false
       Value: true
-    - Class: rviz/Path
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
       Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
       Name: UAV0 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /uav_0/particle0/kinopath
-      Queue Size: 10
+      Unreliable: false
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Name: UAV0 path visualization
+      Marker Topic: /uav_0/odom_visualization/robot
+      Name: UAV0 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_1/odom_visualization/robot
+      Name: UAV1 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_2/odom_visualization/robot
+      Name: UAV2 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_3/odom_visualization/robot
+      Name: UAV3 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_4/odom_visualization/robot
+      Name: UAV4 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_5/odom_visualization/robot
+      Name: UAV5 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_6/odom_visualization/robot
+      Name: UAV6 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_7/odom_visualization/robot
+      Name: UAV7 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_8/odom_visualization/robot
+      Name: UAV8 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_9/odom_visualization/robot
+      Name: UAV9 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_10/odom_visualization/robot
+      Name: UAV10 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_11/odom_visualization/robot
+      Name: UAV11 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_12/odom_visualization/robot
+      Name: UAV12 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_13/odom_visualization/robot
+      Name: UAV13 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_14/odom_visualization/robot
+      Name: UAV14 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
       Marker Topic: /uav_0/path_vis
+      Name: UAV0 path visualization
+      Namespaces:
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Name: UAV0 goal
       Marker Topic: /uav_0/goal_vis
+      Name: UAV0 goal
+      Namespaces:
+        goal_visualization: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Name: UAV0 GVF frontend
       Marker Topic: /uav_0/particle0/gvf/traj_vis
+      Name: UAV0 GVF frontend
+      Namespaces:
+        path_cylinders: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: true
-      Name: UAV0 GVF vector field
+      Enabled: false
       Marker Topic: /uav_0/particle0/gvf/vector_field
+      Name: UAV0 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_0/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Name: UAV0 Tube base path
-      Marker Topic: /uav_0/formation_planning/phase_offset_manual/base_path
+      Marker Topic: /uav_0/phase_offset_adjusted_path
+      Name: UAV0 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
       Queue Size: 100
       Value: true
-    - Class: rviz/Marker
-      Enabled: true
-      Name: UAV0 Tube active path
-      Marker Topic: /uav_0/formation_planning/phase_offset_manual/active_path
-      Queue Size: 100
-      Value: true
-    - Class: rviz/MarkerArray
-      Enabled: true
-      Name: UAV0 Tube frame
-      Marker Topic: /uav_0/formation_planning/phase_offset_manual/frame
-      Queue Size: 100
-      Value: true
-    - Class: rviz/MarkerArray
-      Enabled: true
-      Name: UAV0 Tube candidate
-      Marker Topic: /uav_0/formation_planning/phase_offset_manual/tube_candidate
-      Queue Size: 100
-      Value: true
-    - Class: rviz/MarkerArray
-      Enabled: true
-      Name: UAV0 Tube certified
-      Marker Topic: /uav_0/formation_planning/phase_offset_manual/tube
-      Queue Size: 100
-      Value: true
-    - Class: rviz/PointCloud2
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
       Name: UAV1 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
       Topic: /uav_1/particle0sdf_map/occupancy_inflate
-      Queue Size: 10
-      Style: Points
-      Size (Pixels): 2
+      Unreliable: false
       Use Fixed Frame: true
-      Value: false
-    - Class: rviz/PointCloud2
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
       Name: UAV1 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
       Topic: /uav_1/particle0sdf_map/esdf
-      Queue Size: 10
-      Style: Points
-      Size (Pixels): 2
+      Unreliable: false
       Use Fixed Frame: true
+      Use rainbow: true
       Value: false
-    - Class: rviz/Path
-      Enabled: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
       Name: UAV1 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /uav_1/particle0/path
-      Queue Size: 10
-      Value: false
-    - Class: rviz/Path
-      Enabled: false
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
       Name: UAV1 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /uav_1/particle0/kinopath
-      Queue Size: 10
-      Value: false
+      Unreliable: false
+      Value: true
     - Class: rviz/Marker
-      Enabled: false
-      Name: UAV1 path visualization
+      Enabled: true
       Marker Topic: /uav_1/path_vis
+      Name: UAV1 path visualization
+      Namespaces:
+        {}
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/Marker
-      Enabled: false
-      Name: UAV1 goal
+      Enabled: true
       Marker Topic: /uav_1/goal_vis
+      Name: UAV1 goal
+      Namespaces:
+        goal_visualization: true
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/MarkerArray
-      Enabled: false
-      Name: UAV1 GVF frontend
+      Enabled: true
       Marker Topic: /uav_1/particle0/gvf/traj_vis
+      Name: UAV1 GVF frontend
+      Namespaces:
+        path_cylinders: true
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/MarkerArray
       Enabled: false
-      Name: UAV1 GVF vector field
       Marker Topic: /uav_1/particle0/gvf/vector_field
+      Name: UAV1 GVF vector field
+      Namespaces:
+        {}
       Queue Size: 100
       Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_1/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
     - Class: rviz/Marker
-      Enabled: false
-      Name: UAV1 Tube base path
-      Marker Topic: /uav_1/formation_planning/phase_offset_manual/base_path
+      Enabled: true
+      Marker Topic: /uav_1/phase_offset_adjusted_path
+      Name: UAV1 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
       Queue Size: 100
-      Value: false
-    - Class: rviz/Marker
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
-      Name: UAV1 Tube active path
-      Marker Topic: /uav_1/formation_planning/phase_offset_manual/active_path
-      Queue Size: 100
-      Value: false
-    - Class: rviz/MarkerArray
-      Enabled: false
-      Name: UAV1 Tube frame
-      Marker Topic: /uav_1/formation_planning/phase_offset_manual/frame
-      Queue Size: 100
-      Value: false
-    - Class: rviz/MarkerArray
-      Enabled: false
-      Name: UAV1 Tube candidate
-      Marker Topic: /uav_1/formation_planning/phase_offset_manual/tube_candidate
-      Queue Size: 100
-      Value: false
-    - Class: rviz/MarkerArray
-      Enabled: false
-      Name: UAV1 Tube certified
-      Marker Topic: /uav_1/formation_planning/phase_offset_manual/tube
-      Queue Size: 100
-      Value: false
-    - Class: rviz/PointCloud2
-      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
       Name: UAV2 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
       Topic: /uav_2/particle0sdf_map/occupancy_inflate
-      Queue Size: 10
-      Style: Points
-      Size (Pixels): 2
+      Unreliable: false
       Use Fixed Frame: true
-      Value: false
-    - Class: rviz/PointCloud2
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
       Name: UAV2 ESDF
-      Topic: /uav_2/particle0sdf_map/esdf
+      Position Transformer: XYZ
       Queue Size: 10
-      Style: Points
+      Selectable: true
       Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_2/particle0sdf_map/esdf
+      Unreliable: false
       Use Fixed Frame: true
+      Use rainbow: true
       Value: false
-    - Class: rviz/Path
-      Enabled: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
       Name: UAV2 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /uav_2/particle0/path
-      Queue Size: 10
-      Value: false
-    - Class: rviz/Path
-      Enabled: false
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
       Name: UAV2 kino path
-      Topic: /uav_2/particle0/kinopath
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
       Queue Size: 10
-      Value: false
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_2/particle0/kinopath
+      Unreliable: false
+      Value: true
     - Class: rviz/Marker
-      Enabled: false
-      Name: UAV2 path visualization
+      Enabled: true
       Marker Topic: /uav_2/path_vis
+      Name: UAV2 path visualization
+      Namespaces:
+        {}
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/Marker
-      Enabled: false
-      Name: UAV2 goal
+      Enabled: true
       Marker Topic: /uav_2/goal_vis
+      Name: UAV2 goal
+      Namespaces:
+        goal_visualization: true
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/MarkerArray
-      Enabled: false
-      Name: UAV2 GVF frontend
+      Enabled: true
       Marker Topic: /uav_2/particle0/gvf/traj_vis
+      Name: UAV2 GVF frontend
+      Namespaces:
+        path_cylinders: true
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/MarkerArray
       Enabled: false
-      Name: UAV2 GVF vector field
       Marker Topic: /uav_2/particle0/gvf/vector_field
+      Name: UAV2 GVF vector field
+      Namespaces:
+        {}
       Queue Size: 100
       Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_2/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
     - Class: rviz/Marker
-      Enabled: false
-      Name: UAV2 Tube base path
-      Marker Topic: /uav_2/formation_planning/phase_offset_manual/base_path
+      Enabled: true
+      Marker Topic: /uav_2/phase_offset_adjusted_path
+      Name: UAV2 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
       Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Class: rviz/Axes
+      Enabled: true
+      Length: 1
+      Name: Axes
+      Radius: 0.10000000149011612
+      Reference Frame: <Fixed Frame>
+      Show Trail: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV3 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_3/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV3 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_3/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
       Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV3 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_3/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV3 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_3/particle0/kinopath
+      Unreliable: false
+      Value: true
     - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_3/path_vis
+      Name: UAV3 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_3/goal_vis
+      Name: UAV3 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_3/particle0/gvf/traj_vis
+      Name: UAV3 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
       Enabled: false
-      Name: UAV2 Tube active path
-      Marker Topic: /uav_2/formation_planning/phase_offset_manual/active_path
+      Marker Topic: /uav_3/particle0/gvf/vector_field
+      Name: UAV3 GVF vector field
+      Namespaces:
+        {}
       Queue Size: 100
       Value: false
     - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_3/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_3/phase_offset_adjusted_path
+      Name: UAV3 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
-      Name: UAV2 Tube frame
-      Marker Topic: /uav_2/formation_planning/phase_offset_manual/frame
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV4 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_4/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV4 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_4/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV4 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_4/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV4 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_4/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_4/path_vis
+      Name: UAV4 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_4/goal_vis
+      Name: UAV4 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_4/particle0/gvf/traj_vis
+      Name: UAV4 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_4/particle0/gvf/vector_field
+      Name: UAV4 GVF vector field
+      Namespaces:
+        {}
       Queue Size: 100
       Value: false
     - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_4/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_4/phase_offset_adjusted_path
+      Name: UAV4 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
-      Name: UAV2 Tube candidate
-      Marker Topic: /uav_2/formation_planning/phase_offset_manual/tube_candidate
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV5 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_5/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV5 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_5/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV5 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_5/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV5 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_5/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_5/path_vis
+      Name: UAV5 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_5/goal_vis
+      Name: UAV5 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_5/particle0/gvf/traj_vis
+      Name: UAV5 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_5/particle0/gvf/vector_field
+      Name: UAV5 GVF vector field
+      Namespaces:
+        {}
       Queue Size: 100
       Value: false
     - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_5/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_5/phase_offset_adjusted_path
+      Name: UAV5 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
       Enabled: false
-      Name: UAV2 Tube certified
-      Marker Topic: /uav_2/formation_planning/phase_offset_manual/tube
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV6 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_6/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV6 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_6/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV6 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_6/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV6 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_6/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_6/path_vis
+      Name: UAV6 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_6/goal_vis
+      Name: UAV6 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_6/particle0/gvf/traj_vis
+      Name: UAV6 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_6/particle0/gvf/vector_field
+      Name: UAV6 GVF vector field
+      Namespaces:
+        {}
       Queue Size: 100
       Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_6/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_6/phase_offset_adjusted_path
+      Name: UAV6 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV7 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_7/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV7 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_7/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV7 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_7/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV7 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_7/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_7/path_vis
+      Name: UAV7 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_7/goal_vis
+      Name: UAV7 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_7/particle0/gvf/traj_vis
+      Name: UAV7 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_7/particle0/gvf/vector_field
+      Name: UAV7 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_7/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_7/phase_offset_adjusted_path
+      Name: UAV7 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV8 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_8/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV8 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_8/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV8 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_8/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV8 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_8/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_8/path_vis
+      Name: UAV8 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_8/goal_vis
+      Name: UAV8 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_8/particle0/gvf/traj_vis
+      Name: UAV8 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_8/particle0/gvf/vector_field
+      Name: UAV8 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_8/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_8/phase_offset_adjusted_path
+      Name: UAV8 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV9 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_9/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV9 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_9/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV9 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_9/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV9 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_9/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_9/path_vis
+      Name: UAV9 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_9/goal_vis
+      Name: UAV9 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_9/particle0/gvf/traj_vis
+      Name: UAV9 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_9/particle0/gvf/vector_field
+      Name: UAV9 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_9/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_9/phase_offset_adjusted_path
+      Name: UAV9 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV10 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_10/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV10 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_10/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV10 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_10/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV10 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_10/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_10/path_vis
+      Name: UAV10 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_10/goal_vis
+      Name: UAV10 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_10/particle0/gvf/traj_vis
+      Name: UAV10 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_10/particle0/gvf/vector_field
+      Name: UAV10 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_10/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_10/phase_offset_adjusted_path
+      Name: UAV10 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV11 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_11/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV11 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_11/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV11 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_11/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV11 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_11/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_11/path_vis
+      Name: UAV11 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_11/goal_vis
+      Name: UAV11 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_11/particle0/gvf/traj_vis
+      Name: UAV11 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_11/particle0/gvf/vector_field
+      Name: UAV11 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_11/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_11/phase_offset_adjusted_path
+      Name: UAV11 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV12 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_12/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV12 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_12/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV12 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_12/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV12 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_12/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_12/path_vis
+      Name: UAV12 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_12/goal_vis
+      Name: UAV12 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_12/particle0/gvf/traj_vis
+      Name: UAV12 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_12/particle0/gvf/vector_field
+      Name: UAV12 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_12/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_12/phase_offset_adjusted_path
+      Name: UAV12 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV13 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_13/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV13 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_13/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV13 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_13/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV13 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_13/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_13/path_vis
+      Name: UAV13 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_13/goal_vis
+      Name: UAV13 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_13/particle0/gvf/traj_vis
+      Name: UAV13 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_13/particle0/gvf/vector_field
+      Name: UAV13 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_13/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_13/phase_offset_adjusted_path
+      Name: UAV13 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: z
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 180; 20; 140
+      Min Color: 0; 255; 255
+      Name: UAV14 ESDF occupancy inflated
+      Position Transformer: XYZ
+      Queue Size: 300
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.1
+      Style: Points
+      Topic: /uav_14/particle0sdf_map/occupancy_inflate
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Name: UAV14 ESDF
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: true
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic: /uav_14/particle0sdf_map/esdf
+      Unreliable: false
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV14 planner path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_14/particle0/path
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 25; 255; 0
+      Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
+      Line Style: Lines
+      Line Width: 0.029999999329447746
+      Name: UAV14 kino path
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
+      Topic: /uav_14/particle0/kinopath
+      Unreliable: false
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_14/path_vis
+      Name: UAV14 path visualization
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_14/goal_vis
+      Name: UAV14 goal
+      Namespaces:
+        goal_visualization: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_14/particle0/gvf/traj_vis
+      Name: UAV14 GVF frontend
+      Namespaces:
+        path_cylinders: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: false
+      Marker Topic: /uav_14/particle0/gvf/vector_field
+      Name: UAV14 GVF vector field
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: false
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /uav_14/phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        phase_offset_section_tube_fill: true
+        phase_offset_section_tube_left: true
+        phase_offset_section_tube_right: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_14/phase_offset_adjusted_path
+      Name: UAV14 intent-adjusted reference
+      Namespaces:
+        phase_offset_adjusted_path: true
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
+    Background Color: 255; 255; 255
+    Default Light: true
     Fixed Frame: world
     Frame Rate: 30
   Name: root
   Tools:
     - Class: rviz/Interact
+      Hide Inactive Objects: true
     - Class: rviz/MoveCamera
     - Class: rviz/Select
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+  Value: true
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 35
+      Distance: 32.08279800415039
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.7853981852531433
       Focal Point:
-        X: 0
-        Y: 0
-        Z: 1
-      Pitch: 0.6
-      Yaw: 0.8
+        X: -0.2048882246017456
+        Y: 0.9498913288116455
+        Z: 0.9998031258583069
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 1.5697963237762451
+      Target Frame: <Fixed Frame>
+      Yaw: 3.1500020027160645
+    Saved: ~
 Window Geometry:
+  Displays:
+    collapsed: true
   Height: 900
+  Hide Left Dock: true
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd0000000100000000000005180000032afc0200000003fb000000100044006900730070006c006100790073000000003d00000240000000c900fffffffb0000000a005600690065007700730000000283000000a4000000a400fffffffb0000000800540069006d0065000000032d0000003a0000003900ffffff000005780000032a00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  Time:
+    collapsed: true
+  Views:
+    collapsed: true
   Width: 1400
+  X: 122
+  Y: 27

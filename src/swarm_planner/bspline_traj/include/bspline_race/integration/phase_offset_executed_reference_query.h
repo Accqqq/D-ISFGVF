@@ -4,6 +4,8 @@
 
 #include <bspline_race/continuous_phase_normal_frame.h>
 
+#include <limits>
+
 namespace FLAG_Race {
 
 class PhaseOffsetExecutedReferenceQuery final
@@ -15,7 +17,9 @@ class PhaseOffsetExecutedReferenceQuery final
       std::uint64_t path_revision,
       std::uint64_t frame_revision,
       std::uint64_t owner_revision,
-      std::uint64_t query_revision);
+      std::uint64_t query_revision,
+      double valid_start_w = std::numeric_limits<double>::quiet_NaN(),
+      double valid_end_w = std::numeric_limits<double>::quiet_NaN());
   PhaseOffsetExecutedReferenceQuery(
       const std::shared_ptr<const ContinuousPhasePath>& path,
       double delta,
@@ -23,7 +27,9 @@ class PhaseOffsetExecutedReferenceQuery final
       std::uint64_t path_revision,
       std::uint64_t frame_revision,
       std::uint64_t owner_revision,
-      std::uint64_t query_revision);
+      std::uint64_t query_revision,
+      double valid_start_w = std::numeric_limits<double>::quiet_NaN(),
+      double valid_end_w = std::numeric_limits<double>::quiet_NaN());
 
   bool query(double w,
              phase_offset_navigation::ExecutedReferenceQueryResult& result)
@@ -42,6 +48,9 @@ class PhaseOffsetExecutedReferenceQuery final
   std::uint64_t frame_revision_ = 0U;
   std::uint64_t owner_revision_ = 0U;
   std::uint64_t query_revision_ = 0U;
+  double valid_start_w_ = 0.0;
+  double valid_end_w_ = 0.0;
+  bool valid_domain_ = false;
 };
 
 }  // namespace FLAG_Race

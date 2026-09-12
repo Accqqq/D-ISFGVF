@@ -1558,6 +1558,12 @@ void gvf::setVisualizationProgressW(double w)
     visualization_progress_initialized_ = true;
 }
 
+void gvf::setVisualizationDelta(double delta)
+{
+    std::lock_guard<std::recursive_mutex> lock(path_cache_mutex_);
+    visualization_delta_ = std::isfinite(delta) ? delta : 0.0;
+}
+
 void gvf::setTerminalGoalVisualization(const Eigen::Vector3d& goal)
 {
     if (!goal.allFinite()) return;
@@ -1608,9 +1614,37 @@ bool gvf::calcLiftedVisualizationVector(const Eigen::Vector3d& pos,
     const double w_vis = authoritative_mode
         ? projectToPathLocalForVisualization(pos, w_prev, progress_window_)
         : w_prev;
+
+    // Draw the field on the COORDINATED reference r = p(w) + N(w)*delta, which
+    // is what the governor and the Section offset actually command, instead of
+    // on the bare centerline.  The offset is applied by evaluating the guidance
+    // one lateral offset "inward" (pos - N*delta); the direction of the field
+    // is therefore the one the UAV is following, and with delta = 0 (single-UAV
+    // chain) this degenerates exactly to the previous centreline field.
+    Eigen::Vector3d eval_pos = pos;
+    if (authoritative_mode && std::abs(visualization_delta_) > 1e-9) {
+        Eigen::Vector3d tangent = Eigen::Vector3d::Zero();
+        if (sample_dp_.size() == sample_w_.size() && !sample_w_.empty()) {
+            const auto it = std::lower_bound(sample_w_.begin(),
+                                             sample_w_.end(), w_vis);
+            size_t index = static_cast<size_t>(
+                std::max<long>(0, std::min<long>(
+                    static_cast<long>(std::distance(sample_w_.begin(), it)),
+                    static_cast<long>(sample_w_.size()) - 1)));
+            tangent = sample_dp_[index];
+        }
+        if (tangent.head<2>().norm() > 1e-6) {
+            Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+            normal.x() = -tangent.y();
+            normal.y() = tangent.x();
+            normal.head<2>().normalize();
+            eval_pos = pos - visualization_delta_ * normal;
+        }
+    }
+
     const auto out = authoritative_mode
-        ? calcLiftedGuidanceAtPhase(pos, w_vis)
-        : calcLiftedGuidance3D(pos, w_prev);
+        ? calcLiftedGuidanceAtPhase(eval_pos, w_vis)
+        : calcLiftedGuidance3D(eval_pos, w_prev);
     if (!out.valid) return false;
 
     vec = out.v_cmd;

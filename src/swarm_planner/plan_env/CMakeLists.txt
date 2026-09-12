@@ -40,9 +40,8 @@ include_directories(
 link_directories(${PCL_LIBRARY_DIRS})
 
 add_library(plan_env 
-    src/cloud_occupancy_snapshot.cpp
+    src/local_obstacle_view.cpp
     src/sdf_map.cpp 
-    src/sdf_map_environment_evidence.cpp
     src/obj_predictor.cpp 
     src/edt_environment.cpp 
     src/raycast.cpp
@@ -60,9 +59,20 @@ target_link_libraries(obj_generator
     ${catkin_LIBRARIES})
 
 if(CATKIN_ENABLE_TESTING)
+    # The immutable cloud-snapshot implementation is retained solely for the
+    # historical regression target.  It is deliberately not part of the
+    # production plan_env library (or any planner executable); the M3C map
+    # path uses LocalObstacleView instead.
+    add_library(plan_env_cloud_occupancy_snapshot_legacy
+        src/cloud_occupancy_snapshot.cpp)
+    target_link_libraries(plan_env_cloud_occupancy_snapshot_legacy
+        ${catkin_LIBRARIES})
+
     catkin_add_gtest(manual_map_layer_test test/manual_map_layer_test.cpp)
-    catkin_add_gtest(sdf_map_environment_evidence_test
-        test/sdf_map_environment_evidence_test.cpp)
+    catkin_add_gtest(local_obstacle_view_test
+        test/local_obstacle_view_test.cpp)
+    catkin_add_gtest(local_obstacle_capture_test
+        test/local_obstacle_capture_test.cpp)
     catkin_add_gtest(cloud_occupancy_snapshot_test
         test/cloud_occupancy_snapshot_test.cpp)
     if(TARGET manual_map_layer_test)
@@ -73,8 +83,16 @@ if(CATKIN_ENABLE_TESTING)
             ${OpenCV_LIBS}
         )
     endif()
-    if(TARGET sdf_map_environment_evidence_test)
-        target_link_libraries(sdf_map_environment_evidence_test
+    if(TARGET local_obstacle_view_test)
+        target_link_libraries(local_obstacle_view_test
+            plan_env
+            ${catkin_LIBRARIES}
+            ${PCL_LIBRARIES}
+            ${OpenCV_LIBS}
+        )
+    endif()
+    if(TARGET local_obstacle_capture_test)
+        target_link_libraries(local_obstacle_capture_test
             plan_env
             ${catkin_LIBRARIES}
             ${PCL_LIBRARIES}
@@ -83,6 +101,7 @@ if(CATKIN_ENABLE_TESTING)
     endif()
     if(TARGET cloud_occupancy_snapshot_test)
         target_link_libraries(cloud_occupancy_snapshot_test
+            plan_env_cloud_occupancy_snapshot_legacy
             plan_env
             ${catkin_LIBRARIES}
             ${PCL_LIBRARIES}

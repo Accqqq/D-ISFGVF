@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <limits>
+#include <memory>
 
 #include "bspline_race/integration/phase_offset_tube_markers.h"
 
@@ -559,6 +561,188 @@ TEST(TubeMarkersTest, V2MissingSnapshotPublishesDeletesForBothTopics) {
   ExpectActions(MakeCandidateTubeMarkersV2(
                     ros::Time(2.0), "world", profile, frame),
                 visualization_msgs::Marker::DELETE);
+}
+
+// ---------------------------------------------------------------------------
+// M3C Section display.  These cases exercise only the immutable path plus the
+// committed SectionTubeProfile; no map identity, certificate, or worker state
+// is involved.
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<const ContinuousPhasePath> MakeSectionMarkerPath(
+    const double end_w = 2.0, const std::uint64_t revision = 5U,
+    const bool curved = false) {
+  std::shared_ptr<ContinuousPhasePath> path(new ContinuousPhasePath());
+  if (!path->appendSegment(
+          0.0, end_w, "section-marker",
+          [end_w, curved](const double w, ContinuousPhasePathState& state) {
+            state.p = curved
+                ? Eigen::Vector3d(w, 0.4 * std::sin(w), 1.0)
+                : Eigen::Vector3d(w, 0.0, 1.0);
+            state.dp_dw = curved
+                ? Eigen::Vector3d(1.0, 0.4 * std::cos(w), 0.0)
+                : Eigen::Vector3d::UnitX();
+            state.d2p_dw2 = curved
+                ? Eigen::Vector3d(0.0, -0.4 * std::sin(w), 0.0)
+                : Eigen::Vector3d::Zero();
+            state.vel = state.dp_dw;
+            state.valid = std::isfinite(w) && w >= 0.0 && w <= end_w;
+            return state.valid;
+          })) {
+    return std::shared_ptr<const ContinuousPhasePath>();
+  }
+  path->setPathRevision(revision);
+  return std::shared_ptr<const ContinuousPhasePath>(path);
+}
+
+std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>
+MakeSectionMarkerProfile(const bool complete = true,
+                         const bool finite = true) {
+  std::shared_ptr<phase_offset_navigation::SectionTubeProfile> profile(
+      new phase_offset_navigation::SectionTubeProfile());
+  profile->valid_start = 0.0;
+  profile->valid_end = 2.0;
+  profile->status = complete
+      ? phase_offset_navigation::SectionTubeStatus::COMPLETE
+      : phase_offset_navigation::SectionTubeStatus::PARTIAL;
+  profile->usable = true;
+  profile->complete = complete;
+  for (const double w : {0.0, 0.5, 1.0, 1.5, 2.0}) {
+    phase_offset_navigation::SectionTubeKnot knot;
+    knot.w = w;
+    knot.lower = -0.3;
+    knot.upper = 0.6;
+    profile->knots.push_back(knot);
+  }
+  if (!finite) {
+    profile->knots.front().upper =
+        std::numeric_limits<double>::quiet_NaN();
+  }
+  return std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>(
+      profile);
+}
+
+void ExpectSectionDelete(const visualization_msgs::MarkerArray& markers) {
+  ASSERT_EQ(markers.markers.size(), 3U);
+  EXPECT_EQ(markers.markers[0].ns, "phase_offset_section_tube_left");
+  EXPECT_EQ(markers.markers[1].ns, "phase_offset_section_tube_right");
+  EXPECT_EQ(markers.markers[2].ns, "phase_offset_section_tube_fill");
+  EXPECT_EQ(markers.markers[0].action, visualization_msgs::Marker::DELETE);
+  EXPECT_EQ(markers.markers[1].action, visualization_msgs::Marker::DELETE);
+  EXPECT_EQ(markers.markers[2].action, visualization_msgs::Marker::DELETE);
+}
+
+TEST(SectionTubeMarkersTest, AsymmetricStraightProfileDrawsBothBoundaries) {
+  const auto path = MakeSectionMarkerPath();
+  const auto profile = MakeSectionMarkerProfile();
+  ASSERT_TRUE(path);
+  ASSERT_TRUE(profile);
+  const auto markers = MakeSectionTubeMarkers(
+      ros::Time(3.0), "world", path, profile);
+  ASSERT_EQ(markers.markers.size(), 3U);
+  const auto& left = markers.markers[0];
+  const auto& right = markers.markers[1];
+  const auto& fill = markers.markers[2];
+  EXPECT_EQ(left.ns, "phase_offset_section_tube_left");
+  EXPECT_EQ(right.ns, "phase_offset_section_tube_right");
+  EXPECT_EQ(left.action, visualization_msgs::Marker::ADD);
+  EXPECT_EQ(right.action, visualization_msgs::Marker::ADD);
+  EXPECT_EQ(left.type, visualization_msgs::Marker::LINE_STRIP);
+  EXPECT_EQ(right.type, visualization_msgs::Marker::LINE_STRIP);
+  EXPECT_EQ(left.points.size(), profile->knots.size());
+  EXPECT_EQ(right.points.size(), profile->knots.size());
+  // The straight path is along +x, so the horizontal normal is +y and the
+  // signed offsets appear directly on the y coordinate.
+  for (std::size_t index = 0U; index < left.points.size(); ++index) {
+    EXPECT_DOUBLE_EQ(left.points[index].y, -0.3);
+    EXPECT_DOUBLE_EQ(right.points[index].y, 0.6);
+    EXPECT_DOUBLE_EQ(left.points[index].x,
+                     profile->knots[index].w);
+  }
+  EXPECT_FLOAT_EQ(left.color.a, 1.0F);
+  EXPECT_FLOAT_EQ(right.color.a, 1.0F);
+  // The band between the boundaries is a filled triangle list whose scale must
+  // stay at one on every axis.
+  EXPECT_EQ(fill.ns, "phase_offset_section_tube_fill");
+  EXPECT_EQ(fill.type, visualization_msgs::Marker::TRIANGLE_LIST);
+  EXPECT_EQ(fill.action, visualization_msgs::Marker::ADD);
+  EXPECT_EQ(fill.points.size(), 6U * (profile->knots.size() - 1U));
+  EXPECT_FLOAT_EQ(fill.scale.x, 1.0F);
+  EXPECT_FLOAT_EQ(fill.scale.y, 1.0F);
+  EXPECT_FLOAT_EQ(fill.scale.z, 1.0F);
+  EXPECT_FLOAT_EQ(fill.color.a, 0.35F);
+}
+
+TEST(SectionTubeMarkersTest, CurvedPathOffsetsAlongItsOwnNormal) {
+  const auto path = MakeSectionMarkerPath(2.0, 5U, true);
+  const auto profile = MakeSectionMarkerProfile();
+  ASSERT_TRUE(path);
+  const auto markers = MakeSectionTubeMarkers(
+      ros::Time(3.0), "world", path, profile);
+  ASSERT_EQ(markers.markers.size(), 3U);
+  ASSERT_EQ(markers.markers[0].points.size(), profile->knots.size());
+  // Boundary points must not collapse onto the centerline, and the two
+  // boundaries must stay on opposite sides of it.
+  for (std::size_t index = 0U; index < markers.markers[0].points.size();
+       ++index) {
+    const auto& low = markers.markers[0].points[index];
+    const auto& high = markers.markers[1].points[index];
+    const double separation =
+        std::hypot(high.x - low.x, high.y - low.y);
+    EXPECT_GT(separation, 0.5);
+  }
+  const auto& second = markers.markers[0].points[1];
+  const auto& first = markers.markers[0].points[0];
+  const double dx = second.x - first.x;
+  const double dy = second.y - first.y;
+  EXPECT_GT(std::abs(dy), 1e-6);
+  EXPECT_GT(dx, 0.0);
+}
+
+TEST(SectionTubeMarkersTest, PartialProfileDimsBothBoundaries) {
+  const auto path = MakeSectionMarkerPath();
+  const auto profile = MakeSectionMarkerProfile(false);
+  const auto markers = MakeSectionTubeMarkers(
+      ros::Time(3.0), "world", path, profile);
+  ASSERT_EQ(markers.markers.size(), 3U);
+  EXPECT_EQ(markers.markers[0].action, visualization_msgs::Marker::ADD);
+  EXPECT_EQ(markers.markers[1].action, visualization_msgs::Marker::ADD);
+  EXPECT_EQ(markers.markers[2].action, visualization_msgs::Marker::ADD);
+  EXPECT_FLOAT_EQ(markers.markers[0].color.a, 0.45F);
+  EXPECT_FLOAT_EQ(markers.markers[1].color.a, 0.45F);
+  EXPECT_FLOAT_EQ(markers.markers[2].color.a, 0.20F);
+}
+
+TEST(SectionTubeMarkersTest, MissingOrMalformedInputDeletesBothMarkers) {
+  const auto path = MakeSectionMarkerPath();
+  const auto profile = MakeSectionMarkerProfile();
+  const auto empty_profile =
+      std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>();
+  const auto empty_path = std::shared_ptr<const ContinuousPhasePath>();
+
+  ExpectSectionDelete(
+      MakeSectionTubeMarkers(ros::Time(3.0), "world", empty_path, profile));
+  ExpectSectionDelete(
+      MakeSectionTubeMarkers(ros::Time(3.0), "world", path, empty_profile));
+  ExpectSectionDelete(
+      MakeSectionTubeMarkers(ros::Time(3.0), "world", path,
+                             MakeSectionMarkerProfile(true, false)));
+
+  auto single_knot = MakeSectionMarkerProfile();
+  auto mutable_single =
+      std::const_pointer_cast<phase_offset_navigation::SectionTubeProfile>(
+          single_knot);
+  mutable_single->knots.resize(1U);
+  ExpectSectionDelete(MakeSectionTubeMarkers(
+      ros::Time(3.0), "world", path, single_knot));
+
+  auto out_of_domain = MakeSectionMarkerProfile();
+  auto mutable_domain =
+      std::const_pointer_cast<phase_offset_navigation::SectionTubeProfile>(
+          out_of_domain);
+  mutable_domain->knots.back().w = 5.0;
+  ExpectSectionDelete(MakeSectionTubeMarkers(
+      ros::Time(3.0), "world", path, out_of_domain));
 }
 
 }  // namespace

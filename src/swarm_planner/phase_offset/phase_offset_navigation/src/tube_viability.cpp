@@ -636,77 +636,149 @@ bool DifferenceDownwardV2(const double lhs, const double rhs,
   return Finite(result) && result > 0.0;
 }
 
-bool BuildMergedNodesV2(const TubeProfileV2& profile, const double current_w,
-                        const double horizon_w, const double spacing_w,
-                        const std::size_t max_nodes,
-                        std::vector<double>& nodes, std::string& reason) {
+// A read-only view over either immutable PWL producer.  The strict viability
+// core only needs ordered W knots and an interval evaluation callback; it does
+// not copy a V2 profile or synthesize one for Section input.
+struct StrictPwlSourceView {
+  const TubeProfileV2* v2_profile = nullptr;
+  const SectionTubeProfile* section_profile = nullptr;
+
+  std::size_t knotCount() const {
+    if (v2_profile != nullptr) return v2_profile->knots.size();
+    return section_profile == nullptr ? 0U : section_profile->knots.size();
+  }
+
+  bool knotAt(const std::size_t index, double& w, double& lower,
+             double& upper) const {
+    if (v2_profile != nullptr) {
+      if (index >= v2_profile->knots.size()) return false;
+      const TubePwlKnotV2& knot = v2_profile->knots[index];
+      w = knot.w;
+      lower = knot.lower;
+      upper = knot.upper;
+      return true;
+    }
+    if (section_profile == nullptr || index >= section_profile->knots.size()) {
+      return false;
+    }
+    const SectionTubeKnot& knot = section_profile->knots[index];
+    w = knot.w;
+    lower = knot.lower;
+    upper = knot.upper;
+    return true;
+  }
+};
+
+std::size_t SourceLowerBound(const StrictPwlSourceView& source,
+                             const double value) {
+  std::size_t first = 0U;
+  std::size_t last = source.knotCount();
+  while (first < last) {
+    const std::size_t middle = first + (last - first) / 2U;
+    double w = 0.0;
+    double lower = 0.0;
+    double upper = 0.0;
+    if (!source.knotAt(middle, w, lower, upper) || !(w >= value)) {
+      first = middle + 1U;
+    } else {
+      last = middle;
+    }
+  }
+  return first;
+}
+
+std::size_t SourceUpperBound(const StrictPwlSourceView& source,
+                             const double value) {
+  std::size_t first = 0U;
+  std::size_t last = source.knotCount();
+  while (first < last) {
+    const std::size_t middle = first + (last - first) / 2U;
+    double w = 0.0;
+    double lower = 0.0;
+    double upper = 0.0;
+    if (!source.knotAt(middle, w, lower, upper) || !(w > value)) {
+      first = middle + 1U;
+    } else {
+      last = middle;
+    }
+  }
+  return first;
+}
+
+bool BuildMergedNodesStrict(const StrictPwlSourceView& source,
+                            const double current_w, const double horizon_w,
+                            const double spacing_w,
+                            const std::size_t max_nodes,
+                            std::vector<double>& nodes, std::string& reason) {
   nodes.clear();
-  if (profile.knots.size() < 2U || max_nodes < 2U ||
-      profile.knots.size() > kMaximumProfileKnots) {
-    reason = "immutable V2 profile knot count is out of bounds";
+  if (source.knotCount() < 2U || max_nodes < 2U ||
+      source.knotCount() > kMaximumProfileKnots) {
+    reason = "immutable PWL profile knot count is out of bounds";
     return false;
   }
   double horizon = 0.0;
   if (!DifferenceDownwardV2(horizon_w, current_w, horizon)) {
-    reason = "live V2 horizon width is not representable";
+    reason = "live PWL horizon width is not representable";
     return false;
   }
   double ratio = 0.0;
   if (!Finite(horizon) || horizon <= 0.0 ||
       !RatioCeilV2(horizon, spacing_w, ratio) || !Finite(ratio) ||
       ratio <= 0.0 || ratio > static_cast<double>(max_nodes - 1U)) {
-    reason = "live V2 sample-grid ratio is out of bounds";
+    reason = "live PWL sample-grid ratio is out of bounds";
     return false;
   }
   const double rounded_count = std::ceil(ratio);
   if (!Finite(rounded_count) || rounded_count < 1.0 ||
       rounded_count > static_cast<double>(max_nodes - 1U)) {
-    reason = "live V2 sample-grid count is out of bounds";
+    reason = "live PWL sample-grid count is out of bounds";
     return false;
   }
   const std::size_t sample_count = static_cast<std::size_t>(rounded_count);
-  const auto first_ge = std::lower_bound(
-      profile.knots.begin(), profile.knots.end(), current_w,
-      [](const TubePwlKnotV2& knot, const double value) {
-        return knot.w < value;
-      });
-  const auto first_gt = std::upper_bound(
-      profile.knots.begin(), profile.knots.end(), horizon_w,
-      [](const double value, const TubePwlKnotV2& knot) {
-        return value < knot.w;
-      });
-  const std::size_t geometric_count =
-      static_cast<std::size_t>(first_gt - first_ge);
+  const std::size_t first_ge = SourceLowerBound(source, current_w);
+  const std::size_t first_gt = SourceUpperBound(source, horizon_w);
+  if (first_ge > first_gt || first_gt > source.knotCount()) {
+    reason = "live PWL source partition bounds are malformed";
+    return false;
+  }
+  const std::size_t geometric_count = first_gt - first_ge;
   if (geometric_count > std::numeric_limits<std::size_t>::max() -
           sample_count - 2U) {
-    reason = "live V2 partition size overflow";
+    reason = "live PWL partition size overflow";
     return false;
   }
   const std::size_t raw_bound = geometric_count + sample_count + 2U;
   if (raw_bound > max_nodes) {
-    reason = "live V2 merged partition exceeds finite bound";
+    reason = "live PWL merged partition exceeds finite bound";
     return false;
   }
   nodes.reserve(raw_bound);
   nodes.push_back(current_w);
   nodes.push_back(horizon_w);
-  for (auto iterator = first_ge; iterator != first_gt; ++iterator) {
-    nodes.push_back(iterator->w);
+  for (std::size_t index = first_ge; index < first_gt; ++index) {
+    double knot_w = 0.0;
+    double lower = 0.0;
+    double upper = 0.0;
+    if (!source.knotAt(index, knot_w, lower, upper) || !Finite(knot_w)) {
+      reason = "live PWL source knot is malformed";
+      return false;
+    }
+    nodes.push_back(knot_w);
   }
   for (std::size_t k = 1U; k <= sample_count; ++k) {
     double offset = 0.0;
     if (!ProductFloorV2(static_cast<double>(k), spacing_w, offset)) {
-      reason = "live V2 sample-grid product overflow";
+      reason = "live PWL sample-grid product overflow";
       return false;
     }
     double candidate = 0.0;
     if (!SumFloorV2(current_w, offset, candidate)) {
-      reason = "live V2 sample-grid sum is nonfinite";
+      reason = "live PWL sample-grid sum is nonfinite";
       return false;
     }
     if (!Finite(candidate) || !(candidate > current_w)) {
       if (!Finite(candidate)) {
-        reason = "live V2 sample-grid endpoint is nonfinite";
+        reason = "live PWL sample-grid endpoint is nonfinite";
         return false;
       }
       break;
@@ -718,7 +790,7 @@ bool BuildMergedNodesV2(const TubeProfileV2& profile, const double current_w,
   nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
   if (nodes.size() < 2U || nodes.size() > max_nodes ||
       nodes.front() != current_w || nodes.back() != horizon_w) {
-    reason = "live V2 merged partition is malformed";
+    reason = "live PWL merged partition is malformed";
     return false;
   }
   return true;
@@ -874,6 +946,48 @@ V2Interval V2DividePositive(const V2Interval& numerator,
       std::nextafter(upper, std::numeric_limits<double>::infinity()));
 }
 
+bool InterpolateStrictBounds(const double first_w, const double first_lower,
+                             const double first_upper, const double second_w,
+                             const double second_lower,
+                             const double second_upper, const double w,
+                             TubeViabilityInterval& interval) {
+  interval = TubeViabilityInterval();
+  const TubeViabilityInterval first =
+      MakeInterval(first_lower, first_upper);
+  const TubeViabilityInterval second =
+      MakeInterval(second_lower, second_upper);
+  if (!StrictTubeIntervalValidV2(first) ||
+      !StrictTubeIntervalValidV2(second) || !Finite(first_w) ||
+      !Finite(second_w) || !Finite(w) || !(second_w > first_w) ||
+      w < first_w || w > second_w) {
+    return false;
+  }
+  if (w == first_w) {
+    interval = first;
+    return true;
+  }
+  if (w == second_w) {
+    interval = second;
+    return true;
+  }
+  const V2Interval span = V2Subtract(V2Point(second_w), V2Point(first_w));
+  const V2Interval numerator = V2Subtract(V2Point(w), V2Point(first_w));
+  if (!span.valid || !numerator.valid || !(span.lower > 0.0)) return false;
+  const V2Interval alpha = V2DividePositive(numerator, span);
+  if (!alpha.valid || alpha.lower <= 0.0 || alpha.upper >= 1.0) return false;
+  const V2Interval lower_difference = V2Subtract(
+      V2Point(second.lower), V2Point(first.lower));
+  const V2Interval upper_difference = V2Subtract(
+      V2Point(second.upper), V2Point(first.upper));
+  const V2Interval lower_value = V2Add(
+      V2Point(first.lower), V2Multiply(lower_difference, alpha));
+  const V2Interval upper_value = V2Add(
+      V2Point(first.upper), V2Multiply(upper_difference, alpha));
+  if (!lower_value.valid || !upper_value.valid) return false;
+  interval = MakeInterval(lower_value.upper, upper_value.lower);
+  return interval.valid;
+}
+
 // Return an inward (downward) width for a closed interval.  A zero-width
 // interval is exact and therefore remains valid; a nonzero width uses the
 // complete directed subtraction so b_pre never overstates certified capacity
@@ -992,37 +1106,20 @@ bool InterpolateV2Interval(const TubeViabilityKnot& first,
                            const TubeViabilityKnot& second,
                            const double w,
                            TubeViabilityInterval& interval) {
-  interval = TubeViabilityInterval();
-  if (!StrictTubeIntervalValidV2(first.reachable) ||
-      !StrictTubeIntervalValidV2(second.reachable) ||
-      !Finite(first.w) || !Finite(second.w) || !Finite(w) ||
-      !(second.w > first.w) || w < first.w || w > second.w) {
-    return false;
-  }
-  if (w == first.w) {
-    interval = first.reachable;
-    return true;
-  }
-  if (w == second.w) {
-    interval = second.reachable;
-    return true;
-  }
-  const V2Interval span = V2Subtract(V2Point(second.w), V2Point(first.w));
-  const V2Interval numerator = V2Subtract(V2Point(w), V2Point(first.w));
-  if (!span.valid || !numerator.valid || !(span.lower > 0.0)) return false;
-  const V2Interval alpha = V2DividePositive(numerator, span);
-  if (!alpha.valid || alpha.lower <= 0.0 || alpha.upper >= 1.0) return false;
-  const V2Interval lower_difference = V2Subtract(
-      V2Point(second.reachable.lower), V2Point(first.reachable.lower));
-  const V2Interval upper_difference = V2Subtract(
-      V2Point(second.reachable.upper), V2Point(first.reachable.upper));
-  const V2Interval lower_value = V2Add(
-      V2Point(first.reachable.lower), V2Multiply(lower_difference, alpha));
-  const V2Interval upper_value = V2Add(
-      V2Point(first.reachable.upper), V2Multiply(upper_difference, alpha));
-  if (!lower_value.valid || !upper_value.valid) return false;
-  interval = MakeInterval(lower_value.upper, upper_value.lower);
-  return interval.valid;
+  return InterpolateStrictBounds(
+      first.w, first.reachable.lower, first.reachable.upper, second.w,
+      second.reachable.lower, second.reachable.upper, w, interval);
+}
+
+bool StrictPwlProof(const TubeViabilityProofKind proof_kind) {
+  return proof_kind == TubeViabilityProofKind::V2_LIVE_PWL ||
+      proof_kind == TubeViabilityProofKind::SECTION_PWL;
+}
+
+bool StrictPolicyValid(const TubeViabilityResult& result) {
+  return result.proof_kind == TubeViabilityProofKind::SECTION_PWL
+      ? result.policy.numericValid()
+      : result.policy.valid();
 }
 
 bool QueryEnvelopeV2Strict(const TubeViabilityResult& result,
@@ -1030,7 +1127,7 @@ bool QueryEnvelopeV2Strict(const TubeViabilityResult& result,
                            TubeViabilityInterval& interval) {
   interval = TubeViabilityInterval();
   if (!SupportedFloatingPointEnvironmentV2() ||
-      result.proof_kind != TubeViabilityProofKind::V2_LIVE_PWL ||
+      !StrictPwlProof(result.proof_kind) ||
       !result.valid || !result.feasible || result.knots.size() < 2U ||
       !Finite(w) || w < result.preview_start_w ||
       w > result.preview_end_w) {
@@ -1155,10 +1252,10 @@ bool QueryRateIntervalV2Strict(const TubeViabilityResult& result,
                                TubeViabilityRateInterval& interval) {
   interval = TubeViabilityRateInterval();
   if (!SupportedFloatingPointEnvironmentV2() ||
-      result.proof_kind != TubeViabilityProofKind::V2_LIVE_PWL ||
+      !StrictPwlProof(result.proof_kind) ||
       !result.valid || !result.feasible || result.knots.size() < 2U ||
       !Finite(w) || !Finite(delta) || !Finite(phase_rate) ||
-      !result.policy.valid() || phase_rate < result.policy.lower_nu ||
+      !StrictPolicyValid(result) || phase_rate < result.policy.lower_nu ||
       phase_rate > result.policy.upper_nu || w < result.preview_start_w ||
       w > result.preview_end_w) {
     return false;
@@ -1213,12 +1310,16 @@ bool QueryRateIntervalV2Strict(const TubeViabilityResult& result,
 
 }  // namespace
 
-bool NormalPreviewProductionPolicy::valid() const {
+bool NormalPreviewProductionPolicy::numericValid() const {
   return immutable && Finite(preview_horizon_w) && preview_horizon_w > 0.0 &&
       Finite(sample_spacing_w) && sample_spacing_w > 0.0 &&
       Finite(lower_nu) && lower_nu > 0.0 && Finite(upper_nu) &&
       upper_nu >= lower_nu && Finite(b_tight) && b_tight >= 0.0 &&
-      Finite(b_open) && b_open > b_tight && policy_revision != 0U &&
+      Finite(b_open) && b_open > b_tight;
+}
+
+bool NormalPreviewProductionPolicy::valid() const {
+  return numericValid() && policy_revision != 0U &&
       configuration_identity != 0U;
 }
 
@@ -1499,6 +1600,545 @@ bool TubeViability::evaluate(const TubeViabilityInput& input,
 
 namespace {
 
+bool EvaluateStrictSourceAt(const StrictPwlSourceView& source,
+                            const double w, double& lower, double& upper) {
+  lower = 0.0;
+  upper = 0.0;
+  const std::size_t count = source.knotCount();
+  if (count < 2U || !Finite(w)) return false;
+  double first_w = 0.0;
+  double first_lower = 0.0;
+  double first_upper = 0.0;
+  double last_w = 0.0;
+  double last_lower = 0.0;
+  double last_upper = 0.0;
+  if (!source.knotAt(0U, first_w, first_lower, first_upper) ||
+      !source.knotAt(count - 1U, last_w, last_lower, last_upper) ||
+      w < first_w || w > last_w) {
+    return false;
+  }
+  if (w == first_w) {
+    lower = first_lower;
+    upper = first_upper;
+    return Finite(lower) && Finite(upper) && lower <= upper;
+  }
+  if (w == last_w) {
+    lower = last_lower;
+    upper = last_upper;
+    return Finite(lower) && Finite(upper) && lower <= upper;
+  }
+  if (source.v2_profile != nullptr) {
+    // Keep the frozen V2 profile's established strict evaluator exactly as
+    // the old entry point used it.  The merged partition/recurrence below is
+    // shared with Section PWL, while this callback preserves V2 bit patterns.
+    return source.v2_profile->evaluate(w, lower, upper);
+  }
+  const std::size_t right = SourceUpperBound(source, w);
+  if (right == 0U || right >= count) return false;
+  double left_w = 0.0;
+  double left_lower = 0.0;
+  double left_upper = 0.0;
+  double right_w = 0.0;
+  double right_lower = 0.0;
+  double right_upper = 0.0;
+  if (!source.knotAt(right - 1U, left_w, left_lower, left_upper) ||
+      !source.knotAt(right, right_w, right_lower, right_upper)) return false;
+  TubeViabilityInterval interval;
+  if (!InterpolateStrictBounds(left_w, left_lower, left_upper, right_w,
+                               right_lower, right_upper, w, interval) ||
+      !interval.valid || interval.lower > 0.0 || interval.upper < 0.0) {
+    return false;
+  }
+  lower = interval.lower;
+  upper = interval.upper;
+  return true;
+}
+
+bool EvaluateStrictPwlCore(const StrictPwlSourceView& source,
+                           const TubeViabilityInput& input,
+                           TubeViabilityResult& output,
+                           const double profile_end,
+                           const bool allow_terminal_truncate,
+                           const char* label,
+                           const std::size_t initial_work = 0U) {
+  output.current_w = input.current_w;
+  output.max_work = input.max_work;
+  std::size_t work_count = initial_work;
+  const auto clear_borrowed = [&output]() {
+    output.section_profile = nullptr;
+    output.evaluated_delta = 0.0;
+  };
+  const auto invalid = [&output, &work_count, &clear_borrowed](
+      const std::string& reason) {
+    output.status = TubeViabilityStatus::INVALID_INPUT;
+    output.valid = false;
+    output.feasible = false;
+    output.rate_feasible = false;
+    output.contraction_rate_feasible = false;
+    output.reason = reason;
+    output.knots.clear();
+    clear_borrowed();
+    output.work_count = work_count;
+    return false;
+  };
+  const auto preview_infeasible = [&output, &work_count, &clear_borrowed](
+      const std::string& reason) {
+    output.valid = true;
+    output.feasible = false;
+    output.rate_feasible = false;
+    output.contraction_rate_feasible = false;
+    output.status = TubeViabilityStatus::PREVIEW_INFEASIBLE;
+    output.reason = reason;
+    // Preserve the historical V2 diagnostic knots on a geometrically
+    // infeasible preview; Section failures must not retain borrowable
+    // geometry, so that branch is cleared before returning.
+    if (output.proof_kind == TubeViabilityProofKind::SECTION_PWL) {
+      output.knots.clear();
+    }
+    clear_borrowed();
+    output.work_count = work_count;
+    return true;
+  };
+
+  if (!Finite(profile_end)) {
+    return invalid(std::string(label) + " profile endpoint is nonfinite");
+  }
+  double horizon_end = 0.0;
+  if (!SumCeilV2(input.current_w, input.policy.preview_horizon_w,
+                 horizon_end)) {
+    return invalid(std::string(label) + " horizon endpoint is nonfinite");
+  }
+  output.preview_start_w = input.current_w;
+  output.preview_end_w = horizon_end;
+  double effective_horizon = 0.0;
+  if (!DifferenceDownwardV2(horizon_end, input.current_w,
+                            effective_horizon)) {
+    return invalid(std::string(label) + " horizon width is nonfinite");
+  }
+  output.effective_horizon_w = effective_horizon;
+  if (!Finite(horizon_end) || horizon_end <= input.current_w) {
+    return preview_infeasible(std::string(label) +
+                              " has no positive preview horizon");
+  }
+  if (horizon_end > profile_end) {
+    output.preview_truncated_after = true;
+    if (!allow_terminal_truncate || !(profile_end > input.current_w)) {
+      return preview_infeasible(std::string(label) +
+                                " full normal W horizon is not covered");
+    }
+    horizon_end = profile_end;
+    output.preview_end_w = horizon_end;
+    if (!DifferenceDownwardV2(horizon_end, input.current_w,
+                              effective_horizon) ||
+        !(effective_horizon > 0.0)) {
+      return preview_infeasible(std::string(label) +
+                                " terminal endpoint has no positive preview");
+    }
+    output.effective_horizon_w = effective_horizon;
+  }
+
+  const std::size_t node_budget = std::min(kMaximumSamples, input.max_work);
+  std::vector<double> nodes;
+  std::string reason;
+  if (!BuildMergedNodesStrict(source, input.current_w, horizon_end,
+                              input.policy.sample_spacing_w, node_budget,
+                              nodes, reason)) {
+    return invalid(reason);
+  }
+  if (nodes.size() < 2U || nodes.size() > kMaximumSamples) {
+    return invalid(std::string(label) + " merged partition is outside bounds");
+  }
+  if (!ConsumeWorkV2(nodes.size(), input.max_work, work_count)) {
+    return invalid(std::string(label) + " live preview work budget is exhausted");
+  }
+  output.preview_end_w = horizon_end;
+  output.effective_horizon_w = effective_horizon;
+  if (!DifferenceDownwardV2(nodes[1U], nodes[0U], output.delta_w)) {
+    return invalid(std::string(label) + " merged partition has a bad first cell");
+  }
+
+  double delta_rate = 0.0;
+  if (!RatioFloorV2(input.upper_u_delta, input.policy.upper_nu, delta_rate)) {
+    return invalid(std::string(label) + " reachable-rate ratio is nonfinite");
+  }
+  output.allowed_inward_contraction_slope = delta_rate;
+  output.knots.resize(nodes.size());
+  for (std::size_t i = 0U; i < nodes.size(); ++i) {
+    if (!ConsumeWorkV2(1U, input.max_work, work_count)) {
+      return invalid(std::string(label) + " live preview work budget is exhausted");
+    }
+    TubeViabilityKnot& knot = output.knots[i];
+    knot.w = nodes[i];
+    double lower = 0.0;
+    double upper = 0.0;
+    if (!EvaluateStrictSourceAt(source, nodes[i], lower, upper)) {
+      return invalid(std::string(label) + " PWL evaluation failed on merged partition");
+    }
+    knot.geometric = MakeInterval(lower, upper);
+    if (!knot.geometric.valid) {
+      return invalid(std::string(label) + " geometric interval is invalid");
+    }
+  }
+
+  output.knots.back().reachable = output.knots.back().geometric;
+  output.delta_delta = 0.0;
+  for (std::size_t i = nodes.size() - 1U; i-- > 0U;) {
+    if (!ConsumeWorkV2(1U, input.max_work, work_count)) {
+      return invalid(std::string(label) + " live preview work budget is exhausted");
+    }
+    double span = 0.0;
+    if (!DifferenceDownwardV2(nodes[i + 1U], nodes[i], span)) {
+      return invalid(std::string(label) + " merged cell width is invalid");
+    }
+    double reach = 0.0;
+    if (!ProductFloorV2(delta_rate, span, reach)) {
+      return invalid(std::string(label) + " per-cell reachable width is nonfinite");
+    }
+    if (i == 0U) output.delta_delta = reach;
+    const TubeViabilityInterval& geometric = output.knots[i].geometric;
+    const TubeViabilityInterval& successor = output.knots[i + 1U].reachable;
+    if (!successor.valid) {
+      output.knots[i].reachable = TubeViabilityInterval();
+      continue;
+    }
+    double lower = 0.0;
+    double upper = 0.0;
+    if (!InwardLowerDifferenceV2(successor.lower, reach, lower) ||
+        !InwardUpperSumV2(successor.upper, reach, upper)) {
+      return invalid(std::string(label) + " inward recurrence arithmetic failed");
+    }
+    output.knots[i].reachable = MakeInterval(
+        std::max(geometric.lower, lower),
+        std::min(geometric.upper, upper));
+  }
+  output.delta_reach = MakeInterval(-output.delta_delta, output.delta_delta);
+
+  output.feasible = true;
+  for (TubeViabilityKnot& knot : output.knots) {
+    if (!knot.reachable.valid ||
+        knot.reachable.lower < knot.geometric.lower ||
+        knot.reachable.upper > knot.geometric.upper) {
+      output.feasible = false;
+    }
+  }
+  if (!output.feasible) {
+    return preview_infeasible(std::string(label) +
+                              " reachable envelope is empty or outside I");
+  }
+
+  // Directed one-sided slope intervals on every merged cell.  This is shared
+  // verbatim by V2 and Section PWL; the work accounting remains per endpoint
+  // ratio as in the frozen V2 implementation.
+  for (std::size_t i = 0U; i < output.knots.size(); ++i) {
+    if (i > 0U) {
+      if (!ConsumeWorkV2(2U, input.max_work, work_count)) {
+        return invalid(std::string(label) + " live preview work budget is exhausted");
+      }
+      const V2Interval span_interval = V2Subtract(
+          V2Point(output.knots[i].w), V2Point(output.knots[i - 1U].w));
+      if (!span_interval.valid || !(span_interval.lower > 0.0)) {
+        return invalid(std::string(label) + " left-cell slope span is invalid");
+      }
+      const V2Interval lower_difference = V2Subtract(
+          V2Point(output.knots[i].reachable.lower),
+          V2Point(output.knots[i - 1U].reachable.lower));
+      const V2Interval upper_difference = V2Subtract(
+          V2Point(output.knots[i].reachable.upper),
+          V2Point(output.knots[i - 1U].reachable.upper));
+      const V2Interval lower_slope = V2DividePositive(
+          lower_difference, span_interval);
+      const V2Interval upper_slope = V2DividePositive(
+          upper_difference, span_interval);
+      if (!lower_slope.valid || !upper_slope.valid) {
+        return invalid(std::string(label) + " left-cell slope ratio is invalid");
+      }
+      output.knots[i].lower_slope_left_interval = MakeInterval(
+          lower_slope.lower, lower_slope.upper);
+      output.knots[i].upper_slope_left_interval = MakeInterval(
+          upper_slope.lower, upper_slope.upper);
+      output.knots[i].lower_slope_left = lower_slope.lower;
+      output.knots[i].upper_slope_left = upper_slope.upper;
+      output.knots[i].lower_slope_left_valid =
+          output.knots[i].lower_slope_left_interval.valid;
+      output.knots[i].upper_slope_left_valid =
+          output.knots[i].upper_slope_left_interval.valid;
+    }
+    if (i + 1U < output.knots.size()) {
+      if (!ConsumeWorkV2(2U, input.max_work, work_count)) {
+        return invalid(std::string(label) + " live preview work budget is exhausted");
+      }
+      const V2Interval span_interval = V2Subtract(
+          V2Point(output.knots[i + 1U].w), V2Point(output.knots[i].w));
+      if (!span_interval.valid || !(span_interval.lower > 0.0)) {
+        return invalid(std::string(label) + " right-cell slope span is invalid");
+      }
+      const V2Interval lower_difference = V2Subtract(
+          V2Point(output.knots[i + 1U].reachable.lower),
+          V2Point(output.knots[i].reachable.lower));
+      const V2Interval upper_difference = V2Subtract(
+          V2Point(output.knots[i + 1U].reachable.upper),
+          V2Point(output.knots[i].reachable.upper));
+      const V2Interval lower_slope = V2DividePositive(
+          lower_difference, span_interval);
+      const V2Interval upper_slope = V2DividePositive(
+          upper_difference, span_interval);
+      if (!lower_slope.valid || !upper_slope.valid) {
+        return invalid(std::string(label) + " right-cell slope ratio is invalid");
+      }
+      output.knots[i].lower_slope_right_interval = MakeInterval(
+          lower_slope.lower, lower_slope.upper);
+      output.knots[i].upper_slope_right_interval = MakeInterval(
+          upper_slope.lower, upper_slope.upper);
+      output.knots[i].lower_slope_right = lower_slope.lower;
+      output.knots[i].upper_slope_right = upper_slope.upper;
+      output.knots[i].lower_slope_right_valid =
+          output.knots[i].lower_slope_right_interval.valid;
+      output.knots[i].upper_slope_right_valid =
+          output.knots[i].upper_slope_right_interval.valid;
+    }
+  }
+  output.max_inward_contraction_slope = 0.0;
+  output.contraction_rate_feasible = true;
+  // `delta_rate` is a floored ratio (`RatioFloorV2(upper_u_delta, upper_nu)`)
+  // and the reachable envelope is constructed to contract at or below it.  The
+  // boundary slope recovered below is an outward-rounded interval, so a
+  // corridor whose construction saturates the rate window reads one or two
+  // ULPs *above* the floored ratio even though its exact slope is within the
+  // window.  The geometric evaluator has always absorbed this rounding with
+  // `boundary_tolerance`; the strict PWL core inherited the construction but
+  // not the slack, which spuriously reported RATE_INFEASIBLE for corridors that
+  // are exactly at the limit (a 1-ULP ceiling-vs-floor comparison).  Compare
+  // against a limit that carries both the caller's tolerance and a few ULPs of
+  // the ratio itself; the slack is ~1e-16, far below any physical scale.
+  const double contraction_limit =
+      delta_rate + std::max(input.boundary_tolerance,
+                            16.0 * std::numeric_limits<double>::epsilon() *
+                                std::abs(delta_rate));
+  for (const TubeViabilityKnot& knot : output.knots) {
+    const TubeViabilityInterval* lower_slopes[] = {
+        &knot.lower_slope_left_interval, &knot.lower_slope_right_interval};
+    for (const TubeViabilityInterval* slope : lower_slopes) {
+      if (!slope->valid) continue;
+      if (slope->upper > contraction_limit) {
+        output.contraction_rate_feasible = false;
+      }
+      output.max_inward_contraction_slope = std::max(
+          output.max_inward_contraction_slope, std::max(0.0, slope->upper));
+    }
+    const TubeViabilityInterval* upper_slopes[] = {
+        &knot.upper_slope_left_interval, &knot.upper_slope_right_interval};
+    for (const TubeViabilityInterval* slope : upper_slopes) {
+      if (!slope->valid) continue;
+      if (slope->lower < -contraction_limit) {
+        output.contraction_rate_feasible = false;
+      }
+      output.max_inward_contraction_slope = std::max(
+          output.max_inward_contraction_slope,
+          std::max(0.0, -slope->lower));
+    }
+  }
+
+  output.b_pre = std::numeric_limits<double>::infinity();
+  for (const TubeViabilityKnot& knot : output.knots) {
+    if (!ConsumeWorkV2(1U, input.max_work, work_count)) {
+      return invalid(std::string(label) + " live preview work budget is exhausted");
+    }
+    double width = 0.0;
+    if (!WidthDownwardV2(knot.reachable, width)) {
+      return invalid(std::string(label) + " reachable knot width is invalid");
+    }
+    output.b_pre = std::min(output.b_pre, width);
+  }
+  if (!Finite(output.b_pre)) return invalid(std::string(label) + " b_pre is nonfinite");
+  output.beta_argument = (output.b_pre - input.policy.b_tight) /
+      (input.policy.b_open - input.policy.b_tight);
+  output.beta = TubeViability::smoothstep(output.beta_argument);
+  output.beta_i = output.beta;
+  if (!Finite(output.beta)) return invalid(std::string(label) + " beta is nonfinite");
+
+  for (TubeViabilityKnot& knot : output.knots) {
+    if (!ConsumeWorkV2(2U, input.max_work, work_count)) {
+      return invalid(std::string(label) + " live preview work budget is exhausted");
+    }
+    const bool lower_rate_ok = BuildRateIntervalV2Strict(
+        knot, knot.reachable.lower, input.policy.lower_nu,
+        input.policy.upper_nu, input.upper_u_delta, knot.lower_boundary_rate);
+    const bool upper_rate_ok = BuildRateIntervalV2Strict(
+        knot, knot.reachable.upper, input.policy.lower_nu,
+        input.policy.upper_nu, input.upper_u_delta, knot.upper_boundary_rate);
+    (void)lower_rate_ok;
+    (void)upper_rate_ok;
+  }
+  const TubeViabilityKnot& first = output.knots.front();
+  output.current_delta_inside = first.reachable.contains(input.current_delta, 0.0);
+  output.rate_feasible = output.contraction_rate_feasible;
+  if (output.current_delta_inside) {
+    const bool current_rate_ok = BuildRateIntervalV2Strict(
+        first, input.current_delta, input.policy.lower_nu,
+        input.policy.upper_nu, input.upper_u_delta,
+        output.current_rate_interval);
+    output.rate_feasible = output.rate_feasible && current_rate_ok;
+  } else {
+    output.rate_feasible = false;
+  }
+  output.valid = true;
+  if (!output.contraction_rate_feasible || !output.rate_feasible) {
+    output.status = output.current_delta_inside
+        ? TubeViabilityStatus::RATE_INFEASIBLE
+        : TubeViabilityStatus::CURRENT_DELTA_OUTSIDE;
+    output.reason = output.current_delta_inside
+        ? std::string(label) + " reachable boundary contraction/rate is infeasible"
+        : std::string("current delta is outside ") + label + " K";
+    clear_borrowed();
+  } else {
+    output.status = TubeViabilityStatus::FEASIBLE;
+    output.reason = std::string(label) + " preview is feasible";
+  }
+  output.work_count = work_count;
+  return true;
+}
+
+bool ValidateSectionProfile(const SectionTubeProfile& profile,
+                            const std::size_t max_work,
+                            std::size_t& work_count, std::string& reason) {
+  work_count = 0U;
+  if (!profile.usable) {
+    reason = "Section PWL profile is not usable";
+    return false;
+  }
+  if (!Finite(profile.valid_start) || !Finite(profile.valid_end) ||
+      !(profile.valid_end > profile.valid_start) || profile.knots.size() < 2U ||
+      profile.knots.size() > kMaximumProfileKnots ||
+      profile.knots.front().w != profile.valid_start ||
+      profile.knots.back().w != profile.valid_end) {
+    reason = "Section PWL profile domain or knot count is malformed";
+    return false;
+  }
+  if (profile.status == SectionTubeStatus::COMPLETE && !profile.complete) {
+    reason = "COMPLETE Section PWL profile is not marked complete";
+    return false;
+  }
+  if (profile.status == SectionTubeStatus::ZERO_ONLY && !profile.complete) {
+    reason = "ZERO_ONLY Section PWL profile is not marked complete";
+    return false;
+  }
+  if (profile.status == SectionTubeStatus::PARTIAL && profile.complete) {
+    reason = "PARTIAL Section PWL profile is marked complete";
+    return false;
+  }
+  if (profile.status != SectionTubeStatus::COMPLETE &&
+      profile.status != SectionTubeStatus::ZERO_ONLY &&
+      profile.status != SectionTubeStatus::PARTIAL) {
+    reason = "Section PWL profile status is not queryable";
+    return false;
+  }
+  bool zero_only = true;
+  for (std::size_t i = 0U; i < profile.knots.size(); ++i) {
+    if (!ConsumeWorkV2(1U, max_work, work_count)) {
+      reason = "Section PWL validation work budget is exhausted";
+      return false;
+    }
+    const SectionTubeKnot& knot = profile.knots[i];
+    if (!Finite(knot.w) || !Finite(knot.lower) || !Finite(knot.upper) ||
+        knot.lower > knot.upper || knot.lower > 0.0 || knot.upper < 0.0 ||
+        (i > 0U && !(knot.w > profile.knots[i - 1U].w))) {
+      reason = "Section PWL knots are nonfinite, unordered or exclude zero";
+      return false;
+    }
+    zero_only = zero_only && knot.lower == 0.0 && knot.upper == 0.0;
+  }
+  if (profile.status == SectionTubeStatus::ZERO_ONLY && !zero_only) {
+    reason = "ZERO_ONLY Section PWL profile contains nonzero capacity";
+    return false;
+  }
+  return true;
+}
+
+bool EvaluateSection(const SectionTubeProfile& profile,
+                     const TubeViabilityInput& input,
+                     TubeViabilityResult& output) {
+  output = TubeViabilityResult();
+  output.proof_kind = TubeViabilityProofKind::SECTION_PWL;
+  output.policy = input.policy;
+  output.upper_u_delta = input.upper_u_delta;
+  output.provenance.immutable = true;
+  output.provenance.path_revision = input.path_revision;
+  output.provenance.frame_revision = input.frame_revision;
+  output.provenance.source =
+      "phase_offset_navigation/tube_viability/section-pwl";
+  output.max_work = input.max_work;
+
+  const auto invalid = [&output](const std::string& reason) {
+    output.status = TubeViabilityStatus::INVALID_INPUT;
+    output.valid = false;
+    output.feasible = false;
+    output.rate_feasible = false;
+    output.contraction_rate_feasible = false;
+    output.reason = reason;
+    output.knots.clear();
+    output.section_profile = nullptr;
+    output.evaluated_delta = 0.0;
+    return false;
+  };
+  if (!SupportedFloatingPointEnvironmentV2()) {
+    return invalid("Section PWL preview requires nearest binary64 without FTZ/DAZ/FMA");
+  }
+  std::string reason;
+  if (!input.policy.numericValid() || !Finite(input.current_w) ||
+      !Finite(input.current_delta) || !Finite(input.upper_u_delta) ||
+      input.upper_u_delta < 0.0 || !Finite(input.boundary_tolerance) ||
+      input.boundary_tolerance < 0.0 || input.max_work == 0U) {
+    return invalid("Section PWL policy, capability or live values are invalid");
+  }
+  if (input.profile != nullptr || !input.cross_sections.empty()) {
+    return invalid("Section PWL preview cannot bind a legacy geometric source");
+  }
+  std::size_t validation_work = 0U;
+  if (!ValidateSectionProfile(profile, input.max_work, validation_work,
+                              reason)) {
+    output.work_count = validation_work;
+    return invalid(reason);
+  }
+  output.work_count = validation_work;
+  // A Section profile has no embedded path/frame identity.  The caller's
+  // nonzero revisions are therefore the only immutable binding available to
+  // Preview and allocator consumers.
+  if (input.path_revision == 0U || input.frame_revision == 0U ||
+      (input.expected_path_revision != 0U &&
+       input.expected_path_revision != input.path_revision) ||
+      (input.expected_frame_revision != 0U &&
+       input.expected_frame_revision != input.frame_revision)) {
+    return invalid("Section PWL path/frame provenance is missing or stale");
+  }
+  if (input.current_w < profile.valid_start ||
+      input.current_w > profile.valid_end) {
+    return invalid("current phase is outside the Section PWL domain");
+  }
+  if (input.section_reaches_path_end &&
+      (!profile.complete || profile.status == SectionTubeStatus::PARTIAL)) {
+    return invalid("Section terminal flag requires a complete non-PARTIAL profile");
+  }
+
+  output.current_w = input.current_w;
+  output.current_w_inside = true;
+  StrictPwlSourceView source;
+  source.section_profile = &profile;
+  const bool evaluated = EvaluateStrictPwlCore(
+      source, input, output, profile.valid_end, input.section_reaches_path_end,
+      "Section PWL", validation_work);
+  // A state-feasible evaluation (the corridor exists at the current phase)
+  // borrows the immutable profile even when its *rate* window cannot host the
+  // requested motion, or its offset sits outside the corridor and must be
+  // recovered.  Callers bind the returned pointer to the profile they passed,
+  // so leaving it null for those statuses would make the identity gate reject
+  // every degraded tick and freeze the reference.
+  if (evaluated && output.feasible) {
+    output.section_profile = &profile;
+    output.evaluated_delta = input.current_delta;
+  }
+  return evaluated;
+}
+
 bool EvaluateV2(const TubeProfileV2& profile,
                const TubeViabilityInput& input,
                TubeViabilityResult& output) {
@@ -1609,291 +2249,382 @@ bool EvaluateV2(const TubeProfileV2& profile,
       !(profile.certified_end > profile.certified_start)) {
     return invalid("immutable V2 certified range is invalid");
   }
-  double horizon_end = 0.0;
-  if (!SumCeilV2(input.current_w, input.policy.preview_horizon_w,
-                 horizon_end)) {
-    return invalid("live V2 horizon endpoint is nonfinite");
+  StrictPwlSourceView source;
+  source.v2_profile = &profile;
+  return EvaluateStrictPwlCore(source, input, output,
+                               profile.certified_end, false, "live V2");
+}
+
+// Locate and conservatively interpolate one immutable Section K interval.
+// This is deliberately independent from TubeViabilityResult::envelopeAt,
+// whose observational legacy implementation performs a linear scan.  A held
+// step only visits the small knot range touched by its terminal interval.
+std::size_t HeldProbeCost(const std::size_t count) {
+  std::size_t probes = 1U;
+  std::size_t remaining = count;
+  while (remaining > 1U) {
+    ++probes;
+    remaining = (remaining + 1U) / 2U;
   }
-  output.preview_start_w = input.current_w;
-  output.preview_end_w = horizon_end;
-  double effective_horizon = 0.0;
-  if (!DifferenceDownwardV2(horizon_end, input.current_w,
-                            effective_horizon)) {
-    return invalid("live V2 horizon width is nonfinite");
+  return probes;
+}
+
+void SetHeldFailure(TubeHeldStepResult& output, const std::size_t work,
+                    const std::string& reason) {
+  output.valid = false;
+  output.next_w = 0.0;
+  output.next_delta = 0.0;
+  output.work_count = work;
+  output.reason = reason;
+}
+
+bool HeldEnvelopeAt(const TubeViabilityResult& preview, const double w,
+                    const std::size_t max_work, std::size_t& work,
+                    TubeHeldStepResult& output,
+                    TubeViabilityInterval& interval) {
+  interval = TubeViabilityInterval();
+  if (!Finite(w) || preview.knots.size() < 2U ||
+      w < preview.preview_start_w || w > preview.preview_end_w) {
+    return false;
   }
-  output.effective_horizon_w = effective_horizon;
-  if (!Finite(horizon_end) || horizon_end <= input.current_w ||
-      horizon_end > profile.certified_end) {
-    output.preview_truncated_after = horizon_end > profile.certified_end;
-    output.valid = true;
-    output.feasible = false;
-    output.status = TubeViabilityStatus::PREVIEW_INFEASIBLE;
-    output.reason = "full normal W horizon is not covered by the profile";
-    return true;
+  if (!ConsumeWorkV2(HeldProbeCost(preview.knots.size()), max_work, work)) {
+    SetHeldFailure(output, work, "held-step work budget is exhausted");
+    return false;
+  }
+  const std::vector<TubeViabilityKnot>& knots = preview.knots;
+  std::size_t first = 0U;
+  std::size_t last = knots.size();
+  while (first < last) {
+    const std::size_t middle = first + (last - first) / 2U;
+    if (!Finite(knots[middle].w)) return false;
+    if (knots[middle].w < w) {
+      first = middle + 1U;
+    } else {
+      last = middle;
+    }
+  }
+  if (first < knots.size() && knots[first].w == w) {
+    interval = knots[first].reachable;
+    return StrictTubeIntervalValidV2(interval);
+  }
+  if (first == 0U || first >= knots.size()) return false;
+  const TubeViabilityKnot& left = knots[first - 1U];
+  const TubeViabilityKnot& right = knots[first];
+  if (!(right.w > left.w) || !StrictTubeIntervalValidV2(left.reachable) ||
+      !StrictTubeIntervalValidV2(right.reachable)) {
+    return false;
+  }
+  return InterpolateStrictBounds(
+      left.w, left.reachable.lower, left.reachable.upper, right.w,
+      right.reachable.lower, right.reachable.upper, w, interval);
+}
+
+bool HeldLowerBound(const TubeViabilityResult& preview, const double w,
+                    const std::size_t max_work, std::size_t& work,
+                    TubeHeldStepResult& output, std::size_t& result) {
+  if (!ConsumeWorkV2(HeldProbeCost(preview.knots.size()), max_work, work)) {
+    SetHeldFailure(output, work, "held-step work budget is exhausted");
+    return false;
+  }
+  std::size_t first = 0U;
+  std::size_t last = preview.knots.size();
+  while (first < last) {
+    const std::size_t middle = first + (last - first) / 2U;
+    if (preview.knots[middle].w < w) {
+      first = middle + 1U;
+    } else {
+      last = middle;
+    }
+  }
+  result = first;
+  return true;
+}
+
+bool HeldUpperBound(const TubeViabilityResult& preview, const double w,
+                    const std::size_t max_work, std::size_t& work,
+                    TubeHeldStepResult& output, std::size_t& result) {
+  if (!ConsumeWorkV2(HeldProbeCost(preview.knots.size()), max_work, work)) {
+    SetHeldFailure(output, work, "held-step work budget is exhausted");
+    return false;
+  }
+  std::size_t first = 0U;
+  std::size_t last = preview.knots.size();
+  while (first < last) {
+    const std::size_t middle = first + (last - first) / 2U;
+    if (!(preview.knots[middle].w > w)) {
+      first = middle + 1U;
+    } else {
+      last = middle;
+    }
+  }
+  result = first;
+  return true;
+}
+
+bool ConsumeHeldWork(const std::size_t max_work, std::size_t& work,
+                     TubeHeldStepResult& output, const char* reason) {
+  if (!ConsumeWorkV2(1U, max_work, work)) {
+    SetHeldFailure(output, work, reason);
+    return false;
+  }
+  return true;
+}
+
+bool IntersectHeld(const TubeViabilityInterval& first,
+                   const TubeViabilityInterval& second,
+                   TubeViabilityInterval& result) {
+  if (!StrictTubeIntervalValidV2(first) ||
+      !StrictTubeIntervalValidV2(second)) {
+    result = TubeViabilityInterval();
+    return false;
+  }
+  const TubeViabilityInterval candidate =
+      MakeInterval(std::max(first.lower, second.lower),
+                   std::min(first.upper, second.upper));
+  result = candidate;
+  return StrictTubeIntervalValidV2(candidate);
+}
+
+bool CheckHeldTerminalRange(const TubeViabilityResult& preview,
+                            const V2Interval& terminal_w,
+                            const V2Interval& terminal_delta,
+                            const double next_w, const double next_delta,
+                            const std::size_t max_work,
+                            std::size_t& work,
+                            TubeHeldStepResult& output) {
+  if (!terminal_w.valid || !terminal_delta.valid ||
+      terminal_w.lower < preview.preview_start_w ||
+      terminal_w.upper > preview.preview_end_w ||
+      terminal_w.lower > terminal_w.upper) {
+    SetHeldFailure(output, work,
+                   "held terminal multiply-add interval leaves the preview domain");
+    return false;
   }
 
-  std::vector<double> nodes;
-  std::string reason;
-  const std::size_t node_budget = std::min(
-      kMaximumSamples, input.max_work);
-  if (!BuildMergedNodesV2(profile, input.current_w, horizon_end,
-                          input.policy.sample_spacing_w, node_budget, nodes,
-                          reason)) {
-    return invalid(reason);
+  TubeViabilityInterval common;
+  bool have_common = false;
+  const auto include = [&](const TubeViabilityInterval& envelope) -> bool {
+    if (!ConsumeHeldWork(max_work, work, output,
+                         "held-step work budget is exhausted")) {
+      return false;
+    }
+    if (!StrictTubeIntervalValidV2(envelope)) {
+      SetHeldFailure(output, work,
+                     "held terminal PWL envelope is unavailable");
+      return false;
+    }
+    if (!have_common) {
+      common = envelope;
+      have_common = true;
+      return true;
+    }
+    return IntersectHeld(common, envelope, common);
+  };
+
+  TubeViabilityInterval terminal_lower;
+  TubeViabilityInterval terminal_upper;
+  if (!HeldEnvelopeAt(preview, terminal_w.lower, max_work, work, output,
+                      terminal_lower) ||
+      !include(terminal_lower) ||
+      (terminal_w.upper != terminal_w.lower &&
+       (!HeldEnvelopeAt(preview, terminal_w.upper, max_work, work, output,
+                        terminal_upper) ||
+        !include(terminal_upper)))) {
+    if (output.reason.empty()) {
+      SetHeldFailure(output, work,
+                     "held terminal PWL envelope is unavailable");
+    }
+    return false;
   }
-  if (nodes.size() < 2U || nodes.size() > kMaximumSamples) {
-    return invalid("V2 merged partition is outside finite bounds");
+  std::size_t begin = 0U;
+  std::size_t end = 0U;
+  if (!HeldLowerBound(preview, terminal_w.lower, max_work, work, output,
+                      begin) ||
+      !HeldUpperBound(preview, terminal_w.upper, max_work, work, output,
+                      end)) {
+    return false;
   }
-  if (!ConsumeWorkV2(nodes.size(), input.max_work, work_count)) {
-    return invalid("V2 live preview work budget is exhausted");
+  if (begin > end || end > preview.knots.size()) {
+    SetHeldFailure(output, work, "held terminal knot range is malformed");
+    return false;
   }
-  output.preview_end_w = horizon_end;
-  output.effective_horizon_w = effective_horizon;
-  if (!DifferenceDownwardV2(nodes[1U], nodes[0U], output.delta_w)) {
-    return invalid("V2 merged partition has a nonpositive first cell");
+  for (std::size_t index = begin; index < end; ++index) {
+    const double knot_w = preview.knots[index].w;
+    if (knot_w < terminal_w.lower || knot_w > terminal_w.upper) continue;
+    if (!include(preview.knots[index].reachable)) return false;
+  }
+  if (!have_common || !StrictTubeIntervalValidV2(common) ||
+      terminal_delta.lower > terminal_delta.upper ||
+      terminal_delta.lower < common.lower ||
+      terminal_delta.upper > common.upper ||
+      next_delta < common.lower || next_delta > common.upper ||
+      !Finite(next_w) || !Finite(next_delta)) {
+    SetHeldFailure(output, work,
+                   "held terminal delta interval is outside common PWL bounds");
+    return false;
+  }
+  return true;
+}
+
+bool CheckHeldStepImpl(const TubeViabilityResult& preview,
+                       const double current_w, const double current_delta,
+                       const double phase_rate, const double u_delta,
+                       const double dt, const std::size_t max_work,
+                       TubeHeldStepResult& output) {
+  output = TubeHeldStepResult();
+  std::size_t work = 0U;
+  const auto fail = [&](const std::string& reason) {
+    SetHeldFailure(output, work, reason);
+    return false;
+  };
+  if (!SupportedFloatingPointEnvironmentV2()) {
+    return fail("held Section step requires nearest binary64 without FTZ/DAZ/FMA");
+  }
+  if (preview.proof_kind != TubeViabilityProofKind::SECTION_PWL ||
+      preview.status != TubeViabilityStatus::FEASIBLE ||
+      !preview.valid || !preview.feasible || !preview.rate_feasible ||
+      !preview.contraction_rate_feasible || !preview.current_delta_inside ||
+      preview.section_profile == nullptr ||
+      !preview.policy.numericValid() || preview.knots.size() < 2U ||
+      !Finite(preview.current_w) || !Finite(preview.evaluated_delta) ||
+      !Finite(preview.preview_start_w) || !Finite(preview.preview_end_w) ||
+      !(preview.preview_end_w > preview.preview_start_w) ||
+      preview.current_w != preview.preview_start_w ||
+      !Finite(preview.upper_u_delta) || preview.upper_u_delta < 0.0) {
+    return fail("held Section preview is not a feasible immutable PWL result");
+  }
+  if (!Finite(current_w) || !Finite(current_delta) ||
+      current_w != preview.current_w ||
+      current_delta != preview.evaluated_delta) {
+    return fail("held Section current W/delta does not match Preview state");
+  }
+  const SectionTubeProfile& profile = *preview.section_profile;
+  if (!profile.usable || !Finite(profile.valid_start) ||
+      !Finite(profile.valid_end) || profile.knots.size() < 2U ||
+      profile.knots.front().w != profile.valid_start ||
+      profile.knots.back().w != profile.valid_end ||
+      (profile.status == SectionTubeStatus::COMPLETE && !profile.complete) ||
+      (profile.status == SectionTubeStatus::ZERO_ONLY && !profile.complete) ||
+      (profile.status == SectionTubeStatus::PARTIAL && profile.complete) ||
+      (profile.status != SectionTubeStatus::COMPLETE &&
+       profile.status != SectionTubeStatus::ZERO_ONLY &&
+       profile.status != SectionTubeStatus::PARTIAL) ||
+      preview.knots.front().w != preview.current_w ||
+      preview.knots.back().w != preview.preview_end_w ||
+      preview.preview_start_w < profile.valid_start ||
+      preview.preview_end_w > profile.valid_end) {
+    return fail("held Section profile binding or domain is invalid");
+  }
+  if (!Finite(phase_rate) || phase_rate < 0.0 ||
+      phase_rate < preview.policy.lower_nu ||
+      phase_rate > preview.policy.upper_nu) {
+    return fail("held phase rate is outside the immutable Preview policy");
+  }
+  if (!Finite(u_delta) || std::abs(u_delta) > preview.upper_u_delta) {
+    return fail("held transverse command exceeds the Preview capability");
+  }
+  if (!Finite(dt) || dt <= 0.0 || max_work == 0U) {
+    return fail("held-step duration or work budget is invalid");
   }
 
-  double delta_rate = 0.0;
-  if (!RatioFloorV2(input.upper_u_delta, input.policy.upper_nu,
-                    delta_rate)) {
-    return invalid("V2 reachable-rate ratio is nonfinite");
+  // The endpoint values below are the exact double state that Runtime may
+  // later commit.  Their interval counterparts are used only for the safety
+  // checks, never as a second successor state or as a clamped replacement.
+  const double next_w = current_w + dt * phase_rate;
+  const double next_delta = current_delta + dt * u_delta;
+  if (!Finite(next_w) || !Finite(next_delta) || next_w < current_w) {
+    return fail("held-step endpoint is nonfinite or moves phase backwards");
   }
-  output.allowed_inward_contraction_slope = delta_rate;
-  output.knots.resize(nodes.size());
-  for (std::size_t i = 0U; i < nodes.size(); ++i) {
-    if (!ConsumeWorkV2(1U, input.max_work, work_count)) {
-      return invalid("V2 live preview work budget is exhausted");
-    }
-    TubeViabilityKnot& knot = output.knots[i];
-    knot.w = nodes[i];
-    double lower = 0.0;
-    double upper = 0.0;
-    if (!profile.evaluate(nodes[i], lower, upper)) {
-      return invalid("V2 profile PWL evaluation failed on merged partition");
-    }
-    knot.geometric = MakeInterval(lower, upper);
-    if (!knot.geometric.valid) {
-      return invalid("V2 geometric interval is invalid");
-    }
+  V2Interval terminal_w = V2Add(
+      V2Point(current_w),
+      V2Multiply(V2Point(dt), V2Point(phase_rate)));
+  V2Interval terminal_delta = V2Add(
+      V2Point(current_delta),
+      V2Multiply(V2Point(dt), V2Point(u_delta)));
+  if (!terminal_w.valid || !terminal_delta.valid) {
+    return fail("held-step endpoint multiply-add is not representable");
   }
 
-  output.knots.back().reachable = output.knots.back().geometric;
-  output.delta_delta = 0.0;
-  for (std::size_t i = nodes.size() - 1U; i-- > 0U;) {
-    if (!ConsumeWorkV2(1U, input.max_work, work_count)) {
-      return invalid("V2 live preview work budget is exhausted");
-    }
-    double span = 0.0;
-    if (!DifferenceDownwardV2(nodes[i + 1U], nodes[i], span)) {
-      return invalid("V2 merged cell width is invalid");
-    }
-    double reach = 0.0;
-    if (!ProductFloorV2(delta_rate, span, reach)) {
-      return invalid("V2 per-cell reachable width is nonfinite");
-    }
-    if (i == 0U) output.delta_delta = reach;
-    const TubeViabilityInterval& geometric = output.knots[i].geometric;
-    const TubeViabilityInterval& successor = output.knots[i + 1U].reachable;
-    if (!successor.valid) {
-      output.knots[i].reachable = TubeViabilityInterval();
+  if (!ConsumeHeldWork(max_work, work, output,
+                       "held-step work budget is exhausted")) {
+    return false;
+  }
+  TubeViabilityInterval current_envelope;
+  if (!HeldEnvelopeAt(preview, current_w, max_work, work, output,
+                      current_envelope)) {
+    return false;
+  }
+  if (!current_envelope.contains(current_delta, 0.0)) {
+    return fail("held current point is outside the Preview K envelope");
+  }
+
+  // Every K knot whose W may be reached in this tick is checked using an
+  // outward time/delta interval.  A knot at the exact fixed terminal time is
+  // still covered by CheckHeldTerminalRange and is not reverse-solved from
+  // the rounded endpoint.
+  std::size_t begin = 0U;
+  std::size_t end = 0U;
+  if (!HeldUpperBound(preview, current_w, max_work, work, output, begin) ||
+      !HeldUpperBound(preview, terminal_w.upper, max_work, work, output,
+                      end)) {
+    return false;
+  }
+  if (begin > end || end > preview.knots.size()) {
+    return fail("held crossed-knot range is malformed");
+  }
+  const V2Interval time_domain = V2Bounds(0.0, dt);
+  for (std::size_t index = begin; index < end; ++index) {
+    const double knot_w = preview.knots[index].w;
+    if (!Finite(knot_w) || !(knot_w > current_w) ||
+        knot_w > terminal_w.upper) {
       continue;
     }
-    double lower = 0.0;
-    double upper = 0.0;
-    if (!InwardLowerDifferenceV2(successor.lower, reach, lower) ||
-        !InwardUpperSumV2(successor.upper, reach, upper)) {
-      return invalid("V2 inward recurrence arithmetic failed");
+    const bool exact_terminal_knot =
+        terminal_w.lower == terminal_w.upper && terminal_w.lower == knot_w &&
+        next_w == knot_w;
+    if (exact_terminal_knot) continue;
+    if (!ConsumeHeldWork(max_work, work, output,
+                         "held-step work budget is exhausted")) {
+      return false;
     }
-    output.knots[i].reachable = MakeInterval(
-        std::max(geometric.lower, lower),
-        std::min(geometric.upper, upper));
-  }
-  output.delta_reach = MakeInterval(-output.delta_delta,
-                                    output.delta_delta);
-
-  output.feasible = true;
-  for (TubeViabilityKnot& knot : output.knots) {
-    if (!knot.reachable.valid ||
-        knot.reachable.lower < knot.geometric.lower ||
-        knot.reachable.upper > knot.geometric.upper) {
-      output.feasible = false;
+    const V2Interval elapsed = V2DividePositive(
+        V2Subtract(V2Point(knot_w), V2Point(current_w)),
+        V2Point(phase_rate));
+    if (!elapsed.valid) return fail("held crossed-knot time is not representable");
+    TubeViabilityInterval elapsed_limited;
+    if (!IntersectHeld(TubeViabilityInterval{elapsed.lower, elapsed.upper, true},
+                       TubeViabilityInterval{time_domain.lower,
+                                              time_domain.upper, true},
+                       elapsed_limited)) {
+      continue;
     }
-  }
-  if (!output.feasible) {
-    output.valid = true;
-    output.status = TubeViabilityStatus::PREVIEW_INFEASIBLE;
-    output.reason = "inward V2 reachable envelope is empty or outside I";
-    return true;
-  }
-
-  // Populate both one-sided slope values on the exact merged cells.  Unlike
-  // the legacy path, no minimum-spacing tolerance is allowed to erase a
-  // near-equal geometric knot.
-  for (std::size_t i = 0U; i < output.knots.size(); ++i) {
-    if (i > 0U) {
-      if (!ConsumeWorkV2(2U, input.max_work, work_count)) {
-        return invalid("V2 live preview work budget is exhausted");
-      }
-      // Slope division needs the complete directed interval for the exact
-      // endpoint subtraction.  A downward scalar span is appropriate for
-      // reachability recursion, but using it as a singleton denominator here
-      // could silently understate a signed slope.
-      const V2Interval span_interval = V2Subtract(
-          V2Point(output.knots[i].w),
-          V2Point(output.knots[i - 1U].w));
-      if (!span_interval.valid || !(span_interval.lower > 0.0)) {
-        return invalid("V2 left-cell slope span is invalid");
-      }
-      const V2Interval lower_difference = V2Subtract(
-          V2Point(output.knots[i].reachable.lower),
-          V2Point(output.knots[i - 1U].reachable.lower));
-      const V2Interval upper_difference = V2Subtract(
-          V2Point(output.knots[i].reachable.upper),
-          V2Point(output.knots[i - 1U].reachable.upper));
-      const V2Interval lower_slope = V2DividePositive(
-          lower_difference, span_interval);
-      const V2Interval upper_slope = V2DividePositive(
-          upper_difference, span_interval);
-      if (!lower_slope.valid || !upper_slope.valid) {
-        return invalid("V2 left-cell slope ratio is invalid");
-      }
-      output.knots[i].lower_slope_left_interval = MakeInterval(
-          lower_slope.lower, lower_slope.upper);
-      output.knots[i].upper_slope_left_interval = MakeInterval(
-          upper_slope.lower, upper_slope.upper);
-      output.knots[i].lower_slope_left = lower_slope.lower;
-      output.knots[i].upper_slope_left = upper_slope.upper;
-      output.knots[i].lower_slope_left_valid =
-          output.knots[i].lower_slope_left_interval.valid;
-      output.knots[i].upper_slope_left_valid =
-          output.knots[i].upper_slope_left_interval.valid;
+    if (!ConsumeHeldWork(max_work, work, output,
+                         "held-step work budget is exhausted")) {
+      return false;
     }
-    if (i + 1U < output.knots.size()) {
-      if (!ConsumeWorkV2(2U, input.max_work, work_count)) {
-        return invalid("V2 live preview work budget is exhausted");
-      }
-      const V2Interval span_interval = V2Subtract(
-          V2Point(output.knots[i + 1U].w), V2Point(output.knots[i].w));
-      if (!span_interval.valid || !(span_interval.lower > 0.0)) {
-        return invalid("V2 right-cell slope span is invalid");
-      }
-      const V2Interval lower_difference = V2Subtract(
-          V2Point(output.knots[i + 1U].reachable.lower),
-          V2Point(output.knots[i].reachable.lower));
-      const V2Interval upper_difference = V2Subtract(
-          V2Point(output.knots[i + 1U].reachable.upper),
-          V2Point(output.knots[i].reachable.upper));
-      const V2Interval lower_slope = V2DividePositive(
-          lower_difference, span_interval);
-      const V2Interval upper_slope = V2DividePositive(
-          upper_difference, span_interval);
-      if (!lower_slope.valid || !upper_slope.valid) {
-        return invalid("V2 right-cell slope ratio is invalid");
-      }
-      output.knots[i].lower_slope_right_interval = MakeInterval(
-          lower_slope.lower, lower_slope.upper);
-      output.knots[i].upper_slope_right_interval = MakeInterval(
-          upper_slope.lower, upper_slope.upper);
-      output.knots[i].lower_slope_right = lower_slope.lower;
-      output.knots[i].upper_slope_right = upper_slope.upper;
-      output.knots[i].lower_slope_right_valid =
-          output.knots[i].lower_slope_right_interval.valid;
-      output.knots[i].upper_slope_right_valid =
-          output.knots[i].upper_slope_right_interval.valid;
-    }
-  }
-  output.max_inward_contraction_slope = 0.0;
-  output.contraction_rate_feasible = true;
-  for (const TubeViabilityKnot& knot : output.knots) {
-    // The lower face moves inward only when its slope is positive.  The
-    // directed upper endpoint is the rigorous worst case for that test.
-    const TubeViabilityInterval* lower_slopes[] = {
-        &knot.lower_slope_left_interval, &knot.lower_slope_right_interval};
-    for (const TubeViabilityInterval* slope : lower_slopes) {
-      if (!slope->valid) continue;
-      if (slope->upper > delta_rate) {
-        output.contraction_rate_feasible = false;
-      }
-      output.max_inward_contraction_slope = std::max(
-          output.max_inward_contraction_slope, std::max(0.0, slope->upper));
-    }
-    // The upper face moves inward only when its slope is negative.  The
-    // directed lower endpoint is the rigorous worst case for that test.
-    const TubeViabilityInterval* upper_slopes[] = {
-        &knot.upper_slope_left_interval, &knot.upper_slope_right_interval};
-    for (const TubeViabilityInterval* slope : upper_slopes) {
-      if (!slope->valid) continue;
-      if (slope->lower < -delta_rate) {
-        output.contraction_rate_feasible = false;
-      }
-      output.max_inward_contraction_slope = std::max(
-          output.max_inward_contraction_slope,
-          std::max(0.0, -slope->lower));
+    const V2Interval knot_delta = V2Add(
+        V2Point(current_delta),
+        V2Multiply(V2Point(u_delta),
+                   V2Bounds(elapsed_limited.lower,
+                            elapsed_limited.upper)));
+    TubeViabilityInterval knot_envelope;
+    knot_envelope = preview.knots[index].reachable;
+    if (!knot_delta.valid || !StrictTubeIntervalValidV2(knot_envelope) ||
+        knot_delta.lower < knot_envelope.lower ||
+        knot_delta.upper > knot_envelope.upper) {
+      return fail("held crossed-knot delta interval leaves the Preview K envelope");
     }
   }
 
-  output.b_pre = std::numeric_limits<double>::infinity();
-  for (const TubeViabilityKnot& knot : output.knots) {
-    if (!ConsumeWorkV2(1U, input.max_work, work_count)) {
-      return invalid("V2 live preview work budget is exhausted");
-    }
-    double width = 0.0;
-    if (!WidthDownwardV2(knot.reachable, width)) {
-      return invalid("V2 reachable knot width is invalid");
-    }
-    output.b_pre = std::min(output.b_pre, width);
-  }
-  if (!Finite(output.b_pre)) return invalid("V2 b_pre is nonfinite");
-  output.beta_argument = (output.b_pre - input.policy.b_tight) /
-      (input.policy.b_open - input.policy.b_tight);
-  output.beta = TubeViability::smoothstep(output.beta_argument);
-  output.beta_i = output.beta;
-  if (!Finite(output.beta)) return invalid("V2 beta is nonfinite");
-
-  for (TubeViabilityKnot& knot : output.knots) {
-    if (!ConsumeWorkV2(2U, input.max_work, work_count)) {
-      return invalid("V2 live preview work budget is exhausted");
-    }
-    const bool lower_rate_ok = BuildRateIntervalV2Strict(
-        knot, knot.reachable.lower, input.policy.lower_nu,
-        input.policy.upper_nu, input.upper_u_delta,
-        knot.lower_boundary_rate);
-    const bool upper_rate_ok = BuildRateIntervalV2Strict(
-        knot, knot.reachable.upper, input.policy.lower_nu,
-        input.policy.upper_nu, input.upper_u_delta,
-        knot.upper_boundary_rate);
-    // These are diagnostics for hypothetical states at each knot.  They do
-    // not veto the finite-horizon preview: only the actual current state's
-    // rate and the per-cell inward-contraction proof determine rate_feasible.
-    (void)lower_rate_ok;
-    (void)upper_rate_ok;
-  }
-  const TubeViabilityKnot& first = output.knots.front();
-  output.current_delta_inside = first.reachable.contains(
-      input.current_delta, 0.0);
-  output.rate_feasible = output.contraction_rate_feasible;
-  if (output.current_delta_inside) {
-    const bool current_rate_ok = BuildRateIntervalV2Strict(
-        first, input.current_delta, input.policy.lower_nu,
-        input.policy.upper_nu, input.upper_u_delta,
-        output.current_rate_interval);
-    output.rate_feasible = output.rate_feasible && current_rate_ok;
-  } else {
-    output.rate_feasible = false;
+  if (!CheckHeldTerminalRange(preview, terminal_w, terminal_delta, next_w,
+                              next_delta, max_work, work, output)) {
+    return false;
   }
   output.valid = true;
-  if (!output.contraction_rate_feasible || !output.rate_feasible) {
-    output.status = output.current_delta_inside
-        ? TubeViabilityStatus::RATE_INFEASIBLE
-        : TubeViabilityStatus::CURRENT_DELTA_OUTSIDE;
-    output.reason = output.current_delta_inside
-        ? "V2 reachable boundary contraction/rate is infeasible"
-        : "current delta is outside live V2 K";
-  } else {
-    output.status = TubeViabilityStatus::FEASIBLE;
-    output.reason = "live V2 preview is feasible";
-  }
-  output.work_count = work_count;
+  output.next_w = next_w;
+  output.next_delta = next_delta;
+  output.work_count = work;
+  output.reason = "held Section PWL step is feasible";
   return true;
 }
 
@@ -1903,6 +2634,23 @@ bool TubeViability::evaluate(const TubeProfileV2& profile,
                              const TubeViabilityInput& input,
                              TubeViabilityResult& output) {
   return EvaluateV2(profile, input, output);
+}
+
+bool TubeViability::evaluate(const SectionTubeProfile& profile,
+                             const TubeViabilityInput& input,
+                             TubeViabilityResult& output) {
+  return EvaluateSection(profile, input, output);
+}
+
+bool TubeViability::checkHeldStep(const TubeViabilityResult& preview,
+                                  const double current_w,
+                                  const double current_delta,
+                                  const double phase_rate,
+                                  const double u_delta, const double dt,
+                                  const std::size_t max_work,
+                                  TubeHeldStepResult& output) {
+  return CheckHeldStepImpl(preview, current_w, current_delta, phase_rate,
+                           u_delta, dt, max_work, output);
 }
 
 bool TubeViability::evaluate(const TubeProfileV2& profile,
@@ -1922,7 +2670,7 @@ bool TubeViability::evaluate(const TubeProfileV2& profile,
 bool TubeViability::queryEnvelope(const TubeViabilityResult& result,
                                   const double w,
                                   TubeViabilityInterval& interval) {
-  if (result.proof_kind == TubeViabilityProofKind::V2_LIVE_PWL) {
+  if (StrictPwlProof(result.proof_kind)) {
     return QueryEnvelopeV2Strict(result, w, interval);
   }
   interval = TubeViabilityInterval();
@@ -1966,7 +2714,7 @@ bool TubeViability::queryRateInterval(const TubeViabilityResult& result,
                                       const double delta,
                                       const double phase_rate,
                                       TubeViabilityRateInterval& interval) {
-  if (result.proof_kind == TubeViabilityProofKind::V2_LIVE_PWL) {
+  if (StrictPwlProof(result.proof_kind)) {
     return QueryRateIntervalV2Strict(result, w, delta, phase_rate, interval);
   }
   interval = TubeViabilityRateInterval();

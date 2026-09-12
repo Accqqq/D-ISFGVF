@@ -51,7 +51,6 @@
 #include <path_searching/astar_topo.h>
 #include <path_searching/kinodynamic_astar.h>
 #include "bspline_race/gvf.h"
-#include "bspline_race/integration/phase_offset_cloud_occupancy_query.h"
 #include "bspline_race/integration/phase_offset_matched_adapter.h"
 #include "bspline_race/integration/phase_offset_shadow_adapter.h"
 
@@ -71,50 +70,30 @@ double YAW_MAX = D_YAW_MAX * delta_T;
 namespace FLAG_Race
 {
 
-// Preallocated planner/display values belonging to one immutable successor
-// owner.  This is payload only: retaining it neither installs a path nor
-// grants command-publication authority.
-struct PathReferenceFrontendMirrorV2
-{
+// Publish-first Section path handoff.  Planning builds the complete frontend
+// mirror together with the Section bundle; the command callback applies this
+// immutable payload only after Runtime/PositionCommand publication succeeds.
+struct SectionPathHandoff {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+    std::uint64_t task_generation = 0U;
+    std::uint64_t phase_generation = 0U;
+    std::shared_ptr<const ContinuousPhasePath> source_path;
+    std::shared_ptr<const ContinuousPhasePath> candidate_path;
+    // The exact immutable Section bundle staged for this candidate.  Keeping
+    // it in the handoff ties the post-publish frontend mirror to the same
+    // path/frame/profile value consumed by the adapter; a later staged
+    // refresh cannot be substituted by pointer or path-name coincidence.
+    SectionPathBundlePtr bundle;
+    double copied_prefix_start_w = std::numeric_limits<double>::quiet_NaN();
+    double copied_prefix_end_w = std::numeric_limits<double>::quiet_NaN();
     Eigen::MatrixXd traj;
     Eigen::MatrixXd vel;
     Eigen::VectorXd time;
     std::vector<double> w;
-    int anchor_idx = 0;
+    nav_msgs::Path path_msg;
 
     bool complete() const;
-};
-
-// Small copied-prefix handoff evidence prescribed by the frozen V2 design.
-// S6-A populates the immutable SUCCESSOR request and leaves successor_profile
-// empty; later Stage-6 batches alone may admit a completion and commit the
-// binding/mirror at the publication boundary.
-struct PathReferenceHandoffV2
-{
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-    std::uint64_t expected_execution_generation = 0U;
-    phase_offset_navigation::TubePathKey source_path_key;
-    std::shared_ptr<const ContinuousPhasePath> successor_path_owner;
-    phase_offset_navigation::TubePathKey successor_path_key;
-    double successor_phase_after_w = 0.0;
-    double copied_prefix_start_w = 0.0;
-    double copied_prefix_end_w = 0.0;
-    std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
-        successor_request;
-    // Precomputed adapter-facing view of this same immutable handoff.  The
-    // command callback copies only this shared owner; it never reconstructs
-    // copied-prefix authority or allocates a new admission payload.
-    std::shared_ptr<const TubeV2SuccessorHandoffEvidence>
-        admission_evidence;
-    std::shared_ptr<const phase_offset_navigation::TubeProfileV2>
-        successor_profile;
-    std::shared_ptr<const PathReferenceFrontendMirrorV2> frontend_mirror;
-
-    bool requestComplete() const;
-    bool committedComplete() const;
 };
 
 class gvf_manager
@@ -153,6 +132,13 @@ class gvf_manager
         double cmd_governor_l_rate_max_ = 4.0;
         double cmd_governor_l_ff_weight_ = 0.8;
         double cmd_governor_lead_max_ = 1.6;
+        // A "no valid candidate" hold that survives this long means the
+        // reference has run away from the vehicle and the bounded command set
+        // is empty.  Instead of holding forever (which preserves the very
+        // condition that caused it) the phase is invalidated so the next tick
+        // re-anchors it to the vehicle.  <= 0 disables the unlock.
+        double cmd_governor_unlock_timeout_s_ = 1.0;
+        ros::Time governor_no_valid_since_;
         double cmd_governor_normal_cross_max_ = 0.08;
         double cmd_governor_normal_deadband_ = 0.05;
         double cmd_governor_normal_full_error_ = 0.35;
@@ -377,6 +363,14 @@ class gvf_manager
         ros::Subscriber cmd_enable_sub; // 新增订阅者
 
         ros::Publisher  circle_ref_pub_;
+        // Display-only Section tube boundaries.  Published from the FSM
+        // planning thread; never touched by the command callback.
+        ros::Publisher  section_tube_marker_pub_;
+        // Display-only executed reference (base path shifted by the Section
+        // offset).  Fixed topic name; the per-agent launch remaps it to
+        // /uav_N/phase_offset_adjusted_path.
+        ros::Publisher  adjusted_path_pub_;
+        ros::Time last_adjusted_path_time_;
 
     private:
         struct AuthoritativePhaseSnapshot {
@@ -419,30 +413,32 @@ class gvf_manager
             phase_offset_navigation::RecoveryStepStatus::NONE;
         std::mutex frontend_apply_mutex_;
         mutable std::mutex path_reference_handoff_mutex_;
-        // One immutable successor slot.  Before publication it carries the
-        // request with a null profile; after the publish-first commit the
-        // same slot carries the enriched binding/mirror until FSM applies the
-        // display payload.  It is not a READY latch or a second lifecycle.
-        std::shared_ptr<const PathReferenceHandoffV2>
-            pending_path_reference_handoff_v2_;
-        // Monotonic process-lifetime identities.  Task reset deliberately
-        // does not rewind them, preventing stale successor-key reuse.
-        std::uint64_t next_tube_request_id_v2_ = 0U;
-        std::uint64_t next_path_identity_v2_ = 0U;
-        // The 10 Hz timer owns coherent map capture and CURRENT request
-        // construction.  The command callback copies only this immutable
-        // owner plus bounded accepted-state visibility metadata.
-        mutable std::mutex current_tube_request_mutex_v2_;
-        std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
-            current_tube_request_v2_;
+        // Section candidate path/frontend payload.  It is consumed only by
+        // the post-publication no-fail seam; adapter staging remains the sole
+        // Runtime transaction owner.
+        std::shared_ptr<const SectionPathHandoff>
+            pending_section_path_handoff_;
+        // Monotonic process-lifetime path revisions used only for immutable
+        // planner/frontend ownership; they are not map or execution IDs.
+        std::uint64_t next_path_identity_ = 0U;
         // This mutex protects exactly {phase_w_, phase_initialized_,
         // closed_phase_acquired_, generation}.  Never hold it across path
         // construction, A*, tube construction, publication, or Runtime work.
         mutable std::mutex authoritative_phase_mutex_;
         std::uint64_t authoritative_phase_generation_ = 0U;
-        // S3: MANUAL tube construction/visualization only.  The 50 Hz command
-        // callback never calls TubeEpochManager.
-        ros::Timer phase_offset_tube_timer_;
+        // Last synchronous Section profile attempt on the FSM planning
+        // thread.  Zero means that the next valid immutable path should be
+        // built immediately.
+        ros::Time last_section_build_time_;
+        // Last Section bundle whose boundaries were published, used to publish
+        // only on change plus a slow heartbeat.  Marker construction stays on
+        // the planning thread and never runs in cmdCallback.
+        SectionPathBundlePtr last_section_marker_bundle_;
+        ros::Time last_section_marker_time_;
+        // True while a non-empty tube marker set is currently displayed, so
+        // retirement publishes exactly one DELETE instead of a periodic
+        // DELETE stream.
+        bool section_tube_marker_active_ = false;
         PhaseOffsetMatchedAdapterConfig matched_config_;
         // Exactly one main-side coordination selector is effective for this
         // manager.  Provider/transport flags are validated against it before
@@ -473,6 +469,23 @@ class gvf_manager
 
         enum FSM_EXEC_STATE { INIT, WAIT_TARGET, GEN_NEW_TRAJ, REPLAN_TRAJ, EXEC_TRAJ };
         FSM_EXEC_STATE exec_state_;
+
+        // Set by goalCallback (a spinner thread) whenever a new navigation task
+        // republishes the phase origin.  The FSM thread consumes it, retires the
+        // previous task's frontend and re-enters WAIT_TARGET -> GEN_NEW_TRAJ, so
+        // the new phase origin can never coexist with the old task's path
+        // coordinate domain.
+        std::atomic<bool> new_task_pending_{false};
+
+        // A point goal reached with a bounded, non-decaying Section reference
+        // must still terminate: once the accepted path is exhausted the
+        // governor has no candidate and the vehicle would hold forever.  This
+        // timer bounds how long the residual may keep the task alive.
+        ros::Time terminal_residual_start_;
+        double max_terminal_residual_hold_s_ = 2.0;
+        // Extra radius, on top of the retained Section offset, that counts as
+        // the terminal neighbourhood while the offset is still nonzero.
+        double point_goal_terminal_offset_slack_ = 0.25;
 
         struct KinoPlanSamples {
             double ts = 0.2;
@@ -525,6 +538,7 @@ class gvf_manager
             int valid_count = 0;
             int path_end_clamped_count = 0;
             int skipped_lead_count = 0;
+            int lead_clamped_count = 0;
             double raw_v_norm = 0.0;
             double raw_v_tau = 0.0;
             double raw_v_normal_norm = 0.0;
@@ -582,20 +596,20 @@ class gvf_manager
                                        Eigen::Vector3d& goal_pt,
                                        Eigen::Vector3d& end_vel,
                                        KinoPlanSamples& samples);
-        bool selectClosedPhaseV2Goal(gvfManager& pm,
-                                     const Eigen::Vector3d& curr_pos,
-                                     const Eigen::Vector3d& start_pt,
-                                     const Eigen::Vector3d& start_vel,
-                                     const Eigen::Vector3d& start_acc,
-                                     Eigen::Vector3d& goal_pt,
-                                     Eigen::Vector3d& end_vel,
-                                     KinoPlanSamples& samples);
+        bool selectClosedPhaseGoal(gvfManager& pm,
+                                   const Eigen::Vector3d& curr_pos,
+                                   const Eigen::Vector3d& start_pt,
+                                   const Eigen::Vector3d& start_vel,
+                                   const Eigen::Vector3d& start_acc,
+                                   Eigen::Vector3d& goal_pt,
+                                   Eigen::Vector3d& end_vel,
+                                   KinoPlanSamples& samples);
         bool evaluateSampledPhasePathState(const Eigen::MatrixXd& traj,
                                            const Eigen::MatrixXd& vel,
                                            const std::vector<double>& global_w,
                                            double query_w,
                                            PhasePathState& state) const;
-        bool buildPhaseV2C2Frontend(gvfManager& pm,
+        bool buildPhaseC2Frontend(gvfManager& pm,
                                     double phase_at_switch,
                                     double future_switch_w,
                                     const std::shared_ptr<const ContinuousPhasePath>&
@@ -612,40 +626,35 @@ class gvf_manager
                                     Eigen::VectorXd& stitched_time,
                                     std::vector<double>& stitched_w,
                                     std::shared_ptr<const ContinuousPhasePath>& continuous_path) const;
-        static bool plannerOnlyFutureSeamV2(
-            const std::shared_ptr<const ContinuousPhasePath>& source_path,
-            double phase_at_switch,
-            double construction_lead_w,
-            double& seam_w);
-        bool stageFutureSeamPathReferenceHandoffV2(
-            const AuthoritativePhaseSnapshot& phase_after,
+        bool stageSectionPathHandoff(
+            const AuthoritativePhaseSnapshot& phase,
             gvfManager& pm,
-            double path_end_w,
-            int candidate_anchor_idx,
-            const UniformBspline& candidate_spline,
+            const std::shared_ptr<const ContinuousPhasePath>& candidate_path,
             const Eigen::MatrixXd& candidate_traj,
             const Eigen::MatrixXd& candidate_vel,
             const Eigen::VectorXd& candidate_time,
             const std::vector<double>& candidate_w,
-            Eigen::MatrixXd& staged_traj,
-            Eigen::MatrixXd& staged_vel,
-            Eigen::VectorXd& staged_time,
-            std::vector<double>& staged_w,
-            std::shared_ptr<const ContinuousPhasePath>& staged_path);
-        bool assignPathIdentityV2(
+            const std::shared_ptr<const ContinuousPhasePath>& source_path,
+            double copied_prefix_start_w,
+            double copied_prefix_end_w);
+        bool assignPathIdentity(
             const std::shared_ptr<const ContinuousPhasePath>& candidate,
             std::shared_ptr<const ContinuousPhasePath>& assigned);
-        bool buildCurrentTubeRequestV2(
+        // Planning-thread Section production.  This captures one bounded
+        // local map view, builds the immutable profile from the exact path,
+        // and stages the path/frame/profile bundle for the next command tick.
+        // No Runtime, phase, or publication state is touched here.
+        bool buildAndStageSectionBundle(
             gvfManager& pm,
             const AuthoritativePhaseSnapshot& phase,
-            std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>&
-                request);
-        bool captureCurrentTubeCommandEvidenceV2(
-            gvfManager& pm,
-            const std::shared_ptr<const ContinuousPhasePath>& command_path,
-            double current_w,
-            MatchedAdapterInput& input) const;
-        bool installPlannerOnlyFrontendV2(
+            const std::shared_ptr<const ContinuousPhasePath>& path,
+            const std::shared_ptr<const ContinuousPhasePath>& source_path =
+                std::shared_ptr<const ContinuousPhasePath>(),
+            double copied_prefix_start_w =
+                std::numeric_limits<double>::quiet_NaN(),
+            double copied_prefix_end_w =
+                std::numeric_limits<double>::quiet_NaN());
+        bool installPlannerOnlyFrontend(
             gvfManager& pm,
             const Eigen::MatrixXd& traj,
             const Eigen::MatrixXd& vel,
@@ -659,13 +668,18 @@ class gvf_manager
             double copied_prefix_end_w,
             std::uint64_t expected_execution_generation,
             nav_msgs::Path& path_msg);
-        bool consumeCommittedPathReferenceHandoffV2(
+        bool consumeCommittedSectionPathHandoff(
             gvfManager& pm, const ros::Time& now);
-        std::shared_ptr<const ContinuousPhasePath>
-            captureCommandPathForV2Binding(
-                const gvfManager& pm,
-                const std::shared_ptr<const TubeV2ExecutionBinding>&
-                    binding);
+        // Finalize a point-goal terminal only after the caller's task witness
+        // has been rechecked under the complete publication lock order.  A
+        // zero Runtime offset retires the whole Section task and invalidates
+        // stale phase/task commands before the FSM leaves EXEC_TRAJ; a
+        // nonzero offset keeps the task active for bounded recentering, unless
+        // allow_nonzero_reference is set after that bounded window expired.
+        bool finalizeSectionTerminal(
+            gvfManager& pm, std::uint64_t expected_task_generation,
+            double& retained_manual_reference,
+            bool allow_nonzero_reference = false);
         bool installAuthoritativePathMirrorLocked(
             const Eigen::MatrixXd& traj,
             const Eigen::MatrixXd& vel,
@@ -795,6 +809,14 @@ class gvf_manager
             const double required_w = std::max(0.0, governor_l_max) + std::max(0.0, margin_w);
             return remaining_w <= required_w;
         }
+        // Select the first structural breakpoint strictly ahead of the
+        // current phase and construction lead.  Mapped spline evaluators
+        // expose these exact represented seams through the immutable path;
+        // the endpoint itself is never used as a future handoff seam.
+        static bool plannerOnlyFutureSeam(
+            const std::shared_ptr<const ContinuousPhasePath>& source_path,
+            double phase_at_switch, double construction_lead_w,
+            double& seam_w);
         static Eigen::Vector3d boundedInitialAcquisitionDelta(
             const Eigen::Vector3d& guidance_velocity,
             double velocity_limit,

@@ -171,6 +171,11 @@ struct PathCellGeometryCertificate {
   double sup_p_ww_norm = 0.0;
   double sup_p_www_norm = 0.0;
   double sup_horizontal_p_ww_norm = 0.0;
+  // Optional component-wise absolute p_ww upper bounds supplied by a path
+  // producer.  The capability bit is authoritative: a default zero vector
+  // without the bit set does not claim zero acceleration.
+  Eigen::Vector3d sup_abs_p_ww = Eigen::Vector3d::Zero();
+  bool component_acceleration_bound_complete = false;
   bool horizontal_acceleration_bound_complete = false;
 
   // These are bounds for the same Horizontal-N convention used by

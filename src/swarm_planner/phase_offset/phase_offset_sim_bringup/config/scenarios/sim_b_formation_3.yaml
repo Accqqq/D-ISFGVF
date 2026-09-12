@@ -1,0 +1,32 @@
+# SWARM benchmark scenario in the SPH-planning goal style.
+#
+# Start: one 1 m column around (0, 9, 1), i.e. x = -1 / 0 / +1.
+# Goal: SPH-planning translates the start formation by one goal vector
+# (`goal_i = init_i + clicked_goal + init_bias`), so every UAV keeps the same
+# 1 m relative offset and the formation flies south as one group.
+#
+# Start/goal rows: y = 9.0 -> -11.2 (M4D/M4F).  The old goal row y = -10.0 left
+# the x = +1 agent only 0.15 m from the nearest pillar point, so the planner
+# could not extend the front end to the goal ("no path" every replan) and that
+# agent stalled 0.3~1.0 m short with an exhausted path.  Measured minimum
+# clearance to the pillar cloud at the goal row:
+#   y = -10.0 -> 0.54 / 0.36 / 0.15 m   (x = -1 / 0 / +1)  -- unusable
+#   y = -11.2 -> 1.10 / 0.93 / 0.84 m                        -- chosen
+# (the row peak between the pillar bands; see docs M4E §7.3.)
+#
+# The corridor plus the +/-4 m local-sensing box covers y in [-15.2, +13.2],
+# which fits inside the per-agent map, and both rows are clear of the pillar
+# inflation at the agents' 0.1 m resolution.
+scenario:
+  name: sim_b_formation_3
+  frame_id: world
+  agents:
+    - robot_id: 0
+      initial: {x: -1.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: -1.0, y: -11.2, z: 0.0}
+    - robot_id: 1
+      initial: {x: 0.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: 0.0, y: -11.2, z: 0.0}
+    - robot_id: 2
+      initial: {x: 1.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: 1.0, y: -11.2, z: 0.0}

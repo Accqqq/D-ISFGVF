@@ -204,13 +204,13 @@ Visualization Manager:
       Queue Size: 1000
       Value: false
     - Class: rviz/Marker
-      Enabled: true
+      Enabled: false
       Marker Topic: /traj_vis
       Name: swarm_traj
       Namespaces:
         {}
       Queue Size: 100
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -240,13 +240,13 @@ Visualization Manager:
       Use rainbow: true
       Value: false
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /visualization_particles
       Name: MarkerArray
       Namespaces:
         {}
       Queue Size: 100
-      Value: true
+      Value: false
     - Class: rviz/MarkerArray
       Enabled: false
       Marker Topic: /visualization_trajectories
@@ -272,13 +272,13 @@ Visualization Manager:
       Queue Size: 100
       Value: false
     - Class: rviz/Marker
-      Enabled: true
+      Enabled: false
       Marker Topic: /corridor_vis
       Name: Marker
       Namespaces:
         {}
       Queue Size: 100
-      Value: true
+      Value: false
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /odom_visualization/robot
@@ -337,14 +337,14 @@ Visualization Manager:
           Frame: Local
           Offset: 1
           Scale: 1
-          Value: true
+          Value: false
         Position:
           Alpha: 0.30000001192092896
           Color: 204; 51; 204
           Scale: 1
-          Value: true
-        Value: true
-      Enabled: true
+          Value: false
+        Value: false
+      Enabled: false
       Keep: 1
       Name: Odometry
       Position Tolerance: 0.10000000149011612
@@ -361,7 +361,7 @@ Visualization Manager:
         Value: Axes
       Topic: /drone_1_visual_slam/odom
       Unreliable: false
-      Value: true
+      Value: false
     - Class: rviz/Marker
       Enabled: true
       Marker Topic: /goal_vis
@@ -431,13 +431,13 @@ Visualization Manager:
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /particle0sdf_map/map_boundary
       Name: MarkerArray
       Namespaces:
         {}
       Queue Size: 100
-      Value: true
+      Value: false
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
@@ -495,41 +495,160 @@ Visualization Manager:
       Unreliable: false
       Value: false
     - Class: rviz/Marker
-      Enabled: true
+      Enabled: false
       Marker Topic: /formation_planning/phase_offset_manual/base_path
       Name: A5 Base Path
       Namespaces:
         phase_offset_manual_base: true
       Queue Size: 100
-      Value: true
+      Value: false
     - Class: rviz/Marker
-      Enabled: true
+      Enabled: false
       Marker Topic: /formation_planning/phase_offset_manual/active_path
       Name: A5 Active Path
       Namespaces:
         phase_offset_manual_active: true
       Queue Size: 100
+      Value: false
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_0/phase_offset_adjusted_path
+      Name: UAV0 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_1/phase_offset_adjusted_path
+      Name: UAV1 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_2/phase_offset_adjusted_path
+      Name: UAV2 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /formation_planning/phase_offset_manual/frame
       Name: A5 Frame
       Namespaces:
         phase_offset_manual_frame: true
       Queue Size: 100
-      Value: true
+      Value: false
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /formation_planning/phase_offset_manual/tube_candidate
-      Name: PhaseOffset Tube Candidate (UNCERTIFIED)
-      Namespaces:
-        phase_offset_manual_tube_candidate: true
+      Name: PhaseOffset Tube Candidate (retired V2 publisher)
+      Namespaces: {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Marker Topic: /formation_planning/phase_offset_manual/tube
-      Name: PhaseOffset Tube Certified
+      Marker Topic: /phase_offset_section_tube
+      Name: PhaseOffset Section Tube (left/right)
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_3/phase_offset_adjusted_path
+      Name: UAV3 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_4/phase_offset_adjusted_path
+      Name: UAV4 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_5/phase_offset_adjusted_path
+      Name: UAV5 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_6/phase_offset_adjusted_path
+      Name: UAV6 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_7/phase_offset_adjusted_path
+      Name: UAV7 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_8/phase_offset_adjusted_path
+      Name: UAV8 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_9/phase_offset_adjusted_path
+      Name: UAV9 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_10/phase_offset_adjusted_path
+      Name: UAV10 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_11/phase_offset_adjusted_path
+      Name: UAV11 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_12/phase_offset_adjusted_path
+      Name: UAV12 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_13/phase_offset_adjusted_path
+      Name: UAV13 intent-adjusted reference
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_14/phase_offset_adjusted_path
+      Name: UAV14 intent-adjusted reference
       Namespaces:
         {}
       Queue Size: 100

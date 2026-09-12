@@ -25,6 +25,7 @@ add_library(phase_offset_navigation
   src/tube_viability.cpp
   src/phase_offset_allocator.cpp
   src/tube_certificate_v2.cpp
+  src/section_tube.cpp
 )
 target_compile_definitions(phase_offset_navigation
   PRIVATE PHASE_OFFSET_RUNTIME_V2_PRODUCTION=1)
@@ -114,6 +115,8 @@ if(CATKIN_ENABLE_TESTING)
     test/tube_certificate_v2_test.cpp)
   catkin_add_gtest(phase_offset_tube_execution_v2_test
     test/tube_execution_v2_test.cpp)
+  catkin_add_gtest(phase_offset_section_tube_test
+    test/section_tube_test.cpp)
   foreach(target
       phase_offset_environment_evidence_test
       phase_offset_tube_cross_section_test
@@ -158,6 +161,12 @@ if(CATKIN_ENABLE_TESTING)
   endif()
   if(TARGET phase_offset_tube_execution_v2_test)
     target_link_libraries(phase_offset_tube_execution_v2_test
+      phase_offset_navigation
+      phase_offset_core
+    )
+  endif()
+  if(TARGET phase_offset_section_tube_test)
+    target_link_libraries(phase_offset_section_tube_test
       phase_offset_navigation
       phase_offset_core
     )

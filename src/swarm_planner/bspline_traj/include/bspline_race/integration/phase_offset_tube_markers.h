@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bspline_race/continuous_phase_normal_frame.h>
+#include <phase_offset_navigation/section_tube.h>
 #include <phase_offset_navigation/tube_profile_v2.h>
 #include <phase_offset_navigation/tube_types.h>
 
@@ -15,6 +16,20 @@ namespace FLAG_Race {
 // Geometry-only predicate for the UNCERTIFIED candidate tube display.
 bool TubeProfileGeometryDisplayable(
     const phase_offset_navigation::TubeProfile& profile);
+
+// M3C Section visualization.  This entry point reads one immutable planner
+// path together with one committed SectionTubeProfile and draws the two
+// horizontal boundaries p(w) + N(w) * lower and p(w) + N(w) * upper as
+// LINE_STRIP markers.  It is display-only: no map identity, certificate,
+// worker, runtime, reserve, or control state is consulted, and nothing here
+// can influence execution.  Missing, non-finite, out-of-domain, or
+// fewer-than-two-knot input produces one complete DELETE bundle for both
+// namespaces, so RViz never keeps showing stale geometry.
+visualization_msgs::MarkerArray MakeSectionTubeMarkers(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const ContinuousPhasePath>& path,
+    const std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>& profile);
 
 // Certified tube topic markers. `certified` is the adapter's full display
 // certificate; all geometry is read from the same TubeProfile.

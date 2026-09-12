@@ -4,6 +4,7 @@
 #include "phase_offset_navigation/tube_execution_v2.h"
 #include "phase_offset_navigation/tube_filter.h"
 #include "phase_offset_navigation/recovery_prepared_step.h"
+#include "phase_offset_navigation/phase_offset_allocator.h"
 
 #include <phase_offset_core/geometry.h>
 #include <phase_offset_core/matched_port.h>
@@ -356,6 +357,71 @@ struct RuntimeV2CommitToken {
   bool valid = false;
 };
 
+// Side-effect-free Section handoff input.  The profile/preview are caller
+// authorities borrowed for prepare; the publication owner must retain the
+// immutable profile and Preview bundle until its finalValidate/publish/commit
+// transaction has completed.
+class PhaseOffsetRuntime;
+
+struct RuntimeSectionPrepareInput {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  std::shared_ptr<const SectionTubeProfile> profile;
+  const NormalPreviewResult* preview = nullptr;
+  phase_offset_core::MatchedPortInput matched;
+  phase_offset_core::PortCommand previous_u;
+  PhaseOffsetAllocatorBounds limits;
+  double dt = 0.0;
+  std::size_t max_work = 0U;
+  // Set by the caller when the allocator could not bring the base phase rate
+  // back inside [lower_nu, upper_nu] with the available u_w authority and
+  // therefore saturated on that authority boundary (its own
+  // `phase_window_clipped` evidence).  The Section seam accepts that saturated
+  // rate instead of re-applying the same window and turning an approved
+  // "take the boundary" tick into a persistent HOLD.  The flag is cross-checked
+  // against the base rate and the selected port, so it cannot waive an ordinary
+  // out-of-window command.
+  bool phase_window_saturated = false;
+};
+
+// Immutable value-only result of one Section preparation.  The private fields
+// are populated solely by PhaseOffsetRuntime; callers can inspect the exact
+// selected port and successor but cannot substitute either value before the
+// publish-gated commit seam.
+class RuntimeSectionPreparedStep {
+ public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  RuntimeSectionPreparedStep() = default;
+
+  bool valid() const { return valid_; }
+  double nextW() const { return next_w_; }
+  double nextDelta() const { return next_delta_; }
+  const phase_offset_core::PortCommand& selectedPort() const {
+    return selected_u_;
+  }
+  const phase_offset_core::MatchedPortOutput& matchedOutput() const {
+    return matched_output_;
+  }
+  std::size_t workCount() const { return work_count_; }
+  const std::string& reason() const { return reason_; }
+
+ private:
+  friend class PhaseOffsetRuntime;
+
+  phase_offset_core::MatchedPortOutput matched_output_;
+  phase_offset_core::PortCommand selected_u_;
+  double next_w_ = 0.0;
+  double next_delta_ = 0.0;
+  std::size_t work_count_ = 0U;
+  std::string reason_;
+  const PhaseOffsetRuntime* producer_ = nullptr;
+  std::uint64_t expected_revision_ = 0U;
+  double expected_delta_ = 0.0;
+  phase_offset_core::PortCommand expected_previous_u;
+  bool valid_ = false;
+};
+
 using RuntimePrepareInputV2 = RuntimeV2PrepareInput;
 using RuntimePrepareResultV2 = RuntimeV2PreparedStep;
 using RuntimeCommitTokenV2 = RuntimeV2CommitToken;
@@ -401,6 +467,22 @@ class PhaseOffsetRuntime {
                          RuntimeV2CommitToken& token) const;
   bool commitV2(const RuntimeV2CommitToken& token);
   void commitV2NoFail(const RuntimeV2CommitToken& token) noexcept;
+
+  // Section preparation is a narrow value interface over one immutable
+  // Section PWL preview.  It does not project/reselect the caller's final
+  // port and does not change Runtime state.
+  bool sectionConfigurationValid() const;
+  bool prepareSection(const RuntimeSectionPrepareInput& input,
+                      RuntimeSectionPreparedStep& prepared) const;
+  bool validateSectionBeforePublish(
+      const RuntimeSectionPreparedStep& prepared) const;
+  // The caller must hold the same serial lock across final validation,
+  // successful command publication and this no-fail commit.
+  void commitSectionNoFail(
+      const RuntimeSectionPreparedStep& prepared) noexcept;
+  // Offline convenience seam: this validates and commits values but does not
+  // itself publish a ROS command.
+  bool commitSection(const RuntimeSectionPreparedStep& prepared);
   // Alias names keep the seam readable to publication owners that use the
   // token terminology directly.
   bool makeV2CommitToken(const RuntimeV2PreparedStep& prepared,
@@ -474,6 +556,7 @@ class PhaseOffsetRuntime {
                          bool force_recenter) const;
   bool v2CurrentStateMatches(const TubeExecutionStateV2& state) const;
   void invalidateV2State() noexcept;
+  void bumpSectionStateRevision() noexcept;
 
   PhaseOffsetRuntimeConfig config_;
   bool configuration_valid_ = false;
@@ -489,6 +572,9 @@ class PhaseOffsetRuntime {
   std::shared_ptr<const TubeFiniteReserveV2> v2_successor_reserve_;
   TubeExecutionIdentityV2 v2_identity_;
   bool v2_state_valid_ = false;
+  // Local monotonic value version for Section prepare/validate/commit ABA
+  // protection.  It is not a map/profile identity and never leaves Runtime.
+  std::uint64_t section_state_revision_ = 0U;
   std::uint64_t last_preflight_source_revision_ = 0U;
   bool have_preflight_source_revision_ = false;
   ManualPreflightResult preflight_;

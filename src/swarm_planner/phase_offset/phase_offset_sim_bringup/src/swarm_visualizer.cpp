@@ -40,6 +40,12 @@ public:
   {
     nh.param("scenario_param", scenario_param_,
              std::string("/sim_b_world/scenario/agents"));
+    // The swarm is normally started as a separate launch after this world, and
+    // its orchestrator publishes the agent list (count-driven or file-driven).
+    // Wait for it: 0 (default) waits indefinitely, a positive value bounds the
+    // wait.  A scenario file loaded by this world is already present and skips
+    // the wait entirely.
+    nh.param("scenario_wait_timeout", scenario_wait_timeout_s_, 0.0);
     nh.param("frame_id", frame_id_, std::string("world"));
     nh.param("trajectory_buffer", trajectory_buffer_, 600);
     trajectory_buffer_ = std::max(10, trajectory_buffer_);
@@ -62,18 +68,8 @@ public:
     trajectory_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
       "/phase_offset_swarm/vis/trajectories", 1);
 
-    for (std::size_t index = 0; index < robot_ids_.size(); ++index)
-    {
-      const int robot_id = robot_ids_[index];
-      const std::string topic =
-        "/uav_" + std::to_string(robot_id) + "/sim/odom";
-      odom_subscribers_.push_back(nh.subscribe<nav_msgs::Odometry>(
-        topic, 10,
-        boost::bind(&SwarmVisualizer::odomCallback, this, _1, index)));
-      trajectories_.emplace_back();
-      last_positions_.push_back(std::array<double, 3>{{0.0, 0.0, 0.0}});
-      has_odom_.push_back(false);
-    }
+    nh_ = nh;
+    buildSubscriptions();
   }
 
   bool valid() const { return valid_; }
@@ -81,10 +77,19 @@ public:
   void spin()
   {
     ros::Rate rate(10.0);
+    ros::Time next_scenario_check = ros::Time::now() + ros::Duration(1.0);
     while (ros::ok())
     {
       ros::spinOnce();
       publishMarkers();
+      // The swarm launch may be restarted with a different agent count while
+      // this world keeps running.  Follow the published list instead of
+      // caching the first one seen.
+      if (ros::Time::now() >= next_scenario_check)
+      {
+        next_scenario_check = ros::Time::now() + ros::Duration(1.0);
+        refreshScenarioAgents();
+      }
       rate.sleep();
     }
   }
@@ -93,8 +98,39 @@ private:
   bool loadScenarioAgentIds()
   {
     XmlRpc::XmlRpcValue agents;
-    if (!ros::param::has(scenario_param_) ||
-        !ros::param::get(scenario_param_, agents))
+    bool loaded = ros::param::has(scenario_param_) &&
+                  ros::param::get(scenario_param_, agents);
+    if (!loaded)
+    {
+      const bool bounded = scenario_wait_timeout_s_ > 0.0;
+      const ros::WallTime deadline = bounded
+        ? ros::WallTime::now() + ros::WallDuration(scenario_wait_timeout_s_)
+        : ros::WallTime::now();
+      if (bounded)
+      {
+        ROS_INFO("[SIM_B_VIS] waiting up to %.1f s for '%s'",
+                 scenario_wait_timeout_s_, scenario_param_.c_str());
+      }
+      else
+      {
+        ROS_INFO("[SIM_B_VIS] waiting for '%s' (start the swarm launch when "
+                 "ready)", scenario_param_.c_str());
+      }
+      ros::WallTime next_report = ros::WallTime::now() + ros::WallDuration(5.0);
+      while (!loaded && ros::ok() && (!bounded || ros::WallTime::now() < deadline))
+      {
+        ros::WallDuration(0.2).sleep();
+        loaded = ros::param::has(scenario_param_) &&
+                 ros::param::get(scenario_param_, agents);
+        if (!loaded && !bounded && ros::WallTime::now() >= next_report)
+        {
+          next_report = ros::WallTime::now() + ros::WallDuration(5.0);
+          ROS_INFO("[SIM_B_VIS] still waiting for '%s'",
+                   scenario_param_.c_str());
+        }
+      }
+    }
+    if (!loaded)
     {
       ROS_ERROR("[SIM_B_VIS] required scenario parameter '%s' is unavailable",
                 scenario_param_.c_str());
@@ -157,6 +193,50 @@ private:
       trajectories_[index].pop_front();
     last_positions_[index] = position;
     has_odom_[index] = true;
+  }
+
+  // Rebuild the odometry subscriptions for the current agent list.
+  void buildSubscriptions()
+  {
+    odom_subscribers_.clear();
+    trajectories_.clear();
+    last_positions_.clear();
+    has_odom_.clear();
+    for (std::size_t index = 0; index < robot_ids_.size(); ++index)
+    {
+      const int robot_id = robot_ids_[index];
+      const std::string topic =
+        "/uav_" + std::to_string(robot_id) + "/sim/odom";
+      odom_subscribers_.push_back(nh_.subscribe<nav_msgs::Odometry>(
+        topic, 10,
+        boost::bind(&SwarmVisualizer::odomCallback, this, _1, index)));
+      trajectories_.emplace_back();
+      last_positions_.push_back(std::array<double, 3>{{0.0, 0.0, 0.0}});
+      has_odom_.push_back(false);
+    }
+  }
+
+  // Re-read the scenario agent list; rebuild only when it actually changed.
+  void refreshScenarioAgents()
+  {
+    // Only re-read when the parameter is present; loadScenarioAgentIds() would
+    // otherwise enter its (possibly unbounded) wait from the spin loop.
+    if (!ros::param::has(scenario_param_)) return;
+    const std::vector<int> previous = robot_ids_;
+    robot_ids_.clear();
+    if (!loadScenarioAgentIds())
+    {
+      robot_ids_ = previous;
+      return;
+    }
+    if (robot_ids_ == previous)
+    {
+      robot_ids_ = previous;
+      return;
+    }
+    buildSubscriptions();
+    ROS_INFO("[SIM_B_VIS] scenario agents changed to %zu",
+             robot_ids_.size());
   }
 
   void publishMarkers()
@@ -240,6 +320,8 @@ private:
   std::string scenario_param_ = "/sim_b_world/scenario/agents";
   std::string frame_id_ = "world";
   int trajectory_buffer_ = 600;
+  double scenario_wait_timeout_s_ = 0.0;
+  ros::NodeHandle nh_;
   std::vector<int> robot_ids_;
   ros::Publisher uav_pub_;
   ros::Publisher trajectory_pub_;

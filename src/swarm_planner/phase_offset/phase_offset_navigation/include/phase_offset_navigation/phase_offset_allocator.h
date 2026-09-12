@@ -64,10 +64,12 @@ struct PhaseOffsetAllocatorInput {
   double dt = 0.0;
   PhaseOffsetAllocatorBounds bounds;
 
-  // Production-valid C2 allocation requires every expected revision below to
+  // Legacy/V2 production allocation requires every expected revision below to
   // be nonzero and the obstacle contract ID to be nonempty.  Each expectation
   // must exactly match immutable Normal Preview provenance; zero/empty is an
-  // unbound expectation and is rejected rather than disabling validation.
+  // unbound expectation and is rejected rather than disabling validation.  A
+  // SECTION_PWL preview dispatches separately and uses only its profile pointer
+  // plus path/frame and geometry-state association.
   std::uint64_t expected_path_revision = 0U;
   std::uint64_t expected_frame_revision = 0U;
   std::uint64_t expected_profile_revision = 0U;
@@ -75,6 +77,11 @@ struct PhaseOffsetAllocatorInput {
   std::uint64_t expected_tube_revision = 0U;
   std::uint64_t expected_map_revision = 0U;
   std::string expected_obstacle_contract_id;
+
+  // SECTION_PWL previews borrow the exact immutable SectionTubeProfile rather
+  // than carrying legacy map/source/tube identities.  The allocator requires
+  // this pointer to match preview.section_profile for the current tick.
+  const SectionTubeProfile* expected_section_profile = nullptr;
 };
 
 struct PhaseOffsetScalarSelection {
@@ -102,6 +109,13 @@ struct PhaseOffsetAllocatorResult {
   bool feasible = false;
   bool preview_bound = false;
   bool piecewise_constant = false;
+  // Set when the requested motion could not fit the admissible interval and
+  // the command was clipped onto that interval's boundary instead of being
+  // rejected.  The corresponding hard bound in FinalCommandValid is then the
+  // bound that was provably unreachable for this tick, so it is not re-applied;
+  // every other bound still is.
+  bool phase_window_clipped = false;
+  bool transverse_interval_clipped = false;
 
   double u_w_nom = 0.0;
   double u_delta_nom = 0.0;

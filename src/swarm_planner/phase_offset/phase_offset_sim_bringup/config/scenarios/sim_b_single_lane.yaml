@@ -1,0 +1,13 @@
+# Control scenario: exactly one UAV on the middle lane, same start row and the
+# same translated goal as sim_b_formation_3.  Used to separate "the map leaves
+# no corridor room" from "the multi-UAV case leaves no corridor room".
+#
+# Rows: y = 9.0 -> -10.0, the same 19 m translation as sim_b_formation_3, and
+# inside the per-agent 20 x 30 m map.
+scenario:
+  name: sim_b_single_lane
+  frame_id: world
+  agents:
+    - robot_id: 0
+      initial: {x: 0.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: 0.0, y: -10.0, z: 0.0}

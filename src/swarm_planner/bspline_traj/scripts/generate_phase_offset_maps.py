@@ -45,7 +45,7 @@ def grid_points(x0, x1, y0, y1, step, z=0.5):
     return pts
 
 
-def wall_points(x0, x1, y_center, thickness, step, z0=0.0, z1=3.0, zstep=0.5):
+def wall_points(x0, x1, y_center, thickness, step, z0=0.0, z1=3.0, zstep=0.1):
     pts = []
     x = x0
     while x <= x1 + 1e-9:
@@ -92,8 +92,8 @@ def make_split_merge():
 def make_corridor(width, name):
     # Wall CENTERS at +-(width + thickness)/2 so the FREE gap equals width.
     half = (width + 0.5) / 2.0
-    pts = wall_points(-10.0, 28.0, half, 0.5, 0.2)
-    pts += wall_points(-10.0, 28.0, -half, 0.5, 0.2)
+    pts = wall_points(-10.0, 28.0, half, 0.5, 0.1)
+    pts += wall_points(-10.0, 28.0, -half, 0.5, 0.1)
     return pts
 
 

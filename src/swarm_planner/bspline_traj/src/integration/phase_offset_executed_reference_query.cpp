@@ -1,5 +1,6 @@
 #include <bspline_race/integration/phase_offset_executed_reference_query.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace FLAG_Race {
@@ -7,16 +8,19 @@ namespace FLAG_Race {
 PhaseOffsetExecutedReferenceQuery::PhaseOffsetExecutedReferenceQuery(
     const std::shared_ptr<const ContinuousPhasePath>& path, double delta,
     std::uint64_t path_revision, std::uint64_t frame_revision,
-    std::uint64_t owner_revision, std::uint64_t query_revision)
+    std::uint64_t owner_revision, std::uint64_t query_revision,
+    double valid_start_w, double valid_end_w)
     : PhaseOffsetExecutedReferenceQuery(
           path, delta, std::shared_ptr<const ContinuousPhaseNormalFrame>(),
-          path_revision, frame_revision, owner_revision, query_revision) {}
+          path_revision, frame_revision, owner_revision, query_revision,
+          valid_start_w, valid_end_w) {}
 
 PhaseOffsetExecutedReferenceQuery::PhaseOffsetExecutedReferenceQuery(
     const std::shared_ptr<const ContinuousPhasePath>& path, double delta,
     const std::shared_ptr<const ContinuousPhaseNormalFrame>& frame,
     std::uint64_t path_revision, std::uint64_t frame_revision,
-    std::uint64_t owner_revision, std::uint64_t query_revision)
+    std::uint64_t owner_revision, std::uint64_t query_revision,
+    double valid_start_w, double valid_end_w)
     : path_(path),
       // The fallback exists only for legacy synthetic callers of the old
       // constructor.  Production PathTubePair publication always supplies
@@ -27,7 +31,27 @@ PhaseOffsetExecutedReferenceQuery::PhaseOffsetExecutedReferenceQuery(
               frame_revision == 0U ? 1U : frame_revision))),
       delta_(delta), path_revision_(path_revision),
       frame_revision_(frame_revision), owner_revision_(owner_revision),
-      query_revision_(query_revision) {}
+      query_revision_(query_revision),
+      valid_start_w_(path_ ? path_->startW() : 0.0),
+      valid_end_w_(path_ ? path_->endW() : 0.0),
+      valid_domain_(path_ && path_->endW() >= path_->startW()) {
+  // The legacy constructor's default is the dual-NaN pair.  Any other pair,
+  // including infinities, is an explicit profile-domain claim and must fail
+  // closed unless both endpoints are finite and inside the path domain.
+  const bool explicit_domain =
+      !(std::isnan(valid_start_w) && std::isnan(valid_end_w));
+  if (!explicit_domain) return;
+  // An explicitly supplied profile domain is authoritative.  Never silently
+  // widen malformed, one-sided, reversed, or out-of-path bounds back to the
+  // full path; leave this immutable query unavailable instead.
+  valid_domain_ = std::isfinite(valid_start_w) &&
+      std::isfinite(valid_end_w) && valid_end_w >= valid_start_w && path_ &&
+      valid_start_w >= path_->startW() && valid_end_w <= path_->endW();
+  if (valid_domain_) {
+    valid_start_w_ = valid_start_w;
+    valid_end_w_ = valid_end_w;
+  }
+}
 
 bool PhaseOffsetExecutedReferenceQuery::query(
     double w, phase_offset_navigation::ExecutedReferenceQueryResult& result)
@@ -41,8 +65,8 @@ bool PhaseOffsetExecutedReferenceQuery::query(
   result.provenance =
       "PhaseOffsetExecutedReferenceQuery/ContinuousPhaseNormalFrame/"
       "WorldHorizontalCrossProduct";
-  if (!path_ || !frame_ || !std::isfinite(w) ||
-      w < path_->startW() || w > path_->endW() || !std::isfinite(delta_)) {
+  if (!valid_domain_ || !path_ || !frame_ || !std::isfinite(w) ||
+      w < valid_start_w_ || w > valid_end_w_ || !std::isfinite(delta_)) {
     result.invalid_reason = "executed reference input is invalid";
     return false;
   }
@@ -88,9 +112,9 @@ bool PhaseOffsetExecutedReferenceQuery::query(
 }
 
 bool PhaseOffsetExecutedReferenceQuery::domain(double& w0, double& w1) const {
-  w0 = path_ ? path_->startW() : 0.0;
-  w1 = path_ ? path_->endW() : 0.0;
-  return path_ && path_->endW() >= path_->startW();
+  w0 = valid_start_w_;
+  w1 = valid_end_w_;
+  return valid_domain_ && path_ && valid_end_w_ >= valid_start_w_;
 }
 
 }  // namespace FLAG_Race

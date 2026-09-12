@@ -36,6 +36,12 @@
 namespace plan_env {
 namespace {
 
+// SDFMap's V2 capture/evidence API was retired from the production map in
+// M3C.  Keep the pure CloudOccupancySnapshot and predicate regressions below,
+// while leaving the old map-owned capture tests documented in the migration
+// report rather than trying to resurrect their removed private API.
+#define PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS 0
+
 CloudOccupancySnapshotBuildInput makeInput(
     std::uint64_t sequence = 1U) {
   CloudOccupancySnapshotBuildInput input;
@@ -253,6 +259,7 @@ SDFMapCaptureV2 makeAuthoritativeCaptureFixture() {
   return capture;
 }
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 void bindMapSupportToCurrentConfiguration(SDFMap& map) {
   const std::shared_ptr<const SDFMapCaptureV2> metadata =
       map.captureAuthoritativeSDFMapV2();
@@ -268,6 +275,7 @@ void bindMapSupportToCurrentConfiguration(SDFMap& map) {
       metadata->accepted_time_ticks;
   map.authoritative_capture_mutex_v2_.support_binding_invalidated = false;
 }
+#endif
 
 TEST(CloudOccupancySnapshotTest, NoOdomAndNoObservationAreInvalid) {
   CloudOccupancySnapshotBuildInput input = makeInput();
@@ -280,6 +288,7 @@ TEST(CloudOccupancySnapshotTest, NoOdomAndNoObservationAreInvalid) {
   EXPECT_FALSE(cloudOccupancySnapshotConsistent(absent));
 }
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      DefaultAuthoritativeCaptureAndPredicateFailClosed) {
   SDFMap map;
@@ -293,6 +302,7 @@ TEST(CloudOccupancySnapshotTest,
   EXPECT_EQ(result.status, SDFMapCaptureFreeBallStatusV2::UNAVAILABLE);
   EXPECT_FALSE(result.clearance_certified);
 }
+#endif
 
 TEST(CloudOccupancySnapshotTest, EmptyCloudIsAValidAllFreeObservedBox) {
   const CloudOccupancySnapshot snapshot = buildCloudOccupancySnapshot(makeInput());
@@ -704,6 +714,7 @@ TEST(CloudOccupancySnapshotTest,
   }
 }
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      SdfMapCloudCallbackPublishesImmutableSequenceIncludingEmptyCloud) {
   SDFMap map;
@@ -733,6 +744,7 @@ TEST(CloudOccupancySnapshotTest,
   EXPECT_EQ(queryCloudOccupancySnapshot(*second, Eigen::Vector3d(1.1, 0.1, 0.1)).status,
             CloudOccupancyStatus::OCCUPIED);
 }
+#endif
 
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2PredicateUsesClosedBoundaryAndSupport) {
@@ -821,6 +833,7 @@ TEST(CloudOccupancySnapshotTest,
             SDFMapCaptureFreeBallStatusV2::INCONCLUSIVE);
 }
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2CaptureCopiesEffectiveBackingAndUsesFreshIdentity) {
   SDFMap map;
@@ -1087,6 +1100,7 @@ TEST(CloudOccupancySnapshotTest,
   EXPECT_TRUE(map.md_.authoritative_state_identity_exhausted_v2_);
   EXPECT_FALSE(map.captureAuthoritativeSDFMapV2());
 }
+#endif
 
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2ExactArithmeticCoversSubnormalLargeAndOverflow) {
@@ -1217,6 +1231,7 @@ TEST(CloudOccupancySnapshotTest,
 #endif
 }
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2ManualBoundaryRestrictsDomainAndInvalidatesClear) {
   SDFMap map;
@@ -1342,7 +1357,9 @@ TEST(CloudOccupancySnapshotTest,
   map.md_.authoritative_configuration_identity_exhausted_v2_ = true;
   EXPECT_FALSE(map.captureAuthoritativeSDFMapV2());
 }
+#endif
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2CaptureSerializesConcurrentMutationsCoherently) {
   SDFMap map;
@@ -1441,7 +1458,9 @@ TEST(CloudOccupancySnapshotTest,
   EXPECT_EQ(before->occupied[0U], 0U);
   EXPECT_EQ(before->occupied[1U], 0U);
 }
+#endif
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2SupportDoesNotMixDepthIntoCompleteDomain) {
   SDFMap map;
@@ -1499,6 +1518,7 @@ TEST(CloudOccupancySnapshotTest,
                 .status,
             SDFMapCaptureFreeBallStatusV2::UNKNOWN);
 }
+#endif
 
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2PredicateFailsClosedAtWorkBudget) {
@@ -1548,6 +1568,7 @@ TEST(CloudOccupancySnapshotTest,
   EXPECT_FALSE(result.clearance_certified);
 }
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 TEST(CloudOccupancySnapshotTest,
      AuthoritativeV2CropEquivalenceUsesNonDyadicResolution) {
   SDFMap map;
@@ -1651,7 +1672,9 @@ TEST(CloudOccupancySnapshotTest,
   EXPECT_EQ(crop_occupied.clearance_certified,
             full_occupied.clearance_certified);
 }
+#endif
 
+#if PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 void initializeCompleteCloudProducer(SDFMap& map) {
   ros::Time::init();
   ros::Time::setNow(ros::Time(100.02));
@@ -1821,6 +1844,7 @@ TEST(CloudOccupancySnapshotTest, CompleteCloudNumericalAndFrameFaultsFailClosed)
   map.odomCallback(changed);
   EXPECT_TRUE(map.cloud_odom_history_v2_.empty());
 }
+#endif  // PLAN_ENV_LEGACY_SDFMAP_CAPTURE_TESTS
 
 TEST(CloudOccupancySnapshotTest, SourceCompletenessChecksActualBackingEvenWhenEmpty) {
   pcl::PointCloud<pcl::PointXYZ> backing;

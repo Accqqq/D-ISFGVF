@@ -1,0 +1,22 @@
+# SWARM control scenario: same start column and same SPH-style translated
+# goals as sim_b_formation_3, but with 5 m lateral spacing so every pair sits
+# far outside r_comm (2.5 m).  Neighbour transport stays enabled, yet no
+# neighbour should contribute swarm intent; this isolates the delta motion
+# caused by neighbour coordination from the single-agent baseline behaviour.
+#
+# Rows: y = 9.0 -> -10.0, the same 19 m translation as sim_b_formation_3.  Both
+# rows are free of the pillar inflation for all three lanes at the agents'
+# 0.1 m resolution, and the whole corridor fits the per-agent 20 x 30 m map.
+scenario:
+  name: sim_b_formation_wide_3
+  frame_id: world
+  agents:
+    - robot_id: 0
+      initial: {x: -5.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: -5.0, y: -10.0, z: 0.0}
+    - robot_id: 1
+      initial: {x: 0.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: 0.0, y: -10.0, z: 0.0}
+    - robot_id: 2
+      initial: {x: 5.0, y: 9.0, z: 1.0, yaw: 0.0}
+      goal_message: {x: 5.0, y: -10.0, z: 0.0}

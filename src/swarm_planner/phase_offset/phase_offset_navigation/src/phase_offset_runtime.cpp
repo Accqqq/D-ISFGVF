@@ -248,6 +248,56 @@ bool ValidTubeExecution(const RuntimeTubeExecutionConfig& tube) {
       tube.minimum_reference_speed > 0.0;
 }
 
+bool ValidSectionLimits(const PhaseOffsetAllocatorBounds& limits,
+                        const double dt, std::string& reason) {
+  if (!IsFinite(limits.lower_nu) || !IsFinite(limits.upper_nu) ||
+      limits.lower_nu < 0.0 || limits.upper_nu < limits.lower_nu ||
+      !IsFinite(limits.u_w_abs_max) || limits.u_w_abs_max < 0.0 ||
+      !IsFinite(limits.upper_u_delta) || limits.upper_u_delta < 0.0 ||
+      !IsFinite(limits.u_w_slew_rate) || limits.u_w_slew_rate < 0.0 ||
+      !IsFinite(limits.u_delta_slew_rate) ||
+          limits.u_delta_slew_rate < 0.0 ||
+      !IsFinite(limits.zoh_min_dt) || limits.zoh_min_dt < 0.0 ||
+      !IsFinite(limits.zoh_max_dt) || limits.zoh_max_dt < 0.0 ||
+      !IsFinite(limits.zoh_dt) || limits.zoh_dt < 0.0 ||
+      !IsFinite(dt) || dt <= 0.0) {
+    reason = "Section scalar limits or ZOH duration are invalid";
+    return false;
+  }
+  if (limits.zoh_max_dt > 0.0 && limits.zoh_max_dt < limits.zoh_min_dt) {
+    reason = "Section ZOH duration limits are inverted";
+    return false;
+  }
+  if (limits.zoh_min_dt > 0.0 && dt < limits.zoh_min_dt) {
+    reason = "Section tick is shorter than the minimum ZOH duration";
+    return false;
+  }
+  if (limits.zoh_max_dt > 0.0 && dt > limits.zoh_max_dt) {
+    reason = "Section tick exceeds the maximum ZOH duration";
+    return false;
+  }
+  if (limits.zoh_dt > 0.0 && limits.zoh_dt != dt) {
+    reason = "Section tick does not match the frozen ZOH duration";
+    return false;
+  }
+  return true;
+}
+
+bool SectionSlewContains(const double previous, const double selected,
+                         const double rate, const double dt) {
+  if (!IsFinite(previous) || !IsFinite(selected) || !IsFinite(rate) ||
+      rate < 0.0 || !IsFinite(dt) || dt <= 0.0) {
+    return false;
+  }
+  const double step = rate * dt;
+  if (!IsFinite(step)) return false;
+  const double lower = previous - step;
+  const double upper = previous + step;
+  if (!IsFinite(lower) || !IsFinite(upper) || lower > upper) return false;
+  return selected >= lower && selected <= upper;
+}
+
+
 #ifndef PHASE_OFFSET_RUNTIME_V2_PRODUCTION
 phase_offset_core::PortProjectionLimits MakeProjectionLimits(
     const ManualProfileConfig& manual, double regularity_margin,
@@ -570,10 +620,31 @@ void PhaseOffsetRuntime::requestRecenter() {
   // This is a lifecycle intent, not a state reset.  The next prepare emits a
   // bounded inward port through the existing active owner; complete() retires
   // the profile only after the exact command reaches neutral.
-  returning_to_center_ = true;
+  if (!returning_to_center_) {
+    returning_to_center_ = true;
+    bumpSectionStateRevision();
+  }
 }
 
 bool PhaseOffsetRuntime::configurationValid() const { return configuration_valid_; }
+
+bool PhaseOffsetRuntime::sectionConfigurationValid() const {
+  // Section preparation uses only these three existing physical/configuration
+  // values.  Legacy manual profile/preflight fields intentionally remain
+  // outside this gate (the legacy configurationValid() contract is unchanged).
+  return IsFinite(config_.tube.tracking_error_bound) &&
+      config_.tube.tracking_error_bound >= 0.0 &&
+      IsFinite(config_.tube.minimum_reference_speed) &&
+      config_.tube.minimum_reference_speed > 0.0 &&
+      IsFinite(config_.manual.tangent_speed_min) &&
+      config_.manual.tangent_speed_min > 0.0;
+}
+
+void PhaseOffsetRuntime::bumpSectionStateRevision() noexcept {
+  if (section_state_revision_ != std::numeric_limits<std::uint64_t>::max()) {
+    ++section_state_revision_;
+  }
+}
 
 void PhaseOffsetRuntime::resetForNewNavigationTask() {
   // A new planner goal has a new path coordinate.  Do not retain any value
@@ -590,6 +661,7 @@ void PhaseOffsetRuntime::resetForNewNavigationTask() {
   last_preflight_source_revision_ = 0U;
   have_preflight_source_revision_ = false;
   preflight_ = ManualPreflightResult();
+  bumpSectionStateRevision();
 }
 
 #ifndef PHASE_OFFSET_RUNTIME_V2_PRODUCTION
@@ -674,9 +746,15 @@ bool PhaseOffsetRuntime::refreshPreflight(const RuntimePreflightInput& input) {
   if (preflight_.invalid_reason.empty()) {
     preflight_.invalid_reason = "no bilateral amplitude is feasible";
   }
+  const bool returning_before = returning_to_center_;
+  const bool completed_before = profile_completed_;
   if (profile_started_ || std::abs(delta_) > kTolerance) {
     returning_to_center_ = true;
     profile_completed_ = true;
+  }
+  if (returning_to_center_ != returning_before ||
+      profile_completed_ != completed_before) {
+    bumpSectionStateRevision();
   }
   return false;
 }
@@ -1218,6 +1296,7 @@ bool PhaseOffsetRuntime::complete(const RuntimePreparedStep& prepared,
       profile_completed_ = true;
       returning_to_center_ = false;
     }
+    bumpSectionStateRevision();
   }
   return true;
 }
@@ -1286,6 +1365,7 @@ bool PhaseOffsetRuntime::commitToken(const RuntimeCommitToken& token) {
     profile_completed_ = true;
     returning_to_center_ = false;
   }
+  bumpSectionStateRevision();
   return true;
 }
 
@@ -1313,8 +1393,254 @@ void PhaseOffsetRuntime::commitTokenNoFail(
     profile_completed_ = true;
     returning_to_center_ = false;
   }
+  bumpSectionStateRevision();
 }
 #endif
+
+bool PhaseOffsetRuntime::prepareSection(
+    const RuntimeSectionPrepareInput& input,
+    RuntimeSectionPreparedStep& prepared) const {
+  RuntimeSectionPreparedStep staged;
+  const auto fail = [&prepared, &staged](const std::string& reason) {
+    staged.valid_ = false;
+    staged.reason_ = reason;
+    prepared = std::move(staged);
+    return false;
+  };
+  if (!sectionConfigurationValid()) {
+    return fail("Section runtime configuration is invalid");
+  }
+  if (section_state_revision_ == std::numeric_limits<std::uint64_t>::max()) {
+    return fail("Section runtime state revision is saturated");
+  }
+  if (!input.profile || input.preview == nullptr) {
+    return fail("Section profile or immutable Preview is missing");
+  }
+  const NormalPreviewResult& preview = *input.preview;
+  // M4C: the same rule as the allocator.  A rate-degraded but still
+  // state-feasible immutable Preview is prepared; the allocator clips the
+  // requested motion onto the corridor window instead of dropping the tick.
+  if (preview.proof_kind != TubeViabilityProofKind::SECTION_PWL ||
+      (!preview.valid) || !preview.feasible ||
+      (preview.status != TubeViabilityStatus::FEASIBLE &&
+       preview.status != TubeViabilityStatus::RATE_INFEASIBLE &&
+       preview.status != TubeViabilityStatus::CURRENT_DELTA_OUTSIDE) ||
+      preview.section_profile != input.profile.get() ||
+      !preview.policy.numericValid()) {
+    return fail("Section Preview is not a feasible immutable PWL result");
+  }
+  if (!preview.provenance.immutable ||
+      preview.provenance.path_revision == 0U ||
+      preview.provenance.frame_revision == 0U) {
+    return fail("Section Preview path/frame provenance is unbound");
+  }
+  const phase_offset_core::PhaseOffsetGeometryState& geometry =
+      input.matched.geometry;
+  if (!geometry.valid || geometry.path_revision == 0U ||
+      geometry.frame_revision == 0U ||
+      geometry.path_revision != preview.provenance.path_revision ||
+      geometry.frame_revision != preview.provenance.frame_revision ||
+      geometry.w != preview.current_w ||
+      geometry.delta != preview.evaluated_delta ||
+      !IsFinite(geometry.r_w) || !IsFinite(geometry.T) ||
+      !IsFinite(geometry.N) || !IsFinite(geometry.r) ||
+      !IsFinite(geometry.error) || !IsFinite(geometry.w) ||
+      !IsFinite(geometry.delta)) {
+    return fail("Section geometry does not match Preview W/path/frame state");
+  }
+  const double error_norm = geometry.error.norm();
+  const double reference_speed = geometry.r_w.norm();
+  // M4C-2: the tracking-error bound is the assumption the tube was sized with,
+  // not an enforceable command condition.  The offset is shared by the
+  // reference and the physical command through B*u, so it cannot be the source
+  // of this error; the error comes from base path tracking and the governor's
+  // normal loop recovers it.  Holding the whole tick on it would freeze both
+  // the vehicle and the reference and leave the error permanently outside.
+  if (!IsFinite(error_norm) || !IsFinite(reference_speed) ||
+      reference_speed < config_.tube.minimum_reference_speed) {
+    return fail("Section geometry violates reference-speed bounds");
+  }
+  std::string limits_reason;
+  if (!ValidSectionLimits(input.limits, input.dt, limits_reason)) {
+    return fail(limits_reason);
+  }
+  if (!IsFinite(input.matched.base_v_cmd) ||
+      !IsFinite(input.matched.base_w_dot) ||
+      !IsFinite(input.matched.final_port)) {
+    return fail("Section MatchedPort input is not finite");
+  }
+  if (!IsFinite(input.previous_u) ||
+      !SamePortExact(input.previous_u, previous_final_port_) ||
+      geometry.delta != delta_) {
+    return fail("Section previous port or retained delta is stale");
+  }
+  if (std::abs(input.matched.final_port.u_w) > input.limits.u_w_abs_max ||
+      std::abs(input.matched.final_port.u_delta) > input.limits.upper_u_delta ||
+      !SectionSlewContains(previous_final_port_.u_w,
+                           input.matched.final_port.u_w,
+                           input.limits.u_w_slew_rate, input.dt) ||
+      !SectionSlewContains(previous_final_port_.u_delta,
+                           input.matched.final_port.u_delta,
+                           input.limits.u_delta_slew_rate, input.dt)) {
+    return fail("Section final port violates amplitude or slew limits");
+  }
+
+  phase_offset_core::MatchedPortOutput matched_output;
+  if (!phase_offset_core::MatchedPort::evaluate(input.matched, matched_output) ||
+      !matched_output.valid || !IsFinite(matched_output.v_cmd) ||
+      !IsFinite(matched_output.physical_port) ||
+      !IsFinite(matched_output.w_dot) || !IsFinite(matched_output.delta_dot)) {
+    return fail(matched_output.invalid_reason.empty()
+                    ? "Section MatchedPort evaluation failed"
+                    : matched_output.invalid_reason);
+  }
+  const double tangent_speed = geometry.T.dot(matched_output.v_cmd);
+  if (!IsFinite(tangent_speed) ||
+      tangent_speed < config_.manual.tangent_speed_min) {
+    return fail("Section MatchedPort tangential speed is below the configured minimum");
+  }
+  // M4E: the phase window is an allocator-owned bound (M4C).  When the base
+  // guidance rate leaves [lower_nu, upper_nu] and the +/-u_w_abs_max authority
+  // cannot bring it back, the allocator saturates on that authority boundary
+  // and marks the tick.  Re-applying the same window to that saturated value
+  // would convert an approved "take the boundary" tick into a persistent HOLD
+  // of a planner-valid task.  The waiver is accepted only when this really is
+  // that saturation: the base rate is outside the window and the selected
+  // correction sits exactly on the boundary that reduces the violation.
+  const bool base_rate_above_window =
+      input.matched.base_w_dot > input.limits.upper_nu;
+  const bool base_rate_below_window =
+      input.matched.base_w_dot < input.limits.lower_nu;
+  // The allocator also owns the slew budget: when the admissible phase-rate set
+  // is more than one tick away from the last committed rate it saturates on the
+  // slew boundary and ramps towards the set over the following ticks.  That
+  // tick carries `phase_window_clipped` too, but its correction is not on the
+  // amplitude boundary, so recognise the ramp as the second accepted form.
+  const bool at_authority_boundary =
+      (base_rate_above_window &&
+       input.matched.final_port.u_w == -input.limits.u_w_abs_max) ||
+      (base_rate_below_window &&
+       input.matched.final_port.u_w == input.limits.u_w_abs_max);
+  // Distance of one phase rate to the frozen window (0 when inside it).  A
+  // saturated tick is legal while it does not move *away* from the window:
+  // that covers both the amplitude boundary and every intermediate slew-ramp
+  // point (including one that is momentarily stationary on the ramp).
+  const auto window_distance = [](const double rate, const double lower,
+                                  const double upper) {
+    if (rate < lower) return lower - rate;
+    if (rate > upper) return rate - upper;
+    return 0.0;
+  };
+  const bool phase_window_approach =
+      (base_rate_above_window || base_rate_below_window) &&
+      window_distance(matched_output.w_dot, input.limits.lower_nu,
+                      input.limits.upper_nu) <=
+          window_distance(input.matched.base_w_dot + input.previous_u.u_w,
+                          input.limits.lower_nu, input.limits.upper_nu) +
+              1e-9;
+  const bool phase_window_saturated =
+      input.phase_window_saturated &&
+      (at_authority_boundary || phase_window_approach);
+  const bool phase_rate_within_window =
+      matched_output.w_dot >= input.limits.lower_nu &&
+      matched_output.w_dot <= input.limits.upper_nu &&
+      matched_output.w_dot >= preview.policy.lower_nu &&
+      matched_output.w_dot <= preview.policy.upper_nu;
+  if (!IsFinite(matched_output.delta_dot) ||
+      matched_output.delta_dot != input.matched.final_port.u_delta ||
+      !IsFinite(matched_output.w_dot) ||
+      (!phase_window_saturated && !phase_rate_within_window)) {
+    return fail("Section MatchedPort phase rate is outside the frozen limits");
+  }
+
+  // Option B: the horizontal-section tube is the safe lateral set, so the hard
+  // transverse constraint is the corridor cross-section itself.  The allocator
+  // has already clipped the transverse command into the corridor one tick
+  // ahead, and this seam only materialises the exact successor the command
+  // produces.  The former per-step "reachable envelope conformance" arithmetic
+  // is deliberately not applied here: it rejected ordinary boundary-tracking
+  // lag (sub-millimetre in practice), which froze the phase and locked the
+  // vehicle.
+  // A saturated-low tick carries a negative rate because the guidance wants the
+  // reference to retreat while the vehicle is behind it.  Non-reversing phase
+  // progression wins: hold the phase coordinate for this tick.  Only the phase
+  // rate is affected; the transverse port, the physical command and the
+  // committed delta remain exactly the allocator's saturated pair, and the
+  // recorded matched evidence is recomputed so it stays self-consistent.
+  if (phase_window_saturated && matched_output.w_dot < 0.0) {
+    matched_output.w_dot = 0.0;
+    matched_output.matched_residual =
+        (matched_output.v_cmd - geometry.r_w * matched_output.w_dot -
+         geometry.N * matched_output.delta_dot) -
+        (input.matched.base_v_cmd - geometry.r_w * input.matched.base_w_dot);
+    matched_output.matched_residual_norm = matched_output.matched_residual.norm();
+  }
+  const double held_next_w = geometry.w + input.dt * matched_output.w_dot;
+  const double held_next_delta =
+      geometry.delta + input.dt * matched_output.delta_dot;
+  if (!IsFinite(held_next_w) || !IsFinite(held_next_delta) ||
+      held_next_w < geometry.w) {
+    return fail("Section successor state is not representable");
+  }
+  staged.matched_output_ = matched_output;
+  staged.selected_u_ = input.matched.final_port;
+  staged.next_w_ = held_next_w;
+  staged.next_delta_ = held_next_delta;
+  staged.work_count_ = 0U;
+  staged.producer_ = this;
+  staged.expected_revision_ = section_state_revision_;
+  staged.expected_delta_ = delta_;
+  staged.expected_previous_u = previous_final_port_;
+  staged.valid_ = true;
+  staged.reason_.clear();
+  prepared = std::move(staged);
+  return true;
+}
+
+bool PhaseOffsetRuntime::validateSectionBeforePublish(
+    const RuntimeSectionPreparedStep& prepared) const {
+  if (!prepared.valid_ || prepared.producer_ != this ||
+      prepared.expected_revision_ != section_state_revision_ ||
+      section_state_revision_ == std::numeric_limits<std::uint64_t>::max() ||
+      !sectionConfigurationValid() ||
+      !IsFinite(prepared.next_w_) || !IsFinite(prepared.next_delta_)) {
+    return false;
+  }
+  if (!IsFinite(prepared.expected_delta_) ||
+      prepared.expected_delta_ != delta_ ||
+      !SamePortExact(prepared.expected_previous_u, previous_final_port_) ||
+      !prepared.matched_output_.valid ||
+      !IsFinite(prepared.matched_output_.v_cmd) ||
+      !IsFinite(prepared.matched_output_.physical_port) ||
+      !IsFinite(prepared.matched_output_.w_dot) ||
+      !IsFinite(prepared.matched_output_.delta_dot) ||
+      prepared.matched_output_.delta_dot != prepared.selected_u_.u_delta) {
+    return false;
+  }
+  return true;
+}
+
+void PhaseOffsetRuntime::commitSectionNoFail(
+    const RuntimeSectionPreparedStep& prepared) noexcept {
+  // The publication owner has already run validateSectionBeforePublish() and
+  // published the exact selected_u_ while holding its serial transaction lock.
+  // Keep this seam bounded and non-fallible: a late rejection would split the
+  // physical command from Runtime's ZOH state.
+  previous_final_port_ = prepared.selected_u_;
+  delta_ = prepared.next_delta_;
+  // Section execution retires any V2 identity marker, but deliberately leaves
+  // the immutable reserve owner for the outer lifecycle to reclaim outside
+  // this no-fail lock seam.
+  v2_state_valid_ = false;
+  bumpSectionStateRevision();
+}
+
+bool PhaseOffsetRuntime::commitSection(
+    const RuntimeSectionPreparedStep& prepared) {
+  if (!validateSectionBeforePublish(prepared)) return false;
+  commitSectionNoFail(prepared);
+  return true;
+}
 
 bool PhaseOffsetRuntime::v2CurrentStateMatches(
     const TubeExecutionStateV2& state) const {
@@ -1540,6 +1866,7 @@ void PhaseOffsetRuntime::commitV2NoFail(
   v2_successor_reserve_ = prepared.reserve_owner;
   v2_identity_ = prepared.identity;
   v2_state_valid_ = true;
+  bumpSectionStateRevision();
 }
 
 #ifndef PHASE_OFFSET_RUNTIME_V2_PRODUCTION

@@ -31,6 +31,7 @@ catkin_install_python(
   PROGRAMS
     scripts/swarm_orchestrator.py
     scripts/scenario_goal_publisher.py
+    scripts/clicked_goal_translator.py
     test/sim_c_bringup_test.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

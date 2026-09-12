@@ -37,6 +37,16 @@ class ContinuousPhaseNormalFrame final
   std::uint64_t pathRevision() const override { return path_revision_; }
   std::uint64_t frameRevision() const override { return frame_revision_; }
 
+  // Builds the deterministic world-horizontal frame directly from one path
+  // state.  This is shared by the ordinary path query and cell-aware
+  // integration callbacks so both use exactly the same arithmetic and
+  // capability thresholds.
+  static bool computeGeometry(const ContinuousPhasePathState& state,
+                              Eigen::Vector3d& tangent,
+                              Eigen::Vector3d& tangent_w,
+                              Eigen::Vector3d& normal,
+                              Eigen::Vector3d& normal_w);
+
   bool evaluatePathState(double w, ContinuousPhasePathState& state) const;
 
  private:

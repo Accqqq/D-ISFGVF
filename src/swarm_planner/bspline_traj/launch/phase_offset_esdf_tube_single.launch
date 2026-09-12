@@ -76,35 +76,17 @@
          value="$(arg phase_offset_measurement_callback_csv_path)" />
     <arg name="phase_offset_measurement_tube_due_csv_path"
          value="$(arg phase_offset_measurement_tube_due_csv_path)" />
-    <arg name="phase_offset_tube_fixed_delta_max" value="0.04" />
     <arg name="phase_offset_tube_sample_step_w" value="0.10" />
     <arg name="phase_offset_tube_lookahead_w" value="2.0" />
     <arg name="phase_offset_tube_back_w" value="0.20" />
     <arg name="phase_offset_tube_min_certified_forward_w" value="0.40" />
-    <arg name="phase_offset_tube_ray_step" value="0.05" />
-    <arg name="phase_offset_tube_max_offset" value="0.20" />
-    <arg name="phase_offset_tube_boundary_slope_max" value="0.80" />
     <arg name="phase_offset_tube_invariant_gain" value="1.0" />
     <arg name="phase_offset_tube_interior_margin" value="0.0" />
     <arg name="phase_offset_tube_update_period" value="0.10" />
-    <arg name="phase_offset_tube_esdf_unobserved_threshold" value="1000.0" />
-    <arg name="phase_offset_tube_uav_radius" value="0.25" />
-    <arg name="phase_offset_tube_localization_margin" value="0.05" />
-    <arg name="phase_offset_tube_tracking_error_bound" value="0.15" />
-    <arg name="phase_offset_tube_map_margin" value="0.10" />
-    <arg name="phase_offset_tube_extra_margin" value="0.05" />
-    <arg name="phase_offset_tube_discretization_margin" value="0.10" />
-    <arg name="phase_offset_tube_environment_search_extent" value="3.0" />
-    <arg name="phase_offset_tube_raw_ray_step" value="0.05" />
-    <arg name="phase_offset_tube_boundary_tolerance" value="0.01" />
+    <arg name="phase_offset_tube_environment_search_extent" value="1.5" />
     <arg name="phase_offset_tube_raw_regularity_margin" value="0.10" />
-    <arg name="phase_offset_tube_curvature_epsilon" value="1e-9" />
-    <arg name="phase_offset_tube_raw_uav_radius" value="0.25" />
-    <arg name="phase_offset_tube_raw_map_uncertainty" value="0.10" />
-    <arg name="phase_offset_tube_raw_localization_uncertainty" value="0.05" />
     <arg name="phase_offset_tube_raw_tracking_error_bound" value="0.15" />
     <arg name="phase_offset_tube_cloud_obstacle_set_complete" value="true" />
-    <arg name="phase_offset_tube_preincluded_map_uncertainty" value="0.10" />
     <arg name="sdf_map_buffer_refresh_period" value="3.0" />
   </include>
 </launch>

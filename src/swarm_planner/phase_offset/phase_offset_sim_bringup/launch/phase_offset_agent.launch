@@ -14,7 +14,7 @@
   <arg name="nodelet_manager" default="/so3_nodelet_manager"/>
 
   <arg name="init_x" default="0.0"/>
-  <arg name="init_y" default="0.0"/>
+  <arg name="init_y" default="20.0"/>
   <arg name="init_z" default="1.0"/>
 
   <arg name="odom_topic" default="/uav_$(arg robot_id)/sim/odom"/>
@@ -22,26 +22,78 @@
   <arg name="local_map_topic" default="/uav_$(arg robot_id)/sim/local_map"/>
   <arg name="global_map_topic" default="/mock_map"/>
   <arg name="goal_topic" default="/uav_$(arg robot_id)/goal"/>
+  <!-- Distributed shared operator click.  Every agent subscribes to the SAME
+       click topic and locally computes goal = initial + bias + clicked, so one
+       RViz "2D Nav Goal" moves the whole formation.  No coordinator, no leader:
+       the per-agent instances are interchangeable and use identical arithmetic.
+       bias is the scenario's common start->goal translation, so a click at the
+       origin reproduces the scenario goals. -->
+  <arg name="clicked_goal_enable" default="true"/>
+  <!-- Canonical RViz "2D Nav Goal" topic first; /goal is the relative name a
+       stale saved config can resolve to, kept as a fallback alias. -->
+  <arg name="clicked_goal_source_topic"
+       default="/move_base_simple/goal, /goal"/>
+  <arg name="goal_bias_x" default="0.0"/>
+  <arg name="goal_bias_y" default="0.0"/>
+  <arg name="goal_bias_z" default="0.0"/>
   <arg name="cmd_topic" default="/uav_$(arg robot_id)/position_cmd"/>
   <arg name="so3_cmd_topic" default="/uav_$(arg robot_id)/so3_cmd"/>
   <arg name="frame_id" default="world"/>
-  <arg name="phase_offset_mode" default="active"/>
-  <arg name="phase_offset_coordination_backend" default="disabled"/>
-  <arg name="phase_offset_manual_observe_only" default="true"/>
-  <arg name="phase_offset_manual_tube_source" default="none"/>
-  <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false"/>
-  <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0"/>
-  <arg name="phase_offset_normal_preview_horizon_w" default=""/>
-  <arg name="phase_offset_normal_preview_sample_spacing_w" default=""/>
-  <arg name="phase_offset_normal_preview_lower_nu" default=""/>
-  <arg name="phase_offset_normal_preview_upper_nu" default=""/>
-  <arg name="phase_offset_normal_preview_b_tight" default=""/>
-  <arg name="phase_offset_normal_preview_b_open" default=""/>
+  <!-- Per-agent defaults mirror phase_offset_swarm.launch: the Section tube is
+       built from this agent's own local_sensing obstacle set and the lateral
+       offset is driven by SPH swarm intent.  The orchestrator still passes the
+       same values explicitly for generic-N launches. -->
+  <arg name="phase_offset_mode" default="manual"/>
+  <arg name="phase_offset_coordination_backend" default="sph"/>
+  <arg name="phase_offset_manual_observe_only" default="false"/>
+  <arg name="phase_offset_manual_tube_source" default="esdf"/>
+  <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="true"/>
+  <arg name="phase_offset_normal_preview_horizon_w" default="1.0"/>
+  <arg name="phase_offset_normal_preview_sample_spacing_w" default="0.25"/>
+  <arg name="phase_offset_normal_preview_lower_nu" default="0.02"/>
+  <arg name="phase_offset_normal_preview_upper_nu" default="3.0"/>
+  <arg name="phase_offset_normal_preview_b_tight" default="0.10"/>
+  <arg name="phase_offset_normal_preview_b_open" default="0.90"/>
   <arg name="phase_offset_g_coord_fresh_timeout" default="0.10"/>
   <arg name="phase_offset_future_timestamp_tolerance" default="0.02"/>
+  <!-- Forward tracking gains.  These used to be pinned to 2.0/-2.2 here,
+       which silently overrode the protected bspline_race planner launch and
+       made the swarm run a different gain from the single-UAV chain.  Keep one
+       place per chain and let a caller lower the swarm speed explicitly. -->
+  <arg name="gvf_gain1" default="1.2"/>
+  <arg name="gvf_gain2" default="-1.2"/>
 
-  <!-- SIM-C is an opt-in data-plane process; SIM-B defaults remain intact. -->
-  <arg name="enable_neighbor_transport" default="false"/>
+  <!-- Swarm-intent authority on the Section port.  These are the per-agent
+       limits on how hard the coordinated intent may bend the reference:
+         u_w_abs_max      : additive bias on the path progress rate  [w/s]
+         u_w_rate_max     : slew limit on that bias                  [(w/s)/s]
+         u_delta_abs_max  : lateral slide rate of the reference      [m/s]
+         u_delta_rate_max : slew limit on the lateral slide          [m/s^2]
+       The upstream defaults (0.12 / 0.6 / 0.25 / 1.2) were sized for pure
+       de-confliction and left the swarm intent with ~10% of the 1.2 m/s
+       nominal progress and ~0.2 m of realised lateral offset, so the
+       coordinated motion was barely visible.  The values below keep the same
+       ratio between amplitude and slew (full swing in ~0.2 s) while giving
+       the intent a visible share of both axes.  The physical envelope is
+       still owned by gvf/cmd/vel_max and by the tube cross-section. -->
+  <arg name="phase_offset_manual_u_w_abs_max" default="0.40"/>
+  <arg name="phase_offset_manual_u_w_rate_max" default="2.00"/>
+  <arg name="phase_offset_manual_u_delta_abs_max" default="0.80"/>
+  <arg name="phase_offset_manual_u_delta_rate_max" default="3.00"/>
+  <!-- Centerline recovery gain on delta.  The executed reference is
+       r = p(w) + N*delta, so this spring decides how much of the tube's
+       lateral room the coordination can actually keep.  Measured on the swarm
+       (pillar + 1.2 m tunnel): 3.0 pins delta to the centerline (delta uses
+       ~3% of the cross-section, rides a bound 1.7% of the time), 1.5 triples
+       the used offset (5%) with no change in separation or arrivals, 1.0
+       overshoots (one UAV failed to arrive, min spacing collapsed).
+       The single-UAV chain keeps its own 3.0 default. -->
+  <arg name="phase_offset_manual_delta_tracking_gain" default="1.5"/>
+
+  <!-- SIM-C is an opt-in data-plane process.  Swarm defaults enable it so the
+       Section tube has neighbour intent; a caller can still pass
+       enable_neighbor_transport/enable_sph_provider false. -->
+  <arg name="enable_neighbor_transport" default="true"/>
   <arg name="agent_count" default="1"/>
   <arg name="agent_state_topic" default="/phase_offset/agent_state"/>
   <arg name="neighbor_config_file"
@@ -49,17 +101,53 @@
   <arg name="neighbor_enter_radius" default="2.45"/>
   <arg name="neighbor_exit_radius" default="2.50"/>
   <arg name="all_visible_neighbors" default="false"/>
-  <arg name="enable_sph_provider" default="false"/>
+  <arg name="enable_sph_provider" default="true"/>
   <arg name="sph_beta_topic" default="/uav_$(arg robot_id)/phase_offset/sph_beta"/>
   <arg name="sph_g_coord_topic" default="/uav_$(arg robot_id)/phase_offset/g_coord"/>
+  <!-- Horizontal SPH coordination model (paper formulation).  The gains are
+       workspace velocities in m/s and the ordering contract is
+       d_rep < d_star < 2*h.  d_star defaults to the formation spacing; the
+       orchestrator overrides it when the spacing changes. -->
+  <arg name="sph_h" default="2.0"/>
+  <arg name="sph_reference_spacing" default="1.5"/>
+  <!-- Paper rho_0 = 1 + sum_j Wbar(d*_ij/h) for THIS agent.  The scenario
+       orchestrator fills it in from the nominal formation; 0 falls back to the
+       local estimate (all visible neighbours at d_star). -->
+  <arg name="sph_reference_density" default="0.0"/>
+  <!-- d_rep: activation distance of the bounded short-range repulsion.
+       Paper requires 0 < d_rep < d*.  1.4 m (just below the 1.5 m formation
+       spacing) leaves no dead band: the repulsion is exactly zero at the
+       nominal spacing but starts pulling the moment a pair closes in, which is
+       what keeps the formation at 1.38-1.40 m instead of sagging to 1.15 m.
+       0.9 was the earlier value and was measured worse (see the report). -->
+  <arg name="sph_d_rep" default="1.4"/>
+  <arg name="sph_gamma" default="7.0"/>
+  <arg name="sph_k_rho" default="0.15"/>
+  <arg name="sph_k_rep" default="1.2"/>
+  <arg name="sph_k_damp" default="1.0"/>
+  <arg name="sph_g_max" default="1.5"/>
+  <!-- Which agent's body frame gets broadcast as `world -> base`.  The
+       follow-camera RViz window (phase_offset_agent_view.launch) drives its view
+       from that frame, so only this one agent enables the TF broadcast; all the
+       others keep it off because the frame name is not namespaced. -->
+  <arg name="rviz_follow_agent" default="0"/>
   <arg name="beta_fresh_timeout" default="0.10"/>
   <arg name="snapshot_fresh_timeout" default="0.10"/>
   <arg name="future_timestamp_tolerance" default="0.02"/>
 
-  <arg name="map_resolution" default="0.20"/>
+  <!-- Matches the tuned single-UAV baseline (4.0 / 4.0 / 2.5, resolution 0.1).
+       local_update_range_* are HALF-ranges: the sensor box is
+       +/-range around the vehicle.  Resolution matters beyond fidelity: the
+       SDFMap inflates obstacles by ceil(inflation/resolution) whole voxels, so
+       0.099 m at 0.2 m resolution becomes a +/-0.20 m keep-out while at 0.1 m
+       it stays +/-0.10 m. -->
+  <arg name="map_resolution" default="0.10"/>
   <arg name="map_size_x" default="20.0"/>
   <arg name="map_size_y" default="30.0"/>
   <arg name="map_size_z" default="2.5"/>
+  <arg name="local_update_range_x" default="4.0"/>
+  <arg name="local_update_range_y" default="4.0"/>
+  <arg name="local_update_range_z" default="2.5"/>
 
   <!-- Compatibility-only no-op arguments; do not use these values. -->
   <arg name="spinner_threads" default="2"/>
@@ -103,12 +191,61 @@
     <param name="enter_radius" value="$(arg neighbor_enter_radius)"/>
     <param name="exit_radius" value="$(arg neighbor_exit_radius)"/>
     <param name="enable_sph_provider" value="$(arg enable_sph_provider)"/>
+    <param name="sph/h" value="$(arg sph_h)"/>
+    <param name="sph/reference_spacing" value="$(arg sph_reference_spacing)"/>
+    <param name="sph/reference_density" value="$(arg sph_reference_density)"/>
+    <param name="sph/d_rep" value="$(arg sph_d_rep)"/>
+    <param name="sph/gamma" value="$(arg sph_gamma)"/>
+    <param name="sph/k_rho" value="$(arg sph_k_rho)"/>
+    <param name="sph/k_rep" value="$(arg sph_k_rep)"/>
+    <param name="sph/k_damp" value="$(arg sph_k_damp)"/>
+    <param name="sph/g_max" value="$(arg sph_g_max)"/>
     <param name="beta_fresh_timeout" value="$(arg beta_fresh_timeout)"/>
     <param name="snapshot_fresh_timeout" value="$(arg snapshot_fresh_timeout)"/>
     <param name="future_timestamp_tolerance" value="$(arg future_timestamp_tolerance)"/>
     <remap from="~beta" to="$(arg sph_beta_topic)"/>
     <remap from="~g_coord" to="$(arg sph_g_coord_topic)"/>
     <remap from="~odom" to="$(arg odom_topic)"/>
+  </node>
+
+  <!-- Deliberately outside the namespace group below: that group remaps the
+       operator click topic to this agent's own goal topic, while this node must
+       keep listening to the shared global click so the whole formation reacts
+       to one RViz "2D Nav Goal". -->
+  <!-- Same quadrotor model the single-UAV simulator displays.  One instance per
+       agent, namespaced so the mesh / velocity / trajectory markers of the 15
+       agents do not collide.  All agents use the same flat black finish (the
+       RViz background is white, so they stay readable). -->
+  <node pkg="odom_visualization" type="odom_visualization"
+        name="odom_visualization" ns="$(arg uav_ns)" output="screen">
+    <remap from="~odom" to="$(arg odom_topic)"/>
+    <param name="color/r" value="0.0"/>
+    <param name="color/g" value="0.0"/>
+    <param name="color/b" value="0.0"/>
+    <param name="color/a" value="1.0"/>
+    <param name="robot_scale" value="1.0"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+    <!-- world -> base TF (the body frame the follow-camera window tracks).  Only
+         the selected agent broadcasts it: the frame name is global, so several
+         instances would fight over it. -->
+    <param name="tf45"
+           value="$(eval arg('robot_id') == arg('rviz_follow_agent'))"/>
+    <param name="covariance_position" value="false"/>
+    <param name="covariance_velocity" value="false"/>
+  </node>
+
+  <node if="$(arg clicked_goal_enable)" pkg="phase_offset_sim_bringup"
+        type="clicked_goal_translator.py" name="clicked_goal_translator"
+        ns="$(arg uav_ns)" output="screen">
+    <param name="click_source_topic" value="$(arg clicked_goal_source_topic)"/>
+    <param name="goal_topic" value="$(arg goal_topic)"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+    <param name="initial_x" value="$(arg init_x)"/>
+    <param name="initial_y" value="$(arg init_y)"/>
+    <param name="initial_z" value="$(arg init_z)"/>
+    <param name="bias_x" value="$(arg goal_bias_x)"/>
+    <param name="bias_y" value="$(arg goal_bias_y)"/>
+    <param name="bias_z" value="$(arg goal_bias_z)"/>
   </node>
 
   <!--
@@ -122,6 +259,12 @@
     <remap from="/path_vis" to="/$(arg uav_ns)/path_vis"/>
     <remap from="/goal_vis" to="/$(arg uav_ns)/goal_vis"/>
     <remap from="/optimization_path" to="/$(arg uav_ns)/optimization_path"/>
+    <!-- Display-only Section tube markers: one corridor per UAV. -->
+    <remap from="/phase_offset_section_tube"
+           to="/$(arg uav_ns)/phase_offset_section_tube"/>
+    <!-- Display-only intent-adjusted reference: p(w) + N(w) * delta. -->
+    <remap from="/phase_offset_adjusted_path"
+           to="/$(arg uav_ns)/phase_offset_adjusted_path"/>
 
     <remap from="/particle0/path" to="/$(arg uav_ns)/particle0/path"/>
     <remap from="/particle0/kinopath" to="/$(arg uav_ns)/particle0/kinopath"/>
@@ -152,6 +295,9 @@
 
     <!-- Exactly one protected planner/local-sensing stack per agent. -->
     <include file="$(find bspline_race)/launch/test_gvf.launch">
+      <!-- Per-agent planner log file (see the protected planner launch); pass
+           node_output:=screen to stream to the console instead. -->
+      <arg name="node_output" value="log"/>
       <arg name="drone_id" value="$(arg robot_id)"/>
       <arg name="robot_id" value="$(arg robot_id)"/>
       <arg name="init_x" value="$(arg init_x)"/>
@@ -178,8 +324,6 @@
            value="$(arg phase_offset_manual_tube_source)"/>
       <arg name="phase_offset_tube_cloud_obstacle_set_complete"
            value="$(arg phase_offset_tube_cloud_obstacle_set_complete)"/>
-      <arg name="phase_offset_tube_preincluded_map_uncertainty"
-           value="$(arg phase_offset_tube_preincluded_map_uncertainty)"/>
       <arg name="phase_offset_normal_preview_horizon_w"
            value="$(arg phase_offset_normal_preview_horizon_w)"/>
       <arg name="phase_offset_normal_preview_sample_spacing_w"
@@ -202,8 +346,18 @@
       <param name="gvf/cmd_topic" value="$(arg cmd_topic)"/>
       <param name="gvf/circle_test/enable" value="false"/>
       <param name="gvf/circle_test/auto_start" value="false"/>
-      <param name="gvf/gvf_gain1" value="2.0"/>
-      <param name="gvf/gvf_gain2" value="-2.2"/>
+      <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>
+      <param name="gvf/gvf_gain2" value="$(arg gvf_gain2)"/>
+      <param name="phase_offset/manual/u_w_abs_max"
+             value="$(arg phase_offset_manual_u_w_abs_max)"/>
+      <param name="phase_offset/manual/u_w_rate_max"
+             value="$(arg phase_offset_manual_u_w_rate_max)"/>
+      <param name="phase_offset/manual/u_delta_abs_max"
+             value="$(arg phase_offset_manual_u_delta_abs_max)"/>
+      <param name="phase_offset/manual/u_delta_rate_max"
+             value="$(arg phase_offset_manual_u_delta_rate_max)"/>
+      <param name="phase_offset/manual/delta_tracking_gain"
+             value="$(arg phase_offset_manual_delta_tracking_gain)"/>
       <param name="sdf_map/resolution" value="$(arg map_resolution)"/>
       <param name="sdf_map/map_size_x" value="$(arg map_size_x)"/>
       <param name="sdf_map/map_size_y" value="$(arg map_size_y)"/>
@@ -224,9 +378,9 @@
       <param name="sdf_map/map_size_x" value="$(arg map_size_x)"/>
       <param name="sdf_map/map_size_y" value="$(arg map_size_y)"/>
       <param name="sdf_map/map_size_z" value="$(arg map_size_z)"/>
-      <param name="sdf_map/local_update_range_x" value="6.0"/>
-      <param name="sdf_map/local_update_range_y" value="6.0"/>
-      <param name="sdf_map/local_update_range_z" value="2.5"/>
+      <param name="sdf_map/local_update_range_x" value="$(arg local_update_range_x)"/>
+      <param name="sdf_map/local_update_range_y" value="$(arg local_update_range_y)"/>
+      <param name="sdf_map/local_update_range_z" value="$(arg local_update_range_z)"/>
     </group>
   </group>
 </launch>

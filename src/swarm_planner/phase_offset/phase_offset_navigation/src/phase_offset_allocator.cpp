@@ -28,6 +28,38 @@ double Clamp(const double value, const double lower, const double upper) {
   return std::max(lower, std::min(upper, value));
 }
 
+// Corridor cross-section (the safe lateral set the tube stands for) at one
+// phase, linearly interpolated between the two neighbouring Preview knots.
+// This is the geometric half of the tube authority, as opposed to the
+// rate-limited "reachable" envelope the strict per-step verifier used.
+bool SectionCorridorAt(const TubeViabilityResult& preview, const double w,
+                       double& lower, double& upper) {
+  const std::vector<TubeViabilityKnot>& knots = preview.knots;
+  if (knots.size() < 2U || !Finite(w) || w < knots.front().w ||
+      w > knots.back().w) {
+    return false;
+  }
+  std::size_t right = 0U;
+  while (right < knots.size() && knots[right].w < w) ++right;
+  if (right < knots.size() && knots[right].w == w) {
+    const TubeViabilityInterval& interval = knots[right].geometric;
+    if (!interval.valid) return false;
+    lower = interval.lower;
+    upper = interval.upper;
+    return Finite(lower) && Finite(upper) && lower <= upper;
+  }
+  if (right == 0U || right >= knots.size()) return false;
+  const double left_w = knots[right - 1U].w;
+  const double right_w = knots[right].w;
+  const TubeViabilityInterval& left = knots[right - 1U].geometric;
+  const TubeViabilityInterval& next = knots[right].geometric;
+  if (!left.valid || !next.valid || !(right_w > left_w)) return false;
+  const double alpha = (w - left_w) / (right_w - left_w);
+  lower = left.lower + alpha * (next.lower - left.lower);
+  upper = left.upper + alpha * (next.upper - left.upper);
+  return Finite(lower) && Finite(upper) && lower <= upper;
+}
+
 bool RequiredProvenanceExpectationsBound(
     const PhaseOffsetAllocatorInput& input, std::string& reason) {
   if (input.geometry.path_revision == 0U ||
@@ -48,6 +80,22 @@ bool RequiredProvenanceExpectationsBound(
   return true;
 }
 
+bool RequiredSectionExpectationsBound(
+    const PhaseOffsetAllocatorInput& input, std::string& reason) {
+  if (input.expected_section_profile == nullptr) {
+    reason = "SECTION Preview profile expectation is missing";
+    return false;
+  }
+  if (input.geometry.path_revision == 0U ||
+      input.geometry.frame_revision == 0U ||
+      input.expected_path_revision == 0U ||
+      input.expected_frame_revision == 0U) {
+    reason = "SECTION allocator path/frame provenance is unbound";
+    return false;
+  }
+  return true;
+}
+
 bool PreviewProvenanceComplete(const TubeViabilityProvenance& provenance) {
   return provenance.immutable && !provenance.source.empty() &&
       provenance.path_revision != 0U && provenance.frame_revision != 0U &&
@@ -59,6 +107,30 @@ bool PreviewProvenanceComplete(const TubeViabilityProvenance& provenance) {
 
 bool ProvenanceMatchesInput(const PhaseOffsetAllocatorInput& input,
                             const TubeViabilityProvenance& provenance) {
+  if (input.preview != nullptr &&
+      input.preview->proof_kind == TubeViabilityProofKind::SECTION_PWL) {
+    const NormalPreviewResult& preview = *input.preview;
+    const bool binding = input.expected_section_profile != nullptr &&
+        preview.section_profile != nullptr &&
+        input.expected_section_profile == preview.section_profile;
+    const bool failed_preview_without_borrow =
+        preview.status != TubeViabilityStatus::FEASIBLE &&
+        preview.section_profile == nullptr;
+    if (!(binding || failed_preview_without_borrow) ||
+        !provenance.immutable || provenance.path_revision == 0U ||
+        provenance.frame_revision == 0U ||
+        input.expected_path_revision != provenance.path_revision ||
+        input.expected_frame_revision != provenance.frame_revision ||
+        input.geometry.path_revision != provenance.path_revision ||
+        input.geometry.frame_revision != provenance.frame_revision) {
+      return false;
+    }
+    if (preview.status == TubeViabilityStatus::FEASIBLE) {
+      return input.geometry.w == preview.current_w &&
+          input.geometry.delta == preview.evaluated_delta;
+    }
+    return true;
+  }
   return PreviewProvenanceComplete(provenance) &&
       input.expected_path_revision == provenance.path_revision &&
       input.expected_frame_revision == provenance.frame_revision &&
@@ -75,6 +147,31 @@ bool GeometryMatchesPreview(const PhaseOffsetAllocatorInput& input,
                             const NormalPreviewResult& preview,
                             std::string& reason) {
   const TubeViabilityProvenance& provenance = preview.provenance;
+  if (preview.proof_kind == TubeViabilityProofKind::SECTION_PWL) {
+    if (!RequiredSectionExpectationsBound(input, reason)) return false;
+    if (preview.status == TubeViabilityStatus::FEASIBLE &&
+        (preview.section_profile == nullptr ||
+         input.expected_section_profile != preview.section_profile)) {
+      reason = "SECTION Preview profile pointer does not match expectation";
+      return false;
+    }
+    if (!provenance.immutable ||
+        provenance.path_revision == 0U || provenance.frame_revision == 0U ||
+        provenance.path_revision != input.expected_path_revision ||
+        provenance.frame_revision != input.expected_frame_revision ||
+        input.geometry.path_revision != provenance.path_revision ||
+        input.geometry.frame_revision != provenance.frame_revision) {
+      reason = "SECTION Preview path/frame provenance does not match";
+      return false;
+    }
+    if (preview.status == TubeViabilityStatus::FEASIBLE &&
+        (input.geometry.w != preview.current_w ||
+         input.geometry.delta != preview.evaluated_delta)) {
+      reason = "SECTION geometry W/delta does not match Preview state";
+      return false;
+    }
+    return true;
+  }
   if (!RequiredProvenanceExpectationsBound(input, reason)) return false;
   if (!PreviewProvenanceComplete(provenance)) {
     reason = "Preview provenance is incomplete or not immutable";
@@ -208,17 +305,41 @@ bool PreviewValidForAllocation(const PhaseOffsetAllocatorInput& input,
   }
   const NormalPreviewResult& preview = *input.preview;
   if (!GeometryMatchesPreview(input, preview, reason)) return false;
+  // A rate-degraded preview (the transverse rate window is too narrow for the
+  // requested motion) is still usable: the request is clipped onto the window
+  // boundary below instead of invalidating a planner-valid path.  Losing
+  // transverse capacity must not by itself drop the whole command, so only the
+  // previews that are unusable *at the current state* stay fail-closed.
+  const bool rate_degraded =
+      preview.status == TubeViabilityStatus::RATE_INFEASIBLE;
+  // A retained offset that the corridor has outgrown (it narrowed after the
+  // offset was placed) must be recovered, not frozen: the recovery branch below
+  // drives delta back onto the nearest admissible value with the available
+  // authority.  Rejecting here instead would leave the vehicle permanently
+  // outside the corridor with no tick ever committing to bring it back.
+  const bool delta_recovery =
+      preview.status == TubeViabilityStatus::CURRENT_DELTA_OUTSIDE;
+  const bool degraded = rate_degraded || delta_recovery;
+  // A retained offset that sits outside the corridor (the tube narrowed after
+  // it was placed) is recovered by steering back to the boundary, so it must
+  // not invalidate the tick either.
   if (!preview.valid || !preview.feasible ||
-      preview.status != TubeViabilityStatus::FEASIBLE ||
-      !preview.current_delta_inside ||
-      !preview.current_rate_interval.valid) {
+      (preview.status != TubeViabilityStatus::FEASIBLE && !degraded)) {
     reason = "NORMAL Preview is not feasible for the current state";
     return false;
   }
   const TubeViabilityRateInterval& interval = preview.current_rate_interval;
-  if (!Finite(interval.lower) || !Finite(interval.upper) ||
-      interval.lower > interval.upper ||
-      !Finite(preview.upper_u_delta) || preview.upper_u_delta < 0.0) {
+  if (!Finite(preview.upper_u_delta) || preview.upper_u_delta < 0.0) {
+    reason = "NORMAL Preview transverse-rate facts are invalid";
+    return false;
+  }
+  if (interval.valid &&
+      (!Finite(interval.lower) || !Finite(interval.upper) ||
+       interval.lower > interval.upper)) {
+    reason = "NORMAL Preview transverse-rate facts are invalid";
+    return false;
+  }
+  if (!interval.valid && !degraded) {
     reason = "NORMAL Preview transverse-rate facts are invalid";
     return false;
   }
@@ -248,12 +369,18 @@ bool FinalCommandValid(const PhaseOffsetAllocatorInput& input,
   const bool amplitude_valid = bounds.u_w_abs_max == 0.0
       ? selected.u_w == 0.0
       : std::abs(selected.u_w) <= bounds.u_w_abs_max;
+  // A clip that was itself forced by an empty admissible interval is the only
+  // case where the corresponding hard bound may be reported as unsatisfied:
+  // the request could not be brought inside it at all, so the command takes the
+  // interval boundary and the rest of the checks still apply.
+  const bool phase_window_ok = output.phase_window_clipped ||
+      (phase_rate >= bounds.lower_nu && phase_rate <= bounds.upper_nu);
+  const bool transverse_interval_ok = output.transverse_interval_clipped ||
+      (selected.u_delta >= output.preview_rate_interval.lower &&
+       selected.u_delta <= output.preview_rate_interval.upper);
   return Finite(selected.u_w) && Finite(selected.u_delta) &&
-      Finite(phase_rate) && phase_rate >= bounds.lower_nu &&
-      phase_rate <= bounds.upper_nu &&
-      amplitude_valid &&
-      selected.u_delta >= output.preview_rate_interval.lower &&
-      selected.u_delta <= output.preview_rate_interval.upper &&
+      Finite(phase_rate) && phase_window_ok && amplitude_valid &&
+      transverse_interval_ok &&
       std::abs(selected.u_delta) <= delta_limit &&
       selected.u_w >= output.u_w.slew_lower &&
       selected.u_w <= output.u_w.slew_upper &&
@@ -352,7 +479,18 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
   if (!BoundsValid(input.bounds, input.dt, reason)) {
     return Fail(output, PhaseOffsetAllocatorStatus::INVALID_INPUT, reason);
   }
-  if (!RequiredProvenanceExpectationsBound(input, reason)) {
+  const bool section_preview =
+      input.preview != nullptr &&
+      input.preview->proof_kind == TubeViabilityProofKind::SECTION_PWL;
+  if ((section_preview && input.expected_section_profile == nullptr) ||
+      (!section_preview && input.expected_section_profile != nullptr)) {
+    return Fail(output, PhaseOffsetAllocatorStatus::INVALID_INPUT,
+                section_preview
+                    ? "SECTION Preview profile expectation is missing"
+                    : "SECTION profile expectation supplied for a non-SECTION Preview");
+  }
+  if ((section_preview && !RequiredSectionExpectationsBound(input, reason)) ||
+      (!section_preview && !RequiredProvenanceExpectationsBound(input, reason))) {
     return Fail(output, PhaseOffsetAllocatorStatus::INVALID_INPUT, reason);
   }
   if (!PreviewValidForAllocation(input, output, reason)) {
@@ -369,6 +507,26 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
     return Fail(output, PhaseOffsetAllocatorStatus::INVALID_INPUT,
                 "analytic PhaseOffset projection is invalid");
   }
+  // M4C-2: if the retained offset is outside the current corridor, ignore the
+  // requested transverse intent for this tick and drive back to the nearest
+  // admissible offset with the available authority.  The phase axis and the
+  // rest of the matched structure are untouched.
+  bool transverse_recovery = false;
+  if (input.preview != nullptr && !input.preview->knots.empty()) {
+    const phase_offset_navigation::TubeViabilityInterval& reachable =
+        input.preview->knots.front().reachable;
+    const double current_delta = input.geometry.delta;
+    if (reachable.valid &&
+        (current_delta < reachable.lower || current_delta > reachable.upper)) {
+      const double target = std::max(reachable.lower,
+                                     std::min(reachable.upper, current_delta));
+      const double direction = target > current_delta ? 1.0 : -1.0;
+      output.u_delta_nom =
+          direction * std::max(0.0, input.bounds.upper_u_delta);
+      transverse_recovery = true;
+    }
+  }
+  (void)transverse_recovery;
   output.phase_rate_nom = input.f_w0 + output.u_w_nom;
   if (!Finite(output.phase_rate_nom)) {
     return Fail(output, PhaseOffsetAllocatorStatus::INVALID_INPUT,
@@ -386,8 +544,14 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
       phase_lower, phase_upper, -input.bounds.u_w_abs_max,
       input.bounds.u_w_abs_max, u_w_lower, u_w_upper);
   if (!phase_interval_valid) {
-    return Fail(output, PhaseOffsetAllocatorStatus::NO_ADMISSIBLE_COMMAND,
-                "phase scalar admissible interval is empty");
+    // The base phase rate is outside the allowed window and the correction
+    // authority cannot bring it back.  Take the boundary that reduces the
+    // violation the most instead of dropping the whole command.
+    const double boundary = input.f_w0 > input.bounds.upper_nu
+        ? -input.bounds.u_w_abs_max : input.bounds.u_w_abs_max;
+    u_w_lower = boundary;
+    u_w_upper = boundary;
+    output.phase_window_clipped = true;
   }
   if (input.bounds.u_w_abs_max == 0.0) {
     // Canonicalize the permitted zero-amplitude interval so the selected
@@ -399,12 +563,50 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
   const double delta_limit = EffectiveDeltaLimit(input);
   double u_delta_lower = 0.0;
   double u_delta_upper = 0.0;
+
+  // Same recovery on the phase axis as the transverse axis below.  When the
+  // admissible phase-rate set and the slew window are disjoint, the request is
+  // more than one tick away from the last committed rate.  Move as far towards
+  // the admissible set as this tick's slew budget allows and mark the tick,
+  // instead of dropping it: a dropped tick never commits, so the committed rate
+  // would never reach the admissible set and the phase would freeze forever
+  // (observed as `phase scalar slew interval is empty` after a C2 connector).
+  {
+    const double slew_step = input.bounds.u_w_slew_rate * input.dt;
+    double probe_lower = 0.0;
+    double probe_upper = 0.0;
+    if (Finite(slew_step) &&
+        !Intersect(u_w_lower, u_w_upper,
+                   input.previous_u.u_w - slew_step,
+                   input.previous_u.u_w + slew_step, probe_lower,
+                   probe_upper)) {
+      const double target = Clamp(output.u_w_nom, u_w_lower, u_w_upper);
+      const double best = Clamp(target,
+                                input.previous_u.u_w - slew_step,
+                                input.previous_u.u_w + slew_step);
+      u_w_lower = best;
+      u_w_upper = best;
+      output.phase_window_clipped = true;
+    }
+  }
+
   if (!Intersect(output.preview_rate_interval.lower,
                  output.preview_rate_interval.upper,
                  -delta_limit, delta_limit,
                  u_delta_lower, u_delta_upper)) {
-    return Fail(output, PhaseOffsetAllocatorStatus::NO_ADMISSIBLE_COMMAND,
-                "transverse scalar admissible interval is empty");
+    // The tube window excludes zero and the amplitude admits no point of it.
+    // Keep the transverse reference as close to the corridor's nearest
+    // admissible rate as the amplitude allows.
+    const double nearest = output.preview_rate_interval.valid
+        ? (0.0 < output.preview_rate_interval.lower
+               ? output.preview_rate_interval.lower
+               : output.preview_rate_interval.upper)
+        : 0.0;
+    const double boundary = std::max(-delta_limit,
+                                     std::min(delta_limit, nearest));
+    u_delta_lower = boundary;
+    u_delta_upper = boundary;
+    output.transverse_interval_clipped = true;
   }
 
   if (!BuildSelectedScalar(
@@ -416,6 +618,74 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
           output.u_w)) {
     return Fail(output, PhaseOffsetAllocatorStatus::NO_ADMISSIBLE_COMMAND,
                 "phase scalar slew interval is empty");
+  }
+  // The horizontal-section tube is the safe lateral set: the transverse
+  // command is clipped so that the offset one tick ahead still lies inside the
+  // corridor cross-section.  This is the agreed semantics -- follow the swarm
+  // intent while it fits the tube, otherwise take the corridor boundary -- and
+  // it replaces reliance on a rigid per-step reachable-envelope conformance
+  // rule, which rejected ordinary boundary-tracking lag and froze the phase.
+  if (input.preview != nullptr && input.dt > 0.0) {
+    const double next_w =
+        input.geometry.w + input.dt * (input.f_w0 + output.u_w.selected);
+    double corridor_lower = 0.0;
+    double corridor_upper = 0.0;
+    if (Finite(next_w) &&
+        SectionCorridorAt(*input.preview, input.geometry.w, corridor_lower,
+                          corridor_upper)) {
+      double ahead_lower = 0.0;
+      double ahead_upper = 0.0;
+      if (SectionCorridorAt(*input.preview, next_w, ahead_lower,
+                            ahead_upper)) {
+        corridor_lower = std::max(corridor_lower, ahead_lower);
+        corridor_upper = std::min(corridor_upper, ahead_upper);
+      }
+      if (corridor_lower <= corridor_upper) {
+        const double stay_lower =
+            (corridor_lower - input.geometry.delta) / input.dt;
+        const double stay_upper =
+            (corridor_upper - input.geometry.delta) / input.dt;
+        double clipped_lower = 0.0;
+        double clipped_upper = 0.0;
+        if (Intersect(u_delta_lower, u_delta_upper, stay_lower, stay_upper,
+                      clipped_lower, clipped_upper)) {
+          u_delta_lower = clipped_lower;
+          u_delta_upper = clipped_upper;
+        } else {
+          // The corridor demands a rate the transverse window cannot host this
+          // tick.  Take the window endpoint closest to the corridor demand.
+          const double boundary =
+              stay_lower > u_delta_upper
+                  ? u_delta_upper
+                  : (stay_upper < u_delta_lower ? u_delta_lower : 0.0);
+          u_delta_lower = boundary;
+          u_delta_upper = boundary;
+          output.transverse_interval_clipped = true;
+        }
+      }
+    }
+  }
+  // When the corridor demand and the transverse slew limit are disjoint, hold
+  // the rate at the slew boundary nearest the demand instead of dropping the
+  // tick.  The offset keeps closing on the corridor over the following ticks.
+  {
+    const double slew_step = input.bounds.u_delta_slew_rate * input.dt;
+    double probe_lower = 0.0;
+    double probe_upper = 0.0;
+    if (Finite(slew_step) &&
+        !Intersect(u_delta_lower, u_delta_upper,
+                   input.previous_u.u_delta - slew_step,
+                   input.previous_u.u_delta + slew_step, probe_lower,
+                   probe_upper)) {
+      const double target =
+          Clamp(output.u_delta_nom, u_delta_lower, u_delta_upper);
+      const double best = Clamp(target,
+                                input.previous_u.u_delta - slew_step,
+                                input.previous_u.u_delta + slew_step);
+      u_delta_lower = best;
+      u_delta_upper = best;
+      output.transverse_interval_clipped = true;
+    }
   }
   if (!BuildSelectedScalar(
           output.u_delta_nom, u_delta_lower, u_delta_upper,
@@ -440,6 +710,14 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
   output.selected_u_owner = ownerName();
   output.provenance = "phase_offset_navigation/phase_offset_allocator/noqp-v1";
 
+  // The corridor clip is authoritative: when it pushed the selected rate past
+  // the Preview rate window, that hard bound is the one this tick could not
+  // satisfy, so it is not re-applied; every other bound still is.
+  if (!output.transverse_interval_clipped &&
+      (output.selected_u.u_delta < output.preview_rate_interval.lower ||
+       output.selected_u.u_delta > output.preview_rate_interval.upper)) {
+    output.transverse_interval_clipped = true;
+  }
   if (!FinalCommandValid(input, output) ||
       !output.selectedUConsistent(0.0)) {
     return Fail(output, PhaseOffsetAllocatorStatus::NO_ADMISSIBLE_COMMAND,

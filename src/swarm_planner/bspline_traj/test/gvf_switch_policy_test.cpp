@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -20,13 +21,14 @@
 #undef private
 #include <bspline_race/gvf_manager.h>
 #include <phase_offset_core/geometry.h>
+#include <ros/master.h>
 
 
 namespace FLAG_Race {
 
-// Narrow test-only access for current production phase/governor and V2
+// Narrow test-only access for current production phase/governor and Section
 // publish-first seams.  Retired Pair/READY/mailbox helpers are intentionally
-// absent from this Stage-7 fixture.
+// absent from this fixture.
 class GvfManagerS4AnchorTestAccess {
  public:
   struct PhaseSnapshotProbe {
@@ -131,7 +133,7 @@ class GvfManagerS4AnchorTestAccess {
     return probe;
   }
 
-  static guidance::IsfGains v2Gains() {
+  static guidance::IsfGains sectionGains() {
     guidance::IsfGains gains;
     gains.k1 = 2.0;
     gains.k2 = -2.2;
@@ -142,11 +144,11 @@ class GvfManagerS4AnchorTestAccess {
     return gains;
   }
 
-  static PhaseOffsetMatchedAdapterConfig v2Config() {
+  static PhaseOffsetMatchedAdapterConfig sectionConfig() {
     PhaseOffsetMatchedAdapterConfig config;
     config.mode = PhaseOffsetMatchedMode::MANUAL;
     config.tube_source = phase_offset_navigation::TubeSource::ESDF;
-    config.coordination_backend = PhaseOffsetCoordinationBackend::DISABLED;
+    config.coordination_backend = PhaseOffsetCoordinationBackend::D1B;
     config.observe_only = false;
     config.profile_period = 2.0;
     config.warmup_cycles = 100;
@@ -170,52 +172,15 @@ class GvfManagerS4AnchorTestAccess {
     return config;
   }
 
-  static MatchedAdapterInput v2GateInput(const double stamp) {
-    MatchedAdapterInput input;
-    input.path.p = Eigen::Vector3d(0.25, 0.0, 1.0);
-    input.path.p_w = Eigen::Vector3d::UnitX();
-    input.path.p_ww.setZero();
-    input.path.path_revision = 11U;
-    input.path.frame_revision = 12U;
-    input.path.T = Eigen::Vector3d::UnitX();
-    input.path.N = Eigen::Vector3d::UnitY();
-    input.path.N_w.setZero();
-    input.path.frame_valid = true;
-    input.path.frame_provenance =
-        phase_offset_core::kWorldHorizontalCrossProductProvenance;
-    input.path.w = 0.25;
-    input.path.valid = true;
-    input.semantic_path_start_w = 0.0;
-    input.semantic_path_end_w = 2.0;
-    input.position = input.path.p;
-    input.gains = v2Gains();
-    input.dt = 0.10;
-    input.stamp = ros::Time(stamp);
-    PhaseOffsetActiveAdapter zero;
-    ActiveAdapterInput zero_input;
-    zero_input.path = input.path;
-    zero_input.position = input.position;
-    zero_input.gains = input.gains;
-    ActiveAdapterOutput zero_output;
-    if (!zero.evaluate(zero_input, zero_output)) return MatchedAdapterInput();
-    input.legacy = LegacyGuidanceSnapshot(
-        zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
-        zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
-        zero_output.guidance.ref_pt, zero_output.guidance.tangent,
-        zero_output.guidance.valid);
-    return input;
-  }
-
   static bool installNeutralAdapter(gvf_manager& manager) {
-    PhaseOffsetMatchedAdapterConfig config = v2Config();
-    config.tube_certificate_v2.configuration_id =
-        config.normal_preview_policy.configuration_identity;
-    config.tube_certificate_v2.epsilon = 0.10;
-    config.tube_certificate_v2.nominal_half_width = 0.50;
-    config.tube_certificate_v2.ray_step = 0.05;
-    config.tube_certificate_v2.snapshot_resolution = 0.05;
-    config.tube_certificate_v2.minimum_reference_speed = 1e-8;
-    config.tube_certificate_v2.sample_step_w = 0.25;
+    PhaseOffsetMatchedAdapterConfig config = sectionConfig();
+    config.section_build.clearance = config.tube.cross_section.planner_safe_distance;
+    config.section_build.half_width = config.tube.cross_section.search_extent;
+    config.section_build.minimum_reference_speed =
+        config.tube.cross_section.minimum_reference_speed;
+    config.section_build.max_step_w = 0.25;
+    config.section_build.max_obstacle_checks = 100000U;
+    config.section_build.max_obstacles = 1000U;
     std::unique_ptr<PhaseOffsetMatchedAdapter> adapter(
         new PhaseOffsetMatchedAdapter(config));
     if (!adapter->configurationValid()) return false;
@@ -281,75 +246,158 @@ class GvfManagerS4AnchorTestAccess {
       time(index) = static_cast<double>(index);
     }
     nav_msgs::Path path_msg;
-    return manager.installPlannerOnlyFrontendV2(
+    return manager.installPlannerOnlyFrontend(
         manager.swarmParticlesManager.front(), traj, vel, time, w, owner,
         ros::Time(7, 0), expected_phase, copied_prefix_source,
         copied_prefix_end_w, expected_execution_generation, path_msg);
   }
 
-  static std::uint64_t executionGenerationV2(const gvf_manager& manager) {
+  static std::uint64_t executionGeneration(const gvf_manager& manager) {
     return manager.phase_offset_matched_adapter_
-        ? manager.phase_offset_matched_adapter_->executionGenerationV2() : 0U;
+        ? manager.phase_offset_matched_adapter_->executionGeneration() : 0U;
+  }
+
+  static bool finalizeSectionTerminal(
+      gvf_manager& manager, const std::uint64_t expected_task_generation,
+      double& retained_manual_reference) {
+    if (manager.swarmParticlesManager.empty()) return false;
+    return manager.finalizeSectionTerminal(
+        manager.swarmParticlesManager.front(), expected_task_generation,
+        retained_manual_reference);
   }
 
   static int currentTrajectoryIndex(const gvf_manager& manager) {
     return manager.current_traj_index_;
   }
 
-  static bool plannerOnlyFutureSeam(
-      const std::shared_ptr<const ContinuousPhasePath>& source,
-      const double phase_at_switch,
-      const double construction_lead_w,
-      double& seam_w) {
-    return gvf_manager::plannerOnlyFutureSeamV2(
-        source, phase_at_switch, construction_lead_w, seam_w);
+  static void configureTerminalExecution(gvf_manager& manager,
+                                         const double phase_w,
+                                         const ros::Time& now) {
+    // This fixture bypasses gvf_manager::init(), so initialize the command
+    // mode flags that init() normally loads before exercising cmdCallback.
+    // The isolated governor tests must enter the ordinary command path, not
+    // the legacy test-command or gain-test early returns.
+    manager.use_test_cmd_ = false;
+    manager.cmd_gain_test_enable_ = false;
+    manager.enable_gvfcmd_control = true;
+    manager.test_traj_index_ = 0;
+    manager.enable_trajectory_concatenation_ = false;
+    manager.exec_state_ = gvf_manager::EXEC_TRAJ;
+    manager.point_phase_v2_enabled_ = true;
+    manager.closed_tracking_mode_ = "legacy";
+    manager.enable_circle_reference_test_ = false;
+    manager.collision_threshold_ = 0.0;
+    manager.planInterval = 1e9;
+    manager.last_replan_time_ = now;
+    manager.last_section_build_time_ = now;
+    manager.progress_w_ = phase_w;
+    manager.progress_initialized_ = true;
+    manager.current_traj_index_ = 0;
   }
 
-  static void clearPendingPathReferenceV2(gvf_manager& manager) {
+  static bool isExecuting(const gvf_manager& manager) {
+    return manager.exec_state_ == gvf_manager::EXEC_TRAJ;
+  }
+
+  static bool isWaitingForTarget(const gvf_manager& manager) {
+    return manager.exec_state_ == gvf_manager::WAIT_TARGET;
+  }
+
+  static std::shared_ptr<const SectionPathHandoff>
+      pendingSectionPathHandoff(gvf_manager& manager) {
     std::lock_guard<std::mutex> lock(manager.path_reference_handoff_mutex_);
-    manager.pending_path_reference_handoff_v2_.reset();
+    return manager.pending_section_path_handoff_;
   }
 
-  struct V2ManagerTransactionFixture {
-    std::shared_ptr<const ContinuousPhasePath> source_owner;
-    std::shared_ptr<const ContinuousPhasePath> successor_owner;
-    std::shared_ptr<const TubeV2ExecutionBinding> source_binding;
-    std::shared_ptr<const TubeV2ExecutionBinding> proposed_binding;
-    std::shared_ptr<const PathReferenceHandoffV2> request_handoff;
-    std::shared_ptr<const TubeV2ShadowAdmissionCandidate> candidate;
-    PendingPositionCommandCapture pending_command;
-    double phase_before = 0.0;
-    double phase_after = 0.0;
-  };
-
-  struct V2PublishProbe {
-    bool attempted = false;
-    bool published = false;
-    bool phase_token_prepared = false;
-    int local_publish_count = 0;
-    int post_publish_count = 0;
-    bool local_saw_source_state = false;
-    bool post_saw_atomic_adapter_commit = false;
-    bool post_saw_old_phase = false;
-  };
-
-  static bool prepareV2ManagerTransaction(
-      gvf_manager& manager, V2ManagerTransactionFixture& fixture);
-  static V2PublishProbe publishV2ManagerTransaction(
-      gvf_manager& manager, const V2ManagerTransactionFixture& fixture,
-      bool local_publish_success);
-  static std::shared_ptr<const PathReferenceHandoffV2>
-      pendingPathReferenceV2(gvf_manager& manager);
-  static std::shared_ptr<const ContinuousPhasePath> commandPathForV2(
+  static void setPendingSectionPathHandoff(
       gvf_manager& manager,
-      const std::shared_ptr<const TubeV2ExecutionBinding>& binding);
-  static std::shared_ptr<const TubeV2ExecutionBinding>
-      executionBindingV2(gvf_manager& manager);
-  static bool consumeCommittedPathReferenceV2(gvf_manager& manager);
-  static void installPrematureCommittedMirrorV2(
-      gvf_manager& manager,
-      const V2ManagerTransactionFixture& fixture);
-  static void discardPendingV2Command(gvf_manager& manager);
+      const std::shared_ptr<const SectionPathHandoff>& handoff) {
+    std::lock_guard<std::mutex> lock(manager.path_reference_handoff_mutex_);
+    manager.pending_section_path_handoff_ = handoff;
+  }
+
+  static bool consumeCommittedSectionPathHandoff(gvf_manager& manager) {
+    return !manager.swarmParticlesManager.empty() &&
+        manager.consumeCommittedSectionPathHandoff(
+            manager.swarmParticlesManager.front(), ros::Time(7, 0));
+  }
+
+  static SectionPathBundlePtr currentSectionBundle(gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_
+        ? manager.phase_offset_matched_adapter_->captureSectionBundle()
+        : SectionPathBundlePtr();
+  }
+
+  static SectionPathBundlePtr pendingSectionBundle(gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_
+        ? manager.phase_offset_matched_adapter_->capturePendingSectionBundle()
+        : SectionPathBundlePtr();
+  }
+
+  static void openSectionGate(gvf_manager& manager) {
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->zero_gate_open_ = true;
+    }
+  }
+
+  static bool stageSectionBundle(
+      gvf_manager& manager, const SectionPathBundlePtr& bundle,
+      const std::shared_ptr<const ContinuousPhasePath>& source,
+      double prefix_start, double prefix_end) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->stageSectionBundle(
+            bundle, source, prefix_start, prefix_end);
+  }
+
+  static bool updateSection(gvf_manager& manager,
+                            const MatchedAdapterInput& input,
+                            MatchedAdapterOutput& output) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->update(input, output);
+  }
+
+  static PendingPositionCommandCapture capturePending(gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_
+        ? manager.phase_offset_matched_adapter_->capturePendingPositionCommand()
+        : PendingPositionCommandCapture();
+  }
+
+  static bool publishPending(gvf_manager& manager,
+                             const std::function<bool()>& local_publish,
+                             const std::uint64_t identity) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->publishPendingPositionCommand(
+            local_publish, identity);
+  }
+
+  static bool hasPending(gvf_manager& manager) {
+    return manager.phase_offset_matched_adapter_ &&
+        manager.phase_offset_matched_adapter_->hasPendingPositionCommand();
+  }
+
+  static void discardPendingCommand(gvf_manager& manager) {
+    if (manager.phase_offset_matched_adapter_) {
+      manager.phase_offset_matched_adapter_->discardPendingPositionCommand();
+    }
+  }
+
+  // Test-only replacement used to exercise the production command callback's
+  // candidate retry boundary.  The planner-facing API still stages immutable
+  // Section values; this helper only prepares a current/staged fixture under
+  // the adapter's normal command mutex.
+  static void replaceCurrentSectionBundle(
+      gvf_manager& manager, const SectionPathBundlePtr& bundle) {
+    if (!manager.phase_offset_matched_adapter_) return;
+    std::lock_guard<std::mutex> lock(
+        manager.phase_offset_matched_adapter_->runtime_command_mutex_);
+    manager.phase_offset_matched_adapter_->section_bundle_ = bundle;
+    manager.phase_offset_matched_adapter_->staged_section_bundle_.reset();
+    manager.phase_offset_matched_adapter_->staged_section_source_path_.reset();
+    manager.phase_offset_matched_adapter_->staged_section_copied_prefix_start_w_ =
+        std::numeric_limits<double>::quiet_NaN();
+    manager.phase_offset_matched_adapter_->staged_section_copied_prefix_end_w_ =
+        std::numeric_limits<double>::quiet_NaN();
+  }
 
   static bool point(
                     const gvf_manager& manager,
@@ -399,748 +447,6 @@ class GvfManagerS4AnchorTestAccess {
     return probe;
   }
 };
-bool GvfManagerS4AnchorTestAccess::prepareV2ManagerTransaction(
-    gvf_manager& manager, V2ManagerTransactionFixture& fixture) {
-  fixture = V2ManagerTransactionFixture();
-
-  const auto interval = [](const double lower, const double upper) {
-    phase_offset_core::Binary64Interval value;
-    value.lower = lower;
-    value.upper = upper;
-    value.valid = true;
-    return value;
-  };
-  const auto vector_interval = [&interval]() {
-    phase_offset_core::Binary64VectorInterval value;
-    value.valid = true;
-    for (phase_offset_core::Binary64Interval& component : value.component) {
-      component = interval(0.0, 0.0);
-    }
-    return value;
-  };
-  const auto path_cell = [&interval, &vector_interval](
-      const phase_offset_navigation::TubePathKey& key, const double w0,
-      const double w1, const std::uint64_t segment) {
-    phase_offset_core::CertifiedPathCellV2 cell;
-    cell.w0 = w0;
-    cell.w1 = w1;
-    cell.anchor_w = 0.5 * (w0 + w1);
-    cell.path_revision = key.path_revision;
-    cell.frame_revision = key.frame_revision;
-    cell.segment_identity = segment;
-    cell.proof_identity = 100U + segment;
-    cell.anchor_position = vector_interval();
-    cell.anchor_p_w = vector_interval();
-    cell.anchor_p_ww = vector_interval();
-    cell.inf_p_w_norm = interval(1.0, 1.0);
-    cell.sup_p_w_norm = interval(1.0, 1.0);
-    cell.inf_horizontal_p_w_norm = interval(1.0, 1.0);
-    cell.sup_p_ww_norm = interval(0.0, 0.0);
-    cell.sup_horizontal_p_ww_norm = interval(0.0, 0.0);
-    cell.sup_p_www_norm = interval(0.0, 0.0);
-    cell.sup_normal_derivative = interval(0.0, 0.0);
-    cell.normal_variation = interval(0.0, 0.0);
-    cell.tangent_variation = interval(0.0, 0.0);
-    cell.curvature_variation = interval(0.0, 0.0);
-    cell.midpoint_position_variation = interval(0.0, 0.0);
-    cell.chord_deviation = interval(0.0, 0.0);
-    cell.horizontal_acceleration_bound_complete = true;
-    cell.normal_frame_proof_complete = true;
-    cell.phase_map_proof_complete = true;
-    cell.provenance =
-        phase_offset_core::kWorldHorizontalCrossProductProvenance;
-    cell.complete = true;
-    cell.valid = true;
-    return cell;
-  };
-
-  phase_offset_navigation::TubeConfigurationKey configuration_key;
-  configuration_key.configuration_id = 31U;
-  configuration_key.epsilon = 0.1;
-  configuration_key.nominal_half_width = 0.5;
-  configuration_key.ray_step = 0.05;
-  configuration_key.snapshot_resolution = 0.05;
-  configuration_key.minimum_reference_speed = 1e-8;
-  phase_offset_navigation::TubeMapCaptureKey map_key;
-  map_key.map_instance_id = 41U;
-  map_key.state_id = 43U;
-  map_key.accepted_sequence = 43U;
-  map_key.configuration_generation = 44U;
-  map_key.configuration_id = configuration_key.configuration_id;
-  map_key.frame_provenance_id = 45U;
-  map_key.frame_provenance = "s6c-t08-world";
-  map_key.support_provenance_id = 46U;
-  map_key.accepted_time_ticks = 100U;
-  map_key.support_expiry_ticks = 10000U;
-  map_key.support_halo = 0.1;
-  map_key.halo_reconciled = true;
-  map_key.grid_min_index_x = -10;
-  map_key.grid_min_index_y = -10;
-  map_key.grid_min_index_z = -10;
-  map_key.grid_max_index_x = 10;
-  map_key.grid_max_index_y = 10;
-  map_key.grid_max_index_z = 10;
-  map_key.grid_voxel_resolution = Eigen::Vector3d::Constant(0.05);
-  map_key.complete_support = true;
-
-  PhaseOffsetMatchedAdapterConfig config = v2Config();
-  config.coordination_backend = PhaseOffsetCoordinationBackend::D1B;
-  config.observe_only = false;
-  config.tube_certificate_v2.configuration_id =
-      configuration_key.configuration_id;
-  config.tube_certificate_v2.epsilon = configuration_key.epsilon;
-  config.tube_certificate_v2.nominal_half_width =
-      configuration_key.nominal_half_width;
-  config.tube_certificate_v2.ray_step = configuration_key.ray_step;
-  config.tube_certificate_v2.snapshot_resolution =
-      configuration_key.snapshot_resolution;
-  config.tube_certificate_v2.minimum_reference_speed =
-      configuration_key.minimum_reference_speed;
-  config.tube_certificate_v2.sample_step_w = 0.25;
-  config.normal_preview_policy.preview_horizon_w = 1.0;
-  config.normal_preview_policy.sample_spacing_w = 0.25;
-  config.normal_preview_policy.lower_nu = 0.02;
-  config.normal_preview_policy.upper_nu = 2.0;
-  config.normal_preview_policy.b_tight = 0.1;
-  config.normal_preview_policy.b_open = 0.9;
-  config.normal_preview_policy.configuration_identity =
-      configuration_key.configuration_id;
-  config.normal_preview_policy.configuration_id = "s6c-t08-preview";
-
-  std::unique_ptr<PhaseOffsetMatchedAdapter> adapter(
-      new PhaseOffsetMatchedAdapter(config));
-  if (!adapter->configurationValid()) {
-    return false;
-  }
-  const std::uint64_t execution_generation =
-      adapter->task_generation_.load(std::memory_order_acquire);
-
-  const auto make_path = [](const std::uint64_t revision) {
-    std::shared_ptr<ContinuousPhasePath> path(new ContinuousPhasePath());
-    if (!path->appendSegment(
-            0.0, 2.0, "s6c-t08-straight",
-            [](const double w, ContinuousPhasePathState& state) {
-              state.p = Eigen::Vector3d(w, 0.0, 1.0);
-              state.dp_dw = Eigen::Vector3d::UnitX();
-              state.d2p_dw2.setZero();
-              state.vel = state.dp_dw;
-              state.valid = std::isfinite(w);
-              return state.valid;
-            })) {
-      return std::shared_ptr<const ContinuousPhasePath>();
-    }
-    path->setPathRevision(revision);
-    return std::shared_ptr<const ContinuousPhasePath>(path);
-  };
-  fixture.source_owner = make_path(11U);
-  if (!fixture.source_owner) return false;
-
-  const auto make_profile = [&](const phase_offset_navigation::TubePathKey& key,
-                                const std::uint64_t profile_id,
-                                const std::uint64_t request_id,
-                                const double requested_start,
-                                const std::shared_ptr<const ContinuousPhasePath>&
-                                    owner) {
-    std::shared_ptr<phase_offset_navigation::TubeProfileV2> profile(
-        new phase_offset_navigation::TubeProfileV2());
-    profile->path_key = key;
-    profile->configuration_key = configuration_key;
-    profile->map_capture_key = map_key;
-    profile->profile_id = profile_id;
-    profile->request_id = request_id;
-    profile->requested_start = requested_start;
-    profile->requested_end = 2.0;
-    profile->anchor_w = requested_start;
-    profile->certified_start = 0.0;
-    profile->certified_end = 2.0;
-    profile->valid = true;
-    profile->complete = true;
-    profile->contains_anchor = true;
-    profile->contains_zero_everywhere = true;
-    profile->nonzero_capacity = true;
-    profile->capability =
-        phase_offset_navigation::TubeProfileV2Capability::OFFSET_CERTIFIED;
-    profile->path_owner = std::static_pointer_cast<const void>(owner);
-    profile->capture_owner =
-        std::static_pointer_cast<const void>(std::make_shared<int>(2));
-    profile->query_owner =
-        std::static_pointer_cast<const void>(std::make_shared<int>(3));
-    profile->applicability_assumptions = "s6c-t08-complete-support";
-    profile->applicability_deadline_ticks = 10000U;
-
-    phase_offset_navigation::TubePwlKnotV2 first;
-    first.w = 0.0;
-    first.lower = -0.5;
-    first.upper = 0.5;
-    first.right_cell_id = 61U;
-    first.right_lower_slope_interval = {0.0, 0.0, true};
-    first.right_upper_slope_interval = {0.0, 0.0, true};
-    first.valid = true;
-    phase_offset_navigation::TubePwlKnotV2 middle = first;
-    middle.w = 1.0;
-    middle.left_cell_id = 61U;
-    middle.right_cell_id = 62U;
-    middle.left_lower_slope_interval = {0.0, 0.0, true};
-    middle.left_upper_slope_interval = {0.0, 0.0, true};
-    middle.right_lower_slope_interval = {0.0, 0.0, true};
-    middle.right_upper_slope_interval = {0.0, 0.0, true};
-    phase_offset_navigation::TubePwlKnotV2 last = middle;
-    last.w = 2.0;
-    last.left_cell_id = 62U;
-    last.right_cell_id = 0U;
-    last.right_lower_slope_interval = {};
-    last.right_upper_slope_interval = {};
-    profile->knots = {first, middle, last};
-
-    phase_offset_navigation::TubeProofCellV2 cell0;
-    cell0.w0 = 0.0;
-    cell0.w1 = 1.0;
-    cell0.lower = -0.5;
-    cell0.upper = 0.5;
-    cell0.cell_id = 61U;
-    cell0.valid = true;
-    cell0.complete = true;
-    cell0.path_cell = path_cell(key, 0.0, 1.0, 71U);
-    phase_offset_navigation::TubeProofCellV2 cell1 = cell0;
-    cell1.w0 = 1.0;
-    cell1.w1 = 2.0;
-    cell1.cell_id = 62U;
-    cell1.path_cell = path_cell(key, 1.0, 2.0, 72U);
-    profile->cells = {cell0, cell1};
-    return profile;
-  };
-  const auto make_input = [](
-      const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>&
-          profile) {
-    std::shared_ptr<phase_offset_navigation::TubeBuildInputV2> input(
-        new phase_offset_navigation::TubeBuildInputV2());
-    input->request_id = profile->request_id;
-    input->path_key = profile->path_key;
-    input->configuration_key = profile->configuration_key;
-    input->map_capture_key = profile->map_capture_key;
-    input->requested_start = profile->requested_start;
-    input->requested_end = profile->requested_end;
-    input->anchor_w = profile->anchor_w;
-    for (const phase_offset_navigation::TubeProofCellV2& cell :
-         profile->cells) {
-      input->path_cells.push_back(cell.path_cell);
-    }
-    input->producer_breakpoints = {0.0, 1.0, 2.0};
-    input->free_ball_query = [](
-        const Eigen::Vector3d&, const double) {
-      return phase_offset_navigation::TubeFreeBallQueryResult();
-    };
-    input->path_owner = profile->path_owner;
-    input->capture_owner = profile->capture_owner;
-    input->query_owner = profile->query_owner;
-    input->applicability_assumptions = profile->applicability_assumptions;
-    input->applicability_deadline_ticks =
-        profile->applicability_deadline_ticks;
-    input->applicability_deadline_timeless =
-        profile->applicability_deadline_timeless;
-    return std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>(
-        input);
-  };
-  const auto completion = [](
-      const TubeWorkerPurposeV2 purpose,
-      const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>&
-          profile) {
-    std::shared_ptr<TubeWorkerCompletionV2> value(
-        new TubeWorkerCompletionV2());
-    value->status = TubeWorkerCompletionStatusV2::BUILT;
-    value->purpose = purpose;
-    value->request_id = profile->request_id;
-    value->execution_generation = profile->path_key.execution_generation;
-    value->accepted_state_demand =
-        profile->map_capture_key.accepted_sequence;
-    value->useful_start = profile->requested_start;
-    value->useful_end = profile->requested_end;
-    value->path_key = profile->path_key;
-    value->configuration_key = profile->configuration_key;
-    value->map_capture_key = profile->map_capture_key;
-    value->heavy_build_entered = true;
-    value->build.profile = *profile;
-    value->build.success = true;
-    return std::shared_ptr<const TubeWorkerCompletionV2>(value);
-  };
-  const auto populate_admission = [&config, &map_key](
-      MatchedAdapterInput& input, const std::uint64_t binding_sequence) {
-    input.tube_v2_admission.valid = true;
-    input.tube_v2_admission.binding_sequence = binding_sequence;
-    input.tube_v2_admission.accepted_state_sequence = map_key.accepted_sequence;
-    input.tube_v2_admission.accepted_state_notification_sequence =
-        map_key.accepted_sequence;
-    input.tube_v2_admission.accepted_time_ticks = map_key.accepted_time_ticks;
-    input.tube_v2_admission.support_expiry_ticks =
-        map_key.support_expiry_ticks;
-    input.tube_v2_admission.map_instance_id = map_key.map_instance_id;
-    input.tube_v2_admission.configuration_generation =
-        map_key.configuration_generation;
-    input.tube_v2_admission.configuration_key = map_key.configuration_id;
-    input.tube_v2_admission.support_provenance_id =
-        map_key.support_provenance_id;
-    input.tube_v2_admission.frame_provenance = map_key.frame_provenance;
-    input.tube_v2_admission.latest_accepted_state_sequence =
-        map_key.accepted_sequence;
-    input.tube_v2_admission.latest_accepted_state_notification_sequence =
-        map_key.accepted_sequence;
-    input.tube_v2_admission.latest_accepted_time_ticks =
-        map_key.accepted_time_ticks;
-    input.tube_v2_admission.latest_map_instance_id = map_key.map_instance_id;
-    input.tube_v2_admission.latest_configuration_generation =
-        map_key.configuration_generation;
-    input.tube_v2_admission.latest_configuration_key =
-        map_key.configuration_id;
-    input.tube_v2_admission.latest_support_provenance_id =
-        map_key.support_provenance_id;
-    input.tube_v2_admission.latest_frame_provenance =
-        map_key.frame_provenance;
-    input.tube_v2_admission.selected_u = phase_offset_core::PortCommand();
-    input.tube_v2_admission.selected_u.u_delta = 0.05;
-    input.tube_v2_admission.base_phase_rate = 0.10;
-    input.tube_v2_admission.phase_rate_lower = 0.05;
-    input.tube_v2_admission.phase_rate_upper = 0.50;
-    input.tube_v2_admission.upper_u_delta = 0.20;
-    input.tube_v2_admission.now = 100.0;
-    input.tube_v2_admission.applicability_deadline = 10000.0;
-    input.tube_v2_admission.applicability_deadline_valid = true;
-    input.tube_v2_admission.preview_policy = config.normal_preview_policy;
-    input.tube_v2_admission.limits.lower_phase_rate = 0.05;
-    input.tube_v2_admission.limits.upper_phase_rate = 0.50;
-    input.tube_v2_admission.limits.upper_nu = 0.50;
-    input.tube_v2_admission.limits.max_u_w = 0.50;
-    input.tube_v2_admission.limits.max_u_delta = 1.0;
-    input.tube_v2_admission.limits.u_w_slew_rate = 1.0;
-    input.tube_v2_admission.limits.u_delta_slew_rate = 1.0;
-    input.tube_v2_admission.limits.return_u_delta_max = 0.50;
-    input.tube_v2_admission.limits.return_u_delta_slew_rate = 0.50;
-    input.tube_v2_admission.limits.max_schedule_steps = 200U;
-    input.tube_v2_admission.limits.max_work = 1000U;
-    input.tube_v2_admission.limits.valid = true;
-    input.tube_v2_admission.tracking.valid = true;
-    input.tube_v2_admission.tracking.error_norm = 0.0;
-    input.tube_v2_admission.tracking.error_bound = 0.15;
-    input.tube_v2_admission.tracking.physical_tangent_valid = true;
-    input.tube_v2_admission.max_work = 1000U;
-    input.tube_v2_admission.provenance = "S6C/T08/manager-transaction";
-  };
-
-  phase_offset_navigation::TubePathKey source_key;
-  source_key.execution_generation = execution_generation;
-  source_key.path_instance_id = 22U;
-  source_key.path_revision = fixture.source_owner->pathRevision();
-  source_key.frame_revision = 12U;
-  source_key.frame_convention_id = 13U;
-  source_key.frame_convention =
-      phase_offset_core::kWorldHorizontalCrossProductProvenance;
-  source_key.phase_orientation = 1;
-  source_key.domain_start = 0.0;
-  source_key.domain_end = 2.0;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>
-      source_profile = make_profile(
-          source_key, 51U, 52U, 0.0, fixture.source_owner);
-  const std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
-      source_input = make_input(source_profile);
-  if (!source_profile->structurallyValid() || !source_input->complete()) {
-    return false;
-  }
-  MatchedAdapterInput source_command = v2GateInput(100.0);
-  ContinuousPhasePathState source_state;
-  if (!fixture.source_owner->evaluate(0.25, source_state, false)) {
-    return false;
-  }
-  source_command.path = ConvertContinuousPhasePathStateForActive(
-      source_state, 0.25);
-  source_command.path.path_revision = source_key.path_revision;
-  source_command.path.frame_revision = source_key.frame_revision;
-  source_command.path.T = Eigen::Vector3d::UnitX();
-  source_command.path.N = Eigen::Vector3d::UnitY();
-  source_command.path.N_w.setZero();
-  source_command.path.frame_valid = true;
-  source_command.path.frame_provenance = source_key.frame_convention;
-  source_command.position = source_state.p;
-  source_command.g_des = source_command.path.N * 0.05;
-  source_command.g_des_valid = true;
-  source_command.semantic_path_owner = fixture.source_owner;
-  source_command.semantic_path_start_w = fixture.source_owner->startW();
-  source_command.semantic_path_end_w = fixture.source_owner->endW();
-  source_command.dt = 0.10;
-  source_command.tube_worker_input_v2 = source_input;
-  populate_admission(source_command, 81U);
-
-  // Exercise the unchanged production zero-port equivalence gate.  Stage 7
-  // has no bootstrap-only bypass: the V2 candidate may become selectable
-  // only after one hundred coherent command observations.
-  ActiveAdapterInput zero_input;
-  zero_input.path = source_command.path;
-  zero_input.position = source_command.position;
-  zero_input.gains = source_command.gains;
-  ActiveAdapterOutput zero_output;
-  if (!adapter->zero_port_adapter_.evaluate(zero_input, zero_output)) {
-    return false;
-  }
-  source_command.legacy = LegacyGuidanceSnapshot(
-      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
-      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
-      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
-      zero_output.guidance.valid);
-  for (int cycle = 0; cycle < config.warmup_cycles; ++cycle) {
-    MatchedAdapterOutput gate_output;
-    if (!adapter->updateGate(source_command, gate_output)) {
-      return false;
-    }
-  }
-  if (!adapter->zero_gate_open_) return false;
-
-  const std::shared_ptr<const TubeWorkerCompletionV2> source_completion =
-      completion(TubeWorkerPurposeV2::CURRENT, source_profile);
-  {
-    std::lock_guard<std::mutex> worker_lock(adapter->worker_state_mutex_);
-    adapter->latest_v2_shadow_current_completion_ = source_completion;
-  }
-  MatchedAdapterOutput source_output;
-  if (!adapter->update(source_command, source_output) ||
-      !source_output.selected || !source_output.valid ||
-      !source_output.v2_shadow_admission_candidate) {
-    return false;
-  }
-  const std::shared_ptr<const TubeV2ShadowAdmissionCandidate> source_candidate =
-      source_output.v2_shadow_admission_candidate;
-  const PendingPositionCommandCapture source_pending =
-      adapter->capturePendingPositionCommand();
-  if (!source_pending.pending || !source_pending.valid ||
-      !adapter->publishPendingPositionCommand(
-          []() { return true; }, source_pending.identity)) {
-    return false;
-  }
-  fixture.source_binding = adapter->captureV2ExecutionBinding();
-  if (!fixture.source_binding || !fixture.source_binding->complete()) {
-    return false;
-  }
-
-  const double live_w = source_candidate->prepared_step.successor.w;
-  std::shared_ptr<ContinuousPhasePath> successor(new ContinuousPhasePath());
-  if (!successor->appendSlice(*fixture.source_owner, 0.0, 1.0) ||
-      !successor->appendSegment(
-          1.0, 2.0, "s6c-t08-successor-tail",
-          [](const double w, ContinuousPhasePathState& state) {
-            state.p = Eigen::Vector3d(w, 0.0, 1.0);
-            state.dp_dw = Eigen::Vector3d::UnitX();
-            state.d2p_dw2.setZero();
-            state.vel = state.dp_dw;
-            state.valid = std::isfinite(w);
-            return state.valid;
-          })) {
-    return false;
-  }
-  successor->setPathRevision(14U);
-  fixture.successor_owner = successor;
-  phase_offset_navigation::TubePathKey successor_key = source_key;
-  ++successor_key.path_instance_id;
-  successor_key.path_revision = fixture.successor_owner->pathRevision();
-  successor_key.frame_revision = 15U;
-  const std::shared_ptr<const phase_offset_navigation::TubeProfileV2>
-      successor_profile = make_profile(
-          successor_key, 53U, 54U, live_w, fixture.successor_owner);
-  const std::shared_ptr<const phase_offset_navigation::TubeBuildInputV2>
-      successor_input = make_input(successor_profile);
-  if (!successor_profile->structurallyValid() ||
-      !successor_input->complete()) {
-    return false;
-  }
-
-  std::shared_ptr<TubeV2SuccessorHandoffEvidence> admission(
-      new TubeV2SuccessorHandoffEvidence());
-  admission->valid = true;
-  admission->structurally_copied_prefix = true;
-  admission->expected_execution_generation = execution_generation;
-  admission->source_path_key = source_key;
-  admission->source_path_owner = fixture.source_owner;
-  admission->successor_path_key = successor_key;
-  admission->successor_path_owner = fixture.successor_owner;
-  admission->phase_after_w = live_w;
-  admission->copied_prefix_start_w = live_w;
-  admission->copied_prefix_end_w = 1.0;
-  admission->successor_request = successor_input;
-  admission->provenance = "S6C/T08/appendSlice";
-
-  MatchedAdapterInput successor_command = source_command;
-  if (!fixture.source_owner->evaluate(live_w, source_state, false)) return false;
-  successor_command.path = ConvertContinuousPhasePathStateForActive(
-      source_state, live_w);
-  successor_command.path.path_revision = source_key.path_revision;
-  successor_command.path.frame_revision = source_key.frame_revision;
-  successor_command.path.T = Eigen::Vector3d::UnitX();
-  successor_command.path.N = Eigen::Vector3d::UnitY();
-  successor_command.path.N_w.setZero();
-  successor_command.path.frame_valid = true;
-  successor_command.path.frame_provenance = source_key.frame_convention;
-  successor_command.position = source_state.p;
-  ActiveAdapterInput successor_zero_input;
-  successor_zero_input.path = successor_command.path;
-  successor_zero_input.position = successor_command.position;
-  successor_zero_input.gains = successor_command.gains;
-  ActiveAdapterOutput successor_zero_output;
-  if (!adapter->zero_port_adapter_.evaluate(
-          successor_zero_input, successor_zero_output)) {
-    return false;
-  }
-  successor_command.legacy = LegacyGuidanceSnapshot(
-      successor_zero_output.guidance.v_cmd,
-      successor_zero_output.guidance.w_dot,
-      successor_zero_output.guidance.e_parallel,
-      successor_zero_output.guidance.e_perp,
-      successor_zero_output.guidance.ref_pt,
-      successor_zero_output.guidance.tangent,
-      successor_zero_output.guidance.valid);
-  successor_command.tube_v2_successor_handoff = admission;
-  populate_admission(successor_command, 81U);
-  const std::shared_ptr<const TubeWorkerCompletionV2> successor_completion =
-      completion(TubeWorkerPurposeV2::SUCCESSOR, successor_profile);
-  {
-    std::lock_guard<std::mutex> worker_lock(adapter->worker_state_mutex_);
-    adapter->latest_v2_shadow_successor_completion_ = successor_completion;
-  }
-  MatchedAdapterOutput successor_output;
-  if (!adapter->update(successor_command, successor_output) ||
-      !successor_output.selected || !successor_output.valid ||
-      !successor_output.v2_shadow_admission_candidate) {
-    return false;
-  }
-  fixture.candidate = successor_output.v2_shadow_admission_candidate;
-  fixture.pending_command = adapter->capturePendingPositionCommand();
-  fixture.proposed_binding = fixture.pending_command.proposed_v2_binding;
-  if (!fixture.pending_command.pending || !fixture.pending_command.valid ||
-      !fixture.pending_command.v2_binding_transition ||
-      !fixture.proposed_binding || !fixture.proposed_binding->complete()) {
-    return false;
-  }
-
-  std::shared_ptr<PathReferenceFrontendMirrorV2> mirror(
-      new PathReferenceFrontendMirrorV2());
-  const std::vector<double> mirror_w{0.0, live_w, 1.0, 2.0};
-  mirror->traj.resize(4, 3);
-  mirror->vel.resize(4, 3);
-  mirror->time.resize(4);
-  mirror->w = mirror_w;
-  mirror->anchor_idx = 1;
-  for (int index = 0; index < 4; ++index) {
-    ContinuousPhasePathState state;
-    if (!fixture.successor_owner->evaluate(
-            mirror_w[static_cast<std::size_t>(index)], state, false)) {
-      return false;
-    }
-    mirror->traj.row(index) = state.p.transpose();
-    mirror->vel.row(index) = state.dp_dw.transpose();
-    mirror->time(index) = static_cast<double>(index);
-  }
-  std::shared_ptr<PathReferenceHandoffV2> handoff(
-      new PathReferenceHandoffV2());
-  handoff->expected_execution_generation = execution_generation;
-  handoff->source_path_key = source_key;
-  handoff->successor_path_owner = fixture.successor_owner;
-  handoff->successor_path_key = successor_key;
-  handoff->successor_phase_after_w = live_w;
-  handoff->copied_prefix_start_w = live_w;
-  handoff->copied_prefix_end_w = 1.0;
-  handoff->successor_request = successor_input;
-  handoff->admission_evidence = admission;
-  handoff->frontend_mirror = mirror;
-  if (!handoff->requestComplete()) return false;
-  fixture.request_handoff = handoff;
-
-  manager.matched_config_ = config;
-  manager.phase_offset_matched_adapter_ = std::move(adapter);
-  gvf_manager::gvfManager frontend;
-  frontend.gvf_.reset(new gvf());
-  frontend.gvf_->setAuthoritativePhaseMode(true);
-  frontend.gvf_->setContinuousPhasePath(fixture.source_owner);
-  const std::vector<double> source_w{0.0, 1.0, 2.0};
-  frontend.last_traj.resize(3, 3);
-  frontend.last_vel.resize(3, 3);
-  frontend.last_traj_time_.resize(3);
-  for (int index = 0; index < 3; ++index) {
-    ContinuousPhasePathState state;
-    if (!fixture.source_owner->evaluate(
-            source_w[static_cast<std::size_t>(index)], state, false)) {
-      return false;
-    }
-    frontend.last_traj.row(index) = state.p.transpose();
-    frontend.last_vel.row(index) = state.dp_dw.transpose();
-    frontend.last_traj_time_(index) = static_cast<double>(index);
-  }
-  frontend.gvf_->setNextPathWSamples(source_w);
-  manager.swarmParticlesManager.clear();
-  manager.swarmParticlesManager.push_back(frontend);
-  manager.publishAuthoritativePhase(live_w, true, false);
-  {
-    std::lock_guard<std::mutex> handoff_lock(
-        manager.path_reference_handoff_mutex_);
-    manager.pending_path_reference_handoff_v2_ = fixture.request_handoff;
-  }
-  fixture.phase_before = live_w;
-  fixture.phase_after = fixture.candidate->prepared_step.successor.w;
-  return true;
-}
-
-GvfManagerS4AnchorTestAccess::V2PublishProbe
-GvfManagerS4AnchorTestAccess::publishV2ManagerTransaction(
-    gvf_manager& manager, const V2ManagerTransactionFixture& fixture,
-    const bool local_publish_success) {
-  V2PublishProbe probe;
-  if (!manager.phase_offset_matched_adapter_ ||
-      manager.swarmParticlesManager.empty() ||
-      !fixture.source_binding || !fixture.proposed_binding ||
-      !fixture.request_handoff || !fixture.candidate ||
-      !fixture.pending_command.pending ||
-      !fixture.pending_command.valid ||
-      !fixture.pending_command.v2_binding_transition ||
-      fixture.pending_command.proposed_v2_binding !=
-          fixture.proposed_binding) {
-    return probe;
-  }
-  PhaseOffsetMatchedAdapter& adapter =
-      *manager.phase_offset_matched_adapter_;
-  const gvf_manager::AuthoritativePhaseSnapshot captured_phase =
-      manager.captureAuthoritativePhase();
-  std::shared_ptr<const PathReferenceHandoffV2> expected_handoff;
-  {
-    std::lock_guard<std::mutex> handoff_lock(
-        manager.path_reference_handoff_mutex_);
-    expected_handoff = manager.pending_path_reference_handoff_v2_;
-  }
-  if (expected_handoff != fixture.request_handoff ||
-      !expected_handoff->requestComplete() ||
-      expected_handoff->successor_profile ||
-      fixture.proposed_binding->source_input !=
-          expected_handoff->successor_request ||
-      fixture.proposed_binding->profile->path_key !=
-          expected_handoff->successor_path_key) {
-    return probe;
-  }
-  std::shared_ptr<PathReferenceHandoffV2> enriched_mutable(
-      new PathReferenceHandoffV2(*expected_handoff));
-  enriched_mutable->successor_profile = fixture.proposed_binding->profile;
-  const std::shared_ptr<const PathReferenceHandoffV2> enriched_handoff =
-      enriched_mutable;
-  if (!enriched_handoff->committedComplete()) return probe;
-
-  std::unique_lock<std::mutex> frontend_lock(manager.frontend_apply_mutex_);
-  std::unique_lock<std::mutex> handoff_lock(
-      manager.path_reference_handoff_mutex_);
-  if (manager.pending_path_reference_handoff_v2_ != expected_handoff) {
-    return probe;
-  }
-  std::unique_lock<std::mutex> phase_lock(
-      manager.authoritative_phase_mutex_);
-  gvf_manager::AuthoritativePhaseCommitToken phase_token;
-  probe.phase_token_prepared =
-      manager.prepareAuthoritativePhaseCommitLocked(
-          captured_phase, fixture.phase_after, false, phase_token);
-  if (!probe.phase_token_prepared || !phase_token.valid) return probe;
-
-  probe.attempted = true;
-  probe.published = adapter.publishPendingPositionCommand(
-      [&]() {
-        ++probe.local_publish_count;
-        const phase_offset_core::PortCommand previous =
-            adapter.runtime_->previousFinalPort();
-        probe.local_saw_source_state =
-            adapter.v2_execution_binding_ == fixture.source_binding &&
-            adapter.runtime_->retainedDelta() ==
-                fixture.candidate->prepared_step.expected_current.delta &&
-            previous.u_w == fixture.candidate->prepared_step
-                                .expected_current.previous_u.u_w &&
-            previous.u_delta == fixture.candidate->prepared_step
-                                    .expected_current.previous_u.u_delta &&
-            manager.phase_w_ == captured_phase.w &&
-            manager.authoritative_phase_generation_ ==
-                captured_phase.generation &&
-            manager.pending_path_reference_handoff_v2_ ==
-                expected_handoff &&
-            manager.swarmParticlesManager.front().gvf_ &&
-            manager.swarmParticlesManager.front().gvf_
-                    ->getContinuousPhasePath() == fixture.source_owner;
-        return local_publish_success;
-      },
-      fixture.pending_command.identity, false,
-      [&]() {
-        ++probe.post_publish_count;
-        const phase_offset_core::PortCommand previous =
-            adapter.runtime_->previousFinalPort();
-        probe.post_saw_atomic_adapter_commit =
-            adapter.v2_execution_binding_ == fixture.proposed_binding &&
-            adapter.runtime_->retainedDelta() ==
-                fixture.candidate->prepared_step.successor.delta &&
-            previous.u_w == fixture.candidate->prepared_step
-                                .successor.previous_u.u_w &&
-            previous.u_delta == fixture.candidate->prepared_step
-                                    .successor.previous_u.u_delta;
-        probe.post_saw_old_phase =
-            manager.phase_w_ == captured_phase.w &&
-            manager.authoritative_phase_generation_ ==
-                captured_phase.generation;
-        manager.commitAuthoritativePhaseNoFailLocked(phase_token);
-        manager.pending_path_reference_handoff_v2_ = enriched_handoff;
-      });
-  return probe;
-}
-
-std::shared_ptr<const PathReferenceHandoffV2>
-GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-    gvf_manager& manager) {
-  std::lock_guard<std::mutex> handoff_lock(
-      manager.path_reference_handoff_mutex_);
-  return manager.pending_path_reference_handoff_v2_;
-}
-
-std::shared_ptr<const ContinuousPhasePath>
-GvfManagerS4AnchorTestAccess::commandPathForV2(
-    gvf_manager& manager,
-    const std::shared_ptr<const TubeV2ExecutionBinding>& binding) {
-  return manager.swarmParticlesManager.empty()
-      ? std::shared_ptr<const ContinuousPhasePath>()
-      : manager.captureCommandPathForV2Binding(
-            manager.swarmParticlesManager.front(), binding);
-}
-
-std::shared_ptr<const TubeV2ExecutionBinding>
-GvfManagerS4AnchorTestAccess::executionBindingV2(gvf_manager& manager) {
-  return manager.phase_offset_matched_adapter_
-      ? manager.phase_offset_matched_adapter_->captureV2ExecutionBinding()
-      : std::shared_ptr<const TubeV2ExecutionBinding>();
-}
-
-bool GvfManagerS4AnchorTestAccess::consumeCommittedPathReferenceV2(
-    gvf_manager& manager) {
-  return !manager.swarmParticlesManager.empty() &&
-      manager.consumeCommittedPathReferenceHandoffV2(
-          manager.swarmParticlesManager.front(), ros::Time(7, 0));
-}
-
-void GvfManagerS4AnchorTestAccess::installPrematureCommittedMirrorV2(
-    gvf_manager& manager,
-    const V2ManagerTransactionFixture& fixture) {
-  if (!fixture.request_handoff || !fixture.proposed_binding) return;
-  std::shared_ptr<PathReferenceHandoffV2> enriched(
-      new PathReferenceHandoffV2(*fixture.request_handoff));
-  enriched->successor_profile = fixture.proposed_binding->profile;
-  if (!enriched->committedComplete()) return;
-  std::lock_guard<std::mutex> handoff_lock(
-      manager.path_reference_handoff_mutex_);
-  if (manager.pending_path_reference_handoff_v2_ ==
-      fixture.request_handoff) {
-    manager.pending_path_reference_handoff_v2_ = enriched;
-  }
-}
-
-void GvfManagerS4AnchorTestAccess::discardPendingV2Command(
-    gvf_manager& manager) {
-  if (manager.phase_offset_matched_adapter_) {
-    manager.phase_offset_matched_adapter_->discardPendingPositionCommand();
-  }
-}
-
 }  // namespace FLAG_Race
 
 namespace {
@@ -1224,6 +530,573 @@ makeH2CopiedPrefixReplacement(
     return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
   }
   return replacement;
+}
+
+std::shared_ptr<const FLAG_Race::ContinuousPhasePath> makeSectionPath(
+    const double start_w = 0.0, const double end_w = 4.0,
+    const std::uint64_t revision = 11U) {
+  std::shared_ptr<FLAG_Race::ContinuousPhasePath> path(
+      new FLAG_Race::ContinuousPhasePath());
+  if (!path->appendSegment(
+          start_w, end_w, "section_straight",
+          [start_w, end_w](const double w,
+                           FLAG_Race::ContinuousPhasePathState& state) {
+            state.p = Eigen::Vector3d(w, 0.0, 1.0);
+            state.dp_dw = Eigen::Vector3d::UnitX();
+            state.d2p_dw2 = Eigen::Vector3d::Zero();
+            state.vel = state.dp_dw;
+            state.valid = std::isfinite(w) && w >= start_w && w <= end_w;
+            return state.valid;
+          })) {
+    return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  }
+  path->setPathRevision(revision);
+  return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(path);
+}
+
+// Deliberately non-evaluable owner for the current-bundle fallback test.  The
+// path remains structurally nonempty so it can occupy the committed Section
+// slot, while every state query fails closed.  This models a temporary current
+// frame/path evaluation failure without weakening the candidate's valid
+// guidance setup.
+std::shared_ptr<const FLAG_Race::ContinuousPhasePath>
+makeInvalidSectionPath(const double start_w = 0.0,
+                       const double end_w = 4.0,
+                       const std::uint64_t revision = 71U) {
+  std::shared_ptr<FLAG_Race::ContinuousPhasePath> path(
+      new FLAG_Race::ContinuousPhasePath());
+  if (!path->appendSegment(
+          start_w, end_w, "section_invalid_current",
+          [](const double /*w*/, FLAG_Race::ContinuousPhasePathState& state) {
+            state.valid = false;
+            return false;
+          })) {
+    return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  }
+  path->setPathRevision(revision);
+  return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(path);
+}
+
+std::shared_ptr<const FLAG_Race::ContinuousPhasePath>
+makeSectionSuccessor(
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& source,
+    const double seam_w = 1.20, const double end_w = 4.0,
+    const std::uint64_t revision = 12U) {
+  if (!source || source->empty() || seam_w <= source->startW() ||
+      seam_w >= source->endW() || end_w <= seam_w) {
+    return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  }
+  std::shared_ptr<FLAG_Race::ContinuousPhasePath> successor(
+      new FLAG_Race::ContinuousPhasePath());
+  if (!successor->appendSlice(*source, source->startW(), seam_w) ||
+      !successor->appendSegment(
+          seam_w, end_w, "section_successor_tail",
+          [seam_w, end_w](const double w,
+                          FLAG_Race::ContinuousPhasePathState& state) {
+            const double dw = w - seam_w;
+            state.p = Eigen::Vector3d(w, 0.04 * dw * dw, 1.0);
+            state.dp_dw = Eigen::Vector3d(1.0, 0.08 * dw, 0.0);
+            state.d2p_dw2 = Eigen::Vector3d(0.0, 0.08, 0.0);
+            state.vel = state.dp_dw;
+            state.valid = std::isfinite(w) && w >= seam_w && w <= end_w;
+            return state.valid;
+          })) {
+    return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>();
+  }
+  successor->setPathRevision(revision);
+  return std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(successor);
+}
+
+std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>
+makeSectionProfile(
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path) {
+  if (!path || path->empty()) {
+    return std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>();
+  }
+  std::shared_ptr<phase_offset_navigation::SectionTubeProfile> profile(
+      new phase_offset_navigation::SectionTubeProfile());
+  profile->valid_start = path->startW();
+  profile->valid_end = path->endW();
+  profile->status = phase_offset_navigation::SectionTubeStatus::COMPLETE;
+  profile->usable = true;
+  profile->complete = true;
+  const double middle = 0.5 * (path->startW() + path->endW());
+  for (const double w : {path->startW(), middle, path->endW()}) {
+    phase_offset_navigation::SectionTubeKnot knot;
+    knot.w = w;
+    knot.lower = -1.0;
+    knot.upper = 1.0;
+    profile->knots.push_back(knot);
+  }
+  return std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>(
+      profile);
+}
+
+FLAG_Race::SectionPathBundlePtr makeSectionBundle(
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path,
+    const std::uint64_t generation) {
+  if (!path || path->empty() || path->pathRevision() == 0U ||
+      generation == 0U) {
+    return FLAG_Race::SectionPathBundlePtr();
+  }
+  std::shared_ptr<FLAG_Race::SectionPathBundle> bundle(
+      new FLAG_Race::SectionPathBundle());
+  bundle->path = path;
+  bundle->frame = std::shared_ptr<const FLAG_Race::ContinuousPhaseNormalFrame>(
+      new FLAG_Race::ContinuousPhaseNormalFrame(
+          path, path->pathRevision(), path->pathRevision()));
+  bundle->profile = makeSectionProfile(path);
+  bundle->local_view_status = plan_env::LocalObstacleViewStatus::VALID;
+  bundle->frame_id = "world";
+  bundle->task_generation = generation;
+  bundle->path_revision = path->pathRevision();
+  bundle->frame_revision = path->pathRevision();
+  bundle->environment_validity =
+      std::make_shared<plan_env::EnvironmentValidityState>();
+  bundle->environment_change_mutex = std::make_shared<std::recursive_mutex>();
+  bundle->build_config.clearance = 0.4;
+  bundle->build_config.half_width = 1.0;
+  bundle->build_config.minimum_reference_speed = 1e-8;
+  bundle->build_config.max_obstacle_checks = 100000U;
+  bundle->build_config.max_obstacles = 1000U;
+  return FLAG_Race::SectionPathBundlePtr(bundle);
+}
+
+FLAG_Race::SectionPathBundlePtr makePartialSectionBundle(
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path,
+    const std::uint64_t generation, const double valid_end_w) {
+  const FLAG_Race::SectionPathBundlePtr bundle =
+      makeSectionBundle(path, generation);
+  if (!bundle || !bundle->profile || !std::isfinite(valid_end_w) ||
+      !(valid_end_w > path->startW()) || valid_end_w >= path->endW()) {
+    return FLAG_Race::SectionPathBundlePtr();
+  }
+  std::shared_ptr<phase_offset_navigation::SectionTubeProfile> profile(
+      new phase_offset_navigation::SectionTubeProfile(*bundle->profile));
+  profile->status = phase_offset_navigation::SectionTubeStatus::PARTIAL;
+  profile->complete = false;
+  profile->valid_end = valid_end_w;
+  profile->knots.clear();
+  for (const double w : {path->startW(),
+                         0.5 * (path->startW() + valid_end_w), valid_end_w}) {
+    phase_offset_navigation::SectionTubeKnot knot;
+    knot.w = w;
+    knot.lower = -1.0;
+    knot.upper = 1.0;
+    profile->knots.push_back(knot);
+  }
+  std::shared_ptr<FLAG_Race::SectionPathBundle> mutable_bundle =
+      std::const_pointer_cast<FLAG_Race::SectionPathBundle>(bundle);
+  mutable_bundle->profile =
+      std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>(
+          profile);
+  return bundle;
+}
+
+bool makeSectionInput(
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path,
+    const double w, FLAG_Race::MatchedAdapterInput& input) {
+  input = FLAG_Race::MatchedAdapterInput();
+  if (!path || path->empty()) return false;
+  FLAG_Race::ContinuousPhasePathState state;
+  const FLAG_Race::ContinuousPhaseNormalFrame frame(
+      path, path->pathRevision(), path->pathRevision());
+  if (!frame.evaluatePathState(w, state) || !state.valid ||
+      !state.frame_valid) return false;
+  input.path = FLAG_Race::ConvertContinuousPhasePathStateForActive(state, w);
+  input.semantic_path_owner = path;
+  input.semantic_path_start_w = path->startW();
+  input.semantic_path_end_w = path->endW();
+  input.position = state.p + Eigen::Vector3d(0.0, 0.05, 0.0);
+  input.gains = FLAG_Race::GvfManagerS4AnchorTestAccess::sectionGains();
+  input.dt = 0.10;
+  input.stamp = ros::Time(7, 0);
+  input.g_des = Eigen::Vector3d::Zero();
+  input.g_des_valid = true;
+
+  FLAG_Race::PhaseOffsetActiveAdapter zero;
+  FLAG_Race::ActiveAdapterInput zero_input;
+  zero_input.path = input.path;
+  zero_input.position = input.position;
+  zero_input.gains = input.gains;
+  FLAG_Race::ActiveAdapterOutput zero_output;
+  if (!zero.evaluate(zero_input, zero_output)) return false;
+  input.legacy = FLAG_Race::LegacyGuidanceSnapshot(
+      zero_output.guidance.v_cmd, zero_output.guidance.w_dot,
+      zero_output.guidance.e_parallel, zero_output.guidance.e_perp,
+      zero_output.guidance.ref_pt, zero_output.guidance.tangent,
+      zero_output.guidance.valid);
+  return true;
+}
+
+FLAG_Race::PhaseOffsetMatchedAdapterConfig makeSectionConfig() {
+  FLAG_Race::PhaseOffsetMatchedAdapterConfig config =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::sectionConfig();
+  config.section_build.clearance = config.tube.cross_section.planner_safe_distance;
+  config.section_build.half_width = config.tube.cross_section.search_extent;
+  config.section_build.minimum_reference_speed =
+      config.tube.cross_section.minimum_reference_speed;
+  config.section_build.max_step_w = 0.25;
+  config.section_build.max_obstacle_checks = 100000U;
+  config.section_build.max_obstacles = 1000U;
+  return config;
+}
+
+bool populateSectionFrontend(
+    FLAG_Race::gvf_manager& manager,
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path) {
+  if (manager.swarmParticlesManager.empty() || !path || path->empty()) {
+    return false;
+  }
+  auto& frontend = manager.swarmParticlesManager.front();
+  const std::vector<double> w{path->startW(),
+                              0.5 * (path->startW() + path->endW()),
+                              path->endW()};
+  frontend.last_traj.resize(3, 3);
+  frontend.last_vel.resize(3, 3);
+  frontend.last_traj_time_.resize(3);
+  for (int index = 0; index < 3; ++index) {
+    FLAG_Race::ContinuousPhasePathState state;
+    if (!path->evaluate(w[static_cast<std::size_t>(index)], state, false)) {
+      return false;
+    }
+    frontend.last_traj.row(index) = state.p.transpose();
+    frontend.last_vel.row(index) = state.dp_dw.transpose();
+    frontend.last_traj_time_(index) = static_cast<double>(index);
+  }
+  frontend.gvf_->setNextPathWSamples(w);
+  return true;
+}
+
+bool installSectionManager(
+    FLAG_Race::gvf_manager& manager,
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path,
+    const FLAG_Race::SectionPathBundlePtr& bundle,
+    const double phase_w = 0.40) {
+  if (!path || !bundle || !FLAG_Race::GvfManagerS4AnchorTestAccess::
+      installNeutralAdapter(manager) ||
+      !FLAG_Race::GvfManagerS4AnchorTestAccess::initializePlannerFrontend(
+          manager, path) || !populateSectionFrontend(manager, path)) {
+    return false;
+  }
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, phase_w, true, false);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::openSectionGate(manager);
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+          manager, bundle,
+          std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(),
+          std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::quiet_NaN())) {
+    return false;
+  }
+  FLAG_Race::MatchedAdapterInput input;
+  if (!makeSectionInput(path, phase_w, input)) return false;
+  input.section_bundle = bundle;
+  FLAG_Race::MatchedAdapterOutput output;
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::updateSection(
+          manager, input, output) ||
+      !output.selected || !output.section_prepared_step) {
+    return false;
+  }
+  const FLAG_Race::PendingPositionCommandCapture pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  if (!pending.pending || !pending.valid ||
+      !FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+          manager, []() { return true; }, pending.identity)) {
+    return false;
+  }
+  return FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+             manager) == bundle;
+}
+
+struct SectionTransitionFixture {
+  std::shared_ptr<const FLAG_Race::ContinuousPhasePath> source;
+  std::shared_ptr<const FLAG_Race::ContinuousPhasePath> successor;
+  FLAG_Race::SectionPathBundlePtr source_bundle;
+  FLAG_Race::SectionPathBundlePtr successor_bundle;
+  FLAG_Race::PendingPositionCommandCapture pending;
+  std::shared_ptr<const FLAG_Race::SectionPathHandoff> handoff;
+  double prepared_next_delta = 0.0;
+  double phase_before = 0.0;
+  double phase_after = 0.0;
+};
+
+bool prepareSectionTransition(FLAG_Race::gvf_manager& manager,
+                              SectionTransitionFixture& fixture,
+                              const bool source_nonzero = true) {
+  const auto fail = [](const std::string& reason) {
+    ADD_FAILURE() << "Section transition fixture: " << reason;
+    return false;
+  };
+  fixture = SectionTransitionFixture();
+  fixture.source = makeSectionPath(0.0, 4.0, 11U);
+  fixture.successor = makeSectionSuccessor(fixture.source, 1.20, 4.0, 12U);
+  if (!fixture.source || !fixture.successor ||
+      !FLAG_Race::GvfManagerS4AnchorTestAccess::installNeutralAdapter(manager)) {
+    return fail("paths or adapter setup");
+  }
+  const std::uint64_t generation =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  fixture.source_bundle = makeSectionBundle(fixture.source, generation);
+  fixture.successor_bundle = makeSectionBundle(fixture.successor, generation);
+  if (!fixture.source_bundle || !fixture.successor_bundle ||
+      !FLAG_Race::GvfManagerS4AnchorTestAccess::initializePlannerFrontend(
+          manager, fixture.source) || !populateSectionFrontend(manager, fixture.source)) {
+    return fail("bundle/frontend setup");
+  }
+  const double initial_phase_w = 0.40;
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, initial_phase_w, true, false);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::openSectionGate(manager);
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+          manager, fixture.source_bundle,
+          std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(),
+          std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::quiet_NaN())) {
+    return fail("stage source bundle");
+  }
+  FLAG_Race::MatchedAdapterInput source_input;
+  if (!makeSectionInput(fixture.source, initial_phase_w, source_input)) {
+    return fail("source input");
+  }
+  // Establish the source command through the real Section D1B path.  The
+  // normal transition fixture uses a lateral intent so Runtime owns a real
+  // nonzero delta; terminal-cancellation tests may opt into the same
+  // production path with a neutral source and a prepared successor.
+  if (source_nonzero) {
+    source_input.g_des = Eigen::Vector3d(0.0, 0.30, 0.0);
+  }
+  source_input.section_bundle = fixture.source_bundle;
+  FLAG_Race::MatchedAdapterOutput output;
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::updateSection(
+      manager, source_input, output) ||
+      !output.selected) {
+    return fail(std::string("source update: ") + output.invalid_reason);
+  }
+  const FLAG_Race::PendingPositionCommandCapture source_pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  if (!source_pending.pending || !source_pending.valid ||
+      !FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+          manager, []() { return true; }, source_pending.identity)) {
+    return fail("source publish");
+  }
+  const auto source_runtime =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  if (!source_runtime.present || !std::isfinite(source_runtime.retained_delta) ||
+      (source_nonzero && source_runtime.retained_delta == 0.0) ||
+      (!source_nonzero && source_runtime.retained_delta != 0.0)) {
+    return fail(source_nonzero
+                    ? "source publish did not establish nonzero Runtime delta"
+                    : "neutral source publish changed Runtime delta");
+  }
+  if (!std::isfinite(source_pending.section_next_w) ||
+      source_pending.section_next_w <= initial_phase_w ||
+      source_pending.section_next_w >= fixture.source->endW()) {
+    return fail("source publish produced invalid successor phase");
+  }
+  // The Section commit advances Runtime's retained offset, while the
+  // authoritative phase remains manager-owned.  Mirror the exact committed
+  // next-W before staging the successor so every prefix witness is tied to
+  // the live phase actually observed by the next command.
+  const double live_w = source_pending.section_next_w;
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, live_w, true, false);
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+          manager, fixture.successor_bundle, fixture.source, live_w, 1.20)) {
+    return fail("stage successor bundle");
+  }
+  FLAG_Race::MatchedAdapterInput successor_input;
+  if (!makeSectionInput(fixture.successor, live_w, successor_input)) {
+    return fail("successor input");
+  }
+  successor_input.g_des = Eigen::Vector3d(0.0, 0.30, 0.0);
+  successor_input.section_bundle = fixture.successor_bundle;
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::updateSection(
+      manager, successor_input, output) ||
+      !output.selected || !output.section_prepared_step) {
+    return fail(std::string("successor update: ") + output.invalid_reason);
+  }
+  fixture.prepared_next_delta = output.section_prepared_step->nextDelta();
+  fixture.pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  if (!fixture.pending.pending || !fixture.pending.valid ||
+      !fixture.pending.section_transition ||
+      fixture.pending.section_bundle != fixture.successor_bundle) {
+    return false;
+  }
+
+  std::shared_ptr<FLAG_Race::SectionPathHandoff> handoff(
+      new FLAG_Race::SectionPathHandoff());
+  const auto phase =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  handoff->task_generation = generation;
+  handoff->phase_generation = phase.generation;
+  handoff->source_path = fixture.source;
+  handoff->candidate_path = fixture.successor;
+  handoff->bundle = fixture.successor_bundle;
+  handoff->copied_prefix_start_w = live_w;
+  handoff->copied_prefix_end_w = 1.20;
+  handoff->w = {0.0, live_w, 1.20, 4.0};
+  handoff->traj.resize(4, 3);
+  handoff->vel.resize(4, 3);
+  handoff->time.resize(4);
+  handoff->path_msg.header.frame_id = "world";
+  handoff->path_msg.poses.reserve(handoff->w.size());
+  for (std::size_t index = 0; index < handoff->w.size(); ++index) {
+    FLAG_Race::ContinuousPhasePathState state;
+    if (!fixture.successor->evaluate(handoff->w[index], state, false)) {
+      return fail("handoff sample");
+    }
+    handoff->traj.row(static_cast<int>(index)) = state.p.transpose();
+    handoff->vel.row(static_cast<int>(index)) = state.dp_dw.transpose();
+    handoff->time(static_cast<int>(index)) = static_cast<double>(index);
+    geometry_msgs::PoseStamped pose;
+    pose.pose.position.x = state.p.x();
+    pose.pose.position.y = state.p.y();
+    pose.pose.position.z = state.p.z();
+    pose.pose.orientation.x = state.dp_dw.x();
+    pose.pose.orientation.y = state.dp_dw.y();
+    pose.pose.orientation.z = state.dp_dw.z();
+    pose.pose.orientation.w = 1.0;
+    handoff->path_msg.poses.push_back(pose);
+  }
+  if (!handoff->complete()) return fail("handoff completeness");
+  fixture.handoff = std::shared_ptr<const FLAG_Race::SectionPathHandoff>(
+      std::move(handoff));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setPendingSectionPathHandoff(
+      manager, fixture.handoff);
+  fixture.phase_before = phase.w;
+  fixture.phase_after = fixture.pending.section_next_w;
+  return true;
+}
+
+bool configureTerminalExecution(FLAG_Race::gvf_manager& manager,
+                                const SectionTransitionFixture& fixture) {
+  if (manager.swarmParticlesManager.empty() || !fixture.source ||
+      !std::isfinite(fixture.phase_before)) {
+    return false;
+  }
+  FLAG_Race::ContinuousPhasePathState phase_state;
+  if (!fixture.source->evaluate(fixture.phase_before, phase_state, false) ||
+      !phase_state.valid) {
+    return false;
+  }
+  auto& frontend = manager.swarmParticlesManager.front();
+  manager.odom_ = phase_state.p;
+  FLAG_Race::GvfManagerS4AnchorTestAccess::configureTerminalExecution(
+      manager, fixture.phase_before, ros::Time::now());
+  frontend.receive_startpt = false;
+  frontend.receive_goal = true;
+  frontend.is_first_goal = false;
+  frontend.goal_pt = manager.odom_;
+  return true;
+}
+
+bool stageSuccessorPending(FLAG_Race::gvf_manager& manager,
+                           const SectionTransitionFixture& fixture) {
+  if (!fixture.source || !fixture.successor || !fixture.successor_bundle ||
+      !std::isfinite(fixture.phase_before) ||
+      !(fixture.phase_before < 1.20)) {
+    return false;
+  }
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+          manager, fixture.successor_bundle, fixture.source,
+          fixture.phase_before, 1.20)) {
+    return false;
+  }
+  FLAG_Race::MatchedAdapterInput input;
+  if (!makeSectionInput(fixture.successor, fixture.phase_before, input)) {
+    return false;
+  }
+  input.g_des = Eigen::Vector3d(0.0, 0.30, 0.0);
+  input.section_bundle = fixture.successor_bundle;
+  FLAG_Race::MatchedAdapterOutput output;
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::updateSection(
+          manager, input, output) ||
+      !output.selected || !output.section_prepared_step) {
+    return false;
+  }
+  const auto pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  return pending.pending && pending.valid && pending.section_transition &&
+      pending.section_bundle == fixture.successor_bundle;
+}
+
+bool installTestCommandPublisher(FLAG_Race::gvf_manager& manager) {
+  if (!ros::isInitialized()) {
+    int argc = 1;
+    char name[] = "gvf_switch_policy_test";
+    char* argv[] = {name, nullptr};
+    ros::init(argc, argv, "gvf_switch_policy_test",
+              ros::init_options::AnonymousName |
+                  ros::init_options::NoSigintHandler);
+  }
+  if (!ros::master::check()) return false;
+  try {
+    ros::NodeHandle nh;
+    manager.cmd_pub = nh.advertise<quadrotor_msgs::PositionCommand>(
+        "/gvf_switch_policy_test/position_cmd", 1);
+  } catch (const std::exception&) {
+    return false;
+  }
+  return static_cast<bool>(manager.cmd_pub);
+}
+
+bool prepareNonzeroSectionCommandManager(
+    FLAG_Race::gvf_manager& manager,
+    const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>& path,
+    const FLAG_Race::SectionPathBundlePtr& bundle) {
+  if (!path || !bundle || !installSectionManager(manager, path, bundle)) {
+    return false;
+  }
+  if (manager.swarmParticlesManager.empty() ||
+      !manager.swarmParticlesManager.front().gvf_) {
+    return false;
+  }
+  auto& pm = manager.swarmParticlesManager.front();
+  pm.gvf_->gvf_.K1_ = 2.0;
+  pm.gvf_->gvf_.K2_ = -2.2;
+  pm.gvf_->gvf_.convergence_bandwidth_ = 0.1;
+  pm.gvf_->progress_rho0_ = 0.5;
+  pm.gvf_->progress_delta_ = 0.3;
+  pm.gvf_->alpha_min_ = 0.05;
+
+  FLAG_Race::ContinuousPhasePathState state;
+  if (!path->evaluate(0.40, state, false) || !state.valid) return false;
+  manager.odom_ = state.p + Eigen::Vector3d(0.0, 0.05, 0.0);
+  pm.receive_startpt = false;
+  pm.receive_goal = true;
+  pm.is_first_goal = false;
+  pm.goal_pt = manager.odom_ + Eigen::Vector3d(10.0, 0.0, 0.0);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::configureTerminalExecution(
+      manager, 0.40, ros::Time::now());
+  manager.cmd_governor_l_min_ = 0.50;
+  manager.cmd_governor_l_max_ = 0.50;
+  manager.cmd_governor_l_step_ = 0.05;
+  manager.cmd_governor_lead_max_ = 1.6;
+  manager.cmd_governor_normal_max_ = 0.0;
+  manager.cmd_governor_initialized_ = false;
+  manager.cmd_governor_normal_state_.setZero();
+  manager.cmd_governor_last_l_ = 0.0;
+
+  FLAG_Race::MatchedAdapterInput input;
+  if (!makeSectionInput(path, 0.40, input)) return false;
+  input.g_des = Eigen::Vector3d(0.0, 0.30, 0.0);
+  input.section_bundle = bundle;
+  FLAG_Race::MatchedAdapterOutput output;
+  if (!FLAG_Race::GvfManagerS4AnchorTestAccess::updateSection(
+          manager, input, output) ||
+      !output.selected) {
+    return false;
+  }
+  const FLAG_Race::PendingPositionCommandCapture pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  return pending.pending && pending.valid &&
+      FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+          manager, []() { return true; }, pending.identity) &&
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager)
+              .retained_delta !=
+          0.0;
 }
 
 TEST(GvfSwitchPolicy, ForcesAcceptWhenAcceptedPathCannotSupportGovernorLookahead)
@@ -1527,13 +1400,13 @@ TEST(GvfH2FutureSeam,
       0.0, 4.0, "represented_map", represented));
 
   double seam_w = -1.0;
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-      plannerOnlyFutureSeam(source, 0.40, 0.60, seam_w));
+  ASSERT_TRUE(FLAG_Race::gvf_manager::plannerOnlyFutureSeam(
+      source, 0.40, 0.60, seam_w));
   EXPECT_DOUBLE_EQ(seam_w, 1.25);
 
   seam_w = -1.0;
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-      plannerOnlyFutureSeam(source, 3.30, 0.40, seam_w));
+  EXPECT_FALSE(FLAG_Race::gvf_manager::plannerOnlyFutureSeam(
+      source, 3.30, 0.40, seam_w));
   EXPECT_DOUBLE_EQ(seam_w, 0.0);
 }
 
@@ -1565,13 +1438,11 @@ TEST(GvfManagerGDes,
   EXPECT_TRUE(captured.isZero());
 }
 
-TEST(GvfPlannerOnlyV2,
-     NeutralContinuationInstallsWithoutBindingAndBindingBlocksReplacement) {
+TEST(GvfPlannerOnly,
+     NeutralContinuationInstallsWithoutSectionBundleAndNonzeroBlocksReplacement) {
   ros::Time::init();
-  const std::shared_ptr<const FLAG_Race::ContinuousPhasePath> original =
-      makeH2OldSeamPath();
-  const std::shared_ptr<const FLAG_Race::ContinuousPhasePath> replacement =
-      makeH2ReplacementPath();
+  const auto original = makeH2OldSeamPath();
+  const auto replacement = makeH2ReplacementPath();
   ASSERT_TRUE(original);
   ASSERT_TRUE(replacement);
 
@@ -1582,38 +1453,30 @@ TEST(GvfPlannerOnlyV2,
       neutral_manager, original));
   FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
       neutral_manager, 0.40, true, false);
-  const auto neutral_phase_before =
+  const auto phase_before =
       FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(neutral_manager);
-  const auto neutral_runtime_before =
+  const auto runtime_before =
       FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(neutral_manager);
-  ASSERT_TRUE(neutral_runtime_before.present);
-  ASSERT_DOUBLE_EQ(neutral_runtime_before.retained_delta, 0.0);
-  ASSERT_DOUBLE_EQ(neutral_runtime_before.previous_port.u_w, 0.0);
-  ASSERT_DOUBLE_EQ(neutral_runtime_before.previous_port.u_delta, 0.0);
-  ASSERT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-      neutral_manager));
-  ASSERT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
+  ASSERT_TRUE(runtime_before.present);
+  EXPECT_DOUBLE_EQ(runtime_before.retained_delta, 0.0);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
       neutral_manager));
 
   ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::installPlannerOnly(
       neutral_manager, replacement));
-  const auto neutral_phase_after =
+  const auto phase_after =
       FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(neutral_manager);
-  const auto neutral_runtime_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(neutral_manager);
-  EXPECT_DOUBLE_EQ(neutral_phase_after.w, neutral_phase_before.w);
-  EXPECT_EQ(neutral_phase_after.initialized, neutral_phase_before.initialized);
-  EXPECT_EQ(neutral_phase_after.closed_acquired,
-            neutral_phase_before.closed_acquired);
-  EXPECT_EQ(neutral_phase_after.generation, neutral_phase_before.generation);
-  EXPECT_DOUBLE_EQ(neutral_runtime_after.retained_delta, 0.0);
-  EXPECT_DOUBLE_EQ(neutral_runtime_after.previous_port.u_w, 0.0);
-  EXPECT_DOUBLE_EQ(neutral_runtime_after.previous_port.u_delta, 0.0);
-  ASSERT_FALSE(neutral_manager.swarmParticlesManager.empty());
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_before.w);
+  EXPECT_EQ(phase_after.initialized, phase_before.initialized);
+  EXPECT_EQ(phase_after.closed_acquired, phase_before.closed_acquired);
+  EXPECT_EQ(phase_after.generation, phase_before.generation);
+  EXPECT_DOUBLE_EQ(
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(neutral_manager)
+          .retained_delta,
+      0.0);
   ASSERT_TRUE(neutral_manager.swarmParticlesManager.front().gvf_);
-  const std::shared_ptr<const FLAG_Race::ContinuousPhasePath> installed =
-      neutral_manager.swarmParticlesManager.front().gvf_
-          ->getContinuousPhasePath();
+  const auto installed =
+      neutral_manager.swarmParticlesManager.front().gvf_->getContinuousPhasePath();
   ASSERT_TRUE(installed);
   EXPECT_NE(installed, original);
   EXPECT_NE(installed->pathRevision(), 0U);
@@ -1623,60 +1486,36 @@ TEST(GvfPlannerOnlyV2,
   ASSERT_TRUE(replacement->evaluate(1.0, replacement_state, false));
   EXPECT_TRUE(installed_state.p.isApprox(replacement_state.p, 0.0));
   EXPECT_TRUE(installed_state.dp_dw.isApprox(replacement_state.dp_dw, 0.0));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-      neutral_manager));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-      neutral_manager));
 
-  FLAG_Race::gvf_manager bound_manager;
-  FLAG_Race::GvfManagerS4AnchorTestAccess::V2ManagerTransactionFixture fixture;
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  prepareV2ManagerTransaction(bound_manager, fixture));
-  FLAG_Race::GvfManagerS4AnchorTestAccess::discardPendingV2Command(
-      bound_manager);
-  FLAG_Race::GvfManagerS4AnchorTestAccess::clearPendingPathReferenceV2(
-      bound_manager);
-  const auto binding_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-          bound_manager);
-  ASSERT_TRUE(binding_before);
-  const auto bound_phase_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(bound_manager);
-  const auto bound_runtime_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(bound_manager);
-  ASSERT_TRUE(bound_runtime_before.present);
-  ASSERT_FALSE(bound_manager.swarmParticlesManager.empty());
-  ASSERT_TRUE(bound_manager.swarmParticlesManager.front().gvf_);
-  const auto bound_owner_before =
-      bound_manager.swarmParticlesManager.front().gvf_
-          ->getContinuousPhasePath();
-
+  FLAG_Race::gvf_manager nonzero_manager;
+  SectionTransitionFixture transition;
+  ASSERT_TRUE(prepareSectionTransition(nonzero_manager, transition));
+  FLAG_Race::GvfManagerS4AnchorTestAccess::discardPendingCommand(nonzero_manager);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setPendingSectionPathHandoff(
+      nonzero_manager, std::shared_ptr<const FLAG_Race::SectionPathHandoff>());
+  const auto nonzero_phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(nonzero_manager);
+  const auto nonzero_runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(nonzero_manager);
+  const auto nonzero_owner_before =
+      nonzero_manager.swarmParticlesManager.front().gvf_->getContinuousPhasePath();
+  ASSERT_NE(nonzero_runtime_before.retained_delta, 0.0);
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::installPlannerOnly(
-      bound_manager, replacement));
-  const auto bound_phase_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(bound_manager);
-  const auto bound_runtime_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(bound_manager);
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-                bound_manager),
-            binding_before);
-  EXPECT_EQ(bound_manager.swarmParticlesManager.front().gvf_
+      nonzero_manager, replacement));
+  EXPECT_EQ(nonzero_manager.swarmParticlesManager.front().gvf_
                 ->getContinuousPhasePath(),
-            bound_owner_before);
-  EXPECT_DOUBLE_EQ(bound_phase_after.w, bound_phase_before.w);
-  EXPECT_EQ(bound_phase_after.initialized, bound_phase_before.initialized);
-  EXPECT_EQ(bound_phase_after.closed_acquired,
-            bound_phase_before.closed_acquired);
-  EXPECT_EQ(bound_phase_after.generation, bound_phase_before.generation);
-  EXPECT_DOUBLE_EQ(bound_runtime_after.retained_delta,
-                   bound_runtime_before.retained_delta);
-  EXPECT_DOUBLE_EQ(bound_runtime_after.previous_port.u_w,
-                   bound_runtime_before.previous_port.u_w);
-  EXPECT_DOUBLE_EQ(bound_runtime_after.previous_port.u_delta,
-                   bound_runtime_before.previous_port.u_delta);
+            nonzero_owner_before);
+  const auto nonzero_phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(nonzero_manager);
+  const auto nonzero_runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(nonzero_manager);
+  EXPECT_DOUBLE_EQ(nonzero_phase_after.w, nonzero_phase_before.w);
+  EXPECT_EQ(nonzero_phase_after.generation, nonzero_phase_before.generation);
+  EXPECT_DOUBLE_EQ(nonzero_runtime_after.retained_delta,
+                   nonzero_runtime_before.retained_delta);
 }
 
-TEST(GvfPlannerOnlyV2,
+TEST(GvfPlannerOnly,
      MovingPhaseInsideCopiedPrefixInstallsWithoutRollbackOrIndexJump) {
   ros::Time::init();
   const auto source = makeH2OldSeamPath();
@@ -1694,7 +1533,7 @@ TEST(GvfPlannerOnlyV2,
   const auto captured =
       FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
   const std::uint64_t execution_generation =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGenerationV2(manager);
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
   ASSERT_NE(execution_generation, 0U);
 
   ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::installPlannerOnly(
@@ -1713,7 +1552,6 @@ TEST(GvfPlannerOnlyV2,
   const auto installed = manager.swarmParticlesManager.front().gvf_
                              ->getContinuousPhasePath();
   ASSERT_TRUE(installed);
-  EXPECT_NE(installed, source);
   FLAG_Race::ContinuousPhasePathState source_live;
   FLAG_Race::ContinuousPhasePathState installed_live;
   ASSERT_TRUE(source->evaluate(installed_phase.w, source_live, false));
@@ -1728,7 +1566,7 @@ TEST(GvfPlannerOnlyV2,
                            3U * sizeof(double)));
 }
 
-TEST(GvfPlannerOnlyV2,
+TEST(GvfPlannerOnly,
      CopiedPrefixExpiryTaskResetAndExactCasStillRejectReplacement) {
   ros::Time::init();
   const auto source = makeH2OldSeamPath();
@@ -1740,7 +1578,7 @@ TEST(GvfPlannerOnlyV2,
     return FLAG_Race::GvfManagerS4AnchorTestAccess::installNeutralAdapter(
                manager) &&
         FLAG_Race::GvfManagerS4AnchorTestAccess::initializePlannerFrontend(
-               manager, source);
+            manager, source);
   };
 
   FLAG_Race::gvf_manager expired;
@@ -1748,11 +1586,10 @@ TEST(GvfPlannerOnlyV2,
   FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
       expired, 0.40, true, false);
   const std::uint64_t expired_generation =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGenerationV2(expired);
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(expired);
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::installPlannerOnly(
       expired, replacement, source, 1.20, expired_generation, 1.21));
-  EXPECT_EQ(expired.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
+  EXPECT_EQ(expired.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
             source);
   EXPECT_DOUBLE_EQ(
       FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(expired).w, 1.21);
@@ -1762,11 +1599,10 @@ TEST(GvfPlannerOnlyV2,
   FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
       reset, 0.40, true, false);
   const std::uint64_t stale_task_generation =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGenerationV2(reset);
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(reset);
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::installPlannerOnly(
       reset, replacement, source, 1.20, stale_task_generation, 0.65, true));
-  EXPECT_EQ(reset.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
+  EXPECT_EQ(reset.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
             source);
 
   FLAG_Race::gvf_manager exact;
@@ -1777,8 +1613,7 @@ TEST(GvfPlannerOnlyV2,
       exact, replacement,
       std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(), 0.40, 0U,
       0.41));
-  EXPECT_EQ(exact.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
+  EXPECT_EQ(exact.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
             source);
 }
 
@@ -1984,387 +1819,660 @@ TEST(GvfAuthoritativePhaseSnapshot,
   reader.join();
   EXPECT_FALSE(bad_snapshot.load(std::memory_order_acquire));
 }
-
-TEST(PathReferenceHandoffV2Test,
-     ExactPhaseAfterAndCopiedPrefixIdentityAreImmutableRequestEvidence) {
-  auto mutable_successor =
-      std::make_shared<FLAG_Race::ContinuousPhasePath>();
-  ASSERT_TRUE(mutable_successor->appendSegment(
-      0.25, 2.0, "s6a_successor",
-      [](const double w, FLAG_Race::ContinuousPhasePathState& state) {
-        state.p = Eigen::Vector3d(w, 0.0, 1.0);
-        state.dp_dw = Eigen::Vector3d::UnitX();
-        state.d2p_dw2.setZero();
-        state.vel = state.dp_dw;
-        state.valid = std::isfinite(w);
-        return state.valid;
-      }));
-  mutable_successor->setPathRevision(12U);
-  const std::shared_ptr<const FLAG_Race::ContinuousPhasePath> successor =
-      mutable_successor;
-
-  phase_offset_navigation::TubePathKey source_key;
-  source_key.execution_generation = 4U;
-  source_key.path_instance_id = 10U;
-  source_key.path_revision = 11U;
-  source_key.frame_revision = 11U;
-  source_key.frame_convention_id = 91U;
-  source_key.frame_convention =
-      phase_offset_core::kWorldHorizontalCrossProductProvenance;
-  source_key.phase_orientation = -1;
-  source_key.domain_start = 0.0;
-  source_key.domain_end = 2.0;
-  phase_offset_navigation::TubePathKey successor_key = source_key;
-  successor_key.path_instance_id = 12U;
-  successor_key.path_revision = 12U;
-  successor_key.frame_revision = 12U;
-  successor_key.domain_start = 0.25;
-
-  std::shared_ptr<phase_offset_navigation::TubeBuildInputV2> request(
-      new phase_offset_navigation::TubeBuildInputV2());
-  request->request_id = 19U;
-  request->path_key = successor_key;
-  request->configuration_key.configuration_id = 21U;
-  request->configuration_key.epsilon = 0.4;
-  request->configuration_key.nominal_half_width = 1.0;
-  request->configuration_key.ray_step = 0.05;
-  request->configuration_key.snapshot_resolution = 0.1;
-  request->configuration_key.minimum_reference_speed = 1e-8;
-  request->map_capture_key.map_instance_id = 31U;
-  request->map_capture_key.state_id = 32U;
-  request->map_capture_key.accepted_sequence = 32U;
-  request->map_capture_key.configuration_generation = 33U;
-  request->map_capture_key.configuration_id = 34U;
-  request->map_capture_key.frame_provenance_id = 35U;
-  request->map_capture_key.frame_provenance = "world";
-  request->map_capture_key.support_provenance_id = 36U;
-  request->map_capture_key.accepted_time_ticks = 37U;
-  request->map_capture_key.support_expiry_ticks = 40U;
-  request->map_capture_key.halo_reconciled = true;
-  request->map_capture_key.grid_min_index_x = 0;
-  request->map_capture_key.grid_min_index_y = 0;
-  request->map_capture_key.grid_min_index_z = 0;
-  request->map_capture_key.grid_max_index_x = 9;
-  request->map_capture_key.grid_max_index_y = 9;
-  request->map_capture_key.grid_max_index_z = 9;
-  request->map_capture_key.grid_voxel_resolution =
-      Eigen::Vector3d::Constant(0.1);
-  request->map_capture_key.complete_support = true;
-  request->requested_start = 0.25;
-  request->requested_end = 1.5;
-  request->anchor_w = 0.25;
-  request->path_cell_query = [](
-      double, double, phase_offset_core::CertifiedPathCellV2&) {
-        return false;
-      };
-  request->producer_breakpoints = {0.25, 0.75, 2.0};
-  request->path_owner = std::static_pointer_cast<const void>(successor);
-  request->query_owner = std::static_pointer_cast<const void>(
-      std::make_shared<int>(1));
-  request->capture_owner = std::static_pointer_cast<const void>(
-      std::make_shared<int>(2));
-  request->applicability_assumptions = "immutable S6-A transport fixture";
-  request->applicability_deadline_ticks = 40U;
-  request->free_ball_query = [](
-      const Eigen::Vector3d&, double) {
-        return phase_offset_navigation::TubeFreeBallQueryResult();
-      };
-  ASSERT_TRUE(request->complete());
-
-  std::shared_ptr<FLAG_Race::PathReferenceFrontendMirrorV2> mirror(
-      new FLAG_Race::PathReferenceFrontendMirrorV2());
-  mirror->traj.resize(2, 3);
-  mirror->traj << 0.25, 0.0, 1.0, 2.0, 0.0, 1.0;
-  mirror->vel.resize(2, 3);
-  mirror->vel << 1.0, 0.0, 0.0, 1.0, 0.0, 0.0;
-  mirror->time.resize(2);
-  mirror->time << 0.0, 1.0;
-  mirror->w = {0.25, 2.0};
-  mirror->anchor_idx = 0;
-
-  FLAG_Race::PathReferenceHandoffV2 handoff;
-  handoff.expected_execution_generation = 4U;
-  handoff.source_path_key = source_key;
-  handoff.successor_path_owner = successor;
-  handoff.successor_path_key = successor_key;
-  handoff.successor_phase_after_w = 0.25;
-  handoff.copied_prefix_start_w = 0.25;
-  handoff.copied_prefix_end_w = 0.75;
-  handoff.successor_request = request;
-  handoff.frontend_mirror = mirror;
-  EXPECT_TRUE(handoff.requestComplete());
-  EXPECT_DOUBLE_EQ(handoff.successor_phase_after_w,
-                   handoff.copied_prefix_start_w);
-  EXPECT_EQ(handoff.successor_request->path_owner.get(), successor.get());
-  EXPECT_NE(handoff.source_path_key, handoff.successor_path_key);
-  EXPECT_EQ(handoff.successor_path_key.phase_orientation, -1);
-  EXPECT_EQ(handoff.successor_path_key.frame_convention_id, 91U);
-
-  handoff.successor_path_key.phase_orientation = 1;
-  EXPECT_FALSE(handoff.requestComplete());
-  handoff.successor_path_key.phase_orientation = -1;
-  request->anchor_w = std::nextafter(
-      0.25, std::numeric_limits<double>::infinity());
-  EXPECT_FALSE(handoff.requestComplete());
-  request->anchor_w = 0.25;
-  request->requested_end = 0.5;
-  EXPECT_FALSE(handoff.requestComplete());
-  request->requested_end = 1.5;
-
-  handoff.successor_phase_after_w =
-      std::nextafter(0.25, std::numeric_limits<double>::infinity());
-  EXPECT_FALSE(handoff.requestComplete());
-}
-
-TEST(GvfStage6V2Handoff, PublishFirstBindingPrecedesDeferredMirror) {
+TEST(GvfSectionPathHandoffTest,
+     ExactPhaseAndCopiedPrefixEvidenceRemainImmutableUntilCommit) {
   ros::Time::init();
   FLAG_Race::gvf_manager manager;
-  FLAG_Race::GvfManagerS4AnchorTestAccess::V2ManagerTransactionFixture fixture;
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  prepareV2ManagerTransaction(manager, fixture));
-  ASSERT_TRUE(fixture.source_binding);
-  ASSERT_TRUE(fixture.proposed_binding);
-  ASSERT_TRUE(fixture.request_handoff);
-  ASSERT_TRUE(fixture.candidate);
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture));
+  ASSERT_TRUE(fixture.handoff);
+  EXPECT_TRUE(fixture.handoff->complete());
+  EXPECT_EQ(fixture.handoff->source_path, fixture.source);
+  EXPECT_EQ(fixture.handoff->candidate_path, fixture.successor);
+  EXPECT_EQ(fixture.handoff->bundle, fixture.successor_bundle);
+  EXPECT_DOUBLE_EQ(fixture.handoff->copied_prefix_start_w,
+                   fixture.phase_before);
+  EXPECT_DOUBLE_EQ(fixture.handoff->copied_prefix_end_w, 1.20);
+  EXPECT_DOUBLE_EQ(fixture.handoff->phase_generation,
+                   FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager)
+                       .generation);
+
+  FLAG_Race::SectionPathHandoff malformed(*fixture.handoff);
+  malformed.copied_prefix_end_w = 0.30;
+  EXPECT_FALSE(malformed.complete());
+  malformed.copied_prefix_end_w = 1.20;
+  malformed.bundle = fixture.source_bundle;
+  EXPECT_FALSE(malformed.complete());
+  malformed.bundle = fixture.successor_bundle;
+  malformed.task_generation = 0U;
+  EXPECT_FALSE(malformed.complete());
+}
+
+TEST(GvfSectionHandoff,
+     PublishFirstCommitThenEnvironmentEditStillConsumesDeferredMirror) {
+  ros::Time::init();
+  FLAG_Race::gvf_manager manager;
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture));
+  ASSERT_TRUE(fixture.handoff);
+  ASSERT_TRUE(fixture.pending.pending);
+  ASSERT_TRUE(fixture.pending.valid);
 
   const auto phase_before =
       FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
   const auto runtime_before =
       FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
-  const auto request_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
+  const auto handoff_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
           manager);
   ASSERT_TRUE(runtime_before.present);
   ASSERT_NE(runtime_before.retained_delta, 0.0);
-  ASSERT_DOUBLE_EQ(runtime_before.previous_port.u_delta, 0.05);
-  ASSERT_DOUBLE_EQ(runtime_before.retained_delta,
-                   0.10 * runtime_before.previous_port.u_delta);
-  ASSERT_EQ(request_before, fixture.request_handoff);
-  ASSERT_FALSE(request_before->successor_profile);
-  ASSERT_FALSE(manager.swarmParticlesManager.empty());
-  ASSERT_TRUE(manager.swarmParticlesManager.front().gvf_);
-  const Eigen::MatrixXd display_before =
-      manager.swarmParticlesManager.front().last_traj;
-  const std::shared_ptr<const FLAG_Race::ContinuousPhasePath>
-      display_owner_before = manager.swarmParticlesManager.front().gvf_
-                                 ->getContinuousPhasePath();
-  ASSERT_EQ(display_owner_before, fixture.source_owner);
+  ASSERT_EQ(handoff_before, fixture.handoff);
+  ASSERT_EQ(manager.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
+            fixture.source);
 
-  const auto failed = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      publishV2ManagerTransaction(manager, fixture, false);
-  EXPECT_TRUE(failed.attempted);
-  EXPECT_FALSE(failed.published);
-  EXPECT_TRUE(failed.phase_token_prepared);
-  EXPECT_EQ(failed.local_publish_count, 1);
-  EXPECT_EQ(failed.post_publish_count, 0);
-  EXPECT_TRUE(failed.local_saw_source_state);
-  EXPECT_FALSE(failed.post_saw_atomic_adapter_commit);
-  EXPECT_FALSE(failed.post_saw_old_phase);
-  const auto phase_after_failure =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  int failed_publish_count = 0;
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+      manager,
+      [&failed_publish_count]() {
+        ++failed_publish_count;
+        return false;
+      }, fixture.pending.identity));
+  EXPECT_EQ(failed_publish_count, 1);
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::hasPending(manager));
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(manager),
+            fixture.source_bundle);
   const auto runtime_after_failure =
       FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
-  EXPECT_DOUBLE_EQ(phase_after_failure.w, phase_before.w);
-  EXPECT_EQ(phase_after_failure.initialized, phase_before.initialized);
-  EXPECT_EQ(phase_after_failure.closed_acquired,
-            phase_before.closed_acquired);
-  EXPECT_EQ(phase_after_failure.generation, phase_before.generation);
   EXPECT_DOUBLE_EQ(runtime_after_failure.retained_delta,
                    runtime_before.retained_delta);
   EXPECT_DOUBLE_EQ(runtime_after_failure.previous_port.u_w,
                    runtime_before.previous_port.u_w);
   EXPECT_DOUBLE_EQ(runtime_after_failure.previous_port.u_delta,
                    runtime_before.previous_port.u_delta);
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
                 manager),
-            fixture.source_binding);
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-                manager),
-            request_before);
-  EXPECT_EQ(manager.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
-            fixture.source_owner);
-  EXPECT_TRUE((manager.swarmParticlesManager.front().last_traj.array() ==
-               display_before.array()).all());
+            handoff_before);
 
-  const auto succeeded = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      publishV2ManagerTransaction(manager, fixture, true);
-  EXPECT_TRUE(succeeded.attempted);
-  EXPECT_TRUE(succeeded.published);
-  EXPECT_TRUE(succeeded.phase_token_prepared);
-  EXPECT_EQ(succeeded.local_publish_count, 1);
-  EXPECT_EQ(succeeded.post_publish_count, 1);
-  EXPECT_TRUE(succeeded.local_saw_source_state);
-  EXPECT_TRUE(succeeded.post_saw_atomic_adapter_commit);
-  EXPECT_TRUE(succeeded.post_saw_old_phase);
-  const auto phase_after_success =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  int successful_publish_count = 0;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+      manager,
+      [&successful_publish_count]() {
+        ++successful_publish_count;
+        return true;
+      }, fixture.pending.identity));
+  EXPECT_EQ(successful_publish_count, 1);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::hasPending(manager));
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(manager),
+            fixture.successor_bundle);
   const auto runtime_after_success =
       FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
-  EXPECT_DOUBLE_EQ(phase_after_success.w, fixture.phase_after);
-  EXPECT_TRUE(phase_after_success.initialized);
-  EXPECT_EQ(phase_after_success.generation, phase_before.generation + 1U);
   EXPECT_DOUBLE_EQ(runtime_after_success.retained_delta,
-                   fixture.candidate->prepared_step.successor.delta);
-  EXPECT_DOUBLE_EQ(runtime_after_success.previous_port.u_w,
-                   fixture.candidate->prepared_step.successor.previous_u.u_w);
-  EXPECT_DOUBLE_EQ(
-      runtime_after_success.previous_port.u_delta,
-      fixture.candidate->prepared_step.successor.previous_u.u_delta);
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
+                   fixture.prepared_next_delta);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
                 manager),
-            fixture.proposed_binding);
-  const auto enriched =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-          manager);
-  ASSERT_TRUE(enriched);
-  EXPECT_TRUE(enriched->committedComplete());
-  EXPECT_EQ(enriched->successor_profile, fixture.proposed_binding->profile);
-
-  // Command ownership changes at publication; the FSM/display mirror does
-  // not.  The next command must nevertheless capture the committed owner.
-  EXPECT_EQ(manager.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
-            fixture.source_owner);
-  EXPECT_TRUE((manager.swarmParticlesManager.front().last_traj.array() ==
-               display_before.array()).all());
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::commandPathForV2(
-                manager, fixture.proposed_binding),
-            fixture.successor_owner);
-
+            handoff_before);
+  // The command/runtime commit is already authoritative.  A subsequent
+  // static-map edit invalidates the captured environment witness, but the
+  // deferred frontend mirror still consumes the exact committed Section
+  // handoff rather than rebinding to a later map snapshot.
+  {
+    std::lock_guard<std::recursive_mutex> environment_lock(
+        *fixture.successor_bundle->environment_change_mutex);
+    fixture.successor_bundle->environment_validity->valid = false;
+  }
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, fixture.phase_after, true, false);
   ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  consumeCommittedPathReferenceV2(manager));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
+                  consumeCommittedSectionPathHandoff(manager));
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
       manager));
-  EXPECT_EQ(manager.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
-            fixture.successor_owner);
-  ASSERT_EQ(manager.swarmParticlesManager.front().last_traj.rows(),
-            enriched->frontend_mirror->traj.rows());
-  EXPECT_TRUE(manager.swarmParticlesManager.front().last_traj.isApprox(
-      enriched->frontend_mirror->traj, 0.0));
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::commandPathForV2(
-                manager, fixture.proposed_binding),
-            fixture.successor_owner);
+  EXPECT_EQ(manager.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
+            fixture.successor);
+  EXPECT_GT(manager.swarmParticlesManager.front().last_traj.rows(), 1);
+  FLAG_Race::ContinuousPhasePathState display_state;
+  ASSERT_TRUE(fixture.successor->evaluate(1.20, display_state, false));
+  EXPECT_NEAR(manager.swarmParticlesManager.front().last_traj(2, 0),
+              display_state.p.x(), 1e-12);
 }
 
-TEST(GvfStage6V2Handoff,
+TEST(GvfStage6Handoff,
      PrematureMirrorAndTaskResetCannotRebindOrReplay) {
   ros::Time::init();
-
-  FLAG_Race::gvf_manager stale_manager;
-  FLAG_Race::GvfManagerS4AnchorTestAccess::V2ManagerTransactionFixture
-      stale_fixture;
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  prepareV2ManagerTransaction(stale_manager, stale_fixture));
-  const auto stale_phase_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(stale_manager);
-  const auto stale_runtime_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(stale_manager);
-  ASSERT_TRUE(stale_runtime_before.present);
-  ASSERT_FALSE(stale_manager.swarmParticlesManager.empty());
-  ASSERT_TRUE(stale_manager.swarmParticlesManager.front().gvf_);
-  const Eigen::MatrixXd stale_display_before =
-      stale_manager.swarmParticlesManager.front().last_traj;
-
-  FLAG_Race::GvfManagerS4AnchorTestAccess::installPrematureCommittedMirrorV2(
-      stale_manager, stale_fixture);
-  const auto premature =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-          stale_manager);
-  ASSERT_TRUE(premature);
-  ASSERT_TRUE(premature->committedComplete());
+  FLAG_Race::gvf_manager manager;
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture));
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  const Eigen::MatrixXd display_before =
+      manager.swarmParticlesManager.front().last_traj;
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                   consumeCommittedPathReferenceV2(stale_manager));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-      stale_manager));
-  const auto stale_phase_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(stale_manager);
-  const auto stale_runtime_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(stale_manager);
-  EXPECT_DOUBLE_EQ(stale_phase_after.w, stale_phase_before.w);
-  EXPECT_EQ(stale_phase_after.generation, stale_phase_before.generation);
-  EXPECT_DOUBLE_EQ(stale_runtime_after.retained_delta,
-                   stale_runtime_before.retained_delta);
-  EXPECT_DOUBLE_EQ(stale_runtime_after.previous_port.u_w,
-                   stale_runtime_before.previous_port.u_w);
-  EXPECT_DOUBLE_EQ(stale_runtime_after.previous_port.u_delta,
-                   stale_runtime_before.previous_port.u_delta);
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-                stale_manager),
-            stale_fixture.source_binding);
-  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::commandPathForV2(
-                stale_manager, stale_fixture.source_binding),
-            stale_fixture.source_owner);
-  EXPECT_EQ(stale_manager.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
-            stale_fixture.source_owner);
-  EXPECT_TRUE((stale_manager.swarmParticlesManager.front().last_traj.array() ==
-               stale_display_before.array()).all());
-  FLAG_Race::GvfManagerS4AnchorTestAccess::discardPendingV2Command(
-      stale_manager);
+                   consumeCommittedSectionPathHandoff(manager));
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
+                manager),
+            fixture.handoff);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(manager),
+            fixture.source_bundle);
+  EXPECT_EQ(manager.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
+            fixture.source);
+  EXPECT_TRUE((manager.swarmParticlesManager.front().last_traj.array() ==
+               display_before.array()).all());
 
-  FLAG_Race::gvf_manager reset_manager;
-  FLAG_Race::GvfManagerS4AnchorTestAccess::V2ManagerTransactionFixture
-      reset_fixture;
+  FLAG_Race::GvfManagerS4AnchorTestAccess::discardPendingCommand(manager);
+  const auto stale_identity = fixture.pending.identity;
   ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  prepareV2ManagerTransaction(reset_manager, reset_fixture));
-  ASSERT_FALSE(reset_manager.swarmParticlesManager.empty());
-  ASSERT_TRUE(reset_manager.swarmParticlesManager.front().gvf_);
-  const Eigen::MatrixXd reset_display_before =
-      reset_manager.swarmParticlesManager.front().last_traj;
-  const auto reset_phase_before =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(reset_manager);
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(
-                  reset_manager).pending);
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-      reset_manager));
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-      reset_manager));
+                  resetForNewNavigationTask(manager));
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(manager)
+                   .pending);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
+                   pendingSectionPathHandoff(manager));
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+      manager));
+  EXPECT_DOUBLE_EQ(phase_after.w, 0.0);
+  EXPECT_FALSE(phase_after.initialized);
+  EXPECT_FALSE(phase_after.closed_acquired);
+  EXPECT_GT(phase_after.generation, phase_before.generation);
+  ASSERT_TRUE(runtime_after.present);
+  EXPECT_DOUBLE_EQ(runtime_after.retained_delta, 0.0);
+  EXPECT_DOUBLE_EQ(runtime_after.previous_port.u_w, 0.0);
+  EXPECT_DOUBLE_EQ(runtime_after.previous_port.u_delta, 0.0);
 
-  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                  resetForNewNavigationTask(reset_manager));
-  const auto reset_phase_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(reset_manager);
-  const auto reset_runtime_after =
-      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(reset_manager);
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(
-      reset_manager).pending);
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingPathReferenceV2(
-      reset_manager));
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-      reset_manager));
-  EXPECT_DOUBLE_EQ(reset_phase_after.w, 0.0);
-  EXPECT_FALSE(reset_phase_after.initialized);
-  EXPECT_FALSE(reset_phase_after.closed_acquired);
-  EXPECT_GT(reset_phase_after.generation, reset_phase_before.generation);
-  ASSERT_TRUE(reset_runtime_after.present);
-  EXPECT_DOUBLE_EQ(reset_runtime_after.retained_delta, 0.0);
-  EXPECT_DOUBLE_EQ(reset_runtime_after.previous_port.u_w, 0.0);
-  EXPECT_DOUBLE_EQ(reset_runtime_after.previous_port.u_delta, 0.0);
-
-  int stale_local_publish_count = 0;
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPendingCommand(
-      reset_manager, [&]() {
-        ++stale_local_publish_count;
+  int stale_publish_count = 0;
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+      manager,
+      [&stale_publish_count]() {
+        ++stale_publish_count;
         return true;
-      }, reset_fixture.pending_command.identity));
-  EXPECT_EQ(stale_local_publish_count, 0);
-  const auto stale_replay = FLAG_Race::GvfManagerS4AnchorTestAccess::
-      publishV2ManagerTransaction(reset_manager, reset_fixture, true);
-  EXPECT_FALSE(stale_replay.attempted);
-  EXPECT_FALSE(stale_replay.published);
-  EXPECT_EQ(stale_replay.local_publish_count, 0);
-  EXPECT_EQ(stale_replay.post_publish_count, 0);
-  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::executionBindingV2(
-      reset_manager));
+      }, stale_identity));
+  EXPECT_EQ(stale_publish_count, 0);
   EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::
-                   consumeCommittedPathReferenceV2(reset_manager));
-  EXPECT_EQ(reset_manager.swarmParticlesManager.front().gvf_
-                ->getContinuousPhasePath(),
-            reset_fixture.source_owner);
-  EXPECT_TRUE((reset_manager.swarmParticlesManager.front().last_traj.array() ==
-               reset_display_before.array()).all());
+                   consumeCommittedSectionPathHandoff(manager));
+  EXPECT_EQ(manager.swarmParticlesManager.front().gvf_->getContinuousPhasePath(),
+            fixture.source);
+  EXPECT_TRUE((manager.swarmParticlesManager.front().last_traj.array() ==
+               display_before.array()).all());
+}
+
+TEST(GvfSectionGovernor,
+     RejectedGovernorPublishesHoldWithoutRuntimeOrPhaseCommit) {
+  ros::Time::init();
+  if (std::getenv("M3C_ISOLATED_ROS_TESTS") == nullptr) {
+    GTEST_SKIP() << "set M3C_ISOLATED_ROS_TESTS=1 under a task-owned ROS master";
+  }
+  FLAG_Race::gvf_manager manager;
+  const auto source = makeSectionPath(0.0, 4.0, 11U);
+  const auto bundle = makeSectionBundle(source, 1U);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(bundle);
+  ASSERT_TRUE(installSectionManager(manager, source, bundle));
+  ASSERT_TRUE(installTestCommandPublisher(manager));
+
+  ASSERT_FALSE(manager.swarmParticlesManager.empty());
+  auto& frontend = manager.swarmParticlesManager.front();
+  ASSERT_TRUE(frontend.gvf_);
+  frontend.gvf_->gvf_.K1_ = 2.0;
+  frontend.gvf_->gvf_.K2_ = -2.2;
+  frontend.gvf_->gvf_.convergence_bandwidth_ = 0.1;
+  frontend.gvf_->progress_rho0_ = 0.5;
+  frontend.gvf_->progress_delta_ = 0.3;
+  frontend.gvf_->alpha_min_ = 0.05;
+
+  FLAG_Race::ContinuousPhasePathState phase_state;
+  ASSERT_TRUE(source->evaluate(0.40, phase_state, false));
+  manager.odom_ = phase_state.p;
+  FLAG_Race::GvfManagerS4AnchorTestAccess::configureTerminalExecution(
+      manager, 0.40, ros::Time::now());
+  manager.cmd_governor_l_min_ = 5.0;
+  manager.cmd_governor_l_max_ = 5.0;
+  manager.cmd_governor_l_step_ = 0.10;
+  manager.cmd_governor_lead_max_ = 1.0;
+  manager.cmd_governor_initialized_ = false;
+  manager.cmd_governor_normal_state_.setZero();
+  manager.cmd_governor_last_l_ = 0.0;
+  manager.has_last_governor_cmd_ = false;
+  frontend.receive_startpt = false;
+  frontend.receive_goal = true;
+  frontend.is_first_goal = false;
+  frontend.goal_pt = manager.odom_ + Eigen::Vector3d(10.0, 0.0, 0.0);
+
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_TRUE(runtime_before.present);
+  ASSERT_DOUBLE_EQ(runtime_before.retained_delta, 0.0);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+      manager));
+
+  ros::TimerEvent event;
+  manager.cmdCallback(event);
+
+  // Governor rejection still publishes the position hold, but no prepared
+  // Section step or phase candidate may cross the Runtime commit boundary.
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::hasPending(manager));
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_before.w);
+  EXPECT_EQ(phase_after.generation, phase_before.generation);
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  EXPECT_DOUBLE_EQ(runtime_after.retained_delta,
+                   runtime_before.retained_delta);
+  EXPECT_FALSE(manager.pending_last_yaw_valid_);
+  EXPECT_TRUE(manager.has_last_governor_cmd_);
+  EXPECT_TRUE(manager.last_cmd_pos_.isApprox(manager.odom_, 1e-12));
+}
+
+TEST(GvfSectionCommand,
+     NonzeroCurrentProfileFailureHoldsWithoutCentrelineFallback) {
+  ros::Time::init();
+  if (std::getenv("M3C_ISOLATED_ROS_TESTS") == nullptr) {
+    GTEST_SKIP() << "set M3C_ISOLATED_ROS_TESTS=1 under a task-owned ROS master";
+  }
+  FLAG_Race::gvf_manager manager;
+  const auto source = makeSectionPath(0.0, 4.0, 41U);
+  const auto source_bundle = makeSectionBundle(source, 1U);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(source_bundle);
+  ASSERT_TRUE(installTestCommandPublisher(manager));
+  ASSERT_TRUE(prepareNonzeroSectionCommandManager(
+      manager, source, source_bundle));
+
+  const std::uint64_t generation =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  const auto partial_bundle =
+      makePartialSectionBundle(source, generation, 3.0);
+  ASSERT_TRUE(partial_bundle);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+      manager, partial_bundle,
+      std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(),
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::quiet_NaN()));
+
+  FLAG_Race::MatchedAdapterInput partial_input;
+  ASSERT_TRUE(makeSectionInput(source, 0.40, partial_input));
+  partial_input.g_des = Eigen::Vector3d(0.0, 0.30, 0.0);
+  partial_input.section_bundle = partial_bundle;
+  FLAG_Race::MatchedAdapterOutput partial_output;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::updateSection(
+      manager, partial_input, partial_output));
+  ASSERT_TRUE(partial_output.selected);
+  const auto partial_pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  ASSERT_TRUE(partial_pending.pending);
+  ASSERT_TRUE(partial_pending.valid);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+      manager, []() { return true; }, partial_pending.identity));
+
+  // The partial profile covers the current phase but not the next normal
+  // preview horizon.  Advance only the authoritative phase to just before
+  // that endpoint; the planner path remains valid and the current Section
+  // owner is otherwise unchanged.
+  const double phase_before = 0.999;
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, phase_before, true, false);
+  FLAG_Race::ContinuousPhasePathState state;
+  ASSERT_TRUE(source->evaluate(phase_before, state, false));
+  manager.odom_ = state.p + Eigen::Vector3d(0.0, 0.05, 0.0);
+  const auto phase_snapshot =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_NE(runtime_before.retained_delta, 0.0);
+
+  ros::TimerEvent event;
+  manager.cmdCallback(event);
+
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_snapshot.w);
+  EXPECT_DOUBLE_EQ(runtime_after.retained_delta,
+                   runtime_before.retained_delta);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+                manager),
+            partial_bundle);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::hasPending(manager));
+  // Invalid Section preparation must publish the existing-position hold, not
+  // a zero-offset centreline command generated from the planner mirror.
+  EXPECT_TRUE(manager.last_cmd_pos_.isApprox(manager.odom_, 1e-9));
+}
+
+TEST(GvfSectionCommand,
+     RejectedNarrowCandidateRetriesCommittedCurrentBundle) {
+  ros::Time::init();
+  if (std::getenv("M3C_ISOLATED_ROS_TESTS") == nullptr) {
+    GTEST_SKIP() << "set M3C_ISOLATED_ROS_TESTS=1 under a task-owned ROS master";
+  }
+  FLAG_Race::gvf_manager manager;
+  const auto source = makeSectionPath(0.0, 4.0, 51U);
+  const auto current_bundle = makeSectionBundle(source, 1U);
+  ASSERT_TRUE(source);
+  ASSERT_TRUE(current_bundle);
+  ASSERT_TRUE(installTestCommandPublisher(manager));
+  ASSERT_TRUE(prepareNonzeroSectionCommandManager(
+      manager, source, current_bundle));
+
+  const std::uint64_t generation =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  const auto narrow_candidate =
+      makePartialSectionBundle(source, generation, 0.5);
+  ASSERT_TRUE(narrow_candidate);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+      manager, narrow_candidate,
+      std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(),
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::quiet_NaN()));
+
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_NE(runtime_before.retained_delta, 0.0);
+  ros::TimerEvent event;
+  manager.cmdCallback(event);
+
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  // The staged profile cannot cover the normal horizon at w=.40.  The
+  // callback must retire only that candidate, evaluate/publish the committed
+  // current bundle, and then advance the ordinary Section transaction.
+  EXPECT_GT(phase_after.w, phase_before.w);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+                manager),
+            current_bundle);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionBundle(
+      manager));
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::hasPending(manager));
+  EXPECT_TRUE(std::isfinite(runtime_after.retained_delta));
+  EXPECT_GT((manager.last_cmd_pos_ - manager.odom_).norm(), 1e-6);
+}
+
+TEST(GvfSectionCommand,
+     InvalidCurrentGuidanceCannotReuseRejectedCandidateWhenDeltaIsZero) {
+  ros::Time::init();
+  if (std::getenv("M3C_ISOLATED_ROS_TESTS") == nullptr) {
+    GTEST_SKIP() << "set M3C_ISOLATED_ROS_TESTS=1 under a task-owned ROS master";
+  }
+  FLAG_Race::gvf_manager manager;
+  const auto planner_path = makeSectionPath(0.0, 4.0, 61U);
+  const auto planner_bundle = makeSectionBundle(planner_path, 1U);
+  ASSERT_TRUE(planner_path);
+  ASSERT_TRUE(planner_bundle);
+  ASSERT_TRUE(installTestCommandPublisher(manager));
+  // Establish a committed zero-delta Section owner and the planner frontend,
+  // then replace only the committed bundle with an owner whose state query
+  // fails.  The staged candidate still uses the valid planner path, so its
+  // nominal guidance is valid before the Section preview rejects it.
+  ASSERT_TRUE(installSectionManager(manager, planner_path, planner_bundle));
+  const auto invalid_current_path = makeInvalidSectionPath();
+  const auto invalid_current_bundle = makeSectionBundle(
+      invalid_current_path,
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager));
+  ASSERT_TRUE(invalid_current_path);
+  ASSERT_TRUE(invalid_current_bundle);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::replaceCurrentSectionBundle(
+      manager, invalid_current_bundle);
+
+  const std::uint64_t generation =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  const auto rejected_candidate =
+      makePartialSectionBundle(planner_path, generation, 0.50);
+  ASSERT_TRUE(rejected_candidate);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::stageSectionBundle(
+      manager, rejected_candidate,
+      std::shared_ptr<const FLAG_Race::ContinuousPhasePath>(),
+      std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::quiet_NaN()));
+
+  ASSERT_FALSE(manager.swarmParticlesManager.empty());
+  auto& frontend = manager.swarmParticlesManager.front();
+  ASSERT_TRUE(frontend.gvf_);
+  frontend.gvf_->gvf_.K1_ = 2.0;
+  frontend.gvf_->gvf_.K2_ = -2.2;
+  frontend.gvf_->gvf_.convergence_bandwidth_ = 0.1;
+  frontend.gvf_->progress_rho0_ = 0.5;
+  frontend.gvf_->progress_delta_ = 0.3;
+  frontend.gvf_->alpha_min_ = 0.05;
+  FLAG_Race::ContinuousPhasePathState planner_state;
+  ASSERT_TRUE(planner_path->evaluate(0.40, planner_state, false));
+  const FLAG_Race::gvf::LiftedGuidanceResult candidate_guidance =
+      frontend.gvf_->calcLiftedGuidanceAtPhase(
+          planner_state.p + Eigen::Vector3d(0.0, 0.05, 0.0), 0.40,
+          planner_path);
+  ASSERT_TRUE(candidate_guidance.valid);
+  const FLAG_Race::gvf::LiftedGuidanceResult current_guidance =
+      frontend.gvf_->calcLiftedGuidanceAtPhase(
+          planner_state.p + Eigen::Vector3d(0.0, 0.05, 0.0), 0.40,
+          invalid_current_path);
+  EXPECT_FALSE(current_guidance.valid);
+  manager.odom_ = planner_state.p + Eigen::Vector3d(0.0, 0.05, 0.0);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::configureTerminalExecution(
+      manager, 0.40, ros::Time::now());
+  manager.cmd_governor_l_min_ = 0.50;
+  manager.cmd_governor_l_max_ = 0.50;
+  manager.cmd_governor_l_step_ = 0.05;
+  manager.cmd_governor_lead_max_ = 1.6;
+  manager.cmd_governor_normal_max_ = 0.0;
+  manager.cmd_governor_initialized_ = false;
+  manager.cmd_governor_normal_state_.setZero();
+  manager.cmd_governor_last_l_ = 0.0;
+  manager.has_last_governor_cmd_ = false;
+  frontend.receive_startpt = false;
+  frontend.receive_goal = true;
+  frontend.is_first_goal = false;
+  frontend.goal_pt = manager.odom_ + Eigen::Vector3d(10.0, 0.0, 0.0);
+
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_TRUE(runtime_before.present);
+  ASSERT_DOUBLE_EQ(runtime_before.retained_delta, 0.0);
+
+  ros::TimerEvent event;
+  manager.cmdCallback(event);
+
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_before.w);
+  EXPECT_EQ(phase_after.generation, phase_before.generation);
+  EXPECT_DOUBLE_EQ(runtime_after.retained_delta,
+                   runtime_before.retained_delta);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+                manager),
+            invalid_current_bundle);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionBundle(
+      manager));
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::hasPending(manager));
+  // The candidate's guidance was valid, but the committed current owner was
+  // not evaluable.  The callback must therefore publish the existing-position
+  // hold and never advance phase using the rejected candidate's command.
+  EXPECT_TRUE(manager.last_cmd_pos_.isApprox(manager.odom_, 1e-9));
+}
+
+TEST(GvfSectionTerminal, NonzeroRuntimeReferenceKeepsGoalTaskActive) {
+  ros::Time::init();
+  FLAG_Race::gvf_manager manager;
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture, true));
+  ASSERT_TRUE(configureTerminalExecution(manager, fixture));
+
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_TRUE(runtime_before.present);
+  ASSERT_NE(runtime_before.retained_delta, 0.0);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(manager)
+                  .pending);
+
+  ros::TimerEvent event;
+  manager.FSMCallback(event);
+
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::isExecuting(manager));
+  EXPECT_TRUE(manager.swarmParticlesManager.front().receive_goal);
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_before.w);
+  EXPECT_EQ(phase_after.generation, phase_before.generation);
+  EXPECT_DOUBLE_EQ(runtime_after.retained_delta,
+                   runtime_before.retained_delta);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+                manager),
+            fixture.source_bundle);
+  EXPECT_EQ(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
+                manager),
+            fixture.handoff);
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(manager)
+                  .pending);
+}
+
+TEST(GvfSectionTerminal, ZeroRuntimeReferenceRetiresPendingAndEndsTask) {
+  ros::Time::init();
+  FLAG_Race::gvf_manager manager;
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture, false));
+  ASSERT_TRUE(configureTerminalExecution(manager, fixture));
+
+  const std::uint64_t task_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const auto runtime_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_TRUE(runtime_before.present);
+  ASSERT_DOUBLE_EQ(runtime_before.retained_delta, 0.0);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(manager)
+                  .pending);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
+                  manager));
+
+  ros::TimerEvent event;
+  manager.FSMCallback(event);
+
+  EXPECT_TRUE(
+      FLAG_Race::GvfManagerS4AnchorTestAccess::isWaitingForTarget(manager));
+  EXPECT_FALSE(manager.swarmParticlesManager.front().receive_goal);
+  EXPECT_FALSE(manager.swarmParticlesManager.front().is_first_goal);
+  EXPECT_GT(FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(
+                manager),
+            task_before);
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_before.w);
+  EXPECT_TRUE(phase_after.initialized);
+  EXPECT_GT(phase_after.generation, phase_before.generation);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingCommand(manager)
+                   .pending);
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::pendingSectionPathHandoff(
+      manager));
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::currentSectionBundle(
+      manager));
+  const auto runtime_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_TRUE(runtime_after.present);
+  EXPECT_DOUBLE_EQ(runtime_after.retained_delta, 0.0);
+  EXPECT_DOUBLE_EQ(runtime_after.previous_port.u_w, 0.0);
+  EXPECT_DOUBLE_EQ(runtime_after.previous_port.u_delta, 0.0);
+}
+
+TEST(GvfSectionTerminal, FinalZeroSnapshotFollowedByNonzeroCommitStaysActive) {
+  ros::Time::init();
+  FLAG_Race::gvf_manager manager;
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture, false));
+  ASSERT_TRUE(configureTerminalExecution(manager, fixture));
+
+  FLAG_Race::GvfManagerS4AnchorTestAccess::discardPendingCommand(manager);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setPendingSectionPathHandoff(
+      manager, std::shared_ptr<const FLAG_Race::SectionPathHandoff>());
+  const std::uint64_t terminal_task_generation =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager)
+                  .present);
+  ASSERT_DOUBLE_EQ(
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager)
+          .retained_delta,
+      0.0);
+
+  // A real Section prepare/publish commits the nonzero successor after the
+  // caller captured its zero terminal task witness.
+  ASSERT_TRUE(stageSuccessorPending(manager, fixture));
+  const auto pending =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePending(manager);
+  ASSERT_TRUE(pending.pending);
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::publishPending(
+      manager, []() { return true; }, pending.identity));
+  const auto runtime_after_commit =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager);
+  ASSERT_NE(runtime_after_commit.retained_delta, 0.0);
+
+  double retained_at_terminal = 0.0;
+  EXPECT_FALSE(FLAG_Race::GvfManagerS4AnchorTestAccess::finalizeSectionTerminal(
+      manager, terminal_task_generation, retained_at_terminal));
+  EXPECT_DOUBLE_EQ(retained_at_terminal,
+                   runtime_after_commit.retained_delta);
+  EXPECT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::isExecuting(manager));
+  EXPECT_TRUE(manager.swarmParticlesManager.front().receive_goal);
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, phase_before.w);
+  EXPECT_EQ(phase_after.generation, phase_before.generation);
+  EXPECT_DOUBLE_EQ(
+      FLAG_Race::GvfManagerS4AnchorTestAccess::runtimeState(manager)
+          .retained_delta,
+      runtime_after_commit.retained_delta);
+}
+
+TEST(GvfSectionTerminal, SameTaskPhaseProgressStillAllowsZeroTerminal) {
+  ros::Time::init();
+  FLAG_Race::gvf_manager manager;
+  SectionTransitionFixture fixture;
+  ASSERT_TRUE(prepareSectionTransition(manager, fixture, false));
+  ASSERT_TRUE(configureTerminalExecution(manager, fixture));
+
+  FLAG_Race::GvfManagerS4AnchorTestAccess::discardPendingCommand(manager);
+  FLAG_Race::GvfManagerS4AnchorTestAccess::setPendingSectionPathHandoff(
+      manager, std::shared_ptr<const FLAG_Race::SectionPathHandoff>());
+  const std::uint64_t terminal_task_generation =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(manager);
+  const auto phase_before =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  const double progressed_w = phase_before.w + 0.10;
+  ASSERT_LT(progressed_w, fixture.successor->endW());
+  FLAG_Race::GvfManagerS4AnchorTestAccess::publishPhase(
+      manager, progressed_w, true, false);
+
+  double retained_at_terminal = 0.0;
+  ASSERT_TRUE(FLAG_Race::GvfManagerS4AnchorTestAccess::finalizeSectionTerminal(
+      manager, terminal_task_generation, retained_at_terminal));
+  EXPECT_DOUBLE_EQ(retained_at_terminal, 0.0);
+  EXPECT_TRUE(
+      FLAG_Race::GvfManagerS4AnchorTestAccess::isWaitingForTarget(manager));
+  EXPECT_FALSE(manager.swarmParticlesManager.front().receive_goal);
+  const auto phase_after =
+      FLAG_Race::GvfManagerS4AnchorTestAccess::capturePhase(manager);
+  EXPECT_DOUBLE_EQ(phase_after.w, progressed_w);
+  EXPECT_GT(phase_after.generation, phase_before.generation);
+  EXPECT_GT(FLAG_Race::GvfManagerS4AnchorTestAccess::executionGeneration(
+                manager),
+            terminal_task_generation);
 }
 
 }  // namespace

@@ -72,6 +72,21 @@ class AgentStateNeighborRuntime {
       provider_config.future_timestamp_tolerance =
           manager_config_.future_timestamp_tolerance;
       provider_config.provider_epoch = providerEpoch();
+      provider_config.sph_parameters = sph_parameters_;
+      std::string sph_error;
+      if (!provider_config.sph_parameters.validate(&sph_error)) {
+        throw std::invalid_argument("invalid SPH parameters: " + sph_error);
+      }
+      ROS_INFO_STREAM(
+          "[SIM-C] SPH coordination parameters: h=" << sph_parameters_.h
+          << " d_star=" << sph_parameters_.reference_spacing
+          << " rho0=" << sph_parameters_.reference_density
+          << " d_rep=" << sph_parameters_.d_rep
+          << " gamma=" << sph_parameters_.gamma
+          << " k_rho=" << sph_parameters_.k_rho
+          << " k_rep=" << sph_parameters_.k_rep
+          << " k_damp=" << sph_parameters_.k_damp
+          << " g_max=" << sph_parameters_.g_max);
       sph_provider_.reset(new SphProviderRuntime(provider_config));
       beta_subscriber_ = private_nh_.subscribe(
           "beta", 10, &AgentStateNeighborRuntime::betaCallback, this);
@@ -101,6 +116,31 @@ class AgentStateNeighborRuntime {
     private_nh_.param("beta_fresh_timeout", beta_fresh_timeout_, 0.10);
     private_nh_.param("snapshot_fresh_timeout", snapshot_fresh_timeout_,
                       0.10);
+
+    // Horizontal SPH coordination parameters.  Defaults come from the paper
+    // (d_rep < d_star < 2h) and can be overridden per agent through the
+    // scenario launch; nothing here is a gate.
+    private_nh_.param("sph/h", sph_parameters_.h, sph_parameters_.h);
+    private_nh_.param("sph/reference_spacing",
+                      sph_parameters_.reference_spacing,
+                      sph_parameters_.reference_spacing);
+    private_nh_.param("sph/d_rep", sph_parameters_.d_rep,
+                      sph_parameters_.d_rep);
+    private_nh_.param("sph/gamma", sph_parameters_.gamma,
+                      sph_parameters_.gamma);
+    private_nh_.param("sph/k_rho", sph_parameters_.k_rho,
+                      sph_parameters_.k_rho);
+    private_nh_.param("sph/k_rep", sph_parameters_.k_rep,
+                      sph_parameters_.k_rep);
+    private_nh_.param("sph/k_damp", sph_parameters_.k_damp,
+                      sph_parameters_.k_damp);
+    private_nh_.param("sph/g_max", sph_parameters_.g_max,
+                      sph_parameters_.g_max);
+    // Paper rho_0 for this agent (0 = estimate locally from d_star).  The
+    // scenario generator fills it in from the nominal formation geometry.
+    private_nh_.param("sph/reference_density",
+                      sph_parameters_.reference_density,
+                      sph_parameters_.reference_density);
 
     manager_config_.self_id = robot_id;
     manager_config_.agent_count = agent_count;
@@ -365,6 +405,7 @@ class AgentStateNeighborRuntime {
   double beta_fresh_timeout_ = 0.10;
   double snapshot_fresh_timeout_ = 0.10;
   bool enable_sph_provider_ = false;
+  SphParameters sph_parameters_;
   NeighborManagerConfig manager_config_;
   std::unique_ptr<NeighborManager> manager_;
   std::unique_ptr<SphProviderRuntime> sph_provider_;

@@ -6,41 +6,91 @@
     each ready goal subscriber.  Launch WORLD separately for the common map
     and read-only visualization infrastructure.
   -->
-  <arg name="scenario_file"
-       default="$(find phase_offset_sim_bringup)/config/scenarios/sim_b_open_3.yaml"/>
+  <!-- The swarm size lives here: >0 makes the orchestrator generate the
+       SPH-style circular formation for that many agents (a sunflower disk whose
+       smallest neighbour gap is formation_spacing, flown
+       formation_goal_translation_y south of init_y).  1.5 m spacing keeps the
+       quadrotors separated while staying inside the 2.45 m neighbour radius, so
+       the coordination intent still couples them.  Set agent_count:=0 (and pass
+       scenario_file) to fly an explicit scenario file instead. -->
+  <arg name="agent_count" default="15"/>
+  <arg name="scenario_file" default=""/>
+  <arg name="formation_spacing" default="1.5"/>
+  <arg name="formation_shape" default="disk"/>
+  <arg name="formation_axis" default="y"/>
+  <arg name="formation_goal_translation_y" default="-38.0"/>
+  <arg name="formation_goal_translation_x" default="0.0"/>
+  <arg name="formation_goal_base_y" default=""/>
   <arg name="simulation_rate" default="1000.0"/>
   <arg name="odom_rate" default="100.0"/>
   <arg name="start_at_hover" default="true"/>
+  <!-- Physical simulator initial pose for the formation centre.  The
+       orchestrator applies this translation to every scenario agent while
+       preserving the scenario's relative formation offsets. -->
+  <arg name="init_x" default="0.0"/>
+  <arg name="init_y" default="20.0"/>
+  <arg name="init_z" default="1.0"/>
+  <!-- When false the scenario goals are never published automatically; use
+       RViz's "2D Nav Goal" (topic /uav_<id>/goal) or any other publisher to
+       fly the swarm by hand. -->
+  <arg name="publish_goals" default="false"/>
   <arg name="frame_id" default="world"/>
-  <arg name="map_resolution" default="0.20"/>
+  <!-- Matches the tuned single-UAV baseline; see phase_offset_agent.launch for
+       why the resolution also changes the effective obstacle inflation. -->
+  <arg name="map_resolution" default="0.10"/>
+  <!-- Map parameters are independent of the simulator initial pose above and
+       are intentionally left unchanged by init_x/init_y/init_z.  The y extent
+       is 50 m (world y in [-25, 25]) so the default formation centre at
+       y = 20 and its local sensing box stay inside the fixed map; the
+       baseline single-UAV map remains 20 x 30 and is not affected. -->
   <arg name="map_size_x" default="20.0"/>
-  <arg name="map_size_y" default="30.0"/>
+  <arg name="map_size_y" default="50.0"/>
   <arg name="map_size_z" default="2.5"/>
+  <!-- Local sensing / planner half-range.  Raise it for the single-gate maps:
+       with the default 4.0 m an agent that reaches the wall far from the only
+       opening cannot see it and holds.  SPH-planning runs 7.0. -->
+  <arg name="local_update_range_x" default="4.0"/>
+  <arg name="local_update_range_y" default="4.0"/>
+  <arg name="local_update_range_z" default="2.5"/>
   <arg name="nodelet_manager" default="/so3_nodelet_manager"/>
   <arg name="goal_connection_timeout" default="30.0"/>
   <arg name="goal_publish_timeout" default="25.0"/>
-  <arg name="phase_offset_mode" default="active"/>
-  <arg name="phase_offset_coordination_backend" default="disabled"/>
-  <arg name="phase_offset_manual_observe_only" default="true"/>
-  <arg name="phase_offset_manual_tube_source" default="none"/>
-  <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false"/>
-  <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0"/>
-  <arg name="phase_offset_normal_preview_horizon_w" default=""/>
-  <arg name="phase_offset_normal_preview_sample_spacing_w" default=""/>
-  <arg name="phase_offset_normal_preview_lower_nu" default=""/>
-  <arg name="phase_offset_normal_preview_upper_nu" default=""/>
-  <arg name="phase_offset_normal_preview_b_tight" default=""/>
-  <arg name="phase_offset_normal_preview_b_open" default=""/>
+  <!-- Swarm defaults run the Section tube + SPH coordination end to end.
+       phase_offset_sim_bringup's orchestrator already requires
+       sph => manual + observe_only=false + neighbor transport + SPH provider
+       + all six normal preview values.  These defaults satisfy that frozen
+       contract; they add no new gate. -->
+  <arg name="phase_offset_mode" default="manual"/>
+  <arg name="phase_offset_coordination_backend" default="sph"/>
+  <arg name="phase_offset_manual_observe_only" default="false"/>
+  <arg name="phase_offset_manual_tube_source" default="esdf"/>
+  <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="true"/>
+  <arg name="phase_offset_normal_preview_horizon_w" default="1.0"/>
+  <arg name="phase_offset_normal_preview_sample_spacing_w" default="0.25"/>
+  <arg name="phase_offset_normal_preview_lower_nu" default="0.02"/>
+  <arg name="phase_offset_normal_preview_upper_nu" default="3.0"/>
+  <arg name="phase_offset_normal_preview_b_tight" default="0.10"/>
+  <arg name="phase_offset_normal_preview_b_open" default="0.90"/>
   <arg name="phase_offset_g_coord_fresh_timeout" default="0.10"/>
   <arg name="phase_offset_future_timestamp_tolerance" default="0.02"/>
-  <arg name="enable_neighbor_transport" default="false"/>
+  <arg name="enable_neighbor_transport" default="true"/>
   <arg name="agent_state_topic" default="/phase_offset/agent_state"/>
   <arg name="neighbor_config_file"
        default="$(find phase_offset_swarm)/config/neighbor_transport_v1.yaml"/>
   <arg name="neighbor_enter_radius" default="2.45"/>
   <arg name="neighbor_exit_radius" default="2.50"/>
   <arg name="all_visible_neighbors" default="false"/>
-  <arg name="enable_sph_provider" default="false"/>
+  <arg name="enable_sph_provider" default="true"/>
+  <!-- Which agent the second (follow-camera) RViz window centres on.  That
+       agent broadcasts world->base, and phase_offset_agent_view.launch drives
+       its top-down view from that frame. -->
+  <arg name="rviz_follow_agent" default="0"/>
+  <!-- Nominal inter-UAV spacing the SPH reference density is built from.
+       0 means "same as formation_spacing" (the recommended setting). -->
+  <arg name="sph_reference_spacing" default="0.0"/>
+  <!-- Kernel smoothing length.  The orchestrator uses the same value to build
+       each agent's paper reference density rho_0 from the nominal formation. -->
+  <arg name="sph_h" default="2.0"/>
   <arg name="sph_beta_topic_pattern" default="/uav_{robot_id}/phase_offset/sph_beta"/>
   <arg name="sph_g_coord_topic_pattern" default="/uav_{robot_id}/phase_offset/g_coord"/>
   <arg name="beta_fresh_timeout" default="0.10"/>
@@ -51,14 +101,28 @@
         name="phase_offset_swarm_orchestrator" output="screen"
         required="true">
     <param name="scenario_file" value="$(arg scenario_file)"/>
+    <param name="agent_count" value="$(arg agent_count)"/>
+    <param name="formation_spacing" value="$(arg formation_spacing)"/>
+    <param name="formation_shape" value="$(arg formation_shape)"/>
+    <param name="formation_axis" value="$(arg formation_axis)"/>
+    <param name="formation_goal_translation_y" value="$(arg formation_goal_translation_y)"/>
+    <param name="formation_goal_translation_x" value="$(arg formation_goal_translation_x)"/>
+    <param name="formation_goal_base_y" value="$(arg formation_goal_base_y)"/>
     <param name="simulation_rate" value="$(arg simulation_rate)"/>
     <param name="odom_rate" value="$(arg odom_rate)"/>
     <param name="start_at_hover" value="$(arg start_at_hover)"/>
+    <param name="init_x" value="$(arg init_x)"/>
+    <param name="init_y" value="$(arg init_y)"/>
+    <param name="init_z" value="$(arg init_z)"/>
+    <param name="publish_goals" value="$(arg publish_goals)"/>
     <param name="frame_id" value="$(arg frame_id)"/>
     <param name="map_resolution" value="$(arg map_resolution)"/>
     <param name="map_size_x" value="$(arg map_size_x)"/>
     <param name="map_size_y" value="$(arg map_size_y)"/>
     <param name="map_size_z" value="$(arg map_size_z)"/>
+    <param name="local_update_range_x" value="$(arg local_update_range_x)"/>
+    <param name="local_update_range_y" value="$(arg local_update_range_y)"/>
+    <param name="local_update_range_z" value="$(arg local_update_range_z)"/>
     <param name="nodelet_manager" value="$(arg nodelet_manager)"/>
     <param name="goal_connection_timeout" value="$(arg goal_connection_timeout)"/>
     <param name="goal_publish_timeout" value="$(arg goal_publish_timeout)"/>
@@ -71,8 +135,6 @@
            value="$(arg phase_offset_manual_tube_source)"/>
     <param name="phase_offset_tube_cloud_obstacle_set_complete"
            value="$(arg phase_offset_tube_cloud_obstacle_set_complete)"/>
-    <param name="phase_offset_tube_preincluded_map_uncertainty"
-           value="$(arg phase_offset_tube_preincluded_map_uncertainty)"/>
     <param name="phase_offset_normal_preview_horizon_w"
            value="$(arg phase_offset_normal_preview_horizon_w)"/>
     <param name="phase_offset_normal_preview_sample_spacing_w"
@@ -96,6 +158,9 @@
     <param name="neighbor_exit_radius" value="$(arg neighbor_exit_radius)"/>
     <param name="all_visible_neighbors" value="$(arg all_visible_neighbors)"/>
     <param name="enable_sph_provider" value="$(arg enable_sph_provider)"/>
+    <param name="rviz_follow_agent" value="$(arg rviz_follow_agent)"/>
+    <param name="sph_reference_spacing" value="$(arg sph_reference_spacing)"/>
+    <param name="sph_h" value="$(arg sph_h)"/>
     <param name="sph_beta_topic_pattern" value="$(arg sph_beta_topic_pattern)"/>
     <param name="sph_g_coord_topic_pattern" value="$(arg sph_g_coord_topic_pattern)"/>
     <param name="beta_fresh_timeout" value="$(arg beta_fresh_timeout)"/>

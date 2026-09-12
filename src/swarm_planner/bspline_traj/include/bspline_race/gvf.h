@@ -138,6 +138,10 @@ class gvf
         double alpha_min_ = 0.05;        // 保证alpha始终>0，避免切向项退化
         double visualization_progress_w_ = 0.0;
         bool visualization_progress_initialized_ = false;
+        // Display-only lateral offset of the active reference (r = p + N*delta).
+        // Used by the RViz vector field so the drawn field is built on the same
+        // coordinated reference the controller follows.  Never feeds control.
+        double visualization_delta_ = 0.0;
         bool terminal_goal_visualization_active_ = false;
         Eigen::Vector3d terminal_goal_visualization_pos_ = Eigen::Vector3d::Zero();
 
@@ -225,6 +229,7 @@ class gvf
             double w,
             const std::shared_ptr<const ContinuousPhasePath>& path_owner) const;
         void setVisualizationProgressW(double w);
+        void setVisualizationDelta(double delta);
         void setTerminalGoalVisualization(const Eigen::Vector3d& goal);
         void clearTerminalGoalVisualization();
         bool calcLiftedVisualizationVector(const Eigen::Vector3d& pos,

@@ -2,6 +2,8 @@
 
 #include <string>
 #include <limits>
+#include <utility>
+#include <vector>
 
 #include <bspline_race/integration/phase_offset_executed_reference_query.h>
 
@@ -90,6 +92,64 @@ TEST(PhaseOffsetExecutedReferenceQueryTest,
   ASSERT_TRUE(neutral_query.query(1.0, neutral));
   EXPECT_TRUE(neutral.valid);
   EXPECT_NE(neutral.provenance.find("Unavailable"), std::string::npos);
+}
+
+TEST(PhaseOffsetExecutedReferenceQueryTest,
+     ExplicitProfileDomainConstrainsQueriesAndDomain) {
+  const auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  ASSERT_TRUE(path->appendSegment(
+      0.0, 3.0, "line",
+      [](const double w, FLAG_Race::ContinuousPhasePathState& state) {
+        state.p = Eigen::Vector3d(w, 0.0, 1.0);
+        state.dp_dw = Eigen::Vector3d::UnitX();
+        state.d2p_dw2.setZero();
+        state.vel = state.dp_dw;
+        state.valid = true;
+        return true;
+      }));
+  FLAG_Race::PhaseOffsetExecutedReferenceQuery query(
+      path, 0.0, 5U, 7U, 11U, 13U, 0.5, 1.5);
+  double w0 = 0.0;
+  double w1 = 0.0;
+  ASSERT_TRUE(query.domain(w0, w1));
+  EXPECT_DOUBLE_EQ(w0, 0.5);
+  EXPECT_DOUBLE_EQ(w1, 1.5);
+  phase_offset_navigation::ExecutedReferenceQueryResult result;
+  EXPECT_TRUE(query.query(0.5, result));
+  EXPECT_TRUE(query.query(1.5, result));
+  EXPECT_FALSE(query.query(0.49, result));
+  EXPECT_FALSE(query.query(1.51, result));
+}
+
+TEST(PhaseOffsetExecutedReferenceQueryTest,
+     MalformedExplicitDomainFailsClosedInsteadOfWideningToPath) {
+  const auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  ASSERT_TRUE(path->appendSegment(
+      0.0, 3.0, "line",
+      [](const double w, FLAG_Race::ContinuousPhasePathState& state) {
+        state.p = Eigen::Vector3d(w, 0.0, 1.0);
+        state.dp_dw = Eigen::Vector3d::UnitX();
+        state.d2p_dw2.setZero();
+        state.vel = state.dp_dw;
+        state.valid = true;
+        return true;
+      }));
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const std::vector<std::pair<double, double>> malformed{
+      {0.5, nan}, {nan, 1.5}, {1.5, 0.5}, {-0.1, 1.0},
+      {1.0, 3.1}, {0.0, std::numeric_limits<double>::infinity()},
+      {std::numeric_limits<double>::infinity(),
+       std::numeric_limits<double>::infinity()}};
+  for (const auto& bounds : malformed) {
+    SCOPED_TRACE("explicit query domain");
+    FLAG_Race::PhaseOffsetExecutedReferenceQuery query(
+        path, 0.0, 5U, 7U, 11U, 13U, bounds.first, bounds.second);
+    double w0 = 0.0;
+    double w1 = 0.0;
+    EXPECT_FALSE(query.domain(w0, w1));
+    phase_offset_navigation::ExecutedReferenceQueryResult result;
+    EXPECT_FALSE(query.query(1.0, result));
+  }
 }
 
 int main(int argc, char** argv) {

@@ -119,6 +119,15 @@ if(CATKIN_ENABLE_TESTING)
     )
   endif()
 
+  catkin_add_gtest(phase_offset_swarm_sph_intent_test
+    test/sph_intent_test.cpp
+  )
+  if(TARGET phase_offset_swarm_sph_intent_test)
+    target_link_libraries(phase_offset_swarm_sph_intent_test
+      phase_offset_swarm_core
+    )
+  endif()
+
   add_rostest(test/swarm_intent_shadow.test)
   add_rostest(test/agent_state_neighbor_transport.test)
 endif()

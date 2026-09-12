@@ -63,6 +63,10 @@ struct DifferentialBounds
     double sup_horizontal_acceleration = 0.0;
     double sup_jerk = 0.0;
     double sup_horizontal_jerk = 0.0;
+    // Optional component-wise absolute p_ww bounds.  The scalar fields above
+    // remain the legacy contract; this capability is independently optional.
+    Eigen::Vector3d sup_abs_p_ww = Eigen::Vector3d::Zero();
+    bool component_acceleration_bound_complete = false;
     bool valid = false;
 };
 
@@ -923,6 +927,115 @@ VectorBounds BoundsFromBernsteinControls(
     return bounds;
 }
 
+// Return independent absolute component bounds for a vector Bernstein hull.
+// These are an optional legacy-producer capability, not a replacement for
+// the existing norm bounds.  A zero control polygon remains an exact zero
+// instead of being widened by UpperBound's nonzero margin.
+bool AbsoluteComponentBoundsFromBernsteinControls(
+    const std::vector<Eigen::Vector3d>& controls,
+    Eigen::Vector3d& bounds)
+{
+    bounds = Eigen::Vector3d::Zero();
+    if (controls.empty()) return false;
+    Eigen::Vector3d maximum = Eigen::Vector3d::Zero();
+    for (const Eigen::Vector3d& control : controls) {
+        if (!control.allFinite()) return false;
+        for (int axis = 0; axis < 3; ++axis) {
+            maximum(axis) = std::max(maximum(axis), std::abs(control(axis)));
+        }
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        bounds(axis) = UpperBound(maximum(axis));
+        if (!std::isfinite(bounds(axis)) || bounds(axis) < 0.0) {
+            bounds = Eigen::Vector3d::Zero();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AbsoluteComponentBoundsFromVectorPower(
+    const std::vector<Eigen::Vector3d>& coefficients,
+    const double first, const double last,
+    Eigen::Vector3d& bounds)
+{
+    bounds = Eigen::Vector3d::Zero();
+    if (coefficients.empty()) return false;
+    std::array<bool, 3U> source_zero = {{true, true, true}};
+    for (const Eigen::Vector3d& coefficient : coefficients) {
+        if (!coefficient.allFinite()) return false;
+        for (int axis = 0; axis < 3; ++axis) {
+            if (coefficient(axis) != 0.0) source_zero[static_cast<std::size_t>(axis)] = false;
+        }
+    }
+    const std::vector<Eigen::Vector3d> restricted = RestrictPowerVector(
+        coefficients, first, last);
+    const std::vector<Eigen::Vector3d> controls = VectorPowerToBernstein(
+        restricted);
+    if (controls.empty()) return false;
+    if (!AbsoluteComponentBoundsFromBernsteinControls(controls, bounds)) {
+        return false;
+    }
+    // A nonzero source polynomial must not become a claimed exact zero just
+    // because restriction/scaling rounded every transformed control to zero.
+    // Such a loss of evidence disables only this optional capability.
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!source_zero[static_cast<std::size_t>(axis)] &&
+            bounds(axis) == 0.0) {
+            bounds = Eigen::Vector3d::Zero();
+            return false;
+        }
+    }
+    return true;
+}
+
+// Divide each non-negative component by a positive binary64 scale twice.
+// Chaining outwardUpperRatio avoids first rounding h*h upward and then
+// accidentally producing a quotient below the mathematical value / h^2.
+bool DivideComponentBoundsByScaleSquared(const Eigen::Vector3d& source,
+                                         const double scale,
+                                         Eigen::Vector3d& result)
+{
+    result = Eigen::Vector3d::Zero();
+    if (!std::isfinite(scale) || scale <= 0.0 ||
+        !source.allFinite() || (source.array() < 0.0).any()) {
+        return false;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        double once = 0.0;
+        if (!phase_offset_core::outwardUpperRatio(source(axis), scale, once) ||
+            !phase_offset_core::outwardUpperRatio(once, scale,
+                                                  result(axis)) ||
+            !std::isfinite(result(axis)) || result(axis) < 0.0) {
+            result = Eigen::Vector3d::Zero();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool OutwardUpperSumNonnegative(const double lhs, const double rhs,
+                                double& result)
+{
+    result = std::numeric_limits<double>::quiet_NaN();
+    if (!std::isfinite(lhs) || !std::isfinite(rhs) || lhs < 0.0 ||
+        rhs < 0.0) {
+        return false;
+    }
+    if (lhs == 0.0) {
+        result = rhs;
+        return true;
+    }
+    if (rhs == 0.0) {
+        result = lhs;
+        return true;
+    }
+    const double sum = lhs + rhs;
+    if (!std::isfinite(sum)) return false;
+    result = UpperBound(sum);
+    return std::isfinite(result) && result >= 0.0;
+}
+
 VectorBounds BoundsFromVectorPower(const std::vector<Eigen::Vector3d>& coefficients,
                                    const double first, const double last,
                                    const bool horizontal)
@@ -975,6 +1088,17 @@ bool MakeCertificate(const double w0, const double w1,
     certificate.sup_p_www_norm = differential.sup_jerk;
     certificate.sup_horizontal_p_ww_norm =
         differential.sup_horizontal_acceleration;
+    if (differential.component_acceleration_bound_complete &&
+        differential.sup_abs_p_ww.allFinite() &&
+        (differential.sup_abs_p_ww.array() >= 0.0).all()) {
+        certificate.sup_abs_p_ww = differential.sup_abs_p_ww;
+        certificate.component_acceleration_bound_complete = true;
+    } else {
+        // Optional component evidence must never turn an invalid/default
+        // vector into a claimed zero bound.  Keep all legacy scalar facts.
+        certificate.sup_abs_p_ww = Eigen::Vector3d::Zero();
+        certificate.component_acceleration_bound_complete = false;
+    }
     certificate.horizontal_acceleration_bound_complete = true;
     certificate.sup_N_w_norm = normal_w;
     certificate.sup_abs_curvature = curvature;
@@ -1049,6 +1173,51 @@ bool BoundsFromSpline(const UniformBspline& spline, const double t0,
     return full.valid && horizontal.valid;
 }
 
+bool AbsoluteComponentBoundsFromSpline(const UniformBspline& spline,
+                                       const double t0, const double t1,
+                                       Eigen::Vector3d& bounds)
+{
+    std::vector<Eigen::Vector3d> controls;
+    if (!CollectSplineBernsteinControls(spline, t0, t1, controls)) {
+        bounds = Eigen::Vector3d::Zero();
+        return false;
+    }
+    return AbsoluteComponentBoundsFromBernsteinControls(controls, bounds);
+}
+
+bool ComposeMappedAccelerationComponentBounds(
+    const Eigen::Vector3d& d1, const Eigen::Vector3d& d2,
+    const double dt_dw_max, const double d2t_dw2_max,
+    Eigen::Vector3d& bounds)
+{
+    bounds = Eigen::Vector3d::Zero();
+    if (!d1.allFinite() || !d2.allFinite() ||
+        (d1.array() < 0.0).any() || (d2.array() < 0.0).any() ||
+        !std::isfinite(dt_dw_max) || dt_dw_max < 0.0 ||
+        !std::isfinite(d2t_dw2_max) || d2t_dw2_max < 0.0) {
+        return false;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        // Apply the positive scale twice instead of materializing dt^2;
+        // each operation is independently outward-rounded.
+        double first_product = 0.0;
+        double dt_squared_product = 0.0;
+        double second_product = 0.0;
+        if (!phase_offset_core::outwardUpperProduct(
+                d2(axis), dt_dw_max, first_product) ||
+            !phase_offset_core::outwardUpperProduct(
+                first_product, dt_dw_max, dt_squared_product) ||
+            !phase_offset_core::outwardUpperProduct(
+                d1(axis), d2t_dw2_max, second_product) ||
+            !OutwardUpperSumNonnegative(dt_squared_product, second_product,
+                                        bounds(axis))) {
+            bounds = Eigen::Vector3d::Zero();
+            return false;
+        }
+    }
+    return bounds.allFinite() && (bounds.array() >= 0.0).all();
+}
+
 bool MakeQuinticDifferentialBounds(
     const std::array<Eigen::Vector3d, 6>& a,
     const double segment_w0, const double segment_w1,
@@ -1087,6 +1256,27 @@ bool MakeQuinticDifferentialBounds(
         !horizontal_acceleration.valid || !jerk.valid ||
         !horizontal_jerk.valid) {
         return false;
+    }
+    Eigen::Vector3d component_acceleration = Eigen::Vector3d::Zero();
+    bool component_acceleration_valid =
+        AbsoluteComponentBoundsFromVectorPower(p_ww, first, last,
+                                               component_acceleration);
+    if (component_acceleration_valid) {
+        Eigen::Vector3d scaled_component_acceleration;
+        component_acceleration_valid = DivideComponentBoundsByScaleSquared(
+            component_acceleration, h_segment,
+            scaled_component_acceleration);
+        if (component_acceleration_valid) {
+            if (constant_horizontal_dp_dw != nullptr) {
+                // The nominal quintic evaluator replaces the horizontal
+                // derivative branch with a constant value, so its executed
+                // horizontal p_ww components are exactly zero.
+                scaled_component_acceleration.x() = 0.0;
+                scaled_component_acceleration.y() = 0.0;
+            }
+            differential.sup_abs_p_ww = scaled_component_acceleration;
+            differential.component_acceleration_bound_complete = true;
+        }
     }
     differential.inf_speed = ScaledLowerBound(
         speed.inf_norm, speed.inf_norm_exact, h_segment);
@@ -1159,6 +1349,8 @@ bool MakeQuinticCertificate(
     aggregate.sup_horizontal_acceleration = 0.0;
     aggregate.sup_jerk = 0.0;
     aggregate.sup_horizontal_jerk = 0.0;
+    aggregate.sup_abs_p_ww = Eigen::Vector3d::Zero();
+    aggregate.component_acceleration_bound_complete = true;
     aggregate.valid = true;
     const double span = w1 - w0;
     for (int index = 0; index < kSubdivisions; ++index) {
@@ -1186,6 +1378,16 @@ bool MakeQuinticCertificate(
         aggregate.sup_jerk = std::max(aggregate.sup_jerk, local.sup_jerk);
         aggregate.sup_horizontal_jerk = std::max(
             aggregate.sup_horizontal_jerk, local.sup_horizontal_jerk);
+        if (!local.component_acceleration_bound_complete ||
+            !local.sup_abs_p_ww.allFinite() ||
+            (local.sup_abs_p_ww.array() < 0.0).any()) {
+            aggregate.component_acceleration_bound_complete = false;
+        } else {
+            for (int axis = 0; axis < 3; ++axis) {
+                aggregate.sup_abs_p_ww(axis) = std::max(
+                    aggregate.sup_abs_p_ww(axis), local.sup_abs_p_ww(axis));
+            }
+        }
     }
     if (!aggregate.valid || !std::isfinite(aggregate.inf_speed) ||
         !std::isfinite(aggregate.inf_horizontal_speed)) {
@@ -1605,6 +1807,13 @@ bool MakeMappedBsplineCertificate(
         !BoundsFromSpline(d3p_dt3, enclosed_t0, enclosed_t1, p_ttt, p_ttt_h)) {
         return false;
     }
+    Eigen::Vector3d d1_components = Eigen::Vector3d::Zero();
+    Eigen::Vector3d d2_components = Eigen::Vector3d::Zero();
+    bool component_acceleration_valid =
+        AbsoluteComponentBoundsFromSpline(dp_dt, enclosed_t0, enclosed_t1,
+                                          d1_components) &&
+        AbsoluteComponentBoundsFromSpline(d2p_dt2, enclosed_t0, enclosed_t1,
+                                          d2_components);
     const double dt_dw_max = UpperBound(arclength_per_phase / q_min);
     const double dt_dw_min = LowerBound(arclength_per_phase / q_max);
     const double d2t_dw2_max = UpperBound(
@@ -1620,6 +1829,17 @@ bool MakeMappedBsplineCertificate(
         return false;
     }
     DifferentialBounds differential;
+    if (component_acceleration_valid) {
+        Eigen::Vector3d mapped_components;
+        component_acceleration_valid =
+            ComposeMappedAccelerationComponentBounds(
+                d1_components, d2_components, dt_dw_max, d2t_dw2_max,
+                mapped_components);
+        if (component_acceleration_valid) {
+            differential.sup_abs_p_ww = mapped_components;
+            differential.component_acceleration_bound_complete = true;
+        }
+    }
     differential.inf_speed = ProductLowerBound(
         p_t.inf_norm, p_t.inf_norm_exact, dt_dw_min);
     differential.inf_horizontal_speed = ProductLowerBound(
@@ -1695,7 +1915,21 @@ bool MakeLinearMappedBsplineCertificate(
         !BoundsFromSpline(d3p_dt3, t0, t1, p_ttt, p_ttt_h)) {
         return false;
     }
+    Eigen::Vector3d d1_components = Eigen::Vector3d::Zero();
+    Eigen::Vector3d d2_components = Eigen::Vector3d::Zero();
+    const bool component_acceleration_valid =
+        AbsoluteComponentBoundsFromSpline(dp_dt, t0, t1, d1_components) &&
+        AbsoluteComponentBoundsFromSpline(d2p_dt2, t0, t1, d2_components);
     DifferentialBounds differential;
+    if (component_acceleration_valid) {
+        Eigen::Vector3d mapped_components;
+        if (ComposeMappedAccelerationComponentBounds(
+                d1_components, d2_components, dt_dw, 0.0,
+                mapped_components)) {
+            differential.sup_abs_p_ww = mapped_components;
+            differential.component_acceleration_bound_complete = true;
+        }
+    }
     differential.inf_speed = ProductLowerBound(
         p_t.inf_norm, p_t.inf_norm_exact, dt_dw);
     differential.inf_horizontal_speed = ProductLowerBound(
@@ -2800,12 +3034,12 @@ bool ContinuousPhasePath::cellBounds(
 {
     certificate = phase_offset_core::PathCellGeometryCertificate();
     if (segments_.empty() || !std::isfinite(w0) || !std::isfinite(w1) ||
-        w1 <= w0 + kDomainEps) {
+        !(w1 > w0)) {
         return false;
     }
     const Segment* selected = nullptr;
     for (const Segment& segment : segments_) {
-        if (w0 >= segment.w0 - kDomainEps && w1 <= segment.w1 + kDomainEps) {
+        if (w0 >= segment.w0 && w1 <= segment.w1) {
             selected = &segment;
             break;
         }
@@ -2948,8 +3182,7 @@ bool ContinuousPhasePath::evaluate(
 
     const Segment* selected = nullptr;
     for (const auto& segment : segments_) {
-        if (query_w >= segment.w0 - kDomainEps &&
-            query_w <= segment.w1 + kDomainEps) {
+        if (query_w >= segment.w0 && query_w <= segment.w1) {
             selected = &segment;
             break;
         }

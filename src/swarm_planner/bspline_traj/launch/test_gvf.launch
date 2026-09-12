@@ -48,45 +48,39 @@
     <arg name="phase_offset_normal_preview_upper_nu" default="2.0" />
     <arg name="phase_offset_normal_preview_b_tight" default="0.10" />
     <arg name="phase_offset_normal_preview_b_open" default="0.90" />
-    <arg name="phase_offset_tube_fixed_delta_max" default="0.06" />
     <arg name="phase_offset_tube_nominal_half_width" default="1.0" />
     <arg name="phase_offset_tube_sample_step_w" default="0.10" />
     <arg name="phase_offset_tube_lookahead_w" default="2.0" />
     <arg name="phase_offset_tube_back_w" default="0.20" />
     <arg name="phase_offset_tube_min_certified_forward_w" default="0.40" />
-    <arg name="phase_offset_tube_ray_step" default="0.05" />
-    <arg name="phase_offset_tube_max_offset" default="0.20" />
-    <arg name="phase_offset_tube_boundary_slope_max" default="0.80" />
     <arg name="phase_offset_tube_invariant_gain" default="1.0" />
     <arg name="phase_offset_tube_interior_margin" default="0.0" />
     <arg name="phase_offset_tube_update_period" default="0.10" />
-    <!-- Compatibility-only: older fixed regression launch files still pass
-         this argument.  It is intentionally not forwarded as a parameter and
-         cannot reinstate the retired rebuild/stability gate. -->
-    <arg name="phase_offset_tube_stable_rebuild_cycles" default="1" />
-    <arg name="phase_offset_tube_esdf_unobserved_threshold" default="1000.0" />
-    <arg name="phase_offset_tube_uav_radius" default="0.25" />
-    <arg name="phase_offset_tube_localization_margin" default="0.05" />
-    <arg name="phase_offset_tube_tracking_error_bound" default="0.15" />
-    <arg name="phase_offset_tube_map_margin" default="0.10" />
-    <arg name="phase_offset_tube_extra_margin" default="0.05" />
-    <arg name="phase_offset_tube_discretization_margin" default="0.10" />
-    <!-- Raw occupancy tube contract: these are independent of the legacy
-         inflated-ESDF max_offset and six-field erosion settings above. -->
-    <arg name="phase_offset_tube_environment_search_extent" default="3.0" />
-    <arg name="phase_offset_tube_raw_ray_step" default="0.05" />
-    <arg name="phase_offset_tube_boundary_tolerance" default="0.01" />
+    <!-- Transverse half width the Section tube may claim on each side of the
+         path, measured after the configured clearance is taken off the free
+         distance.  The map view is requested one clearance wider so this value
+         is reachable in open space. -->
+    <arg name="phase_offset_tube_environment_search_extent" default="1.5" />
+    <!-- Corridor-only clearance between the tube wall and the first occupied
+         voxel.  Independent of planning/safe_distance, which keeps governing
+         the B-spline obstacle preference. -->
+    <arg name="phase_offset_tube_section_clearance" default="0.20" />
     <arg name="phase_offset_tube_raw_regularity_margin" default="0.10" />
-    <arg name="phase_offset_tube_curvature_epsilon" default="1e-9" />
-    <arg name="phase_offset_tube_raw_uav_radius" default="0.25" />
-    <arg name="phase_offset_tube_raw_map_uncertainty" default="0.10" />
-    <arg name="phase_offset_tube_raw_localization_uncertainty" default="0.05" />
+    <arg name="phase_offset_tube_min_regularity_ratio" default="0.35" />
     <arg name="phase_offset_tube_raw_tracking_error_bound" default="0.15" />
     <!-- Explicit opt-in: local_sensing publishes the complete local obstacle
-         set in its update AABB.  Real sparse hit clouds must leave this false
-         until an observed-domain producer is supplied. -->
-    <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="false" />
-    <arg name="phase_offset_tube_preincluded_map_uncertainty" default="0.0" />
+         set in its update AABB.  This launch starts that producer itself, so
+         the Section tube can declare a known domain and be built.  A workspace
+         whose cloud topic carries raw sparse hit points must set this false
+         again, because then the unknown region is genuinely unknown. -->
+    <arg name="phase_offset_tube_cloud_obstacle_set_complete" default="true" />
+    <!-- Section build work budgets.  These are honest truncation limits for
+         the profile prefix, not safety gates: the local view exposes one box
+         per occupied native voxel, so the per-cell obstacle loop needs a
+         budget sized for the configured sensing volume. -->
+    <arg name="phase_offset_tube_section_max_obstacle_checks" default="4000000" />
+    <arg name="phase_offset_tube_section_max_obstacles" default="60000" />
+    <arg name="phase_offset_tube_section_max_cells" default="20000" />
     <arg name="phase_offset_measurement_enable" default="false" />
     <arg name="phase_offset_measurement_callback_csv_path" default="" />
     <arg name="phase_offset_measurement_tube_due_csv_path" default="" />
@@ -96,8 +90,8 @@
     <arg name="map_size_y_" value="30.0"/>
     <arg name="map_size_z_" value=" 2.5"/>
 
-    <arg name="local_update_range_x" value="6.0"/>
-    <arg name="local_update_range_y" value="6.0"/>
+    <arg name="local_update_range_x" value="4.0"/>
+    <arg name="local_update_range_y" value="4.0"/>
     <arg name="local_update_range_z" value="2.5"/>
     
     <arg name="v_max" value="2.0"/>
@@ -105,7 +99,11 @@
     <!-- <arg name="v_max" value="0.8"/>
     <arg name="a_max" value="1.2"/>    -->
     
-  <node name="formation_planning" pkg="bspline_race" type="formation_planning" output="screen">
+  <!-- node_output: "screen" for the single-UAV chain; the swarm passes "log" so
+       each agent's planner writes its own file under ~/.ros/log/<run>/, which is
+       what a per-agent stall investigation needs. -->
+  <arg name="node_output" default="screen"/>
+  <node name="formation_planning" pkg="bspline_race" type="formation_planning" output="$(arg node_output)">
         <!-- Plan Manager -->
         <param name="gvf/cloud_topic"      type="string" value="/sim/local_map" />
         <param name="gvf/odom_topic"       type="string" value="/sim/odom" />
@@ -164,36 +162,23 @@
         <param if="$(eval arg('phase_offset_normal_preview_b_open') != '')"
                name="phase_offset/normal_preview/b_open"
                value="$(arg phase_offset_normal_preview_b_open)" />
-        <param name="phase_offset/tube/fixed_delta_max" value="$(arg phase_offset_tube_fixed_delta_max)" />
         <param name="phase_offset/tube/nominal_half_width" value="$(arg phase_offset_tube_nominal_half_width)" />
         <param name="phase_offset/tube/sample_step_w" value="$(arg phase_offset_tube_sample_step_w)" />
         <param name="phase_offset/tube/lookahead_w" value="$(arg phase_offset_tube_lookahead_w)" />
         <param name="phase_offset/tube/back_w" value="$(arg phase_offset_tube_back_w)" />
         <param name="phase_offset/tube/min_certified_forward_w" value="$(arg phase_offset_tube_min_certified_forward_w)" />
-        <param name="phase_offset/tube/ray_step" value="$(arg phase_offset_tube_ray_step)" />
-        <param name="phase_offset/tube/max_offset" value="$(arg phase_offset_tube_max_offset)" />
-        <param name="phase_offset/tube/boundary_slope_max" value="$(arg phase_offset_tube_boundary_slope_max)" />
         <param name="phase_offset/tube/invariant_gain" value="$(arg phase_offset_tube_invariant_gain)" />
         <param name="phase_offset/tube/interior_margin" value="$(arg phase_offset_tube_interior_margin)" />
         <param name="phase_offset/tube/update_period" value="$(arg phase_offset_tube_update_period)" />
-        <param name="phase_offset/tube/esdf_unobserved_threshold" value="$(arg phase_offset_tube_esdf_unobserved_threshold)" />
-        <param name="phase_offset/tube/uav_radius" value="$(arg phase_offset_tube_uav_radius)" />
-        <param name="phase_offset/tube/localization_margin" value="$(arg phase_offset_tube_localization_margin)" />
-        <param name="phase_offset/tube/tracking_error_bound" value="$(arg phase_offset_tube_tracking_error_bound)" />
-        <param name="phase_offset/tube/map_margin" value="$(arg phase_offset_tube_map_margin)" />
-        <param name="phase_offset/tube/extra_margin" value="$(arg phase_offset_tube_extra_margin)" />
-        <param name="phase_offset/tube/discretization_margin" value="$(arg phase_offset_tube_discretization_margin)" />
         <param name="phase_offset/tube/environment_search_extent" value="$(arg phase_offset_tube_environment_search_extent)" />
-        <param name="phase_offset/tube/raw_ray_step" value="$(arg phase_offset_tube_raw_ray_step)" />
-        <param name="phase_offset/tube/boundary_tolerance" value="$(arg phase_offset_tube_boundary_tolerance)" />
+        <param name="phase_offset/tube/section_clearance" value="$(arg phase_offset_tube_section_clearance)" />
         <param name="phase_offset/tube/raw_regularity_margin" value="$(arg phase_offset_tube_raw_regularity_margin)" />
-        <param name="phase_offset/tube/curvature_epsilon" value="$(arg phase_offset_tube_curvature_epsilon)" />
-        <param name="phase_offset/tube/raw_uav_radius" value="$(arg phase_offset_tube_raw_uav_radius)" />
-        <param name="phase_offset/tube/raw_map_uncertainty" value="$(arg phase_offset_tube_raw_map_uncertainty)" />
-        <param name="phase_offset/tube/raw_localization_uncertainty" value="$(arg phase_offset_tube_raw_localization_uncertainty)" />
+        <param name="phase_offset/tube/min_regularity_ratio" value="$(arg phase_offset_tube_min_regularity_ratio)" />
         <param name="phase_offset/tube/raw_tracking_error_bound" value="$(arg phase_offset_tube_raw_tracking_error_bound)" />
         <param name="phase_offset/tube/cloud_obstacle_set_complete" value="$(arg phase_offset_tube_cloud_obstacle_set_complete)" />
-        <param name="phase_offset/tube/preincluded_map_uncertainty" value="$(arg phase_offset_tube_preincluded_map_uncertainty)" />
+        <param name="phase_offset/tube/section_max_obstacle_checks" value="$(arg phase_offset_tube_section_max_obstacle_checks)" />
+        <param name="phase_offset/tube/section_max_obstacles" value="$(arg phase_offset_tube_section_max_obstacles)" />
+        <param name="phase_offset/tube/section_max_cells" value="$(arg phase_offset_tube_section_max_cells)" />
         <param name="phase_offset/measurement/enable" value="$(arg phase_offset_measurement_enable)" />
         <param name="phase_offset/measurement/callback_csv_path" value="$(arg phase_offset_measurement_callback_csv_path)" />
         <param name="phase_offset/measurement/tube_due_csv_path" value="$(arg phase_offset_measurement_tube_due_csv_path)" />
@@ -302,6 +287,11 @@
         <param name="gvf/cmd/governor_l_rate_max" value="4.0" />
         <param name="gvf/cmd/governor_l_ff_weight" value="0.8" />
         <param name="gvf/cmd/governor_lead_max" value="1.6" />
+        <!-- Persistent no-valid-candidate unlock: after this many seconds with
+             an empty candidate set (and real path still ahead) the phase is
+             re-anchored to the vehicle instead of holding forever.  <= 0
+             disables it. -->
+        <param name="gvf/cmd/governor_unlock_timeout" value="1.0" />
         <param name="gvf/cmd/governor_normal_cross_max" value="0.08" />
         <param name="gvf/cmd/governor_normal_deadband" value="0.05" />
         <param name="gvf/cmd/governor_normal_full_error" value="0.20" />
@@ -399,8 +389,11 @@
         <param name="search/margin" value="0.5" type="double"/>
         <param name="search/allocate_num" value="100000" type="int"/>
         <param name="search/check_num" value="5" type="int"/>
-        <param name="search/z_min" value="0.8" type="double"/>
-        <param name="search/z_max" value="1.2" type="double"/>
+        <!-- Kino A* altitude search band.  Map z extent is left untouched
+             (sdf_map/map_size_z stays 2.5), so the search may use 0.5-2.0 m
+             inside that map. -->
+        <param name="search/z_min" value="0.5" type="double"/>
+        <param name="search/z_max" value="2.0" type="double"/>
 
         <!-- kinodynamic path searching -->
         <!-- <param name="search/max_tau" value="0.6" type="double"/>

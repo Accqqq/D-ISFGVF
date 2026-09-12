@@ -56,23 +56,11 @@
     <arg name="phase_offset_manual_tangent_speed_min" value="0.02" />
     <arg name="phase_offset_manual_preflight_sample_step_w" value="0.10" />
     <arg name="phase_offset_manual_tube_source" value="fixed" />
-    <arg name="phase_offset_tube_fixed_delta_max" value="0.04" />
     <arg name="phase_offset_tube_sample_step_w" value="0.10" />
     <arg name="phase_offset_tube_lookahead_w" value="2.0" />
     <arg name="phase_offset_tube_back_w" value="0.20" />
     <arg name="phase_offset_tube_min_certified_forward_w" value="0.40" />
-    <arg name="phase_offset_tube_ray_step" value="0.05" />
-    <arg name="phase_offset_tube_max_offset" value="0.20" />
-    <arg name="phase_offset_tube_boundary_slope_max" value="0.80" />
     <arg name="phase_offset_tube_invariant_gain" value="1.0" />
     <arg name="phase_offset_tube_interior_margin" value="0.0" />
-    <arg name="phase_offset_tube_stable_rebuild_cycles" value="1" />
-    <arg name="phase_offset_tube_esdf_unobserved_threshold" value="1000.0" />
-    <arg name="phase_offset_tube_uav_radius" value="0.25" />
-    <arg name="phase_offset_tube_localization_margin" value="0.05" />
-    <arg name="phase_offset_tube_tracking_error_bound" value="0.15" />
-    <arg name="phase_offset_tube_map_margin" value="0.10" />
-    <arg name="phase_offset_tube_extra_margin" value="0.05" />
-    <arg name="phase_offset_tube_discretization_margin" value="0.10" />
   </include>
 </launch>

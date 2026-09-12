@@ -27,6 +27,10 @@ PACKAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 WORKSPACE = os.path.abspath(os.path.join(PACKAGE_DIR, "../../../.."))
 LAUNCH_DIR = os.path.join(PACKAGE_DIR, "launch")
 SCENARIO_PATH = os.path.join(PACKAGE_DIR, "config/scenarios/sim_b_open_3.yaml")
+CONFLICT_SCENARIO_PATH = os.path.join(
+    PACKAGE_DIR, "config/scenarios/sim_b_conflict_3.yaml")
+FORMATION_SCENARIO_PATH = os.path.join(
+    PACKAGE_DIR, "config/scenarios/sim_b_formation_3.yaml")
 ORCHESTRATOR_PATH = os.path.join(PACKAGE_DIR, "scripts/swarm_orchestrator.py")
 PUBLISHER_PATH = os.path.join(PACKAGE_DIR, "scripts/scenario_goal_publisher.py")
 AGENT_LAUNCH = os.path.join(LAUNCH_DIR, "phase_offset_agent.launch")
@@ -40,11 +44,23 @@ import sys
 sys.path.insert(0, os.path.join(PACKAGE_DIR, "scripts"))
 from swarm_orchestrator import (  # noqa: E402
     ScenarioValidationError,
+    _validate_options,
     build_child_launch,
     canonical_scenario,
+    translate_initial_states,
     validate_scenario,
     write_scenario,
 )
+
+
+def _launch_arg_defaults(path):
+    """Return the roslaunch ``<arg>`` defaults of one launch document."""
+    defaults = {}
+    for element in ET.parse(path).getroot().findall("arg"):
+        name = element.get("name")
+        if name is not None and name not in defaults:
+            defaults[name] = element.get("default", "")
+    return defaults
 
 
 def _finite(value):
@@ -457,6 +473,171 @@ class SimBBRingupTest(unittest.TestCase):
                 self.assertNotIn("uav_50", child)
             for robot_id in range(count):
                 self.assertIn("uav_%d" % robot_id, child)
+
+    def test_swarm_defaults_are_sph_ready(self):
+        """Shipped swarm defaults must satisfy the frozen SPH contract.
+
+        The orchestrator already rejects ``sph`` unless the run is MANUAL with
+        ``observe_only=false``, neighbour transport, the SPH provider and all
+        six normal preview values.  Parsing the launch defaults and feeding
+        them straight into that validator proves the defaults are accepted
+        without duplicating the contract here.
+        """
+        defaults = _launch_arg_defaults(SWARM_LAUNCH)
+        options = {
+            "scenario_file": CONFLICT_SCENARIO_PATH,
+            # 0 keeps the explicit scenario file (no generated formation); the
+            # validator only needs it to be a non-negative integer.
+            "agent_count": 0,
+            "formation_spacing": float(defaults["formation_spacing"]),
+            "formation_shape": defaults["formation_shape"],
+            "formation_axis": defaults["formation_axis"],
+            "formation_goal_translation_x": float(
+                defaults["formation_goal_translation_x"]),
+            "formation_goal_translation_y": float(
+                defaults["formation_goal_translation_y"]),
+            "sph_reference_spacing": float(defaults["sph_reference_spacing"]),
+            "sph_h": float(defaults["sph_h"]),
+            "local_update_range_x": float(defaults["local_update_range_x"]),
+            "local_update_range_y": float(defaults["local_update_range_y"]),
+            "local_update_range_z": float(defaults["local_update_range_z"]),
+            "simulation_rate": 1000.0,
+            "odom_rate": 100.0,
+            "start_at_hover": True,
+            "init_x": float(defaults["init_x"]),
+            "init_y": float(defaults["init_y"]),
+            "init_z": float(defaults["init_z"]),
+            "frame_id": "world",
+            "map_resolution": 0.10,
+            "map_size_x": 20.0,
+            "map_size_y": 30.0,
+            "map_size_z": 2.5,
+            "nodelet_manager": "/so3_nodelet_manager",
+            "goal_connection_timeout": 30.0,
+            "goal_publish_timeout": 25.0,
+        }
+        preview_keys = (
+            "phase_offset_normal_preview_horizon_w",
+            "phase_offset_normal_preview_sample_spacing_w",
+            "phase_offset_normal_preview_lower_nu",
+            "phase_offset_normal_preview_upper_nu",
+            "phase_offset_normal_preview_b_tight",
+            "phase_offset_normal_preview_b_open",
+        )
+        for key in ("phase_offset_mode", "phase_offset_coordination_backend",
+                    "agent_state_topic", "neighbor_config_file",
+                    "sph_beta_topic_pattern", "sph_g_coord_topic_pattern"):
+            options[key] = defaults[key]
+        for key in preview_keys:
+            self.assertNotEqual(defaults[key], "")
+            options[key] = defaults[key]
+        for key in ("phase_offset_manual_observe_only",
+                    "phase_offset_tube_cloud_obstacle_set_complete",
+                    "enable_neighbor_transport", "enable_sph_provider",
+                    "all_visible_neighbors"):
+            options[key] = defaults[key] == "true"
+        for key in ("neighbor_enter_radius", "neighbor_exit_radius",
+                    "beta_fresh_timeout", "snapshot_fresh_timeout",
+                    "future_timestamp_tolerance",
+                    "phase_offset_g_coord_fresh_timeout",
+                    "phase_offset_future_timestamp_tolerance"):
+            options[key] = float(defaults[key])
+
+        _validate_options(options)
+        self.assertEqual(options["phase_offset_mode"], "manual")
+        self.assertEqual(options["phase_offset_coordination_backend"], "sph")
+        self.assertTrue(options["enable_neighbor_transport"])
+        self.assertTrue(options["enable_sph_provider"])
+        self.assertFalse(options["phase_offset_manual_observe_only"])
+        self.assertTrue(
+            options["phase_offset_tube_cloud_obstacle_set_complete"])
+        self.assertEqual(
+            (options["init_x"], options["init_y"], options["init_z"]),
+            (0.0, 20.0, 1.0))
+
+        agent_defaults = _launch_arg_defaults(AGENT_LAUNCH)
+        self.assertEqual(agent_defaults["phase_offset_mode"], "manual")
+        self.assertEqual(agent_defaults["phase_offset_coordination_backend"],
+                         "sph")
+        self.assertEqual(
+            agent_defaults["phase_offset_tube_cloud_obstacle_set_complete"],
+            "true")
+        for key in preview_keys:
+            self.assertNotEqual(agent_defaults[key], "")
+
+        conflict = validate_scenario(CONFLICT_SCENARIO_PATH)
+        self.assertEqual(conflict["name"], "sim_b_conflict_3")
+        lanes = sorted(agent["initial"]["x"] for agent in conflict["agents"])
+        self.assertEqual(len(lanes), 3)
+        for left, right in zip(lanes, lanes[1:]):
+            self.assertAlmostEqual(right - left, 1.2, places=9)
+
+    def test_formation_scenario_matches_sph_goal_style(self):
+        """Preserve the SPH formation geometry and translated goals.
+
+        SPH-planning computes ``goal_i = init_i + clicked_goal + init_bias``,
+        so the goal formation is the start formation shifted by one common
+        vector: every UAV keeps its 1 m relative offset.  The launch-level
+        ``init_x/init_y/init_z`` translation is checked below separately.
+        """
+        formation = validate_scenario(FORMATION_SCENARIO_PATH)
+        self.assertEqual(formation["name"], "sim_b_formation_3")
+        starts = [(agent["initial"]["x"], agent["initial"]["y"])
+                  for agent in formation["agents"]]
+        goals = [(agent["goal_message"]["x"], agent["goal_message"]["y"])
+                 for agent in formation["agents"]]
+        self.assertEqual(len(starts), 3)
+        self.assertTrue(all(abs(y - 9.0) < 1e-9 for _, y in starts))
+        self.assertTrue(all(abs(x) <= 1.0 + 1e-9 for x, _ in starts))
+        for left, right in zip(sorted(starts), sorted(starts)[1:]):
+            self.assertAlmostEqual(right[0] - left[0], 1.0, places=9)
+
+        # One common translation vector for the whole formation.
+        translations = {(round(gx - sx, 9), round(gy - sy, 9))
+                        for (sx, sy), (gx, gy) in zip(starts, goals)}
+        self.assertEqual(len(translations), 1)
+        self.assertLess(translations.pop()[1], 0.0)  # the group moves south
+
+        effective = translate_initial_states(formation, 0.0, 20.0, 1.0)
+        effective_starts = [
+            (agent["initial"]["x"], agent["initial"]["y"],
+             agent["initial"]["z"])
+            for agent in effective["agents"]]
+        self.assertEqual(effective_starts,
+                         [(-1.0, 20.0, 1.0),
+                          (0.0, 20.0, 1.0),
+                          (1.0, 20.0, 1.0)])
+        self.assertEqual(
+            [agent["goal_message"] for agent in effective["agents"]],
+            [agent["goal_message"] for agent in formation["agents"]])
+
+    def test_launch_initial_pose_translation_does_not_change_map(self):
+        scenario = canonical_scenario(3)
+        original_offsets = [
+            (agent["initial"]["x"] - scenario["agents"][1]["initial"]["x"],
+             agent["initial"]["y"] - scenario["agents"][1]["initial"]["y"])
+            for agent in scenario["agents"]]
+        translated = translate_initial_states(scenario, 4.0, 20.0, 1.5)
+        translated_offsets = [
+            (agent["initial"]["x"] - translated["agents"][1]["initial"]["x"],
+             agent["initial"]["y"] - translated["agents"][1]["initial"]["y"])
+            for agent in translated["agents"]]
+        self.assertEqual(translated_offsets, original_offsets)
+        self.assertAlmostEqual(
+            sum(agent["initial"]["x"] for agent in translated["agents"]) / 3.0,
+            4.0)
+        self.assertAlmostEqual(
+            sum(agent["initial"]["y"] for agent in translated["agents"]) / 3.0,
+            20.0)
+        self.assertAlmostEqual(
+            sum(agent["initial"]["z"] for agent in translated["agents"]) / 3.0,
+            1.5)
+        child = build_child_launch(
+            translated, "/tmp/translated_initial_states.yaml",
+            map_size_x=20.0, map_size_y=30.0, map_size_z=2.5)
+        self.assertIn('<arg name="map_size_x" value="20.0"/>', child)
+        self.assertIn('<arg name="map_size_y" value="30.0"/>', child)
+        self.assertIn('<arg name="map_size_z" value="2.5"/>', child)
 
     def test_invalid_schema_rejected(self):
         with tempfile.TemporaryDirectory(prefix="sim_b_schema_") as directory:

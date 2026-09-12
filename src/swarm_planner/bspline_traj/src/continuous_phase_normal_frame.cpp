@@ -69,6 +69,18 @@ bool ContinuousPhaseNormalFrame::representedNormalAt(
       !finite(state.dp_dw) || !finite(state.d2p_dw2)) {
     return false;
   }
+  return computeGeometry(state, tangent, tangent_w, normal, normal_w);
+}
+
+bool ContinuousPhaseNormalFrame::computeGeometry(
+    const ContinuousPhasePathState& state,
+    Eigen::Vector3d& tangent,
+    Eigen::Vector3d& tangent_w,
+    Eigen::Vector3d& normal,
+    Eigen::Vector3d& normal_w) {
+  if (!state.valid || !finite(state.dp_dw) || !finite(state.d2p_dw2)) {
+    return false;
+  }
   const double speed = state.dp_dw.norm();
   if (!finite(speed) || speed <= kFrameTangentEpsilon) return false;
   tangent = state.dp_dw / speed;

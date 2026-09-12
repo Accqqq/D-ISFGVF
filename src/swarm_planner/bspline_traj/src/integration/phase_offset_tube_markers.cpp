@@ -419,4 +419,134 @@ visualization_msgs::MarkerArray MakeCandidateTubeMarkersV2(
   return MakeTubeMarkersV2(stamp, frame_id, profile, frame_owner, true);
 }
 
+namespace {
+
+// The Section display owns exactly two persistent marker slots.  Keeping the
+// ids fixed means a failed build can always retire the previously published
+// geometry with a DELETE on the same namespaces.
+const char kSectionTubeLeftNs[] = "phase_offset_section_tube_left";
+const char kSectionTubeRightNs[] = "phase_offset_section_tube_right";
+const char kSectionTubeFillNs[] = "phase_offset_section_tube_fill";
+const int kSectionTubeMarkerId = 0;
+
+visualization_msgs::MarkerArray MakeSectionTubeDeleteAll(
+    const ros::Time& stamp, const std::string& frame_id) {
+  visualization_msgs::MarkerArray markers;
+  markers.markers.push_back(
+      MakeDelete(stamp, frame_id, kSectionTubeLeftNs, kSectionTubeMarkerId));
+  markers.markers.push_back(
+      MakeDelete(stamp, frame_id, kSectionTubeRightNs, kSectionTubeMarkerId));
+  markers.markers.push_back(
+      MakeDelete(stamp, frame_id, kSectionTubeFillNs, kSectionTubeMarkerId));
+  return markers;
+}
+
+}  // namespace
+
+visualization_msgs::MarkerArray MakeSectionTubeMarkers(
+    const ros::Time& stamp,
+    const std::string& frame_id,
+    const std::shared_ptr<const ContinuousPhasePath>& path,
+    const std::shared_ptr<const phase_offset_navigation::SectionTubeProfile>&
+        profile) {
+  if (!path || path->empty() || path->pathRevision() == 0U ||
+      !std::isfinite(path->startW()) || !std::isfinite(path->endW()) ||
+      !(path->endW() > path->startW())) {
+    return MakeSectionTubeDeleteAll(stamp, frame_id);
+  }
+  if (!profile || !profile->usable ||
+      !std::isfinite(profile->valid_start) ||
+      !std::isfinite(profile->valid_end) ||
+      !(profile->valid_end > profile->valid_start) ||
+      profile->knots.size() < 2U) {
+    return MakeSectionTubeDeleteAll(stamp, frame_id);
+  }
+
+  // The profile stores signed offsets along the path's horizontal normal, so
+  // the display has to evaluate the same frame arithmetic the builder used.
+  // The revisions are taken from the immutable path that owns this profile.
+  const ContinuousPhaseNormalFrame frame(
+      path, path->pathRevision(), path->pathRevision());
+  visualization_msgs::Marker left = MakeTubeLine(
+      stamp, frame_id, kSectionTubeLeftNs, kSectionTubeMarkerId, 0.05F, 0.0F,
+      1.0F, 0.0F);
+  visualization_msgs::Marker right = MakeTubeLine(
+      stamp, frame_id, kSectionTubeRightNs, kSectionTubeMarkerId, 0.05F, 0.0F,
+      0.6F, 1.0F);
+  // Filled band between the two boundaries.  TRIANGLE_LIST is rendered in the
+  // marker's local frame and the marker scale multiplies every vertex, so the
+  // scale must stay at one on all three axes or the band collapses.
+  visualization_msgs::Marker fill;
+  fill.header.stamp = stamp;
+  fill.header.frame_id = frame_id;
+  fill.ns = kSectionTubeFillNs;
+  fill.id = kSectionTubeMarkerId;
+  fill.type = visualization_msgs::Marker::TRIANGLE_LIST;
+  fill.action = visualization_msgs::Marker::ADD;
+  fill.pose.orientation.w = 1.0;
+  fill.scale.x = fill.scale.y = fill.scale.z = 1.0F;
+  fill.color.r = 0.62F;
+  fill.color.g = 0.62F;
+  fill.color.b = 0.62F;
+  fill.color.a = 0.35F;
+
+  std::vector<Eigen::Vector3d> lower_points;
+  std::vector<Eigen::Vector3d> upper_points;
+  lower_points.reserve(profile->knots.size());
+  upper_points.reserve(profile->knots.size());
+  for (const phase_offset_navigation::SectionTubeKnot& knot : profile->knots) {
+    if (!std::isfinite(knot.w) || !std::isfinite(knot.lower) ||
+        !std::isfinite(knot.upper) || knot.lower > knot.upper ||
+        knot.w < profile->valid_start || knot.w > profile->valid_end) {
+      return MakeSectionTubeDeleteAll(stamp, frame_id);
+    }
+    ContinuousPhasePathState state;
+    if (!frame.evaluatePathState(knot.w, state) || !state.valid ||
+        !state.frame_valid || !state.p.allFinite() || !state.N.allFinite()) {
+      return MakeSectionTubeDeleteAll(stamp, frame_id);
+    }
+    const Eigen::Vector3d lower_point = state.p + state.N * knot.lower;
+    const Eigen::Vector3d upper_point = state.p + state.N * knot.upper;
+    if (!lower_point.allFinite() || !upper_point.allFinite()) {
+      return MakeSectionTubeDeleteAll(stamp, frame_id);
+    }
+    lower_points.push_back(lower_point);
+    upper_points.push_back(upper_point);
+    left.points.push_back(ToPoint(lower_point));
+    right.points.push_back(ToPoint(upper_point));
+  }
+  if (left.points.size() < 2U || left.points.size() != right.points.size()) {
+    return MakeSectionTubeDeleteAll(stamp, frame_id);
+  }
+
+  // A PARTIAL profile is a truthful prefix rather than a full-horizon tube.
+  // Dimming it keeps the geometry visible without implying full coverage.
+  if (!profile->complete) {
+    left.color.a = 0.45F;
+    right.color.a = 0.45F;
+    fill.color.a = 0.20F;
+  }
+  for (std::size_t index = 0U; index + 1U < lower_points.size(); ++index) {
+    const Eigen::Vector3d& lower_i = lower_points[index];
+    const Eigen::Vector3d& upper_i = upper_points[index];
+    const Eigen::Vector3d& lower_next = lower_points[index + 1U];
+    const Eigen::Vector3d& upper_next = upper_points[index + 1U];
+    fill.points.push_back(ToPoint(lower_i));
+    fill.points.push_back(ToPoint(upper_i));
+    fill.points.push_back(ToPoint(upper_next));
+    fill.points.push_back(ToPoint(lower_i));
+    fill.points.push_back(ToPoint(upper_next));
+    fill.points.push_back(ToPoint(lower_next));
+  }
+  if (fill.points.size() != 6U * (lower_points.size() - 1U)) {
+    return MakeSectionTubeDeleteAll(stamp, frame_id);
+  }
+
+  visualization_msgs::MarkerArray markers;
+  markers.markers.push_back(left);
+  markers.markers.push_back(right);
+  markers.markers.push_back(fill);
+  return markers;
+}
+
 }  // namespace FLAG_Race

@@ -72,6 +72,53 @@ NormalPreviewResult MakePreview(const TubeProfile& profile,
   return result;
 }
 
+SectionTubeProfile MakeSectionProfile() {
+  SectionTubeProfile profile;
+  profile.valid_start = 0.0;
+  profile.valid_end = 2.0;
+  profile.status = SectionTubeStatus::COMPLETE;
+  profile.usable = true;
+  profile.complete = true;
+  const double knots[] = {0.0, 1.0, 2.0};
+  const double lowers[] = {-1.0, -0.8, -0.7};
+  const double uppers[] = {1.0, 0.8, 0.7};
+  for (std::size_t i = 0U; i < 3U; ++i) {
+    SectionTubeKnot knot;
+    knot.w = knots[i];
+    knot.lower = lowers[i];
+    knot.upper = uppers[i];
+    profile.knots.push_back(knot);
+  }
+  return profile;
+}
+
+NormalPreviewResult MakeSectionPreview(const SectionTubeProfile& profile,
+                                       const double delta = 0.0) {
+  NormalPreviewInput input;
+  input.current_w = 0.0;
+  input.current_delta = delta;
+  input.upper_u_delta = 1.0;
+  input.policy.preview_horizon_w = 2.0;
+  input.policy.sample_spacing_w = 1.0;
+  input.policy.lower_nu = 0.5;
+  input.policy.upper_nu = 2.0;
+  input.policy.b_tight = 0.1;
+  input.policy.b_open = 0.9;
+  input.path_revision = 71U;
+  input.frame_revision = 72U;
+  input.expected_path_revision = 71U;
+  input.expected_frame_revision = 72U;
+  input.max_work = 100000U;
+  NormalPreviewResult result;
+  EXPECT_TRUE(NormalPreview::evaluate(profile, input, result))
+      << result.reason;
+  EXPECT_EQ(result.status, TubeViabilityStatus::FEASIBLE);
+  EXPECT_TRUE(result.valid);
+  EXPECT_TRUE(result.feasible);
+  EXPECT_EQ(result.section_profile, &profile);
+  return result;
+}
+
 phase_offset_core::PhaseOffsetGeometryState MakeGeometry(
     const std::uint64_t path_revision = 11U,
     const std::uint64_t frame_revision = 12U) {
@@ -151,6 +198,193 @@ TEST(PhaseOffsetAllocatorTest, FullyBoundMatchingProvenanceAllowsSelection) {
             preview.provenance.map_revision);
   EXPECT_EQ(output.preview_provenance.obstacle_contract_id,
             preview.provenance.obstacle_contract_id);
+}
+
+TEST(PhaseOffsetAllocatorSectionTest,
+     SectionPreviewUsesPointerAndGeometryStateOnly) {
+  const SectionTubeProfile profile = MakeSectionProfile();
+  const NormalPreviewResult preview = MakeSectionPreview(profile);
+  PhaseOffsetAllocatorInput input;
+  input.geometry = MakeGeometry(preview.provenance.path_revision,
+                                preview.provenance.frame_revision);
+  input.geometry.w = preview.current_w;
+  input.geometry.delta = preview.evaluated_delta;
+  input.preview = &preview;
+  input.expected_section_profile = &profile;
+  input.expected_path_revision = preview.provenance.path_revision;
+  input.expected_frame_revision = preview.provenance.frame_revision;
+  input.f_w0 = 1.0;
+  input.dt = 0.1;
+  input.bounds = BaseBounds();
+  input.g_des = Eigen::Vector3d(0.4, 0.2, 0.0);
+  // Legacy identity expectations intentionally remain empty for SECTION.
+  PhaseOffsetAllocatorResult output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(input, output)) << output.reason;
+  EXPECT_EQ(output.status, PhaseOffsetAllocatorStatus::SELECTED);
+  EXPECT_TRUE(output.selectedUConsistent(0.0));
+  EXPECT_EQ(output.preview_provenance.profile_revision, 0U);
+  EXPECT_EQ(output.preview_provenance.map_revision, 0U);
+}
+
+TEST(PhaseOffsetAllocatorSectionTest, SectionAssociationMismatchesFailClosed) {
+  const SectionTubeProfile profile = MakeSectionProfile();
+  const SectionTubeProfile other = MakeSectionProfile();
+  const NormalPreviewResult preview = MakeSectionPreview(profile);
+  PhaseOffsetAllocatorInput input;
+  input.geometry = MakeGeometry(preview.provenance.path_revision,
+                                preview.provenance.frame_revision);
+  input.geometry.w = preview.current_w;
+  input.geometry.delta = preview.evaluated_delta;
+  input.preview = &preview;
+  input.expected_section_profile = &other;
+  input.expected_path_revision = preview.provenance.path_revision;
+  input.expected_frame_revision = preview.provenance.frame_revision;
+  input.f_w0 = 1.0;
+  input.dt = 0.1;
+  input.bounds = BaseBounds();
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::STALE_PREVIEW);
+
+  input.expected_section_profile = &profile;
+  input.geometry.delta = 0.1;
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::STALE_PREVIEW);
+
+  input.geometry.delta = preview.evaluated_delta;
+  ++input.geometry.path_revision;
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::STALE_PREVIEW);
+
+  NormalPreviewResult wrong_kind = preview;
+  wrong_kind.proof_kind = TubeViabilityProofKind::V2_LIVE_PWL;
+  input.geometry.path_revision = preview.provenance.path_revision;
+  input.preview = &wrong_kind;
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::INVALID_INPUT);
+}
+
+TEST(PhaseOffsetAllocatorSectionTest,
+     SectionGeometryAndFrameMismatchesAreRejected) {
+  const SectionTubeProfile profile = MakeSectionProfile();
+  const NormalPreviewResult preview = MakeSectionPreview(profile);
+  PhaseOffsetAllocatorInput input;
+  input.geometry = MakeGeometry(preview.provenance.path_revision,
+                                preview.provenance.frame_revision);
+  input.geometry.w = preview.current_w;
+  input.geometry.delta = preview.evaluated_delta;
+  input.preview = &preview;
+  input.expected_section_profile = &profile;
+  input.expected_path_revision = preview.provenance.path_revision;
+  input.expected_frame_revision = preview.provenance.frame_revision;
+  input.f_w0 = 1.0;
+  input.dt = 0.1;
+  input.bounds = BaseBounds();
+
+  input.geometry.w = std::nextafter(preview.current_w, 1.0);
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::STALE_PREVIEW);
+  input.geometry.w = preview.current_w;
+  ++input.expected_frame_revision;
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::STALE_PREVIEW);
+}
+
+TEST(PhaseOffsetAllocatorSectionTest,
+     EmptySectionDiagnosticSourceDoesNotGateValidAssociation) {
+  const SectionTubeProfile profile = MakeSectionProfile();
+  NormalPreviewResult preview = MakeSectionPreview(profile);
+  preview.provenance.source.clear();
+  PhaseOffsetAllocatorInput input;
+  input.geometry = MakeGeometry(preview.provenance.path_revision,
+                                preview.provenance.frame_revision);
+  input.geometry.w = preview.current_w;
+  input.geometry.delta = preview.evaluated_delta;
+  input.preview = &preview;
+  input.expected_section_profile = &profile;
+  input.expected_path_revision = preview.provenance.path_revision;
+  input.expected_frame_revision = preview.provenance.frame_revision;
+  input.f_w0 = 1.0;
+  input.dt = 0.1;
+  input.bounds = BaseBounds();
+  PhaseOffsetAllocatorResult output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(input, output)) << output.reason;
+  EXPECT_EQ(output.status, PhaseOffsetAllocatorStatus::SELECTED);
+}
+
+TEST(PhaseOffsetAllocatorSectionTest,
+     FailedSectionPreviewIsClassifiedInfeasibleWithNonzeroDelta) {
+  SectionTubeProfile partial;
+  partial.valid_start = 0.0;
+  partial.valid_end = 1.0;
+  partial.status = SectionTubeStatus::PARTIAL;
+  partial.usable = true;
+  partial.complete = false;
+  partial.knots.push_back(SectionTubeKnot{0.0, -1.0, 1.0});
+  partial.knots.push_back(SectionTubeKnot{1.0, -1.0, 1.0});
+  NormalPreviewInput preview_input;
+  preview_input.current_w = 0.0;
+  preview_input.current_delta = 0.3;
+  preview_input.upper_u_delta = 1.0;
+  preview_input.policy.preview_horizon_w = 2.0;
+  preview_input.policy.sample_spacing_w = 1.0;
+  preview_input.policy.lower_nu = 0.5;
+  preview_input.policy.upper_nu = 2.0;
+  preview_input.policy.b_tight = 0.1;
+  preview_input.policy.b_open = 0.9;
+  preview_input.path_revision = 71U;
+  preview_input.frame_revision = 72U;
+  preview_input.expected_path_revision = 71U;
+  preview_input.expected_frame_revision = 72U;
+  preview_input.max_work = 100000U;
+  NormalPreviewResult preview;
+  ASSERT_TRUE(NormalPreview::evaluate(partial, preview_input, preview));
+  ASSERT_EQ(preview.status, TubeViabilityStatus::PREVIEW_INFEASIBLE);
+  EXPECT_EQ(preview.section_profile, nullptr);
+
+  PhaseOffsetAllocatorInput input;
+  input.geometry = MakeGeometry(71U, 72U);
+  input.geometry.w = 0.0;
+  input.geometry.delta = 0.3;
+  input.preview = &preview;
+  input.expected_section_profile = &partial;
+  input.expected_path_revision = 71U;
+  input.expected_frame_revision = 72U;
+  input.f_w0 = 1.0;
+  input.dt = 0.1;
+  input.bounds = BaseBounds();
+  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::PREVIEW_INFEASIBLE);
+}
+
+TEST(PhaseOffsetAllocatorSectionTest,
+     LegacyAndSectionSelectionMatchForSameGeometryAndLimits) {
+  const TubeProfile legacy_profile = MakeProfile({{-1.0, 1.0}, {-1.0, 1.0}});
+  const NormalPreviewResult legacy_preview = MakePreview(legacy_profile);
+  const SectionTubeProfile section_profile = MakeSectionProfile();
+  const NormalPreviewResult section_preview = MakeSectionPreview(section_profile);
+  PhaseOffsetAllocatorInput legacy_input = BaseInput(legacy_preview);
+  legacy_input.g_des = Eigen::Vector3d(0.6, -0.3, 0.0);
+  legacy_input.previous_u.u_w = 0.1;
+  legacy_input.previous_u.u_delta = -0.1;
+  legacy_input.bounds.u_w_abs_max = 0.4;
+  legacy_input.bounds.upper_u_delta = 0.5;
+  legacy_input.dt = 0.2;
+  PhaseOffsetAllocatorInput section_input;
+  section_input.geometry = MakeGeometry(section_preview.provenance.path_revision,
+                                         section_preview.provenance.frame_revision);
+  section_input.geometry.w = section_preview.current_w;
+  section_input.geometry.delta = section_preview.evaluated_delta;
+  section_input.preview = &section_preview;
+  section_input.expected_section_profile = &section_profile;
+  section_input.expected_path_revision = section_preview.provenance.path_revision;
+  section_input.expected_frame_revision = section_preview.provenance.frame_revision;
+  section_input.f_w0 = legacy_input.f_w0;
+  section_input.g_des = legacy_input.g_des;
+  section_input.previous_u = legacy_input.previous_u;
+  section_input.dt = legacy_input.dt;
+  section_input.bounds = legacy_input.bounds;
+  PhaseOffsetAllocatorResult legacy_output;
+  PhaseOffsetAllocatorResult section_output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(legacy_input, legacy_output))
+      << legacy_output.reason;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(section_input, section_output))
+      << section_output.reason;
+  EXPECT_DOUBLE_EQ(section_output.selected_u.u_w, legacy_output.selected_u.u_w);
+  EXPECT_DOUBLE_EQ(section_output.selected_u.u_delta,
+                   legacy_output.selected_u.u_delta);
 }
 
 TEST(PhaseOffsetAllocatorTest, MissingExpectedSourceFailsClosed) {
@@ -370,6 +604,33 @@ TEST(PhaseOffsetAllocatorTest,
 }
 
 TEST(PhaseOffsetAllocatorTest,
+     PhaseSlewRampTowardsAnUnreachableWindowStillSelects) {
+  const TubeProfile profile = MakeProfile({{-1.0, 1.0}, {-1.0, 1.0}});
+  const NormalPreviewResult preview = MakePreview(profile);
+  PhaseOffsetAllocatorInput input = BaseInput(preview);
+  // Base rate above the window, and the requested correction is further away
+  // than one tick of slew authority.  The tick must still produce the
+  // closest slew-reachable rate and ramp over the following ticks; failing
+  // here would freeze the phase permanently because a dropped tick never
+  // commits (`phase scalar slew interval is empty`).
+  input.f_w0 = 2.5;
+  input.bounds.lower_nu = 0.5;
+  input.bounds.upper_nu = 2.0;
+  input.bounds.u_w_abs_max = 0.2;
+  input.bounds.u_w_slew_rate = 0.2;
+  input.previous_u.u_w = 0.0;
+  input.g_des = Eigen::Vector3d::Zero();
+
+  PhaseOffsetAllocatorResult output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(input, output)) << output.reason;
+  EXPECT_NEAR(output.selected_u.u_w, -0.02, 1e-12);
+  EXPECT_TRUE(output.phase_window_clipped);
+  EXPECT_NEAR(output.phase_rate_selected,
+              input.f_w0 + output.selected_u.u_w, 1e-12);
+  EXPECT_GT(output.phase_rate_selected, input.bounds.upper_nu);
+}
+
+TEST(PhaseOffsetAllocatorTest,
      ExactTouchingClosedPhaseIntervalsRemainFeasible) {
   const TubeProfile profile = MakeProfile({{-1.0, 1.0}, {-1.0, 1.0}});
   const NormalPreviewResult preview = MakePreview(profile);
@@ -499,7 +760,11 @@ TEST(PhaseOffsetAllocatorTest, LowerAndUpperMovingBoundaryRatesAreConsumed) {
 }
 
 TEST(PhaseOffsetAllocatorTest,
-     TransverseAmplitudeSubEpsilonDisjointFailsClosed) {
+     TransverseAmplitudeSubEpsilonDisjointClipsToBoundary) {
+  // M4C: a transverse window that excludes every admissible rate no longer
+  // invalidates the whole command.  Losing transverse capacity must not by
+  // itself drop a planner-valid path, so the command takes the boundary of the
+  // window that the amplitude can actually reach.
   const TubeProfile profile = MakeProfile({{-1.0, 1.0}, {-1.0, 1.0}});
   NormalPreviewResult preview = MakePreview(profile);
   preview.current_rate_interval.lower = 0.2500000000005;
@@ -510,7 +775,62 @@ TEST(PhaseOffsetAllocatorTest,
   input.bounds.upper_u_delta = 0.25;
   input.g_des = Eigen::Vector3d::Zero();
 
-  ExpectFailClosed(input, PhaseOffsetAllocatorStatus::NO_ADMISSIBLE_COMMAND);
+  PhaseOffsetAllocatorResult output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(input, output));
+  EXPECT_TRUE(output.valid);
+  EXPECT_TRUE(output.transverse_interval_clipped);
+  EXPECT_FALSE(output.phase_window_clipped);
+  EXPECT_DOUBLE_EQ(output.selected_u.u_delta, 0.25);
+  EXPECT_DOUBLE_EQ(output.u_delta.selected, 0.25);
+}
+
+TEST(PhaseOffsetAllocatorTest,
+     PhaseWindowClipsOntoAuthorityBoundaryInsteadOfFailing) {
+  // M4C: when the base phase rate sits outside the allowed window and the
+  // correction authority cannot reach the window, take the authority boundary
+  // that reduces the violation the most (here: slow down as much as allowed).
+  const TubeProfile profile = MakeProfile({{-1.0, 1.0}, {-1.0, 1.0}});
+  const NormalPreviewResult preview = MakePreview(profile);
+  PhaseOffsetAllocatorInput input = BaseInput(preview);
+  input.bounds.u_w_abs_max = 0.12;
+  input.f_w0 = 3.0;  // window is [0.5, 2.0]; f_w0 is far above it
+  input.g_des = Eigen::Vector3d::Zero();
+
+  PhaseOffsetAllocatorResult output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(input, output));
+  EXPECT_TRUE(output.valid);
+  EXPECT_TRUE(output.phase_window_clipped);
+  EXPECT_DOUBLE_EQ(output.selected_u.u_w, -0.12);
+  EXPECT_DOUBLE_EQ(output.u_w.selected, -0.12);
+  EXPECT_DOUBLE_EQ(output.phase_rate_selected, input.f_w0 - 0.12);
+}
+
+TEST(PhaseOffsetAllocatorTest,
+     RateDegradedPreviewStillAllocatesAClippedCommand) {
+  // M4C: a RATE_INFEASIBLE preview whose current state is still inside the
+  // corridor stays usable; the allocator clips instead of returning
+  // PREVIEW_INFEASIBLE.
+  const TubeProfile profile = MakeProfile({{-1.0, 1.0}, {-1.0, 1.0}});
+  NormalPreviewResult preview = MakePreview(profile);
+  preview.status = TubeViabilityStatus::RATE_INFEASIBLE;
+  preview.rate_feasible = false;
+  // The corridor window is unusable for allocation, but the current state is
+  // still inside the corridor, so the tick must not be dropped.
+  preview.current_rate_interval.lower = 0.0;
+  preview.current_rate_interval.upper = 0.0;
+  preview.current_rate_interval.valid = false;
+
+  PhaseOffsetAllocatorInput input = BaseInput(preview);
+  input.bounds.u_w_abs_max = 0.12;
+  input.f_w0 = 3.0;
+  input.g_des = Eigen::Vector3d(0.0, 0.2, 0.0);
+
+  PhaseOffsetAllocatorResult output;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(input, output));
+  EXPECT_TRUE(output.valid);
+  EXPECT_TRUE(output.phase_window_clipped);
+  EXPECT_DOUBLE_EQ(output.selected_u.u_w, -0.12);
+  EXPECT_DOUBLE_EQ(output.selected_u.u_delta, 0.0);
 }
 
 TEST(PhaseOffsetAllocatorTest,

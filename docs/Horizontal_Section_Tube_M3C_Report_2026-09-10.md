@@ -1,0 +1,163 @@
+# M3C 配套运行切换监督记录
+
+## 最新断点续验（2026-09-10）
+
+主会话重启既有唯一编码代理Luna失败，返回429 Too Many Requests/exceeded retry limit；没有换编码模型或自行接管编码。当前需要修复的隔离governor测试fixture正常命令模式初始化尚未完成，不能宣布M3C验收结束。
+
+主会话独立重编local_obstacle_capture_test成功，离线14/14通过（supervisor/d_map_offline14.xml），包含新增真实manualBoundaryCallback两点更新、旧capture失效及刷新后域限制。随后确认任务自有master 127.0.0.1:11479的PID仍为4171285，仅在该master运行真实MessageEvent来源/default/contract变化测试，1/1通过（supervisor/d_map_source_event.xml/log）。未启动飞机仿真，未连接用户默认master。
+
+此前隔离governor用例d_ros_governor.log失败，未观察到预期命令历史更新；测试fixture未初始化use_test_cmd_等正常cmd入口模式字段是已发现待查因素，未擅自将其判定为已修复。需要Luna恢复或用户授权其他编码执行者后继续返修、重测其余真实ROS命令用例及N=1验证。地图测试通过不等于整条控制链或论文效果验收通过。
+
+日期2026-09-10。状态：R2已冻结并派发Luna实施，实际改动/验收进行中，尚未完成。
+
+## 授权和保护
+
+主会话负责规格、调度、独立验收；Luna唯一编码；Astra medium仅只读审核。执行者先前追加的8.3–8.5建议已经由主会话完整审核修订，不能算执行者自行授权。最终规范以M3C R2为准。
+
+工作区HEAD20d44c94d4165e35621cc30269e3fa0b2a5f10ff；进入时src摘要f800b25e992fead531de22dc707d10bf2cd482c575b999037876e41e4f2643d0。现有未提交修改与未跟踪源码全部保留。
+
+源码/文档归档`.horizontal_section_refactor/m3c_20260910_01/supervisor/source_before.tgz`，SHA256为3c844dd4853d37c8ca0963c867019415ceeca69b0c9478552cdc71da6232e5c2；另有supervisor/entry.json、src_before.sha256。未建分支、stage/commit或操作用户ROS进程。
+
+## 冻结设计要点
+
+本批要真正连接原地图局部capture、同步FSM section build、Section Preview/Allocator/Runtime、原governor和发布后提交；旧worker/安装/map-ID生产调用退出。必须A–D配套全部编译/测试完成才视作可运行，不交付中间缺接口版本。
+
+baseline地图核心成对恢复并补完整map读写同步；原local_sensing静态完整云/源中心range为known域依据，不新增全局地图旁路或从空值推free。真实manual/来源变化以environment锁+有效标记与发布序列化，不逐帧比较map编号。
+
+非零offset保留旧reference，原回中意图+重规划；候选不可行不是整个物理约束无解，不声称必能回零。如果隔离测试有限窗口不能恢复到达，则场景验收失败并报告，不将无限HOLD当成功。
+
+旧共享navigation数学兼容定义可最终清理阶段剥离，但运行端不得创建/调用旧worker/reserve/map capture/authority。不会为删除旧类型字符串重写已验收数学。
+
+## 审核结果
+
+Astra确认8.1–8.6无新增架构硬blocking，要求map真实变更与known/validity指针替换原子完成；来源变化不能在已持map锁时反取environment锁；发布必须从外层先取environment，再manager/adapter锁；复制重建地图不能绕过旧capture失效。全部已写入R2。
+
+## 验收状态
+
+独立八包catkin配置完成，数学/Section基础构建完成。尚未测试实际M3C功能，尚未跑ROS；旧运行链当前仍在，不能说已恢复地图或已退出worker。
+
+上述为进入A时状态，后续进展见末尾各节点；截至C地图测试节点，baseline地图核心已恢复并加入局部读取/同步，但生产消费者清理和完整构建尚未完成，未启动ROS。
+
+## A子批监督与执行偏差
+
+LocalObstacleCapture/EnvironmentValidityState、SDFMap::readLocalObstacleView(request)、SectionPathBundle已落盘。主会话要求read缺state/mutex明确失败，不在const读接口临时制造有效状态；copy缺锁不无锁读bool，复制仅稳定源/无存续目标capture前置。Astra只读确认当前读取无新ID/锁反转；A当前仍借旧support bbox，最终C必须换为简化known域。
+
+主会话在本批supervisor/build独立构建plan_env/phase_offset_section_input通过，基础Geometry28/Matched6/SectionBuilder32/Allocator44共110项基线通过。
+
+执行偏差：Luna在A编译误用了原 `/home/cxq/ISF-GVF/New_ISFGVF/gvf_ws/build`，执行plan_env和phase_offset_section_input目标，更新了原devel/lib相关产物。已向用户明确报告，要求立即停止使用原build、不删除或回滚用户产物；后续仅executor独立build。没有启动ROS，不声称原build/devel完全未触及。503恢复后继续同一已授权源码任务，未换编码模型。
+
+第二次偏差：Luna后续误用catkin_make参数触发原build的force-cmake重新配置，make因参数失败，未编译目标。主会话已向用户说明并禁止执行者再运行任何catkin/cmake/make/ROS；后续唯一编码者仍是Luna，但所有构建由主会话在隔离supervisor目录完成。原build配置与产物不删除、不擅自回滚。
+
+## B子批首轮返修
+
+- 原constructor误沿用Runtime旧manual configuration门槛，已要求sectionConfigurationValid与实际numeric policy，不保留旧certificate条件。
+- staged规划candidate与pending单拍prepared混用，要求分离，stage不覆盖待发布命令。
+- capture当前bundle曾返回pending优先，已要求只返回已提交current。
+- publish锁顺序必须environment最外层；不能task/runtime内首次取environment。manager正在接外层锁，旧对象生命周期须撑过全部发布锁再回收。
+- 新规划candidate到来不使仍安全current单拍失效，删除staged!=pending/input拒绝；观察模式不得留下可commit pending；去掉诊断owner字符串gate和预算0暗改1。
+- 首轮ROI按每cell速度界累计膨胀整个历史bbox，主会话要求改为逐cell两端与逐坐标二阶界h²/8包围再取并集，不累加所有跨度/伪造z余量。数学生成下沉既有section bridge，不在manager堆推导；计数转换与总预算先检查。
+- 同步构建范围不能仅恰等于preview horizon，否则控制前进后候选即过短；需按总计划刷新/构建延迟的真实覆盖条件选择，记录实际范围。
+
+## 已验收的ROI小节点（M3C整体仍未完成）
+
+主会话将执行任务收窄，先完成makeSectionReferenceRegion纠错再继续B。短正区间使用至少一个cell；总预算/浮点到size_t转换先检查；逐cell首尾精确共享且末端直接取segment边界；逐坐标acc*h²/8用已有向上包围helper；acc=0方向不虚增厚度；各cell包围取并集而非累计扩张；halfwidth=0不人为nextafter扩大。
+
+独立编译phase_offset_section_input_test通过，32/32测试通过，其中6项新ROI回归：短结构段、总cell预算、细分不累计膨胀、水平弯曲z精确平面、升降路径含法向offset独立密采样、结构seam端点。结果supervisor/section_input_roi.xml，构建日志supervisor/roi_build.log。ROI源码hash f6ef6849b214e15e28ca963954f67556bfd912351bfe7ad0e05f6c861468bcdb，测试hash addd0986b3a9f1e0a1387010dff6fcba95dccf0f8fc9cb8ad5fa91402c5b024d。
+
+后续B待修：实际非零Section handoff DTO/源prefix最新状态/发布后bundle与mirror切换，原requestRecenter与FSM仍有V2分支；不能仅在旧planner先install后补stage。C baseline地图恢复与旧API/target退役未开始。不得用本ROI节点通过宣称M3C完整交付。
+
+## B关键小节点独立验证
+
+之后Luna补齐SectionPathHandoff/stage/consume/候选源prefix选择和发布事务接线。主会话修正反锁序、candidate提前暴露、未commit当前读、stage覆盖pending、observer留下pending、错误诊断门控、worst-case nextW过早拒绝、完整DTO每拍扫描、已commit镜像被env再次拒绝等问题；最终检查实际selected nextW，不增加地图ID或reserve。
+
+独立formation_planning可执行链接通过（补bspline_gvf→phase_offset_section_input）。Section adapter四项用例通过，覆盖失败publish不写、成功一次commit、新staged不替换旧pending、source/prefix拒绝、observe/closed gate无pending。
+
+GvfSectionHandoff.PublishFirstCommitThenEnvironmentEditStillConsumesDeferredMirror独立通过：source rev7/candidate rev8真实不同path、source提交后delta非零、候选common prefix、失败publish不改runtime/phase/mirror、成功发布在env→frontend→handoff→phase→adapter锁序下post callback仅noFail提交，环境随后失效仍对齐已commit候选镜像。测试private访问通过既有friend，未开放生产成员；位置更新后legacy指导量同输入重算，不清latch/放宽等价容差。
+
+结果supervisor/b_phase_offset_matched_adapter_test_section.xml（4/4）和supervisor/b_manager_section.xml（1/1），不是全M3C回归。主会话据此放行同规格C子批：baseline地图核心恢复、known域/锁闭包、旧API/worker/CMake退役和地图回归。C完成及全构建/ROS验收前，仍不宣称整体完成。
+
+## C地图节点与生产清理进行中
+
+baseline sdf_map.cpp/h核心已成对恢复，加入无地图ID的map-data锁、局部完整观测known域和真实环境改变有效标记。plan_env生产目标移除旧snapshot/evidence实现。主会话独立构建plan_env通过，local_obstacle_view_test 23/23、manual_map_layer_test 5/5通过。
+
+新local_obstacle_capture_test经独立重编译与运行9/9通过，结果supervisor/c_capture9_final.xml。覆盖完整空云建立known、粗网格halo导致UNKNOWN、manual/static层、自身缓存reset清未来known、真实手动变化撤销旧capture、独立地图复制有效状态、源/接收中心偏移、缺声明和时间戳不匹配。原两项失败是测试预期错误：复制体修改后新capture应有效但域UNKNOWN；源偏移fixture的解析XY域为[2,6]而非额外缩窄。修正测试，不扩大几何余量或增加门控。
+
+Astra前轮指出的producer默认world与/sim/odom接线、普通cloud两次map锁之间来源竞争已交执行者修正；已请求再次只读核验。并发、真实source事件、普通cloud不取得environment发布锁、reset保留旧静态capture有效性仍需补充覆盖，9/9不能视为这些项目均已验收。
+
+Luna继续同规格R2清理adapter/manager的旧worker、V2 stage/install/consume生产入口与CMake链接闭包，保留Section pending发布事务和原planner/governor回归。此时仍为配套施工中间态；后续由主会话独立全构建与测试放行，执行者继续禁止build/ROS。不宣称旧链全部退出或M3C完成。
+
+### C追加数值审核发现：已知域无必要缩格（待修）
+
+主会话针对safeKnownAxis与source面双重nextafter发起具体反例核查，Astra确认精确闭边界也被强制缩入。origin0/res1/map[0,8]³，source与receiver中心4，source range3/receiver range4/inflation0时，原合同应有XY[2,6]、Z[3,5]；现实现错误返回UNKNOWN，丢掉两格可用Z域。前述9/9没有覆盖此例，不能据其宣布known域数值实现完全正确。
+
+已明确向用户报告并交Luna修正，规格第5节补充精确开闭边界数值验收，保留source=receiver range3的严格开边界负例。不变更原inflation、clearance或预算，不加门控；此项修复并独立测试通过前，地图节点仍有已知缺陷。
+
+### Section-only adapter首轮清理审核（待完整构建）
+
+Luna已落盘Section-only adapter头/实现，原worker/reserve/authority/update生产分支移除，主会话读到实现约1010行；manager与CMake闭包仍在同步施工，不能从单文件减量推出全链退役完成。
+
+主会话与Astra追加具体返修：新update失败必须撤销上一拍pending（stage仍保留pending，不动current或delta）；delta==0的真实terminal取消不能被废弃pending的env/prefix检查挡住原到达命令；executed reference query仍需传入profile实际域；无消费者的legacy policy identity哈希应退出Section生产加载。discard/reset/deactivate需要将最后profile/path所有权移至锁外回收；manager已有外层current/staged/pending持有还需核对撑过完整发布锁。以上是既定R2事务和有效域实现缺口，不增加几何余量或新的可行性门控，待代码与回归核验后更新结论。
+
+Astra地图复审另记录baseline遗留的gradualResetBuffer/bufferRefreshCallback函数static状态跨实例共享；本批不顺手重写原算法，仅声明单地图实例同步边界，复制测试不构成多实例并发安全证明。复制生命周期前置注释待补：源稳定且目标无存续capture/bundle。
+
+### C生产主程序独立链接节点通过
+
+主会话在supervisor/build独立编译formation_planning，首轮修正adapter字符串参数模板与capture成员拼写，第二轮清理manager残存旧成员与改名不一致，第三轮exit0链接通过，日志supervisor/c_section_only_retry2.log。没有通过补回旧成员、假接口或放宽参数来消除编译错误。
+
+ldd/readelf实际检查formation_planning/adapter动态闭包，不再加载旧tube_runtime_v2、tube_v2_diagnostics、cloud_occupancy_query或environment_evidence_query独立库；项目动态库来自隔离supervisor/devel。共享navigation仍可包含R2允许的离线旧数学兼容定义，这不是所有V2源码已删除的声明。
+
+主会话亦确认buildPhaseV2C2Frontend改名buildPhaseC2Frontend后，函数正文与source_before归档逐字一致；当时源码摘要比较的14个已有文件变化均在白名单内。后续最终摘要仍需重做。配置八包的ALL构建已启动检查其他库闭包（不等同运行所有gtest）；Section/map已知返修和测试迁移未完成，未启动ROS，本批仍未验收完成。
+
+### C补充独立验证与尚未闭合的数值项
+
+配置八包ALL构建exit0，日志supervisor/c_all_build.log；这是库/可执行默认目标构建，不包含全部gtest运行。主会话另重编并执行8个稳定回归目标：geometry28、matched_port6、port_projector24、section_tube32、tube_viability42、allocator44、runtime14、section_input32，共222/222通过。日志及XML位于supervisor/c_phase_offset_*，构建日志c_math_regression_build.log；这是明确子集，不声称所有旧测试均已迁移。
+
+地图第一次闭边界修复后，capture10/10通过（supervisor/c_capture_closed10.xml）。Astra进一步给出严格receiver面被重复舍入缩边的0.125网格反例：center1.5、range=nextafter(0.5,+∞)、halo0.125、其他边界宽松时，正确native域[1.125,1.875]，实现多缩至[1.25,1.75]。主会话已拒绝“仅删除第二nextafter”不完整方案，要求按原始边界加减halo与native面做开闭和舍入方向分离的小型数值处理，补反例，不扩大几何条件。此项仍待修，10/10不作为数值完全正确的结论。
+
+后续该数值节点已修：经主会话批准采用小型long double原始边界/halo运算，receiver开面不预nextafter，strict仅在native面选择和最后比较中表达；转回double后的实际输出面再次对照所算边界。Astra限定复审确认两个反例、strict与回转无新blocking；主会话独立编译并运行capture11/11通过，supervisor/c_capture_numeric11.xml，含ExtendedPrecisionKeepsSubVoxelStrictFace。此为当前平台实测，不宣称long double对任意极端binary64组合构成精确证明；不增加证明库、地图ID、几何余量或预算。
+
+主会话继续指出manager两个既定事务缺口并交返修：terminal override原先把pending identity无条件置0；governor未采用Section步/initial acquisition时不能借成功发布hold提交Runtime。Luna已提交配套修改，当前正在独立重编，仍须相应manager/adapter测试证明行为，不以代码落盘替代验收。
+
+### Section-only adapter迁移测试首组通过
+
+最新地图和事务修改的formation_planning重编exit0（c_numeric_transaction_build.log）。adapter测试源已迁至Section-only。主会话发现初稿InvalidUpdateLeavesOlderPendingCommandUntouched错误地认可新update失败后旧pending可发布，明确拒收该预期；只先运行其余6项（6/6，c_adapter_initial.xml），不将被排除项算通过。
+
+Luna随后修正update入口撤销上一命令pending、锁外保留其owner、保留current/staged，并改成InvalidUpdateRetiresOlderPendingButPreservesCurrentAndStaged。补回stage-only不替换pending与observe/zero-gate关闭不创建pending。主会话独立重编后完整9/9通过，c_adapter9.xml；另覆盖ACTIVE暖机/不等价锁存、失败publish可在下一update前重试且不改runtime、成功commit、正常replacement、零delta取消失效环境pending、非零有/无pending均不直接goal override、reset淘汰及prefix crossing拒绝。
+
+仍需manager真实配套测试与旧测试迁移映射、executed query域、source事件/并发覆盖及启动文件清理；requestShutdown与发布序列化小修待核。非零terminal在manager应保留原Section/governor结果并请求既有回中，不能仅把goal override交adapter拒绝而持续没有命令。未启动ROS，不宣称整体完成。
+
+### 重要清理偏差：统一相位REPLAN生产分支误删（正在返修）
+
+主会话在审核测试迁移时查到buildPhaseC2Frontend、stageSectionPathHandoff、installPlannerOnlyFrontend仅剩定义而无生产调用，REPLAN_TRAJ的point/closed两条统一相位分支约359行被整体删去、落回legacy分支。Luna和Astra均已确认。此前formation/ALL构建通过不能证明这段功能仍存在；已经向用户明确报告，禁止用测试局部seam选择替代缺失生产逻辑。
+
+恢复方案已由主会话按R2批准：以source_before归档保留原planner候选评分、真实B-spline弧长/全局相位映射、future seam/appendSlice/C2以及目标记录，只改Section消费者；nonzero stage→实际publish后切owner/mirror，中性安装保留原共同前缀内相位推进与无prefix精确校验。另纠正中性helper误加的prefix也精确CAS，以及非零直接install保护缺失；不增加current bundle必须空/同candidate身份的门控，零delta成功中性安装成组退役旧pending/bundle。
+
+FSM仍有仅XY到达即WAIT_TARGET/receive_goal=false的提前退出；非零必须保持原回中与控制，零delta保留原阈值。规格第3节已明确这一既定恢复边界。Luna继续唯一编码，主会话审核/独立验收，Astra只读。测试源的原30个测试清单已从快照提取，24个原数学/导航/发布基础断言保留，其余6个旧handoff相关场景迁移而非删覆盖，另须补回本批B已验的Section发布后环境变化mirror场景。
+
+query域首轮独立编译与5/5测试通过（c_query5.xml），但尚有双Inf/NaN+Inf误当默认未提供的已知缺口，已交修补，不以5/5宣布该输入合同完全正确。
+
+REPLAN生产恢复后续节点：closed/point已重新接入真实future seam、原C2、非零Section stage和中性install；generic plannerOnlyFutureSeam复用原结构breakpoint选择。Astra限定复审确认point评分/弧长映射及各分支break保留，无legacy跌落；neutral最终锁内拒非零。主会话随后独立formation_planning构建exit0，c_replan_restore_build.log。这次同时检查了函数定义及实际FSM调用，仍待manager回归运行。
+
+恢复期另修neutral的task锁遗漏、pending/query/source/manager handoff锁外回收，以及expected task generation为0的原兼容语义，避免无prefix current-seam fallback被误拒。FSM非零终点已保活，但Astra发现“解锁后读零快照→命令提交非零→结束任务”的竞态，已交以原发布锁序闭合终止事务，未宣称该项完成。
+
+### manager迁移回归30/30通过，终点同步继续返修
+
+首轮测试迁移误漏12项原phase/publication回归，主会话按原30项清单要求恢复8项PhaseCommit、2项GovernorPublication、2项PhaseSnapshot原断言，未接受18项缩减版。私有访问改经既有friend桥，不开放生产成员。第一轮可编后26/30通过，4项同一fixture失败；frame输入改为真实ContinuousPhaseNormalFrame::evaluatePathState。
+
+后续4项中2项仍因当前delta实际为0失败。主会话确认仅successor prepared.nextDelta非零不代表当前非零，要求source先用D1B lateral intent真实update→publish，再以source已提交nextW对齐fixture相位、重建successor输入与prefix。最终manager30/30独立通过，supervisor/c_manager_nonzero30.xml/log；包含原24基础断言与6个迁移场景，原Stage6发布场景与本批B环境随后改变的mirror断言合并在GvfSectionHandoff用例。query修复双Inf显式输入后5/5通过，c_query_domain_final.xml。
+
+这30项仍不等于直接FSM终止/完整governor拒用事务覆盖。Luna须继续新增同生产入口测试。主会话发现终点修补仍在锁内读布尔、锁外WAIT_TARGET/receive_goal=false，故竞态未消除；另有pending_environment_matches门槛无必要，已要求删除。终止动作和旧task/phase命令退休须在原锁序内一起完成，可视化和大对象回收锁外，不添加新身份/证明体系。
+
+### 终点34项离线通过、仍在修真正非零失败接线
+
+终点最终抽为实际FSM调用的finalizeSectionTerminal，使用既有phase锁同时捕获FSM phase/task，最后同锁复核真实delta并完成既有task/phase退休与WAIT_TARGET。主会话拒绝生产测试回调、pending环境地址门槛，以及旧w/generation必须完全相等的多余终点条件；纯退休也移除无关environment锁。新增4项真实FSM/生产helper测试覆盖非零保活、零退休、旧零快照后实际非零提交、同任务正常零相位推进仍可结束。独立编译及离线34/34通过，supervisor/c_manager_terminal34.xml/log。
+
+另有真实cmdCallback governor拒用/hold发布测试需要ROS master；用测试专属M3C_ISOLATED_ROS_TESTS显式启用，默认跳过，不连接用户默认master，不计入34项。尚未运行该ROS用例或仿真。
+
+主会话继续审真实cmd发现关键遗漏：adapter_update_success原未用于失败分支，已有非零delta时update失败可能继续中心线out并推进manager相位。已明确优先派发Luna同R2修复：候选失败先请求原回中并重试仍可用current，失败则保留current/δ、原hold和重规划，w/δ不提交；零δ可继续已提交路径的nominal，不用未提交candidate或滞后镜像。测试要通过真实partial profile在合法source提交后自然耗尽下一拍horizon，不能直接篡改已提交profile来替代执行场景。
+
+同时，未提交且被拒/prefix失效的pending handoff不能永久挡住FSM刷新和新stage。须短事务只退休该被拒候选及匹配staged值，保留current与其pending；已commit未consume的mirror仍必须完成。此项代码与测试正在进行，34项通过不代表这些新增实际失败场景已验收。
+
+全测试目标编译审计（仅build tests，未run_tests）在旧cloud离线回归缺snapshot纯函数链接处失败，c_tests_compile_audit.log；已交由test-only未导出legacy snapshot库解决，不得加回生产plan_env。ASan/UBSan独立构建树已配置，稳定core/nav/map子集正在编译，尚无本批sanitizer运行结论。
+
+另登记Astra确认的既有新goal生命周期缺口：source_before与当前均无注释声称的FSM frontend-clear mailbox，EXEC中换goal可能保留旧frontend至周期重规划。不是此次类型清理新增删除，本批不擅自新建状态机；若D实际验收受阻，按规格报告既有问题并另请范围。

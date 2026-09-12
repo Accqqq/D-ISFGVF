@@ -31,6 +31,44 @@ TEST(ContinuousPhaseNormalFrameTest, DeterministicQueryAndOrthonormality) {
   EXPECT_NEAR(first.T.dot(first.N), 0.0, 1e-10);
 }
 
+TEST(ContinuousPhaseNormalFrameTest, ComputeGeometryMatchesQueryArithmetic) {
+  const auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
+  FLAG_Race::ContinuousPhasePathState start;
+  start.p = Eigen::Vector3d(0.0, 0.0, 1.0);
+  start.dp_dw = Eigen::Vector3d(1.0, 2.0, 0.4);
+  start.d2p_dw2 = Eigen::Vector3d(0.1, -0.3, 0.2);
+  start.vel = start.dp_dw;
+  start.valid = true;
+  auto end = start;
+  end.p = Eigen::Vector3d(2.0, 4.0, 1.8);
+  ASSERT_TRUE(path->appendSegment(
+      0.0, 2.0, "compute_geometry",
+      FLAG_Race::ContinuousPhasePath::makeQuinticHermite(
+          0.0, 2.0, start, end)));
+  FLAG_Race::ContinuousPhaseNormalFrame frame(path, 17U, 19U);
+  const double w = 0.73;
+  FLAG_Race::ContinuousPhasePathState state;
+  ASSERT_TRUE(path->evaluate(w, state, false));
+  Eigen::Vector3d tangent;
+  Eigen::Vector3d tangent_w;
+  Eigen::Vector3d normal;
+  Eigen::Vector3d normal_w;
+  ASSERT_TRUE(FLAG_Race::ContinuousPhaseNormalFrame::computeGeometry(
+      state, tangent, tangent_w, normal, normal_w));
+  phase_offset_core::NormalFrameQuery query;
+  ASSERT_TRUE(frame.query(w, query));
+  EXPECT_DOUBLE_EQ((tangent - query.T).norm(), 0.0);
+  EXPECT_DOUBLE_EQ((tangent_w -
+                    (state.d2p_dw2 - tangent * tangent.dot(state.d2p_dw2)) /
+                        state.dp_dw.norm()).norm(), 0.0);
+  EXPECT_DOUBLE_EQ((normal - query.N).norm(), 0.0);
+  EXPECT_DOUBLE_EQ((normal_w - query.N_w).norm(), 0.0);
+  FLAG_Race::ContinuousPhasePathState invalid = state;
+  invalid.valid = false;
+  EXPECT_FALSE(FLAG_Race::ContinuousPhaseNormalFrame::computeGeometry(
+      invalid, tangent, tangent_w, normal, normal_w));
+}
+
 TEST(ContinuousPhaseNormalFrameTest, NearVerticalTangentFailsHorizontalCapabilityClosed) {
   const auto path = std::make_shared<FLAG_Race::ContinuousPhasePath>();
   FLAG_Race::ContinuousPhasePathState start;

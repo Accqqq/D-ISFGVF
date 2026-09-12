@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -249,6 +250,90 @@ PhaseOffsetRuntimeConfig MakeConfig(TubeSource source) {
   config.tube.source = source;
   config.tube.tracking_error_bound = 0.15;
   return config;
+}
+
+std::shared_ptr<const SectionTubeProfile> MakeRuntimeSectionProfile(
+    const double narrow_upper = 1.0) {
+  std::shared_ptr<SectionTubeProfile> profile(new SectionTubeProfile());
+  profile->valid_start = 0.0;
+  profile->valid_end = 2.0;
+  profile->status = SectionTubeStatus::COMPLETE;
+  profile->usable = true;
+  profile->complete = true;
+  const double knot_w[] = {0.0, 0.5, 1.0, 2.0};
+  for (double w : knot_w) {
+    SectionTubeKnot knot;
+    knot.w = w;
+    knot.lower = -1.0;
+    knot.upper = (w == 0.5) ? narrow_upper : 1.0;
+    profile->knots.push_back(knot);
+  }
+  return profile;
+}
+
+NormalPreviewResult MakeRuntimeSectionPreview(
+    const std::shared_ptr<const SectionTubeProfile>& profile,
+    const double current_delta = 0.0, const double current_w = 0.0,
+    const double preview_horizon = 2.0) {
+  NormalPreviewProductionPolicy policy;
+  policy.preview_horizon_w = preview_horizon;
+  policy.sample_spacing_w = 0.5;
+  policy.lower_nu = 0.5;
+  policy.upper_nu = 1.0;
+  policy.b_tight = 0.1;
+  policy.b_open = 0.9;
+  TubeViabilityInput input;
+  input.current_w = current_w;
+  input.current_delta = current_delta;
+  input.policy = policy;
+  input.upper_u_delta = 1.0;
+  input.path_revision = 41U;
+  input.frame_revision = 42U;
+  input.expected_path_revision = 41U;
+  input.expected_frame_revision = 42U;
+  input.max_work = 100000U;
+  NormalPreviewResult preview;
+  if (profile) {
+    EXPECT_TRUE(TubeViability::evaluate(*profile, input, preview))
+        << preview.reason;
+  }
+  return preview;
+}
+
+RuntimeSectionPrepareInput MakeRuntimeSectionInput(
+    const std::shared_ptr<const SectionTubeProfile>& profile,
+    const NormalPreviewResult& preview, const double final_u_w = 0.1,
+    const double final_u_delta = 0.1, const double dt = 0.1,
+    const double current_delta = 0.0, const double current_w = 0.0) {
+  RuntimeSectionPrepareInput input;
+  input.profile = profile;
+  input.preview = &preview;
+  phase_offset_core::PathDifferentialState path;
+  path.w = current_w;
+  path.p = Eigen::Vector3d(current_w, 0.0, 1.0);
+  path.p_w = Eigen::Vector3d(1.0, 0.0, 0.0);
+  path.p_ww = Eigen::Vector3d::Zero();
+  path.valid = true;
+  phase_offset_core::GeometryEvaluator evaluator;
+  EXPECT_TRUE(evaluator.evaluate(path, path.p, current_delta,
+                                 input.matched.geometry));
+  input.matched.geometry.path_revision = 41U;
+  input.matched.geometry.frame_revision = 42U;
+  input.matched.base_v_cmd = input.matched.geometry.T * 0.5;
+  input.matched.base_w_dot = 0.5;
+  input.matched.final_port.u_w = final_u_w;
+  input.matched.final_port.u_delta = final_u_delta;
+  input.previous_u = phase_offset_core::PortCommand();
+  input.limits.lower_nu = 0.5;
+  input.limits.upper_nu = 1.0;
+  input.limits.u_w_abs_max = 0.2;
+  input.limits.upper_u_delta = 1.0;
+  input.limits.u_w_slew_rate = 10.0;
+  input.limits.u_delta_slew_rate = 10.0;
+  input.limits.zoh_dt = dt;
+  input.dt = dt;
+  input.max_work = 100000U;
+  return input;
 }
 
 // Small immutable V2 admission fixture.  It mirrors the production value
@@ -529,6 +614,10 @@ RuntimePrepareInput MakeInput(const RuntimePathSamples& path,
   return input;
 }
 
+// `refreshPreflight`/`complete` belong to the retired runtime profile and are
+// compiled out of the production library, so the helpers that call them follow
+// the same guard as the tests that use them.
+#ifndef PHASE_OFFSET_RUNTIME_V2_TEST_ONLY
 void Refresh(PhaseOffsetRuntime& runtime, const RuntimePathSamples& path,
              std::uint64_t revision = 1U) {
   RuntimePreflightInput input;
@@ -543,6 +632,7 @@ bool Complete(PhaseOffsetRuntime& runtime, const RuntimePreparedStep& prepared,
   return runtime.complete(prepared, prepared.geometry.T * 0.5, 0.5, true,
                           output);
 }
+#endif
 
 RuntimeDryRunInput MakeDryRunInput(const RuntimePathSamples& path,
                                    const RuntimeInstalledTubeView& view) {
@@ -1440,6 +1530,29 @@ TEST(PhaseOffsetRuntimeTest, RecenterIsContinuousAndDoesNotResetBeforeCommit) {
   EXPECT_FALSE(runtime.recenterRequested());
   EXPECT_FALSE(runtime.hasExecutedOffsetAuthority());
 }
+
+TEST(PhaseOffsetRuntimeTest,
+     LegacySuccessfulCommitInvalidatesPreviouslyPreparedSectionValue) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  const RuntimeSectionPrepareInput section_input =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  RuntimeSectionPreparedStep section_prepared;
+  ASSERT_TRUE(runtime.prepareSection(section_input, section_prepared))
+      << section_prepared.reason();
+  ASSERT_TRUE(runtime.validateSectionBeforePublish(section_prepared));
+
+  const RuntimePathSamples path = MakePath();
+  Refresh(runtime, path);
+  RuntimePreparedStep legacy_prepared;
+  ASSERT_TRUE(runtime.prepare(MakeInput(path, RuntimeInstalledTubeView()),
+                              legacy_prepared));
+  RuntimeStepOutput legacy_output;
+  ASSERT_TRUE(Complete(runtime, legacy_prepared, legacy_output));
+  EXPECT_FALSE(runtime.validateSectionBeforePublish(section_prepared));
+}
 #endif
 
 #ifndef PHASE_OFFSET_RUNTIME_LEGACY_TEST_ONLY
@@ -1640,7 +1753,389 @@ TEST(PhaseOffsetRuntimeTest, V2DryRunDoesNotInstallReserveOrLifecycleState) {
   EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w, 0.0);
   EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, 0.0);
 }
+
+TEST(PhaseOffsetRuntimeTest,
+     V2SuccessfulCommitInvalidatesPreviouslyPreparedSectionValue) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::FIXED));
+  const std::shared_ptr<const SectionTubeProfile> section_profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult section_preview =
+      MakeRuntimeSectionPreview(section_profile);
+  const RuntimeSectionPrepareInput section_input =
+      MakeRuntimeSectionInput(section_profile, section_preview, 0.1, 0.0, 0.1);
+  RuntimeSectionPreparedStep section_prepared;
+  ASSERT_TRUE(runtime.prepareSection(section_input, section_prepared))
+      << section_prepared.reason();
+  ASSERT_TRUE(runtime.validateSectionBeforePublish(section_prepared));
+
+  const std::shared_ptr<TubeProfileV2> v2_profile = MakeRuntimeV2Profile();
+  RuntimeV2PrepareInput v2_input = MakeRuntimeV2Input(v2_profile);
+  RuntimeV2PreparedStep v2_prepared;
+  ASSERT_TRUE(runtime.prepareV2(v2_input, v2_prepared))
+      << v2_prepared.invalid_reason;
+  RuntimeV2CommitToken token;
+  ASSERT_TRUE(runtime.makeCommitTokenV2(v2_prepared, token));
+  ASSERT_TRUE(runtime.commitV2(token));
+  EXPECT_FALSE(runtime.validateSectionBeforePublish(section_prepared));
+}
 #endif
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     SectionPrepareUsesOnlyRelevantConfigurationAndBindsExactPort) {
+  PhaseOffsetRuntimeConfig config = MakeConfig(TubeSource::NONE);
+  config.manual.amplitude = 0.0;  // Invalid only for the legacy profile gate.
+  PhaseOffsetRuntime runtime(config);
+  EXPECT_FALSE(runtime.configurationValid());
+  EXPECT_TRUE(runtime.sectionConfigurationValid());
+
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  RuntimeSectionPrepareInput input =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.1, 0.1);
+  PhaseOffsetAllocatorInput allocator_input;
+  allocator_input.geometry = input.matched.geometry;
+  allocator_input.preview = &preview;
+  allocator_input.g_des = allocator_input.geometry.T * 0.1 +
+      allocator_input.geometry.N * 0.1;
+  allocator_input.f_w0 = input.matched.base_w_dot;
+  allocator_input.previous_u = input.previous_u;
+  allocator_input.dt = input.dt;
+  allocator_input.bounds = input.limits;
+  allocator_input.expected_path_revision = 41U;
+  allocator_input.expected_frame_revision = 42U;
+  allocator_input.expected_section_profile = profile.get();
+  PhaseOffsetAllocatorResult allocation;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(allocator_input, allocation))
+      << allocation.reason;
+  ASSERT_TRUE(allocation.selectedUConsistent(0.0));
+  input.matched.final_port = allocation.selected_u;
+  RuntimeSectionPreparedStep prepared;
+  ASSERT_TRUE(runtime.prepareSection(input, prepared)) << prepared.reason();
+  EXPECT_TRUE(prepared.valid());
+  EXPECT_TRUE(runtime.validateSectionBeforePublish(prepared));
+  EXPECT_DOUBLE_EQ(prepared.selectedPort().u_w, input.matched.final_port.u_w);
+  EXPECT_DOUBLE_EQ(prepared.selectedPort().u_delta,
+                   input.matched.final_port.u_delta);
+  EXPECT_DOUBLE_EQ(prepared.matchedOutput().delta_dot,
+                   prepared.selectedPort().u_delta);
+  EXPECT_LE(prepared.matchedOutput().matched_residual_norm, 1e-12);
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), 0.0);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, 0.0);
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     SectionPublishFailureDoesNotCommitAndSuccessfulCommitIsOneShot) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  const RuntimeSectionPrepareInput input =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.2, 0.1);
+  RuntimeSectionPreparedStep prepared;
+  ASSERT_TRUE(runtime.prepareSection(input, prepared)) << prepared.reason();
+  const double delta_before = runtime.retainedDelta();
+  const phase_offset_core::PortCommand previous_before =
+      runtime.previousFinalPort();
+
+  // A simulated failed publication simply drops the prepared value.
+  EXPECT_TRUE(runtime.validateSectionBeforePublish(prepared));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta,
+                   previous_before.u_delta);
+
+  ASSERT_TRUE(runtime.commitSection(prepared));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), prepared.nextDelta());
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w,
+                   prepared.selectedPort().u_w);
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta,
+                   prepared.selectedPort().u_delta);
+  EXPECT_FALSE(runtime.validateSectionBeforePublish(prepared));
+  EXPECT_FALSE(runtime.commitSection(prepared));
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     SectionPrepareValueIsBoundToRuntimeRevisionAndInstance) {
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  PhaseOffsetRuntime first(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPrepareInput input =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  RuntimeSectionPreparedStep prepared;
+  ASSERT_TRUE(first.prepareSection(input, prepared)) << prepared.reason();
+
+  PhaseOffsetRuntime other(MakeConfig(TubeSource::NONE));
+  EXPECT_FALSE(other.validateSectionBeforePublish(prepared));
+
+  first.requestRecenter();
+  EXPECT_FALSE(first.validateSectionBeforePublish(prepared));
+  RuntimeSectionPreparedStep replacement;
+  ASSERT_TRUE(first.prepareSection(input, replacement)) << replacement.reason();
+  first.resetForNewNavigationTask();
+  EXPECT_FALSE(first.validateSectionBeforePublish(replacement));
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     SectionRejectsProfileOrGeometryBindingAndDoesNotMutateState) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  RuntimeSectionPrepareInput input =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  RuntimeSectionPreparedStep prepared;
+  ASSERT_TRUE(runtime.prepareSection(input, prepared)) << prepared.reason();
+  const double delta_before = runtime.retainedDelta();
+  input.profile = MakeRuntimeSectionProfile();
+  EXPECT_FALSE(runtime.prepareSection(input, prepared));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+  input = MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  input.matched.geometry.path_revision = 999U;
+  EXPECT_FALSE(runtime.prepareSection(input, prepared));
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), delta_before);
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     PreparedSectionValueDoesNotDereferenceExpiredPreviewOrProfile) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPreparedStep prepared;
+  {
+    const std::shared_ptr<const SectionTubeProfile> profile =
+        MakeRuntimeSectionProfile();
+    const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+    const RuntimeSectionPrepareInput input =
+        MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+    ASSERT_TRUE(runtime.prepareSection(input, prepared)) << prepared.reason();
+  }
+  // prepare stores only the already-evaluated value witness; the borrowed
+  // profile/preview can leave scope before final validation.
+  EXPECT_TRUE(runtime.validateSectionBeforePublish(prepared));
+  EXPECT_TRUE(runtime.commitSection(prepared));
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     AllocatorSelectedPortCanAdvanceAndThenRecoverNonzeroDelta) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult first_preview =
+      MakeRuntimeSectionPreview(profile, 0.0, 0.0, 1.0);
+  ASSERT_EQ(first_preview.status, TubeViabilityStatus::FEASIBLE)
+      << first_preview.reason;
+  RuntimeSectionPrepareInput first_input =
+      MakeRuntimeSectionInput(profile, first_preview, 0.05, 0.15, 0.1);
+  PhaseOffsetAllocatorInput allocator_input;
+  allocator_input.geometry = first_input.matched.geometry;
+  allocator_input.preview = &first_preview;
+  allocator_input.g_des = allocator_input.geometry.T * 0.05 +
+      allocator_input.geometry.N * 0.15;
+  allocator_input.f_w0 = first_input.matched.base_w_dot;
+  allocator_input.previous_u = first_input.previous_u;
+  allocator_input.dt = first_input.dt;
+  allocator_input.bounds = first_input.limits;
+  allocator_input.expected_path_revision = 41U;
+  allocator_input.expected_frame_revision = 42U;
+  allocator_input.expected_section_profile = profile.get();
+  PhaseOffsetAllocatorResult first_allocation;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(allocator_input,
+                                              first_allocation))
+      << first_allocation.reason;
+  first_input.matched.final_port = first_allocation.selected_u;
+  RuntimeSectionPreparedStep first_prepared;
+  ASSERT_TRUE(runtime.prepareSection(first_input, first_prepared))
+      << first_prepared.reason();
+  ASSERT_TRUE(runtime.commitSection(first_prepared));
+  ASSERT_NE(runtime.retainedDelta(), 0.0);
+
+  const double retained = runtime.retainedDelta();
+  const NormalPreviewResult second_preview =
+      MakeRuntimeSectionPreview(profile, retained, first_prepared.nextW(), 1.0);
+  ASSERT_EQ(second_preview.status, TubeViabilityStatus::FEASIBLE)
+      << second_preview.reason;
+  RuntimeSectionPrepareInput second_input = MakeRuntimeSectionInput(
+      profile, second_preview, 0.0, -0.15, 0.1, retained,
+      first_prepared.nextW());
+  second_input.previous_u = runtime.previousFinalPort();
+  allocator_input.geometry = second_input.matched.geometry;
+  allocator_input.preview = &second_preview;
+  allocator_input.g_des = allocator_input.geometry.N * -0.15;
+  allocator_input.previous_u = second_input.previous_u;
+  PhaseOffsetAllocatorResult second_allocation;
+  ASSERT_TRUE(PhaseOffsetAllocator::allocate(allocator_input,
+                                              second_allocation))
+      << second_allocation.reason;
+  second_input.matched.final_port = second_allocation.selected_u;
+  RuntimeSectionPreparedStep second_prepared;
+  ASSERT_TRUE(runtime.prepareSection(second_input, second_prepared))
+      << second_prepared.reason();
+  EXPECT_GT(second_prepared.nextW(), first_prepared.nextW());
+  ASSERT_TRUE(runtime.commitSection(second_prepared));
+  EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta,
+                   second_allocation.selected_u.u_delta);
+  EXPECT_NE(runtime.retainedDelta(), retained);
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     PublicationLockCoversValidatePublishAndNoFailCommit) {
+  PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  const RuntimeSectionPrepareInput input =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  RuntimeSectionPreparedStep prepared;
+  ASSERT_TRUE(runtime.prepareSection(input, prepared)) << prepared.reason();
+  std::mutex publication_mutex;
+  const double before = runtime.retainedDelta();
+  {
+    std::lock_guard<std::mutex> lock(publication_mutex);
+    ASSERT_TRUE(runtime.validateSectionBeforePublish(prepared));
+    const bool published = false;
+    if (published) runtime.commitSectionNoFail(prepared);
+  }
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), before);
+  {
+    std::lock_guard<std::mutex> lock(publication_mutex);
+    ASSERT_TRUE(runtime.validateSectionBeforePublish(prepared));
+    const bool published = true;
+    if (published) runtime.commitSectionNoFail(prepared);
+  }
+  EXPECT_DOUBLE_EQ(runtime.retainedDelta(), prepared.nextDelta());
+  EXPECT_FALSE(runtime.validateSectionBeforePublish(prepared));
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     SectionPreparationRejectsPhysicalAndZohBoundaryViolations) {
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+  const auto rejected_without_state_change =
+      [&](const PhaseOffsetRuntimeConfig& config,
+          const RuntimeSectionPrepareInput& input) {
+        PhaseOffsetRuntime runtime(config);
+        RuntimeSectionPreparedStep prepared;
+        EXPECT_FALSE(runtime.prepareSection(input, prepared));
+        EXPECT_DOUBLE_EQ(runtime.retainedDelta(), 0.0);
+        EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_w, 0.0);
+        EXPECT_DOUBLE_EQ(runtime.previousFinalPort().u_delta, 0.0);
+      };
+
+  // M4C-2: exceeding the tracking-error bound is an assumption violation, not
+  // a command condition.  The offset is shared by the reference and the
+  // physical command through B*u, the error itself comes from base path
+  // tracking, and the governor's normal loop recovers it.  Holding the tick
+  // here would freeze the vehicle and leave the error outside forever.
+  {
+    RuntimeSectionPrepareInput tracking =
+        MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+    tracking.matched.geometry.error.y() = 0.2;
+    PhaseOffsetRuntime runtime(MakeConfig(TubeSource::NONE));
+    RuntimeSectionPreparedStep prepared;
+    EXPECT_TRUE(runtime.prepareSection(tracking, prepared));
+    EXPECT_TRUE(prepared.valid());
+  }
+
+  PhaseOffsetRuntimeConfig tangent_config = MakeConfig(TubeSource::NONE);
+  tangent_config.manual.tangent_speed_min = 2.0;
+  rejected_without_state_change(tangent_config,
+                                MakeRuntimeSectionInput(profile, preview));
+
+  rejected_without_state_change(
+      MakeConfig(TubeSource::NONE),
+      MakeRuntimeSectionInput(profile, preview, 0.3, 0.0, 0.1));
+
+  RuntimeSectionPrepareInput slew =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  slew.limits.u_w_slew_rate = 0.0;
+  rejected_without_state_change(MakeConfig(TubeSource::NONE), slew);
+
+  RuntimeSectionPrepareInput zoh =
+      MakeRuntimeSectionInput(profile, preview, 0.1, 0.0, 0.1);
+  zoh.limits.zoh_dt = 0.2;
+  rejected_without_state_change(MakeConfig(TubeSource::NONE), zoh);
+}
+
+TEST(PhaseOffsetRuntimeSectionTest,
+     AllocatorSaturatedPhaseWindowExecutesBoundaryPortWithoutFreezingPhase) {
+  const std::shared_ptr<const SectionTubeProfile> profile =
+      MakeRuntimeSectionProfile();
+  const NormalPreviewResult preview = MakeRuntimeSectionPreview(profile);
+
+  // M4E: the allocator owns the phase window.  Base guidance wants to run faster
+  // than upper_nu and the +/-u_w_abs_max authority cannot bring it back, so the
+  // allocator saturated on the maximum negative correction.  That saturated
+  // tick must execute: re-applying the window here froze the phase and held an
+  // otherwise planner-valid task.
+  RuntimeSectionPrepareInput fast =
+      MakeRuntimeSectionInput(profile, preview, -0.2, 0.0, 0.1);
+  fast.matched.base_w_dot = 2.0;
+  fast.phase_window_saturated = true;
+  PhaseOffsetRuntime fast_runtime(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPreparedStep fast_prepared;
+  ASSERT_TRUE(fast_runtime.prepareSection(fast, fast_prepared))
+      << fast_prepared.reason();
+  EXPECT_DOUBLE_EQ(fast_prepared.matchedOutput().w_dot, 1.8);
+  EXPECT_GT(fast_prepared.nextW(), fast.matched.geometry.w);
+  EXPECT_TRUE(fast_runtime.commitSection(fast_prepared));
+
+  // The identical out-of-window command without the allocator's saturation
+  // evidence stays fail-closed: the waiver is not a general window opening.
+  RuntimeSectionPrepareInput unmarked = fast;
+  unmarked.phase_window_saturated = false;
+  PhaseOffsetRuntime unmarked_runtime(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPreparedStep unmarked_prepared;
+  EXPECT_FALSE(unmarked_runtime.prepareSection(unmarked, unmarked_prepared));
+  EXPECT_DOUBLE_EQ(unmarked_runtime.retainedDelta(), 0.0);
+  EXPECT_DOUBLE_EQ(unmarked_runtime.previousFinalPort().u_w, 0.0);
+
+  // Saturation evidence plus an off-boundary correction is not the allocator's
+  // saturation either.  A correction that moves *away* from the window is the
+  // clearest such case, so it also stays rejected.
+  RuntimeSectionPrepareInput off_boundary = fast;
+  off_boundary.matched.final_port.u_w = 0.1;
+  PhaseOffsetRuntime off_boundary_runtime(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPreparedStep off_boundary_prepared;
+  EXPECT_FALSE(off_boundary_runtime.prepareSection(off_boundary,
+                                                   off_boundary_prepared));
+
+  // The allocator also saturates on the *slew* boundary when the admissible
+  // rate is more than one tick away from the last committed rate.  That tick
+  // ramps towards the window rather than reaching it, and it must execute too:
+  // dropping it would mean the committed rate never travels to the admissible
+  // set, which is the observed `phase scalar slew interval is empty` freeze.
+  RuntimeSectionPrepareInput ramping =
+      MakeRuntimeSectionInput(profile, preview, -0.05, 0.0, 0.1);
+  ramping.matched.base_w_dot = 2.0;
+  ramping.phase_window_saturated = true;
+  PhaseOffsetRuntime ramping_runtime(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPreparedStep ramping_prepared;
+  ASSERT_TRUE(ramping_runtime.prepareSection(ramping, ramping_prepared))
+      << ramping_prepared.reason();
+  EXPECT_DOUBLE_EQ(ramping_prepared.matchedOutput().w_dot, 1.95);
+  EXPECT_GT(ramping_prepared.nextW(), ramping.matched.geometry.w);
+  EXPECT_TRUE(ramping_runtime.commitSection(ramping_prepared));
+
+  // Base guidance wants the reference to retreat (the vehicle is behind it) and
+  // the saturated rate is still negative.  Non-reversing phase progression
+  // wins: the phase coordinate is held for this tick, and the transverse port,
+  // physical command and committed delta stay the allocator's saturated pair.
+  RuntimeSectionPrepareInput slow =
+      MakeRuntimeSectionInput(profile, preview, 0.2, 0.0, 0.1);
+  slow.matched.base_w_dot = -0.4;
+  slow.phase_window_saturated = true;
+  PhaseOffsetRuntime slow_runtime(MakeConfig(TubeSource::NONE));
+  RuntimeSectionPreparedStep slow_prepared;
+  ASSERT_TRUE(slow_runtime.prepareSection(slow, slow_prepared))
+      << slow_prepared.reason();
+  EXPECT_DOUBLE_EQ(slow_prepared.matchedOutput().w_dot, 0.0);
+  EXPECT_DOUBLE_EQ(slow_prepared.nextW(), slow.matched.geometry.w);
+  EXPECT_DOUBLE_EQ(slow_prepared.selectedPort().u_w,
+                   slow.limits.u_w_abs_max);
+  EXPECT_TRUE(slow_runtime.commitSection(slow_prepared));
+  EXPECT_DOUBLE_EQ(slow_runtime.previousFinalPort().u_w,
+                   slow.limits.u_w_abs_max);
+}
 
 }  // namespace
 }  // namespace phase_offset_navigation

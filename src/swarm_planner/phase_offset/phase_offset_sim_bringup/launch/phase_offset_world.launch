@@ -4,17 +4,29 @@
     does not start a simulator, controller, planner, goal publisher, or any
     swarm/control implementation.  SWARM owns those processes.
   -->
-  <arg name="scenario_file"
-       default="$(find phase_offset_sim_bringup)/config/scenarios/sim_b_open_3.yaml"/>
+  <!-- Optional read-only preload.  The world itself carries no swarm size: the
+       agent count lives in the swarm launch (phase_offset_swarm.launch
+       agent_count), and its orchestrator publishes the agent list to
+       /sim_b_world/scenario/agents.  The visualizer below waits for that, so
+       the two launches stay independent.  Pass a scenario_file here only to
+       display agents without running the swarm. -->
+  <arg name="scenario_file" default=""/>
   <arg name="map_file"
-       default="$(find map_generator)/resource/phase_offset_open.pcd"/>
+       default="$(find map_generator)/resource/pillar.pcd"/>
   <arg name="frame_id" default="world"/>
-  <arg name="enable_rviz" default="false"/>
+  <arg name="enable_rviz" default="true"/>
   <arg name="rviz_config"
        default="$(find phase_offset_sim_bringup)/rviz/phase_offset_sim_b.rviz"/>
+  <!-- Second window, mirroring the single-UAV chain's fpv.rviz: same content,
+       camera following one agent (that agent's odom_visualization broadcasts
+       world->base; pick it with the swarm launch's rviz_follow_agent). -->
+  <arg name="enable_follow_rviz" default="true"/>
+  <arg name="follow_rviz_config"
+       default="$(find phase_offset_sim_bringup)/rviz/phase_offset_follow.rviz"/>
 
   <!-- Sole scenario source for the generic-N read-only visualizer. -->
-  <rosparam command="load" file="$(arg scenario_file)" ns="/sim_b_world"/>
+  <rosparam command="load" file="$(arg scenario_file)" ns="/sim_b_world"
+            if="$(eval arg('scenario_file') != '')"/>
 
   <node pkg="map_generator" type="map_pub" name="map_pub" output="screen"
         args="$(arg map_file)"/>
@@ -27,4 +39,8 @@
 
   <node if="$(arg enable_rviz)" pkg="rviz" type="rviz" name="rviz"
         output="screen" required="true" args="-d $(arg rviz_config)"/>
+
+  <node if="$(arg enable_follow_rviz)" pkg="rviz" type="rviz"
+        name="rviz_follow" output="screen"
+        args="-d $(arg follow_rviz_config)"/>
 </launch>

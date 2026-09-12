@@ -1,0 +1,16 @@
+<launch>
+  <!-- Second RViz window: same content as the swarm window (all 15 agents,
+       their tubes, references and vector fields) but with the CAMERA following
+       one agent, the way the single-UAV RViz view does.
+
+       The selected agent's odom_visualization broadcasts `world -> base`
+       (phase_offset_agent.launch, arg rviz_follow_agent), and this window uses
+       a top-down orthographic view whose Target Frame is that `base`, so the
+       chosen UAV stays centred while the rest of the swarm moves around it. -->
+  <arg name="agent_id" default="0"/>
+  <arg name="config"
+       default="$(find phase_offset_sim_bringup)/rviz/phase_offset_follow.rviz"/>
+
+  <node pkg="rviz" type="rviz" name="rviz_agent_view" output="screen"
+        args="-d $(arg config)"/>
+</launch>

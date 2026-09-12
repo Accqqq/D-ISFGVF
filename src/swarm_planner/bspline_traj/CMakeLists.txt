@@ -82,15 +82,6 @@ target_link_libraries(phase_offset_executed_reference_query
   phase_offset_navigation
 )
 
-add_library(phase_offset_environment_evidence_query
-  src/integration/phase_offset_environment_evidence_query.cpp
-)
-target_link_libraries(phase_offset_environment_evidence_query
-  phase_offset_navigation
-  plan_env
-  ${catkin_LIBRARIES}
-)
-
 add_library(phase_offset_sph_ros_bridge
   src/integration/phase_offset_sph_ros_bridge.cpp
 )
@@ -115,35 +106,31 @@ target_link_libraries(phase_offset_clearance_audit
   ${catkin_LIBRARIES}
 )
 
-# Standalone V2 tube worker.  It owns one joined worker thread and consumes
-# only immutable navigation/core certificate DTOs; adapters and map objects
-# remain outside this target's dependency direction.
-find_package(Threads REQUIRED)
-add_library(phase_offset_tube_runtime_v2
-  src/integration/phase_offset_tube_runtime_v2.cpp
+add_library(phase_offset_section_input
+  src/integration/phase_offset_section_input.cpp
 )
-target_link_libraries(phase_offset_tube_runtime_v2
+target_link_libraries(phase_offset_section_input
+  continuous_phase_path
   phase_offset_navigation
-  phase_offset_core
-  Threads::Threads
+  plan_env
+  ${catkin_LIBRARIES}
 )
 
-add_library(phase_offset_tube_v2_diagnostics
-  src/integration/phase_offset_tube_v2_diagnostics.cpp
+# Display-only Section tube geometry (immutable path + SectionTubeProfile ->
+# two boundary LINE_STRIPs).  This library has no worker, certificate,
+# reserve, map-identity, or runtime consumer.
+add_library(phase_offset_tube_markers
+  src/integration/phase_offset_tube_markers.cpp
 )
-target_link_libraries(phase_offset_tube_v2_diagnostics
-  phase_offset_tube_runtime_v2
+target_link_libraries(phase_offset_tube_markers
+  continuous_phase_path
   phase_offset_navigation
   phase_offset_core
+  ${catkin_LIBRARIES}
 )
 
 add_library(phase_offset_matched_adapter
-  src/integration/phase_offset_cloud_occupancy_query.cpp
   src/integration/phase_offset_matched_adapter.cpp
-  src/integration/phase_offset_recovery_continuation_provider.cpp
-  src/integration/phase_offset_raw_candidate_diagnostics.cpp
-  src/integration/phase_offset_tube_epoch_diagnostics.cpp
-  src/integration/phase_offset_tube_markers.cpp
 )
 target_link_libraries(phase_offset_matched_adapter
   continuous_phase_path
@@ -153,7 +140,6 @@ target_link_libraries(phase_offset_matched_adapter
   plan_env
   isf_reference_kernel
   phase_offset_active_adapter
-  phase_offset_tube_runtime_v2
   phase_offset_sph_ros_bridge
   ${catkin_LIBRARIES}
 )
@@ -166,6 +152,8 @@ target_link_libraries(phase_offset_shadow_adapter ${catkin_LIBRARIES})
 target_link_libraries(bspline_gvf
   ${catkin_LIBRARIES}
   continuous_phase_path
+  phase_offset_section_input
+  phase_offset_tube_markers
   phase_offset_shadow_adapter
   isf_reference_kernel
   phase_offset_active_adapter
@@ -185,6 +173,55 @@ bspline_gvf
 
 if(CATKIN_ENABLE_TESTING)
   find_package(rostest REQUIRED)
+  find_package(Threads REQUIRED)
+
+  # Historical V2/evidence implementations are intentionally test-only.  They
+  # are kept as isolated regression seams for the migration matrix below, but
+  # none is linked by phase_offset_matched_adapter, bspline_gvf, or
+  # formation_planning.
+  add_library(phase_offset_cloud_occupancy_query_legacy
+    src/integration/phase_offset_cloud_occupancy_query.cpp)
+  target_link_libraries(phase_offset_cloud_occupancy_query_legacy
+    plan_env_cloud_occupancy_snapshot_legacy
+    phase_offset_navigation
+    plan_env
+    ${catkin_LIBRARIES})
+
+  add_library(phase_offset_recovery_continuation_provider_legacy
+    src/integration/phase_offset_recovery_continuation_provider.cpp)
+  target_link_libraries(phase_offset_recovery_continuation_provider_legacy
+    phase_offset_executed_reference_query
+    continuous_phase_path
+    phase_offset_navigation
+    phase_offset_core
+    ${catkin_LIBRARIES})
+
+  add_library(phase_offset_raw_candidate_diagnostics_legacy
+    src/integration/phase_offset_raw_candidate_diagnostics.cpp)
+  target_link_libraries(phase_offset_raw_candidate_diagnostics_legacy
+    phase_offset_navigation
+    ${catkin_LIBRARIES})
+
+  add_library(phase_offset_tube_epoch_diagnostics_legacy
+    src/integration/phase_offset_tube_epoch_diagnostics.cpp)
+  target_link_libraries(phase_offset_tube_epoch_diagnostics_legacy
+    phase_offset_navigation
+    ${catkin_LIBRARIES})
+
+  add_library(phase_offset_tube_runtime_v2_legacy
+    src/integration/phase_offset_tube_runtime_v2.cpp)
+  target_link_libraries(phase_offset_tube_runtime_v2_legacy
+    phase_offset_navigation
+    phase_offset_core
+    Threads::Threads)
+
+  add_library(phase_offset_tube_v2_diagnostics_legacy
+    src/integration/phase_offset_tube_v2_diagnostics.cpp)
+  target_link_libraries(phase_offset_tube_v2_diagnostics_legacy
+    phase_offset_tube_runtime_v2_legacy
+    phase_offset_navigation
+    phase_offset_core)
+
   catkin_add_gtest(reference_join_test test/reference_join_test.cpp)
   catkin_add_gtest(gvf_switch_policy_test test/gvf_switch_policy_test.cpp)
   catkin_add_gtest(gvf_lifted_visualization_test test/gvf_lifted_visualization_test.cpp)
@@ -211,10 +248,10 @@ if(CATKIN_ENABLE_TESTING)
     test/phase_offset_raw_occupancy_query_test.cpp)
   catkin_add_gtest(phase_offset_cloud_occupancy_query_test
     test/phase_offset_cloud_occupancy_query_test.cpp)
-  catkin_add_gtest(phase_offset_environment_evidence_query_test
-    test/phase_offset_environment_evidence_query_test.cpp)
   catkin_add_gtest(phase_offset_clearance_audit_test
     test/phase_offset_clearance_audit_test.cpp)
+  catkin_add_gtest(phase_offset_section_input_test
+    test/phase_offset_section_input_test.cpp)
   catkin_add_gtest(phase_offset_tube_runtime_v2_test
     test/phase_offset_tube_runtime_v2_test.cpp)
   catkin_add_gtest(phase_offset_tube_v2_diagnostics_test
@@ -225,12 +262,8 @@ if(CATKIN_ENABLE_TESTING)
     test/phase_offset_tube_markers_test.cpp)
   catkin_add_gtest(phase_offset_tube_epoch_diagnostics_test
     test/phase_offset_tube_epoch_diagnostics_test.cpp)
-  catkin_add_gtest(phase_offset_tube_epoch_integration_test
-    test/phase_offset_tube_epoch_integration_test.cpp)
   catkin_add_gtest(phase_offset_recovery_continuation_provider_test
     test/phase_offset_recovery_continuation_provider_test.cpp)
-  catkin_add_nosetests(test/tube_runtime_v2_acceptance.py)
-  add_rostest(test/tube_runtime_v2_acceptance.test)
   # G2d removes this raw-log-odds bridge from all production targets.  Keep a
   # test-only target so the deprecated reference remains independently
   # exercisable without a path from formation_planning to raw occupancy.
@@ -290,15 +323,8 @@ if(CATKIN_ENABLE_TESTING)
   endif()
   if(TARGET phase_offset_cloud_occupancy_query_test)
     target_link_libraries(phase_offset_cloud_occupancy_query_test
-      phase_offset_matched_adapter
-      phase_offset_navigation
-      plan_env
-      ${catkin_LIBRARIES}
-    )
-  endif()
-  if(TARGET phase_offset_environment_evidence_query_test)
-    target_link_libraries(phase_offset_environment_evidence_query_test
-      phase_offset_environment_evidence_query
+      phase_offset_cloud_occupancy_query_legacy
+      plan_env_cloud_occupancy_snapshot_legacy
       phase_offset_navigation
       plan_env
       ${catkin_LIBRARIES}
@@ -308,6 +334,8 @@ if(CATKIN_ENABLE_TESTING)
     target_link_libraries(phase_offset_clearance_audit_test
       phase_offset_clearance_audit
       phase_offset_matched_adapter
+      phase_offset_cloud_occupancy_query_legacy
+      plan_env_cloud_occupancy_snapshot_legacy
       continuous_phase_path
       phase_offset_navigation_legacy_tube
       phase_offset_core
@@ -315,9 +343,18 @@ if(CATKIN_ENABLE_TESTING)
       ${catkin_LIBRARIES}
     )
   endif()
+  if(TARGET phase_offset_section_input_test)
+    target_link_libraries(phase_offset_section_input_test
+      phase_offset_section_input
+      continuous_phase_path
+      phase_offset_navigation
+      plan_env
+      ${catkin_LIBRARIES}
+    )
+  endif()
   if(TARGET phase_offset_tube_runtime_v2_test)
     target_link_libraries(phase_offset_tube_runtime_v2_test
-      phase_offset_tube_runtime_v2
+      phase_offset_tube_runtime_v2_legacy
       phase_offset_navigation
       phase_offset_core
       Threads::Threads
@@ -325,8 +362,8 @@ if(CATKIN_ENABLE_TESTING)
   endif()
   if(TARGET phase_offset_tube_v2_diagnostics_test)
     target_link_libraries(phase_offset_tube_v2_diagnostics_test
-      phase_offset_tube_v2_diagnostics
-      phase_offset_tube_runtime_v2
+      phase_offset_tube_v2_diagnostics_legacy
+      phase_offset_tube_runtime_v2_legacy
       phase_offset_navigation
       phase_offset_core
       Threads::Threads
@@ -334,14 +371,14 @@ if(CATKIN_ENABLE_TESTING)
   endif()
   if(TARGET phase_offset_raw_candidate_diagnostics_test)
     target_link_libraries(phase_offset_raw_candidate_diagnostics_test
-      phase_offset_matched_adapter
+      phase_offset_raw_candidate_diagnostics_legacy
       phase_offset_navigation
       ${catkin_LIBRARIES}
     )
   endif()
   if(TARGET phase_offset_tube_markers_test)
     target_link_libraries(phase_offset_tube_markers_test
-      phase_offset_matched_adapter
+      phase_offset_tube_markers
       continuous_phase_path
       phase_offset_navigation
       ${catkin_LIBRARIES}
@@ -349,25 +386,15 @@ if(CATKIN_ENABLE_TESTING)
   endif()
   if(TARGET phase_offset_tube_epoch_diagnostics_test)
     target_link_libraries(phase_offset_tube_epoch_diagnostics_test
-      phase_offset_matched_adapter
-      phase_offset_navigation
-      ${catkin_LIBRARIES}
-    )
-  endif()
-  if(TARGET phase_offset_tube_epoch_integration_test)
-    target_link_libraries(phase_offset_tube_epoch_integration_test
-      phase_offset_matched_adapter
-      phase_offset_active_adapter
-      isf_reference_kernel
-      continuous_phase_path
-      phase_offset_core
+      phase_offset_tube_epoch_diagnostics_legacy
+      phase_offset_raw_candidate_diagnostics_legacy
       phase_offset_navigation
       ${catkin_LIBRARIES}
     )
   endif()
   if(TARGET phase_offset_recovery_continuation_provider_test)
     target_link_libraries(phase_offset_recovery_continuation_provider_test
-      phase_offset_matched_adapter
+      phase_offset_recovery_continuation_provider_legacy
       phase_offset_executed_reference_query
       continuous_phase_path
       phase_offset_core

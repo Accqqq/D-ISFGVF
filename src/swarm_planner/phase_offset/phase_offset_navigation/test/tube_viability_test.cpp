@@ -376,6 +376,56 @@ TubeViabilityInput V2Input(const double current_w, const double current_delta,
   return input;
 }
 
+SectionTubeProfile MakeSectionProfile(
+    const std::vector<double>& knots,
+    const std::vector<std::pair<double, double>>& bounds,
+    const SectionTubeStatus status = SectionTubeStatus::COMPLETE,
+    const bool complete = true) {
+  EXPECT_EQ(knots.size(), bounds.size());
+  SectionTubeProfile profile;
+  profile.valid_start = knots.empty() ? 0.0 : knots.front();
+  profile.valid_end = knots.empty() ? 0.0 : knots.back();
+  profile.status = status;
+  profile.usable = true;
+  profile.complete = complete;
+  for (std::size_t i = 0U; i < knots.size(); ++i) {
+    SectionTubeKnot knot;
+    knot.w = knots[i];
+    knot.lower = bounds[i].first;
+    knot.upper = bounds[i].second;
+    profile.knots.push_back(knot);
+  }
+  return profile;
+}
+
+NormalPreviewProductionPolicy SectionPolicy(const double horizon = 2.0,
+                                            const double spacing = 1.0) {
+  NormalPreviewProductionPolicy policy;
+  policy.preview_horizon_w = horizon;
+  policy.sample_spacing_w = spacing;
+  policy.lower_nu = 0.5;
+  policy.upper_nu = 1.0;
+  policy.b_tight = 0.1;
+  policy.b_open = 0.9;
+  // Section PWL intentionally does not require these legacy identities.
+  return policy;
+}
+
+TubeViabilityInput SectionInput(const double current_w = 0.0,
+                                const double current_delta = 0.0) {
+  TubeViabilityInput input;
+  input.current_w = current_w;
+  input.current_delta = current_delta;
+  input.policy = SectionPolicy();
+  input.upper_u_delta = 1.0;
+  input.path_revision = 41U;
+  input.frame_revision = 42U;
+  input.expected_path_revision = 41U;
+  input.expected_frame_revision = 42U;
+  input.max_work = 100000U;
+  return input;
+}
+
 TEST(TubeViabilityTest, CompleteValidFilteredBoundsAreAuthoritative) {
   TubeProfile profile = MakeProfileWithRawAndFiltered(
       {{-0.2, 0.3}, {-0.4, 0.5}}, {{-0.9, 0.9}, {-0.8, 0.8}});
@@ -676,6 +726,340 @@ TEST(TubeViabilityTest, QueryUsesWCoordinateAndOneSidedKnotRules) {
   TubeViabilityRateInterval rate;
   ASSERT_TRUE(result.rateIntervalAt(1.0, interval.lower, 1.0, rate));
   EXPECT_TRUE(rate.lower_boundary_active);
+}
+
+TEST(TubeViabilitySectionTest, StrictPwlConsumesNonuniformSectionWithoutLegacyIds) {
+  SectionTubeProfile profile = MakeSectionProfile(
+      {0.0, 0.35, 1.4, 2.0},
+      {{-1.0, 1.0}, {-0.7, 0.7}, {-0.7, 0.8}, {-0.4, 0.4}});
+  TubeViabilityInput input = SectionInput();
+  TubeViabilityResult result;
+  ASSERT_TRUE(TubeViability::evaluate(profile, input, result)) << result.reason;
+  ASSERT_TRUE(result.valid) << result.reason;
+  ASSERT_TRUE(result.feasible) << result.reason;
+  EXPECT_EQ(result.status, TubeViabilityStatus::FEASIBLE) << result.reason;
+  EXPECT_EQ(result.proof_kind, TubeViabilityProofKind::SECTION_PWL);
+  EXPECT_EQ(result.section_profile, &profile);
+  EXPECT_DOUBLE_EQ(result.evaluated_delta, input.current_delta);
+  EXPECT_EQ(result.provenance.path_revision, input.path_revision);
+  EXPECT_EQ(result.provenance.frame_revision, input.frame_revision);
+  EXPECT_EQ(result.provenance.profile_revision, 0U);
+  EXPECT_EQ(result.provenance.source_revision, 0U);
+  EXPECT_EQ(result.provenance.map_revision, 0U);
+  EXPECT_TRUE(result.policy.numericValid());
+  EXPECT_FALSE(result.policy.valid());
+  bool retained_narrow_knot = false;
+  for (const TubeViabilityKnot& knot : result.knots) {
+    retained_narrow_knot = retained_narrow_knot || knot.w == 0.35;
+  }
+  EXPECT_TRUE(retained_narrow_knot);
+  TubeViabilityInterval interval;
+  ASSERT_TRUE(result.envelopeAt(0.35, interval));
+  EXPECT_TRUE(interval.contains(0.0, 0.0));
+  TubeViabilityRateInterval rate;
+  ASSERT_TRUE(result.rateIntervalAt(0.35, interval.lower, 1.0, rate));
+  EXPECT_TRUE(rate.lower_boundary_active);
+  ASSERT_TRUE(result.envelopeAt(0.5, interval));
+  ASSERT_TRUE(result.rateIntervalAt(0.5, 0.0, 1.0, rate));
+}
+
+TEST(TubeViabilitySectionTest, PartialCoverageAndTerminalFlagAreExplicit) {
+  SectionTubeProfile partial = MakeSectionProfile(
+      {0.0, 1.0}, {{-1.0, 1.0}, {-1.0, 1.0}},
+      SectionTubeStatus::PARTIAL, false);
+  TubeViabilityInput input = SectionInput();
+  input.policy.preview_horizon_w = 2.0;
+  TubeViabilityResult result;
+  ASSERT_TRUE(TubeViability::evaluate(partial, input, result));
+  EXPECT_FALSE(result.feasible);
+  EXPECT_EQ(result.status, TubeViabilityStatus::PREVIEW_INFEASIBLE);
+  EXPECT_EQ(result.section_profile, nullptr);
+
+  input.policy.preview_horizon_w = 0.5;
+  ASSERT_TRUE(TubeViability::evaluate(partial, input, result));
+  EXPECT_EQ(result.status, TubeViabilityStatus::FEASIBLE) << result.reason;
+  EXPECT_EQ(result.section_profile, &partial);
+
+  input.section_reaches_path_end = true;
+  EXPECT_FALSE(TubeViability::evaluate(partial, input, result));
+  EXPECT_EQ(result.status, TubeViabilityStatus::INVALID_INPUT);
+
+  SectionTubeProfile complete = MakeSectionProfile(
+      {0.0, 1.0}, {{-1.0, 1.0}, {-1.0, 1.0}});
+  input.section_reaches_path_end = true;
+  input.policy.preview_horizon_w = 2.0;
+  ASSERT_TRUE(TubeViability::evaluate(complete, input, result));
+  EXPECT_TRUE(result.feasible);
+  EXPECT_TRUE(result.preview_truncated_after);
+  EXPECT_DOUBLE_EQ(result.preview_end_w, complete.valid_end);
+
+  input.current_w = complete.valid_end;
+  ASSERT_TRUE(TubeViability::evaluate(complete, input, result));
+  EXPECT_FALSE(result.feasible);
+  EXPECT_EQ(result.status, TubeViabilityStatus::PREVIEW_INFEASIBLE);
+  EXPECT_EQ(result.section_profile, nullptr);
+}
+
+TEST(TubeViabilitySectionTest, InvalidKnotsAndBudgetFailClosed) {
+  SectionTubeProfile malformed = MakeSectionProfile(
+      {0.0, 1.0}, {{-1.0, 1.0}, {-1.0, 1.0}});
+  malformed.knots[1].w = 0.5;
+  TubeViabilityInput input = SectionInput();
+  input.max_work = 1U;
+  TubeViabilityResult result;
+  EXPECT_FALSE(TubeViability::evaluate(malformed, input, result));
+  EXPECT_EQ(result.status, TubeViabilityStatus::INVALID_INPUT);
+  EXPECT_FALSE(result.valid);
+  EXPECT_EQ(result.section_profile, nullptr);
+  EXPECT_LE(result.work_count, input.max_work);
+
+  SectionTubeProfile valid = MakeSectionProfile(
+      {0.0, 1.0}, {{-1.0, 1.0}, {-1.0, 1.0}});
+  input = SectionInput();
+  input.policy.preview_horizon_w = 1.0;
+  input.max_work = 2U;
+  EXPECT_FALSE(TubeViability::evaluate(valid, input, result));
+  EXPECT_EQ(result.status, TubeViabilityStatus::INVALID_INPUT);
+  EXPECT_EQ(result.work_count, 2U);
+  EXPECT_LE(result.work_count, input.max_work);
+}
+
+TEST(TubeViabilitySectionTest, MatchesV2PwlMathWithoutV2IdentityFields) {
+  const std::vector<double> knots = {0.0, 0.75, 2.0};
+  const std::vector<std::pair<double, double>> bounds = {
+      {-1.0, 1.0}, {-0.6, 0.7}, {-0.4, 0.5}};
+  TubeProfileV2 v2 = MakeV2Profile(knots, bounds);
+  TubeViabilityInput v2_input = V2Input(0.0, 0.0, V2Policy(2.0, 1.5));
+  TubeViabilityResult v2_result;
+  ASSERT_TRUE(TubeViability::evaluate(v2, v2_input, v2_result))
+      << v2_result.reason;
+  ASSERT_TRUE(v2_result.feasible);
+
+  SectionTubeProfile section = MakeSectionProfile(knots, bounds);
+  TubeViabilityInput section_input = SectionInput();
+  section_input.policy = SectionPolicy(2.0, 1.5);
+  TubeViabilityResult section_result;
+  ASSERT_TRUE(TubeViability::evaluate(section, section_input, section_result))
+      << section_result.reason;
+  ASSERT_TRUE(section_result.feasible);
+  ASSERT_EQ(v2_result.knots.size(), section_result.knots.size());
+  EXPECT_DOUBLE_EQ(v2_result.b_pre, section_result.b_pre);
+  EXPECT_DOUBLE_EQ(v2_result.beta, section_result.beta);
+  EXPECT_DOUBLE_EQ(v2_result.delta_delta, section_result.delta_delta);
+  for (std::size_t i = 0U; i < v2_result.knots.size(); ++i) {
+    EXPECT_DOUBLE_EQ(v2_result.knots[i].w, section_result.knots[i].w);
+    EXPECT_DOUBLE_EQ(v2_result.knots[i].reachable.lower,
+                     section_result.knots[i].reachable.lower);
+    EXPECT_DOUBLE_EQ(v2_result.knots[i].reachable.upper,
+                     section_result.knots[i].reachable.upper);
+  }
+}
+
+TEST(TubeViabilitySectionTest, StrictQueriesUseRightKnotAndRejectOutsideDomain) {
+  SectionTubeProfile profile = MakeSectionProfile(
+      {0.0, 0.5, 2.0}, {{-1.0, 1.0}, {-0.7, 0.7}, {-0.2, 0.2}});
+  TubeViabilityInput input = SectionInput();
+  input.policy = SectionPolicy(2.0, 1.0);
+  TubeViabilityResult result;
+  ASSERT_TRUE(TubeViability::evaluate(profile, input, result)) << result.reason;
+  ASSERT_EQ(result.status, TubeViabilityStatus::FEASIBLE) << result.reason;
+  TubeViabilityInterval knot_interval;
+  ASSERT_TRUE(result.envelopeAt(0.5, knot_interval));
+  EXPECT_DOUBLE_EQ(knot_interval.lower, result.knots[1].reachable.lower);
+  EXPECT_DOUBLE_EQ(knot_interval.upper, result.knots[1].reachable.upper);
+  TubeViabilityRateInterval rate;
+  ASSERT_TRUE(result.rateIntervalAt(0.5, knot_interval.lower, 1.0, rate));
+  EXPECT_TRUE(rate.lower_boundary_active);
+  EXPECT_FALSE(result.envelopeAt(-std::numeric_limits<double>::epsilon(),
+                                 knot_interval));
+  EXPECT_FALSE(result.rateIntervalAt(
+      std::nextafter(2.0, std::numeric_limits<double>::infinity()), 0.0, 1.0,
+      rate));
+}
+
+TEST(TubeViabilitySectionTest, ZeroOnlyRequiresZeroBoundsAndIsQueryable) {
+  SectionTubeProfile zero = MakeSectionProfile(
+      {0.0, 1.0}, {{0.0, 0.0}, {0.0, 0.0}},
+      SectionTubeStatus::ZERO_ONLY, true);
+  TubeViabilityInput input = SectionInput();
+  input.policy.preview_horizon_w = 1.0;
+  TubeViabilityResult result;
+  ASSERT_TRUE(TubeViability::evaluate(zero, input, result)) << result.reason;
+  ASSERT_EQ(result.status, TubeViabilityStatus::FEASIBLE) << result.reason;
+  EXPECT_EQ(result.section_profile, &zero);
+
+  SectionTubeProfile pseudo = zero;
+  pseudo.knots[1].upper = 0.1;
+  EXPECT_FALSE(TubeViability::evaluate(pseudo, input, result));
+  EXPECT_EQ(result.status, TubeViabilityStatus::INVALID_INPUT);
+  EXPECT_EQ(result.section_profile, nullptr);
+}
+
+TEST(TubeViabilitySectionTest, CriticalNonuniformRateStateMatchesV2) {
+  const std::vector<double> knots = {0.0, 0.35, 1.4, 2.0};
+  const std::vector<std::pair<double, double>> bounds = {
+      {-1.0, 1.0}, {-0.2, 0.2}, {-0.7, 0.8}, {-0.4, 0.4}};
+  TubeProfileV2 v2 = MakeV2Profile(knots, bounds);
+  TubeViabilityInput v2_input = V2Input(0.0, 0.0, V2Policy(2.0, 1.0));
+  TubeViabilityResult v2_result;
+  ASSERT_TRUE(TubeViability::evaluate(v2, v2_input, v2_result))
+      << v2_result.reason;
+  SectionTubeProfile section = MakeSectionProfile(knots, bounds);
+  TubeViabilityInput section_input = SectionInput();
+  section_input.policy = SectionPolicy(2.0, 1.0);
+  TubeViabilityResult section_result;
+  ASSERT_TRUE(TubeViability::evaluate(section, section_input, section_result))
+      << section_result.reason;
+  EXPECT_EQ(section_result.status, v2_result.status);
+  EXPECT_EQ(section_result.feasible, v2_result.feasible);
+  // This envelope's boundary contracts at exactly the rate limit.  The
+  // recovered boundary slope is an outward-rounded interval, so a floored
+  // ratio comparison used to read it one ULP above the limit and report
+  // RATE_INFEASIBLE; the construction itself is within the window, so the
+  // state is feasible and - being feasible - the Section preview borrows the
+  // immutable profile it was evaluated against.
+  EXPECT_EQ(section_result.status, TubeViabilityStatus::FEASIBLE)
+      << section_result.reason;
+  EXPECT_EQ(section_result.section_profile, &section);
+}
+
+TEST(TubeViabilitySectionTest, HeldStepChecksEndpointsAndCrossedKnots) {
+  SectionTubeProfile profile = MakeSectionProfile(
+      {0.0, 0.35, 1.4, 2.0},
+      {{-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}});
+  TubeViabilityInput input = SectionInput();
+  input.policy = SectionPolicy(2.0, 1.0);
+  TubeViabilityResult preview;
+  ASSERT_TRUE(TubeViability::evaluate(profile, input, preview))
+      << preview.reason;
+  ASSERT_EQ(preview.status, TubeViabilityStatus::FEASIBLE) << preview.reason;
+
+  TubeHeldStepResult held;
+  ASSERT_TRUE(TubeViability::checkHeldStep(
+      preview, 0.0, 0.0, 1.0, 0.2, 1.0, 1000U, held)) << held.reason;
+  EXPECT_TRUE(held.valid);
+  EXPECT_DOUBLE_EQ(held.next_w, 1.0);
+  EXPECT_DOUBLE_EQ(held.next_delta, 0.2);
+  EXPECT_GT(held.work_count, 0U);
+  EXPECT_LE(held.work_count, 1000U);
+
+  TubeHeldStepResult mismatch;
+  EXPECT_FALSE(TubeViability::checkHeldStep(
+      preview, 0.0, 0.0, 1.0, 0.2, 1.0, 2U, mismatch));
+  EXPECT_FALSE(mismatch.valid);
+  EXPECT_LE(mismatch.work_count, 2U);
+}
+
+TEST(TubeViabilitySectionTest, HeldStepRejectsNarrowCrossedKnotAndZeroRate) {
+  SectionTubeProfile profile = MakeSectionProfile(
+      {0.0, 0.5, 1.0}, {{-1.0, 1.0}, {-0.1, 0.1}, {-1.0, 1.0}});
+  TubeViabilityInput input = SectionInput();
+  input.policy = SectionPolicy(1.0, 1.0);
+  TubeViabilityResult preview;
+  ASSERT_TRUE(TubeViability::evaluate(profile, input, preview))
+      << preview.reason;
+  ASSERT_EQ(preview.status, TubeViabilityStatus::FEASIBLE) << preview.reason;
+
+  TubeHeldStepResult held;
+  EXPECT_FALSE(TubeViability::checkHeldStep(
+      preview, 0.0, 0.0, 1.0, 0.5, 1.0, 1000U, held));
+  EXPECT_FALSE(held.valid);
+  EXPECT_NE(held.reason.find("crossed-knot"), std::string::npos);
+
+  input.policy.lower_nu = 0.0;
+  EXPECT_FALSE(TubeViability::checkHeldStep(
+      preview, 0.0, 0.0, 0.0, 0.0, 0.1, 1000U, held));
+  EXPECT_FALSE(held.valid);
+}
+
+TEST(TubeViabilitySectionTest, HeldStepRespectsPartialValidEndWithoutExtrapolation) {
+  SectionTubeProfile profile = MakeSectionProfile(
+      {0.0, 0.4, 1.0}, {{-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}},
+      SectionTubeStatus::PARTIAL, false);
+  TubeViabilityInput input = SectionInput();
+  input.policy = SectionPolicy(0.5, 0.25);
+  TubeViabilityResult preview;
+  ASSERT_TRUE(TubeViability::evaluate(profile, input, preview))
+      << preview.reason;
+  ASSERT_EQ(preview.status, TubeViabilityStatus::FEASIBLE) << preview.reason;
+  TubeHeldStepResult held;
+  ASSERT_TRUE(TubeViability::checkHeldStep(
+      preview, 0.0, 0.0, 0.5, 0.0, 0.5, 1000U, held)) << held.reason;
+  EXPECT_DOUBLE_EQ(held.next_w, 0.25);
+
+  EXPECT_FALSE(TubeViability::checkHeldStep(
+      preview, 0.0, 0.0, 1.0, 0.0, 1.1, 1000U, held));
+  EXPECT_FALSE(held.valid);
+}
+
+TEST(TubeViabilitySectionTest, HeldStepGuardsRoundedTerminalKnot) {
+  const double current_w = 0.1;
+  const double phase_rate = 1.0;
+  const double dt = 0.7;
+  // The rounded successor is below the exact dyadic sum.  This is the
+  // guard's boundary case: a rounded endpoint equal to a PWL knot must not
+  // suppress the crossed-knot check.
+  const double rounded_next_w = current_w + dt * phase_rate;
+  const ExactRational exact_terminal =
+      DecodeExact(current_w) + DecodeExact(dt) * DecodeExact(phase_rate);
+  ASSERT_GT(exact_terminal, DecodeExact(rounded_next_w));
+  EXPECT_EQ(exact_terminal - DecodeExact(rounded_next_w),
+            ExactRational(1) /
+                (boost::multiprecision::cpp_int(1) << 55));
+
+  SectionTubeProfile rounded_profile = MakeSectionProfile(
+      {current_w, rounded_next_w - 0.125, rounded_next_w, 2.0},
+      {{-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}});
+  TubeViabilityInput rounded_input = SectionInput(current_w, 0.0);
+  rounded_input.policy = SectionPolicy(1.9, 2.0);
+  rounded_input.section_reaches_path_end = true;
+  TubeViabilityResult rounded_preview;
+  ASSERT_TRUE(TubeViability::evaluate(rounded_profile, rounded_input,
+                                      rounded_preview))
+      << rounded_preview.reason;
+  ASSERT_EQ(rounded_preview.status, TubeViabilityStatus::FEASIBLE)
+      << rounded_preview.reason;
+  TubeHeldStepResult rounded_held;
+  ASSERT_TRUE(TubeViability::checkHeldStep(
+      rounded_preview, current_w, 0.0, phase_rate, 0.0, dt, 1000U,
+      rounded_held))
+      << rounded_held.reason;
+  EXPECT_TRUE(rounded_held.valid);
+  EXPECT_DOUBLE_EQ(rounded_held.next_w, rounded_next_w);
+  EXPECT_DOUBLE_EQ(rounded_held.next_delta, 0.0);
+  // The non-singleton terminal interval is charged at both outward endpoint
+  // queries, and the crossed-knot loop also charges the rounded knot.  The
+  // resulting bounded charge is stable for this four-knot partition.
+  EXPECT_EQ(rounded_held.work_count, 29U);
+
+  // A genuinely exact terminal knot is covered by the terminal-range check
+  // and is intentionally not charged as a crossed knot.
+  const double exact_dt = 0.125;
+  const double exact_next_w = current_w + exact_dt * phase_rate;
+  ASSERT_EQ(DecodeExact(current_w) + DecodeExact(exact_dt) *
+                DecodeExact(phase_rate),
+            DecodeExact(exact_next_w));
+  SectionTubeProfile exact_profile = MakeSectionProfile(
+      {current_w, exact_next_w, rounded_next_w, 2.0},
+      {{-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}, {-1.0, 1.0}});
+  TubeViabilityInput exact_input = SectionInput(current_w, 0.0);
+  exact_input.policy = SectionPolicy(1.9, 2.0);
+  exact_input.section_reaches_path_end = true;
+  TubeViabilityResult exact_preview;
+  ASSERT_TRUE(TubeViability::evaluate(exact_profile, exact_input,
+                                      exact_preview))
+      << exact_preview.reason;
+  ASSERT_EQ(exact_preview.status, TubeViabilityStatus::FEASIBLE)
+      << exact_preview.reason;
+  TubeHeldStepResult exact_held;
+  ASSERT_TRUE(TubeViability::checkHeldStep(
+      exact_preview, current_w, 0.0, phase_rate, 0.0, exact_dt, 1000U,
+      exact_held))
+      << exact_held.reason;
+  EXPECT_TRUE(exact_held.valid);
+  EXPECT_DOUBLE_EQ(exact_held.next_w, exact_next_w);
+  EXPECT_DOUBLE_EQ(exact_held.next_delta, 0.0);
+  EXPECT_EQ(exact_held.work_count, 21U);
 }
 
 TEST(TubeViabilityV2Test, ExactProvenanceIsRetainedAndMapConfigMayDiffer) {
