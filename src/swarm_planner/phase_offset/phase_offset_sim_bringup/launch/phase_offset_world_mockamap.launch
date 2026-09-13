@@ -30,6 +30,8 @@
   <arg name="trajectory_buffer" default="20000"/>
   <arg name="trajectory_min_step" default="0.05"/>
   <arg name="trajectory_reset_step" default="5.0"/>
+  <!-- Flown-path line width [m]; 0.06 was the old hairline default. -->
+  <arg name="trajectory_width" default="0.12"/>
 
   <!-- mockamap 3D field parameters (density = fill).
 
@@ -93,6 +95,7 @@
     <param name="trajectory_buffer" value="$(arg trajectory_buffer)"/>
     <param name="trajectory_min_step" value="$(arg trajectory_min_step)"/>
     <param name="trajectory_reset_step" value="$(arg trajectory_reset_step)"/>
+    <param name="trajectory_width" value="$(arg trajectory_width)"/>
   </node>
 
   <node if="$(arg enable_rviz)" pkg="rviz" type="rviz" name="rviz"

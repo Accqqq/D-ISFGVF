@@ -70,6 +70,10 @@ public:
     // the map between two runs.
     nh.param("trajectory_reset_step", trajectory_reset_step_, 5.0);
     trajectory_reset_step_ = std::max(1.0, trajectory_reset_step_);
+    // Flown-path line width [m].  The tail used to be drawn 0.06 m wide, which
+    // reads as a hairline next to the quadrotor mesh in a screenshot.
+    nh.param("trajectory_width", trajectory_width_, 0.12);
+    trajectory_width_ = std::max(0.01, trajectory_width_);
 
     if (frame_id_ != "world")
     {
@@ -323,7 +327,7 @@ private:
       path.type = visualization_msgs::Marker::LINE_STRIP;
       path.action = visualization_msgs::Marker::ADD;
       path.pose.orientation.w = 1.0;
-      path.scale.x = 0.06;
+      path.scale.x = trajectory_width_;
       path.color.r = color[0];
       path.color.g = color[1];
       path.color.b = color[2];
@@ -357,6 +361,7 @@ private:
   int trajectory_buffer_ = 20000;
   double trajectory_min_step_ = 0.05;
   double trajectory_reset_step_ = 5.0;
+  double trajectory_width_ = 0.12;
   double scenario_wait_timeout_s_ = 0.0;
   ros::NodeHandle nh_;
   std::vector<int> robot_ids_;
