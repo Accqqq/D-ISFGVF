@@ -1,3 +1,20 @@
+pillar_gap_corridor:
+  generator: dynamic_map_generator/scripts/make_pillar_gap_corridor.py
+  pillar_field: authentic crop of pillar.pcd, centres y >= 0 (30 pillars)
+  y_layout:
+    pillar_field: '[14.0, -0.6]'
+    reformation_gap: '[-0.6, -5.6]'
+    entrance_funnel: '[-5.6, -10.6] half-width 6.0 -> 1.5'
+    narrow_corridor: '[-10.6, -19.6] clear opening 3.0, length 9.0'
+    exit_bay: '[-19.6, -30.0]'
+  wall_thickness: 0.2 skin on the inner face, coarse 0.5 m body behind it
+  walls_seal: 'both walls run to |x| = 10 m (map window edge), so the opening is the only passage; map_size_x must stay 20'
+  lattice: 0.1
+  launch:
+    world: phase_offset_world_pillar_gap.launch
+    swarm: 'agent_count:=15 publish_goals:=true formation_goal_translation_y:=-47.0 map_size_y:=80'
+  start_centre: '(0, 20, 1) -> disk y[17, 23]'
+  goal_centre: '(0, -27) -> disk y[-30, -24]'
 corridor_single_wide:
   wall_thickness: 0.5
   width_m: 1.0
