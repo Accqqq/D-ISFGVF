@@ -194,138 +194,138 @@ Visualization Manager:
     Queue Size: 100
     Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_1/odom_visualization/robot
     Name: UAV1 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_2/odom_visualization/robot
     Name: UAV2 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_3/odom_visualization/robot
     Name: UAV3 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_4/odom_visualization/robot
     Name: UAV4 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_5/odom_visualization/robot
     Name: UAV5 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_6/odom_visualization/robot
     Name: UAV6 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_7/odom_visualization/robot
     Name: UAV7 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_8/odom_visualization/robot
     Name: UAV8 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_9/odom_visualization/robot
     Name: UAV9 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_10/odom_visualization/robot
     Name: UAV10 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_11/odom_visualization/robot
     Name: UAV11 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_12/odom_visualization/robot
     Name: UAV12 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_13/odom_visualization/robot
     Name: UAV13 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_14/odom_visualization/robot
     Name: UAV14 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_15/odom_visualization/robot
     Name: UAV15 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_16/odom_visualization/robot
     Name: UAV16 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_17/odom_visualization/robot
     Name: UAV17 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_18/odom_visualization/robot
     Name: UAV18 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_19/odom_visualization/robot
     Name: UAV19 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/Marker
     Enabled: true
     Marker Topic: /uav_0/path_vis
