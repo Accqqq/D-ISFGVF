@@ -6,7 +6,7 @@ Panels:
       Expanded:
         - /Common open map1
       Splitter Ratio: 0.5
-    Tree Height: 445
+    Tree Height: 371
   - Class: rviz/Views
     Expanded:
       - /Current View1
@@ -2552,7 +2552,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 50.482906341552734
+      Distance: 30.274364471435547
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -2560,9 +2560,9 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -1.6081219911575317
-        Y: 2.442427158355713
-        Z: 0.46394169330596924
+        X: -0.5320401787757874
+        Y: 0.5882996320724487
+        Z: 0.8739445805549622
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
