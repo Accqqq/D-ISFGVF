@@ -6,7 +6,7 @@ Panels:
       Expanded:
         - /Common open map1
       Splitter Ratio: 0.5
-    Tree Height: 445
+    Tree Height: 371
   - Class: rviz/Views
     Expanded:
       - /Current View1
@@ -125,7 +125,7 @@ Visualization Manager:
       Color: 255; 255; 255
       Color Transformer: Intensity
       Decay Time: 0
-      Enabled: false
+      Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
       Min Color: 0; 0; 0
@@ -140,7 +140,7 @@ Visualization Manager:
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
@@ -374,13 +374,13 @@ Visualization Manager:
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: false
+      Enabled: true
       Marker Topic: /uav_0/particle0/gvf/vector_field
       Name: UAV0 GVF vector field
       Namespaces:
         {}
       Queue Size: 100
-      Value: false
+      Value: true
     - Class: rviz/MarkerArray
       Enabled: true
       Marker Topic: /uav_0/phase_offset_section_tube
@@ -2552,7 +2552,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 50.482906341552734
+      Distance: 33.90728759765625
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -2560,9 +2560,9 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -1.6081219911575317
-        Y: 2.442427158355713
-        Z: 0.46394169330596924
+        X: -1.0780742168426514
+        Y: 0.28512147068977356
+        Z: 0.6642725467681885
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
