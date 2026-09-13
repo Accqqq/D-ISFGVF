@@ -616,6 +616,14 @@ bool PhaseOffsetRuntime::hasExecutedOffsetAuthority() const {
       delta_, profile_started_, profile_completed_);
 }
 
+void PhaseOffsetRuntime::applyBoundedDeltaDecayNoFail(const double max_step) {
+  if (!std::isfinite(max_step) || max_step <= 0.0) return;
+  if (!std::isfinite(delta_)) return;
+  const double step = std::min(std::abs(delta_), max_step);
+  const double next = delta_ - std::copysign(step, delta_);
+  delta_ = std::abs(next) < 1e-12 ? 0.0 : next;
+}
+
 void PhaseOffsetRuntime::requestRecenter() {
   // This is a lifecycle intent, not a state reset.  The next prepare emits a
   // bounded inward port through the existing active owner; complete() retires
@@ -1495,8 +1503,29 @@ bool PhaseOffsetRuntime::prepareSection(
                     : matched_output.invalid_reason);
   }
   const double tangent_speed = geometry.T.dot(matched_output.v_cmd);
+  // M4E, second instance of the same policy: the tangential-speed minimum is a
+  // constraint the allocator/projector already owns -- the port projector lifts
+  // w_lower so that the commanded tangential speed meets the minimum whenever
+  // the admissible phase window allows it.  When the coordination-driven
+  // transverse motion eats into the tangential component, the achieved speed
+  // can still land under the minimum with the phase correction already on its
+  // boundary.  Re-applying the minimum as a hard failure then converts an
+  // approved saturated tick into a persistent HOLD of a planner-valid task.
+  // Accept the saturated tick (it is already the best the authority can do) and
+  // keep failing closed when the authority still has room, so a genuinely
+  // infeasible port is still rejected.
+  // The projector owns the minimum as a constraint and lifts w_lower to satisfy
+  // it whenever the admissible phase authority allows; when the coordination
+  // driven transverse motion consumes the tangential component, the realisation
+  // can land under the minimum with no authority left.  The architecture
+  // contract is "preserve the positive tangential margin whenever feasible" and
+  // "a staging or offset-authority failure alone must not cause a persistent
+  // HOLD of a planner-valid task", so the saturation is accepted and only an
+  // actual reversal (or a non-finite command) stays closed.
+  const bool tangent_window_saturated = input.phase_window_saturated;
   if (!IsFinite(tangent_speed) ||
-      tangent_speed < config_.manual.tangent_speed_min) {
+      (!tangent_window_saturated &&
+       tangent_speed < config_.manual.tangent_speed_min)) {
     return fail("Section MatchedPort tangential speed is below the configured minimum");
   }
   // M4E: the phase window is an allocator-owned bound (M4C).  When the base

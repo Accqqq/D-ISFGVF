@@ -5,9 +5,8 @@
     one SO3 controller nodelet and one protected GVF launch include (formation
     planner plus local sensing).
 
-    spinner_threads and use_velocity_feedforward are retained only so older
-    launch callers can pass them.  They are deliberately not forwarded,
-    stored as parameters, or consumed by any control path.
+    spinner_threads bounds the planner's ROS callback concurrency.  The
+    legacy use_velocity_feedforward argument remains a compatibility no-op.
   -->
   <arg name="robot_id" default="0"/>
   <arg name="uav_ns" default="uav_$(arg robot_id)"/>
@@ -149,8 +148,9 @@
   <arg name="local_update_range_y" default="4.0"/>
   <arg name="local_update_range_z" default="2.5"/>
 
-  <!-- Compatibility-only no-op arguments; do not use these values. -->
-  <arg name="spinner_threads" default="2"/>
+  <!-- Swarm planners share a small number of cores; keep ROS callback
+       concurrency bounded instead of giving every agent eight threads. -->
+  <arg name="spinner_threads" default="1"/>
   <arg name="use_velocity_feedforward" default="false"/>
 
   <!-- One deterministic controller nodelet in the caller-owned manager. -->
@@ -336,6 +336,20 @@
            value="$(arg phase_offset_normal_preview_b_tight)"/>
       <arg name="phase_offset_normal_preview_b_open"
            value="$(arg phase_offset_normal_preview_b_open)"/>
+      <!-- The planner's own map-update half-range must match the sensing node
+           above, otherwise local_sensing hands the planner a cloud wider than
+           the region the map is allowed to fuse, and the known-domain evidence
+           no longer agrees with the cloud that carries it. -->
+      <arg name="local_update_range_x" value="$(arg local_update_range_x)"/>
+      <!-- Static mockamap worlds: no stale data to age out, so keep the
+           observations instead of invalidating the known static domain
+           every buffer refresh (which holds the Section tube). -->
+      <arg name="sdf_map_enable_buffer_fade_refresh" value="false"/>
+      <!-- Keep the retained offset alive (bounded decay) while no certified
+           Section exists, instead of parking the agent. -->
+      <arg name="phase_offset_recovery_from_hold_enable" value="true"/>
+      <arg name="local_update_range_y" value="$(arg local_update_range_y)"/>
+      <arg name="local_update_range_z" value="$(arg local_update_range_z)"/>
     </include>
 
     <!-- Explicit per-instance private planner parameters. -->
@@ -344,6 +358,7 @@
       <param name="gvf/odom_topic" value="$(arg odom_topic)"/>
       <param name="gvf/cloud_topic" value="$(arg local_map_topic)"/>
       <param name="gvf/cmd_topic" value="$(arg cmd_topic)"/>
+      <param name="gvf/spinner_threads" value="$(arg spinner_threads)"/>
       <param name="gvf/circle_test/enable" value="false"/>
       <param name="gvf/circle_test/auto_start" value="false"/>
       <param name="gvf/gvf_gain1" value="$(arg gvf_gain1)"/>

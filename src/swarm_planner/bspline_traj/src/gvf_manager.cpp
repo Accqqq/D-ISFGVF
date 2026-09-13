@@ -14,6 +14,11 @@ namespace FLAG_Race
     namespace {
     constexpr double kPathReferenceHandoffTolerance = 1e-10;
     constexpr std::uint64_t kWorldHorizontalFrameConventionId = 1U;
+    // Exhausted-frontend handoffs use a backdated seam and a small phase
+    // overshoot allowance: the command thread may re-anchor the live phase by
+    // a few centimetres after the FSM captured its snapshot.
+    constexpr double kExhaustedFrontendSeamBackW = 0.5;
+    constexpr double kExhaustedFrontendSeamSlackW = 0.10;
 
     double steadyTicksAsDouble()
     {
@@ -396,6 +401,10 @@ bool SectionPathHandoff::complete() const
         nh.param("gvf/cmd/governor_l_rate_max", cmd_governor_l_rate_max_, 4.0);
         nh.param("gvf/cmd/governor_l_ff_weight", cmd_governor_l_ff_weight_, 0.8);
         nh.param("gvf/cmd/governor_lead_max", cmd_governor_lead_max_, 1.6);
+        nh.param("phase_offset/recovery_from_hold_enable",
+                 recovery_from_hold_enable_, false);
+        nh.param("phase_offset/recovery_delta_step",
+                 recovery_delta_step_, 0.05);
         nh.param("gvf/cmd/governor_unlock_timeout",
                  cmd_governor_unlock_timeout_s_, 1.0);
         nh.param("gvf/cmd/governor_normal_cross_max", cmd_governor_normal_cross_max_, 0.08);
@@ -2166,7 +2175,13 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     phase_before <
                         section_candidate_capture.copied_prefix_start_w ||
                     phase_before >
-                        section_candidate_capture.copied_prefix_end_w) {
+                        section_candidate_capture.copied_prefix_end_w +
+                            ((section_current && section_current->path &&
+                              section_candidate_capture.copied_prefix_end_w >=
+                                  section_current->path->endW() -
+                                      kPathReferenceHandoffTolerance)
+                                 ? kExhaustedFrontendSeamSlackW
+                                 : 0.0)) {
                     return false;
                 }
                 if (!section_current || !section_current->path ||
@@ -2291,6 +2306,20 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                     last_recovery_status_ = matched_output.recovery_status;
                     bool section_output_selected = adapter_update_success &&
                         matched_output.selected;
+                    // Diagnostic only: name why the Section port refused this
+                    // tick.  The governor reports "guidance_invalid" without
+                    // this string, so the dominant cause of a HOLD could not be
+                    // told apart from a stale bundle, a non-finite motion, or a
+                    // rejected selected step.
+                    if (!section_output_selected) {
+                        ROS_WARN_THROTTLE(
+                            1.0,
+                            "[branch-debug] section port unavailable "
+                            "update_ok=%d selected=%d reason='%s'",
+                            (int)adapter_update_success,
+                            (int)matched_output.selected,
+                            matched_output.invalid_reason.c_str());
+                    }
 
                     // A freshly staged Section candidate is only a proposal.
                     // If its profile/preview cannot support this tick, retry
@@ -2423,19 +2452,77 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                         governor_reference_delta = matched_output.delta;
                     }
                     else if (retained_nonzero_section()) {
-                        // A nonzero Runtime reference has no safe nominal
-                        // fallback when both the new candidate and the
-                        // committed profile fail.  Publish the existing
-                        // position hold, leave phase/Runtime untouched, and
-                        // ask the planning FSM for a compatible retry.
-                        phase_offset_matched_adapter_->requestRecenter();
-                        out.valid = false;
+                        // Optional: keep the offset alive (never drop it) and
+                        // follow the coordinated reference while no certified
+                        // Section exists.  Off by default -> previous hold.
+                        bool recovered = false;
+                        if (recovery_from_hold_enable_) {
+                            double delta_now = 0.0;
+                            {
+                                std::lock_guard<std::mutex> recovery_lock(
+                                    phase_offset_matched_adapter_
+                                        ->runtime_command_mutex_);
+                                if (phase_offset_matched_adapter_->runtime_) {
+                                    phase_offset_matched_adapter_->runtime_
+                                        ->applyBoundedDeltaDecayNoFail(
+                                            recovery_delta_step_);
+                                    delta_now = phase_offset_matched_adapter_
+                                                    ->runtime_->retainedDelta();
+                                }
+                            }
+                            const SectionPathBundlePtr nominal_bundle =
+                                (section_current && section_current->path)
+                                    ? section_current : section_for_command;
+                            if (nominal_bundle && nominal_bundle->path &&
+                                !nominal_bundle->path->empty()) {
+                                section_for_command = nominal_bundle;
+                                command_path = nominal_bundle->path;
+                                out = pm.gvf_->calcLiftedGuidanceAtPhaseWithDelta(
+                                    pos, phase_before, command_path, delta_now);
+                                governor_reference_delta = delta_now;
+                                recovered = out.valid;
+                            }
+                        }
+                        if (!recovered) {
+                            phase_offset_matched_adapter_->requestRecenter();
+                            out.valid = false;
+                        }
                     }
                 }
                 else
                 {
-                    const bool retain_nonzero_reference =
+                    bool retain_nonzero_reference =
                         retained_nonzero_section();
+                    if (retain_nonzero_reference && recovery_from_hold_enable_) {
+                        // Keep the offset (bounded decay) instead of dropping it:
+                        // the committed path is still planner-valid, so fly it
+                        // on the coordinated reference rather than HOLDing.
+                        double delta_now = 0.0;
+                        {
+                            std::lock_guard<std::mutex> recovery_lock(
+                                phase_offset_matched_adapter_
+                                    ->runtime_command_mutex_);
+                            if (phase_offset_matched_adapter_->runtime_) {
+                                phase_offset_matched_adapter_->runtime_
+                                    ->applyBoundedDeltaDecayNoFail(
+                                        recovery_delta_step_);
+                                delta_now = phase_offset_matched_adapter_
+                                                ->runtime_->retainedDelta();
+                            }
+                        }
+                        const SectionPathBundlePtr recovery_bundle =
+                            (section_current && section_current->path)
+                                ? section_current : section_for_command;
+                        if (recovery_bundle && recovery_bundle->path &&
+                            !recovery_bundle->path->empty()) {
+                            section_for_command = recovery_bundle;
+                            command_path = recovery_bundle->path;
+                            out = pm.gvf_->calcLiftedGuidanceAtPhaseWithDelta(
+                                pos, phase_before, command_path, delta_now);
+                            governor_reference_delta = delta_now;
+                            retain_nonzero_reference = !out.valid;
+                        }
+                    }
                     if (retain_nonzero_reference) {
                         phase_offset_matched_adapter_->requestRecenter();
                         out.valid = false;
@@ -2459,11 +2546,13 @@ void gvf_manager::cmdCallback(const ros::TimerEvent& event)
                             deactivate_phase_offset();
                         }
                     }
-                    ROS_WARN_THROTTLE(
+                    if (ros::isInitialized()) {
+                        ROS_WARN_THROTTLE(
                         1.0,
                         retain_nonzero_reference
                             ? "[phase_offset_matched] current semantic path unavailable; retain nonzero Section reference and hold"
                             : "[phase_offset_matched] current semantic path unavailable; committed nominal guidance retained");
+                    }
                 }
             }
         }
@@ -4096,7 +4185,21 @@ bool gvf_manager::stageSectionPathHandoff(
     {
         std::lock_guard<std::mutex> handoff_lock(path_reference_handoff_mutex_);
         if (pending_section_path_handoff_) {
-            return false;
+            std::lock_guard<std::mutex> phase_lock(
+                authoritative_phase_mutex_);
+            const bool source_exhausted =
+                source_path && !source_path->empty() &&
+                std::isfinite(phase_w_) &&
+                phase_w_ >=
+                    source_path->endW() - kExhaustedFrontendSeamSlackW;
+            const bool candidate_not_committed =
+                !committed_section_bundle ||
+                committed_section_bundle->path !=
+                    pending_section_path_handoff_->candidate_path;
+            if (!(source_exhausted && candidate_not_committed)) {
+                return false;
+            }
+            pending_section_path_handoff_.reset();
         }
     }
 
@@ -4190,11 +4293,19 @@ bool gvf_manager::stageSectionPathHandoff(
             std::isfinite(copied_prefix_start_w);
         const bool prefix_end_finite =
             std::isfinite(copied_prefix_end_w);
+        const bool prefix_reaches_source_end =
+            source_path && !source_path->empty() &&
+            prefix_end_finite &&
+            copied_prefix_end_w >=
+                source_path->endW() - kPathReferenceHandoffTolerance;
+        const double phase_upper =
+            copied_prefix_end_w +
+            (prefix_reaches_source_end ? kExhaustedFrontendSeamSlackW : 0.0);
         const bool latest_phase_matches =
             phase_initialized_ && std::isfinite(phase_w_) &&
             ((prefix_start_finite && prefix_end_finite)
                  ? (phase_w_ >= copied_prefix_start_w &&
-                    phase_w_ <= copied_prefix_end_w)
+                    phase_w_ <= phase_upper)
                  : (!prefix_start_finite && !prefix_end_finite &&
                     authoritative_phase_generation_ == phase.generation &&
                     phase_w_ == phase.w));
@@ -4256,10 +4367,20 @@ bool gvf_manager::installPlannerOnlyFrontend(
         }
     }
     const bool has_copied_prefix = static_cast<bool>(copied_prefix_source);
+    const bool copied_prefix_reaches_source_end =
+        has_copied_prefix && !copied_prefix_source->empty() &&
+        copied_prefix_end_w >=
+            copied_prefix_source->endW() - kPathReferenceHandoffTolerance;
+    const double copied_prefix_phase_slack =
+        copied_prefix_reaches_source_end ? kExhaustedFrontendSeamSlackW : 0.0;
     if (has_copied_prefix) {
         if (!expected_phase.initialized ||
             expected_execution_generation == 0U ||
-            !(copied_prefix_end_w > expected_phase.w) ||
+            // A current-seam handoff copies the last prefix up to the live
+            // phase and starts the new path there; equality is the exhausted-
+            // frontend case, not an already-consumed prefix.
+            !(copied_prefix_end_w >=
+              expected_phase.w - copied_prefix_phase_slack) ||
             copied_prefix_source->empty() ||
             expected_phase.w < copied_prefix_source->startW() ||
             copied_prefix_end_w > copied_prefix_source->endW() ||
@@ -4327,12 +4448,12 @@ bool gvf_manager::installPlannerOnlyFrontend(
           phase_w_ != expected_phase.w)) ||
         (has_copied_prefix &&
          (authoritative_phase_generation_ < expected_phase.generation ||
-          phase_w_ < expected_phase.w))) {
+          phase_w_ > copied_prefix_end_w + copied_prefix_phase_slack))) {
         return false;
     }
     if (has_copied_prefix) {
         if (pm.gvf_->getContinuousPhasePath() != copied_prefix_source ||
-            phase_w_ > copied_prefix_end_w) {
+            phase_w_ > copied_prefix_end_w + copied_prefix_phase_slack) {
             return false;
         }
     }
@@ -4392,7 +4513,9 @@ bool gvf_manager::installPlannerOnlyFrontend(
 bool gvf_manager::consumeCommittedSectionPathHandoff(
     gvfManager& pm, const ros::Time& now)
 {
-    if (!phase_offset_matched_adapter_ || !pm.gvf_) return false;
+    if (!phase_offset_matched_adapter_ || !pm.gvf_) {
+        return false;
+    }
 
     std::shared_ptr<const SectionPathHandoff> section_handoff;
     {
@@ -4467,7 +4590,9 @@ bool gvf_manager::consumeCommittedSectionPathHandoff(
         pm.gvf_->setContinuousPhasePath(section_handoff->candidate_path);
         pm.gvf_->setNextPathWSamples(section_handoff->w);
         resetGovernorState();
-        if (pending_section_path_handoff_ != section_handoff) return false;
+        if (pending_section_path_handoff_ != section_handoff) {
+            return false;
+        }
         pending_section_path_handoff_.reset();
     }
     path_pub.publish(path_msg);
@@ -5451,6 +5576,15 @@ bool gvf_manager::checkCollision()
         if (distance < collision_threshold_) {
             consecutive_hits++;
             if (consecutive_hits >= std::max(1, collision_consecutive_hits_)) {
+                if (ros::isInitialized()) {
+                    ROS_WARN_THROTTLE(1.0,
+                        "[GVF][COLL_HIT] i=%d start_i=%d end_i=%d rows=%d occ=%d "
+                        "dist=%.3f thr=%.3f pts=(%.2f,%.2f,%.2f) progress_w=%.3f "
+                        "d_self=%.2f",
+                        i, start_idx, end_idx, traj_rows, occ, distance,
+                        collision_threshold_, point.x(), point.y(), point.z(),
+                        progress_w_, (point - odom_).norm());
+                }
                 return true;
             }
         } else {
@@ -5575,6 +5709,28 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
 
     std::vector<Eigen::Vector3d> kino_path = pm.kino_path_finder_->getKinoTraj(0.01);  // 0.01s的时间间隔
     pm.last_path = kino_path;
+    if (!kino_path.empty()) {
+        // Diagnostic only: the A*/kino plan is expected to end at the task
+        // goal.  A stalled agent's path has been observed to stop several
+        // metres short of it, so record start/end/goal and the path extent.
+        double path_len = 0.0;
+        for (std::size_t i = 1; i < kino_path.size(); ++i) {
+            path_len += (kino_path[i] - kino_path[i - 1]).norm();
+        }
+        if (ros::isInitialized()) {
+            ROS_INFO_THROTTLE(
+            1.0,
+            "[GVF][PATH] cmd=%d start=(%.2f,%.2f) end=(%.2f,%.2f) "
+            "path_last=(%.2f,%.2f) len=%.2f end_to_goal=%.2f "
+            "last_to_goal=%.2f goal=(%.2f,%.2f) d0_to_goal=%.2f horizon=%.2f "
+            "pts=%zu",
+            result, start_pt.x(), start_pt.y(), end_pt.x(), end_pt.y(),
+            kino_path.back().x(), kino_path.back().y(), path_len,
+            (end_pt - original_goal).norm(),
+            (kino_path.back() - original_goal).norm(), original_goal.x(),
+            original_goal.y(), path_dist_to_goal, horizon, kino_path.size());
+        }
+    }
 
     // 发布动力学路径
     nav_msgs::Path path_msg;
@@ -7015,8 +7171,19 @@ void gvf_manager::KinoPathCallback(const ros::TimerEvent& event)
         }
 
         ROS_INFO_THROTTLE(1.0,
-            "\033[36m[GVF][SWITCH]\033[0m accept=%d reason=%s J_old=%.3f J_new=%.3f ",
-            (int)accept_new, switch_reason.c_str(), J_old, J_new);
+            "\033[36m[GVF][SWITCH]\033[0m accept=%d reason=%s J_old=%.3f J_new=%.3f "
+            "rel=%.3f old_coll=%d old_near_end=%d gov_short=%d "
+            "progress_w=%.3f path_w_end=%.3f remain_w=%.3f d_goal=%.2f "
+            "pos=(%.2f,%.2f) goal=(%.2f,%.2f) old_i0=%d new_i0=%d",
+            (int)accept_new, switch_reason.c_str(), J_old, J_new,
+            (J_old != 0.0) ? (J_old - J_new) / J_old : 0.0,
+            (int)old_collision, (int)old_near_end,
+            (int)old_governor_path_short,
+            accepted_progress_w, accepted_path_w_end,
+            accepted_path_w_end - accepted_progress_w,
+            (goal_pt - odom_).norm(),
+            odom_.x(), odom_.y(), goal_pt.x(), goal_pt.y(),
+            old_i0, new_i0);
 
         reason_out = switch_reason;
         return accept_new;
@@ -8279,19 +8446,52 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                 future_seam_w);
 
                         if (section_handoff_required) {
-                            frontend_ready = future_seam_available &&
-                                buildPhaseC2Frontend(
-                                    pm, phase_at_switch, future_seam_w,
+                            double handoff_switch_w = future_seam_w;
+                            double copied_prefix_start_w = phase_at_switch;
+                            double copied_prefix_end_w = future_seam_w;
+                            bool handoff_seam_available =
+                                future_seam_available;
+                            if (!handoff_seam_available && old_path &&
+                                !old_path->empty() &&
+                                phase_at_switch >=
+                                    old_path->startW() - 1e-9 &&
+                                phase_at_switch <= old_path->endW() + 1e-9) {
+                                // The old frontend is exhausted at the live
+                                // phase, so no future seam exists.  Start the
+                                // connector a little behind the live phase and
+                                // keep the whole source tail as the prefix
+                                // window, so command-thread re-anchoring cannot
+                                // fall outside the staged handoff.
+                                const double seam_anchor_w = std::min(
+                                    phase_at_switch, old_path->endW());
+                                handoff_switch_w = std::max(
+                                    old_path->startW(),
+                                    seam_anchor_w -
+                                        kExhaustedFrontendSeamBackW);
+                                copied_prefix_start_w = handoff_switch_w;
+                                copied_prefix_end_w = old_path->endW();
+                                copied_prefix_start_w = std::max(
+                                    copied_prefix_start_w,
+                                    old_path->startW());
+                                handoff_seam_available =
+                                    copied_prefix_end_w >
+                                    copied_prefix_start_w + 1e-6;
+                            }
+                            if (handoff_seam_available) {
+                                frontend_ready = buildPhaseC2Frontend(
+                                    pm, phase_at_switch, handoff_switch_w,
                                     old_path, path_end_w, new_i0, cand_spline,
                                     cand_traj, cand_vel, cand_time, global_w,
                                     install_traj, install_vel, install_time,
                                     install_w, install_continuous_path);
+                            }
                             if (frontend_ready) {
                                 frontend_ready = stageSectionPathHandoff(
                                     fsm_phase, pm, install_continuous_path,
                                     install_traj, install_vel, install_time,
-                                    install_w, old_path, phase_at_switch,
-                                    future_seam_w);
+                                    install_w, old_path,
+                                    copied_prefix_start_w,
+                                    copied_prefix_end_w);
                             }
                         } else if (closed_phase_c2_enabled_) {
                             frontend_ready = future_seam_available &&
@@ -8307,8 +8507,11 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                 planner_only_execution_generation =
                                     captured_execution_generation;
                             } else {
-                                planner_only_prefix_source.reset();
-                                planner_only_prefix_end_w = phase_at_switch;
+                                planner_only_prefix_source = old_path;
+                                planner_only_prefix_end_w =
+                                    old_path && !old_path->empty()
+                                        ? old_path->endW()
+                                        : phase_at_switch;
                                 planner_only_execution_generation =
                                     captured_execution_generation;
                                 frontend_ready = buildPhaseC2Frontend(
@@ -8436,9 +8639,11 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                             const double path_end_w =
                                 phase_at_switch + remaining_length;
                             std::vector<double> candidate_w;
-                            if (pm.gvf_ && buildGlobalPhaseSamples(
+                            const bool build_samples_ok =
+                                pm.gvf_ && buildGlobalPhaseSamples(
                                     cand_traj, new_i0, phase_at_switch,
-                                    path_end_w, candidate_w)) {
+                                    path_end_w, candidate_w);
+                            if (build_samples_ok) {
                                 Eigen::MatrixXd install_traj;
                                 Eigen::MatrixXd install_vel;
                                 Eigen::VectorXd install_time;
@@ -8489,21 +8694,58 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                 std::uint64_t planner_only_execution_generation = 0U;
 
                                 if (section_handoff_required) {
-                                    frontend_ready = future_seam_available &&
-                                        buildPhaseC2Frontend(
-                                            pm, phase_at_switch, future_seam_w,
-                                            old_path, path_end_w, new_i0,
-                                            cand_spline, cand_traj, cand_vel,
-                                            cand_time, candidate_w, install_traj,
-                                            install_vel, install_time, install_w,
-                                            install_continuous_path);
+                                    double handoff_switch_w = future_seam_w;
+                                    double copied_prefix_start_w =
+                                        phase_at_switch;
+                                    double copied_prefix_end_w = future_seam_w;
+                                    bool handoff_seam_available =
+                                        future_seam_available;
+                                    if (!handoff_seam_available && old_path &&
+                                        !old_path->empty() &&
+                                        phase_at_switch >=
+                                            old_path->startW() - 1e-9 &&
+                                        phase_at_switch <=
+                                            old_path->endW() + 1e-9) {
+                                        // Exhausted frontend: use a backdated
+                                        // C2 seam and the full source tail as
+                                        // the copied-prefix window while
+                                        // retaining the Section-owned delta.
+                                        const double seam_anchor_w = std::min(
+                                            phase_at_switch,
+                                            old_path->endW());
+                                        handoff_switch_w = std::max(
+                                            old_path->startW(),
+                                            seam_anchor_w -
+                                                kExhaustedFrontendSeamBackW);
+                                        copied_prefix_start_w =
+                                            handoff_switch_w;
+                                        copied_prefix_end_w =
+                                            old_path->endW();
+                                        handoff_seam_available =
+                                            copied_prefix_end_w >
+                                            copied_prefix_start_w + 1e-6;
+                                    }
+                                    if (handoff_seam_available) {
+                                        frontend_ready =
+                                            buildPhaseC2Frontend(
+                                                pm, phase_at_switch,
+                                                handoff_switch_w, old_path,
+                                                path_end_w, new_i0,
+                                                cand_spline, cand_traj,
+                                                cand_vel, cand_time,
+                                                candidate_w, install_traj,
+                                                install_vel, install_time,
+                                                install_w,
+                                                install_continuous_path);
+                                    }
                                     if (frontend_ready) {
                                         frontend_ready = stageSectionPathHandoff(
                                             fsm_phase, pm,
                                             install_continuous_path,
                                             install_traj, install_vel,
                                             install_time, install_w, old_path,
-                                            phase_at_switch, future_seam_w);
+                                            copied_prefix_start_w,
+                                            copied_prefix_end_w);
                                     }
                                     if (!frontend_ready &&
                                         phase_offset_matched_adapter_) {
@@ -8524,6 +8766,11 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                         planner_only_execution_generation =
                                             captured_execution_generation;
                                     } else {
+                                        planner_only_prefix_source = old_path;
+                                        planner_only_prefix_end_w =
+                                            old_path && !old_path->empty()
+                                                ? old_path->endW()
+                                                : phase_at_switch;
                                         frontend_ready = buildPhaseC2Frontend(
                                             pm, phase_at_switch, phase_at_switch,
                                             old_path, path_end_w, new_i0,

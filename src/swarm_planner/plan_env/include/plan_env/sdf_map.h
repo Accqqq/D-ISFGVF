@@ -149,6 +149,14 @@ struct MappingParameters {
 
   /* buffer refresh */
   double buffer_refresh_period_;
+  // Static-environment switch for the periodic fade refresh.  The refresh
+  // erases the occupancy around the drone and, because the erased cells read as
+  // free, it must simultaneously invalidate the known static observation.  In a
+  // static map there is nothing stale to age out, and the invalidation makes the
+  // Section tube report UNKNOWN_DOMAIN / "profile not queryable" for the next
+  // ticks, which the governor turns into a HOLD.  Default true keeps the
+  // existing behaviour for every dynamic scene; set false for static maps.
+  bool enable_buffer_fade_refresh_;
 
   /* manual map layer */
   bool enable_manual_map_;
@@ -313,7 +321,8 @@ public:
   MappingData md_;
   
 private:
-  void invalidateKnownStaticObservationLocked();
+  void invalidateKnownStaticObservationLocked(
+      const char* caller = "unspecified");
   void beginEnvironmentChangeLocked();
   void finishEnvironmentChangeLocked();
   bool updateKnownDomainFromCloudLocked(

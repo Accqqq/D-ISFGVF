@@ -1,0 +1,88 @@
+<launch>
+  <!--
+    Identical to phase_offset_world.launch except that the common map source is
+    the density-tunable mockamap 3D field instead of a fixed PCD.
+
+    Both sources publish on /mock_map and local_sensing consumes /mock_map, so
+    this file is a drop-in alternative: start it INSTEAD of
+    phase_offset_world.launch, never alongside it.
+
+    The swarm itself is still phase_offset_swarm.launch (agent count, formation,
+    goals, SPH/tube parameters all live there, unchanged):
+
+      roslaunch phase_offset_sim_bringup phase_offset_world_mockamap.launch \
+        enable_rviz:=false enable_follow_rviz:=false
+      roslaunch phase_offset_sim_bringup phase_offset_swarm.launch \
+        agent_count:=3 publish_goals:=true
+
+    Density / extent overrides go straight to the mockamap launch args:
+      map_fill:=0.12  map_seed:=7  map_y_length:=70
+  -->
+  <arg name="scenario_file" default=""/>
+  <arg name="frame_id" default="world"/>
+  <arg name="enable_rviz" default="true"/>
+  <arg name="rviz_config"
+       default="$(find phase_offset_sim_bringup)/rviz/phase_offset_sim_b.rviz"/>
+  <arg name="enable_follow_rviz" default="true"/>
+  <arg name="follow_rviz_config"
+       default="$(find phase_offset_sim_bringup)/rviz/phase_offset_follow.rviz"/>
+
+  <!-- mockamap 3D field parameters (density = fill).
+
+       Geometry contract, measured rather than assumed.  The planner's own
+       sdf_map window is FIXED (map_size 20 x 50 x 2.5 around the origin, i.e.
+       world x[-10,10] y[-25,25]); a start or goal outside it deadlocks the
+       kinodynamic search at the first replan.
+
+         disk radius (spacing 1.5):  N=3 -> 1.50 m, N=15 -> 3.00 m, N=30 -> 4.50 m
+
+       Defaults below are sized for the 30-agent disk and still hold for 3/15:
+         field y in [-12.8, 12.8]  (map_y_length 26)
+         start centre y = 19       -> start disk y[14.5,23.5] inside the window,
+                                      and 1.7 m clear of the field above it
+         goal  centre y = -7       -> goal disk y[-11.5,-2.5] still inside the
+                                      field, so every agent keeps observing
+         sensing half-range 6 m > start-to-field-edge gap 1.7 m, so the box is
+         never empty (an empty box is an unobserved map, which also deadlocks). -->
+  <arg name="map_seed" default="511"/>
+  <arg name="map_type" default="1"/>
+  <arg name="map_resolution" default="0.2"/>
+  <arg name="map_x_length" default="40"/>
+  <arg name="map_y_length" default="26"/>
+  <arg name="map_z_length" default="4"/>
+  <arg name="map_fill" default="0.08"/>
+  <arg name="map_complexity" default="0.07"/>
+  <arg name="map_fractal" default="1"/>
+  <arg name="map_attenuation" default="0.1"/>
+
+  <!-- Sole scenario source for the generic-N read-only visualizer. -->
+  <rosparam command="load" file="$(arg scenario_file)" ns="/sim_b_world"
+            if="$(eval arg('scenario_file') != '')"/>
+
+  <include file="$(find mockamap)/launch/mockamap_3d_60x60.launch">
+    <arg name="seed" value="$(arg map_seed)"/>
+    <arg name="type" value="$(arg map_type)"/>
+    <arg name="resolution" value="$(arg map_resolution)"/>
+    <arg name="x_length" value="$(arg map_x_length)"/>
+    <arg name="y_length" value="$(arg map_y_length)"/>
+    <arg name="z_length" value="$(arg map_z_length)"/>
+    <arg name="fill" value="$(arg map_fill)"/>
+    <arg name="complexity" value="$(arg map_complexity)"/>
+    <arg name="fractal" value="$(arg map_fractal)"/>
+    <arg name="attenuation" value="$(arg map_attenuation)"/>
+    <arg name="enable_rviz" value="false"/>
+  </include>
+
+  <node pkg="phase_offset_sim_bringup" type="swarm_visualizer"
+        name="phase_offset_swarm_visualizer" output="screen">
+    <param name="scenario_param" value="/sim_b_world/scenario/agents"/>
+    <param name="frame_id" value="$(arg frame_id)"/>
+  </node>
+
+  <node if="$(arg enable_rviz)" pkg="rviz" type="rviz" name="rviz"
+        output="screen" required="true" args="-d $(arg rviz_config)"/>
+
+  <node if="$(arg enable_follow_rviz)" pkg="rviz" type="rviz"
+        name="rviz_follow" output="screen"
+        args="-d $(arg follow_rviz_config)"/>
+</launch>

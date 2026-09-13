@@ -132,6 +132,11 @@ class gvf_manager
         double cmd_governor_l_rate_max_ = 4.0;
         double cmd_governor_l_ff_weight_ = 0.8;
         double cmd_governor_lead_max_ = 1.6;
+        // Fallback that keeps the retained offset alive (instead of dropping it
+        // to the bare centreline) while no certified Section exists.  Default
+        // false keeps the current behaviour bit-for-bit.
+        bool recovery_from_hold_enable_ = false;
+        double recovery_delta_step_ = 0.05;
         // A "no valid candidate" hold that survives this long means the
         // reference has run away from the vehicle and the bounded command set
         // is empty.  Instead of holding forever (which preserves the very

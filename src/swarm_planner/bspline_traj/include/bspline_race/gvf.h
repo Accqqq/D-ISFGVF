@@ -228,6 +228,18 @@ class gvf
             const Eigen::Vector3d& pos,
             double w,
             const std::shared_ptr<const ContinuousPhasePath>& path_owner) const;
+        // Same evaluation, but with the coordinated lateral offset applied the
+        // way the vector field already does it: evaluate the ISF kernel at
+        // (pos - delta * N(w)) so the returned command is expressed on the
+        // coordinated reference r = p(w) + N(w)*delta.  Used by the fallback
+        // that must keep a nonzero offset alive while no certified Section is
+        // available.  delta == 0 is delegated to the overload above, so the
+        // zero-offset chains stay bit-identical.
+        LiftedGuidanceResult calcLiftedGuidanceAtPhaseWithDelta(
+            const Eigen::Vector3d& pos,
+            double w,
+            const std::shared_ptr<const ContinuousPhasePath>& path_owner,
+            double delta) const;
         void setVisualizationProgressW(double w);
         void setVisualizationDelta(double delta);
         void setTerminalGoalVisualization(const Eigen::Vector3d& goal);

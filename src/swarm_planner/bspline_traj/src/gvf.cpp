@@ -765,6 +765,17 @@ void gvf::visCallback(const ros::TimerEvent& /*event*/) {
 }
 
 void gvf::gvfVisCallback(const ros::TimerEvent& /*event*/) {
+    // The local vector field is a pure RViz output: nothing in the control path
+    // reads /particle0/gvf/vector_field.  Building it costs one spline
+    // evaluation and one ARROW marker per sample cell over the local box
+    // (25 x 25 = 625 arrows at gvf/local_update_range = 3.0) at 20 Hz, and it
+    // was built unconditionally, i.e. also when no RViz display is subscribed
+    // to it.  Skip the construction while nobody is watching; the field is
+    // rebuilt on the next tick once a display subscribes, so the rendered
+    // output is unchanged.
+    if (vector_field_pub_.getNumSubscribers() == 0) {
+        return;
+    }
     publishGVF();
 }
 
@@ -1537,6 +1548,71 @@ gvf::LiftedGuidanceResult gvf::calcLiftedGuidanceAtPhase(
     guidance::IsfGuidance guidance_output;
     if (!guidance::IsfReferenceKernel::evaluate(
             pos, reference, gains, guidance_output)) {
+        return out;
+    }
+
+    out.v_cmd = guidance_output.v_cmd;
+    out.w_proj = w;
+    out.w_dot = guidance_output.w_dot;
+    out.e_parallel = guidance_output.e_parallel;
+    out.e_perp = guidance_output.e_perp;
+    out.ref_pt = guidance_output.ref_pt;
+    out.tangent = guidance_output.tangent;
+    out.valid = true;
+    return out;
+}
+
+gvf::LiftedGuidanceResult gvf::calcLiftedGuidanceAtPhaseWithDelta(
+    const Eigen::Vector3d& pos,
+    double w,
+    const std::shared_ptr<const ContinuousPhasePath>& path_owner,
+    double delta) const
+{
+    // Zero (or absent) offset must be bit-identical to the plain overload so
+    // every existing chain is unaffected.
+    if (!std::isfinite(delta) || std::abs(delta) < 1e-12) {
+        return calcLiftedGuidanceAtPhase(pos, w, path_owner);
+    }
+
+    LiftedGuidanceResult out;
+    if (!std::isfinite(w)) return out;
+
+    ContinuousPhasePathState state;
+    if (!path_owner || path_owner->empty() || !path_owner->evaluate(w, state)) {
+        return out;
+    }
+    const Eigen::Vector3d dpdw = state.dp_dw;
+    const double dpdw_norm = dpdw.norm();
+    if (dpdw_norm < 1e-6) return out;
+
+    // The same lateral lift the vector-field visualisation uses: evaluate the
+    // guidance one offset "inward" from the coordinated reference.
+    const Eigen::Vector3d tangent = dpdw / dpdw_norm;
+    Eigen::Vector3d normal = Eigen::Vector3d::Zero();
+    normal.x() = -tangent.y();
+    normal.y() = tangent.x();
+    if (normal.head<2>().norm() > 1e-9) {
+        normal.head<2>().normalize();
+    } else {
+        normal.setZero();
+    }
+    const Eigen::Vector3d eval_pos = pos - delta * normal;
+
+    guidance::ReferenceGeometry reference;
+    reference.point = state.p;
+    reference.tangent = tangent;
+    reference.derivative_norm = dpdw_norm;
+    reference.valid = true;
+    guidance::IsfGains gains;
+    gains.k1 = gvf_.K1_;
+    gains.k2 = gvf_.K2_;
+    gains.convergence_bandwidth = gvf_.convergence_bandwidth_;
+    gains.progress_rho0 = progress_rho0_;
+    gains.progress_delta = progress_delta_;
+    gains.alpha_min = alpha_min_;
+    guidance::IsfGuidance guidance_output;
+    if (!guidance::IsfReferenceKernel::evaluate(
+            eval_pos, reference, gains, guidance_output)) {
         return out;
     }
 

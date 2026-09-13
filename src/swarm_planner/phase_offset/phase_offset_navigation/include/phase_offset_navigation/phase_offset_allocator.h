@@ -48,6 +48,16 @@ struct PhaseOffsetAllocatorBounds {
   double zoh_min_dt = 0.0;
   double zoh_max_dt = 0.0;
   double zoh_dt = 0.0;
+
+  // Minimum physical tangential speed of the realised command.  The port
+  // projector already carries this as a constraint on w_lower
+  // (port_projector.cpp: "w_lower = max(w_lower, (tangent_speed_min -
+  // base_tangent_speed) / r_w_norm)"); the allocator owns the phase window and
+  // the amplitude, so it must carry the same lower bound or it can select a
+  // command that the runtime's tangential-speed audit then rejects, turning a
+  // reachable tick into a HOLD.  Zero disables the constraint (unchanged
+  // behaviour for every caller that does not set it).
+  double tangent_speed_min = 0.0;
 };
 
 struct PhaseOffsetAllocatorInput {
@@ -60,6 +70,11 @@ struct PhaseOffsetAllocatorInput {
 
   // f_w0 is the nominal phase rate before the selected port is added.
   double f_w0 = 0.0;
+  // Tangential component of the base (pre-port) command, i.e. T . base_v_cmd.
+  // Used with bounds.tangent_speed_min to keep the selected u_w from spending
+  // the tangential budget below its floor.  Zero means "not provided", which
+  // leaves the tangential constraint inactive together with a zero minimum.
+  double base_tangent_speed = 0.0;
   phase_offset_core::PortCommand previous_u;
   double dt = 0.0;
   PhaseOffsetAllocatorBounds bounds;

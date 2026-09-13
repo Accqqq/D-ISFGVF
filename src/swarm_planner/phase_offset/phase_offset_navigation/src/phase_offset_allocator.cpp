@@ -362,6 +362,18 @@ double EffectiveDeltaLimit(const PhaseOffsetAllocatorInput& input) {
 
 bool FinalCommandValid(const PhaseOffsetAllocatorInput& input,
                        const PhaseOffsetAllocatorResult& output) {
+  // The admissible windows are expressed in the u_w / u_delta domain
+  // (lower_nu - f_w0, the preview rate interval, +-delta_limit), and that is
+  // also the domain in which BuildSelectedScalar clamps the command.  Checking
+  // membership there is exact.  Re-deriving the phase rate as f_w0 + u_w and
+  // comparing that against [lower_nu, upper_nu] is NOT exact: f + (b - f) != b
+  // in IEEE754, and over 200k random inputs 5.1% of saturated lower-boundary
+  // picks and 3.7% of upper-boundary ones landed a few ULP outside their own
+  // window.  A saturated command was then reported as failing its ZOH checks,
+  // the Section port was dropped, and the UAV hovered metres short of its goal
+  // on dense swarms.  Nothing is relaxed here: the interval is the same one,
+  // only compared in the representation it was built in.  The independent
+  // amplitude and slew checks below stay strict.
   const PhaseOffsetAllocatorBounds& bounds = input.bounds;
   const phase_offset_core::PortCommand& selected = output.selected_u;
   const double phase_rate = input.f_w0 + selected.u_w;
@@ -374,10 +386,10 @@ bool FinalCommandValid(const PhaseOffsetAllocatorInput& input,
   // the request could not be brought inside it at all, so the command takes the
   // interval boundary and the rest of the checks still apply.
   const bool phase_window_ok = output.phase_window_clipped ||
-      (phase_rate >= bounds.lower_nu && phase_rate <= bounds.upper_nu);
+      (selected.u_w >= output.u_w.lower && selected.u_w <= output.u_w.upper);
   const bool transverse_interval_ok = output.transverse_interval_clipped ||
-      (selected.u_delta >= output.preview_rate_interval.lower &&
-       selected.u_delta <= output.preview_rate_interval.upper);
+      (selected.u_delta >= output.u_delta.lower &&
+       selected.u_delta <= output.u_delta.upper);
   return Finite(selected.u_w) && Finite(selected.u_delta) &&
       Finite(phase_rate) && phase_window_ok && amplitude_valid &&
       transverse_interval_ok &&
@@ -386,6 +398,51 @@ bool FinalCommandValid(const PhaseOffsetAllocatorInput& input,
       selected.u_w <= output.u_w.slew_upper &&
       selected.u_delta >= output.u_delta.slew_lower &&
       selected.u_delta <= output.u_delta.slew_upper;
+}
+
+// Diagnostic only: expands the six FinalCommandValid sub-conditions so a
+// rejected tick names the exact quantity that failed instead of only reporting
+// that "a" bound was violated.  It does not change any decision.
+std::string FinalCommandFailDetail(const PhaseOffsetAllocatorInput& input,
+                                   const PhaseOffsetAllocatorResult& output) {
+  const PhaseOffsetAllocatorBounds& bounds = input.bounds;
+  const phase_offset_core::PortCommand& selected = output.selected_u;
+  const double phase_rate = input.f_w0 + selected.u_w;
+  const double delta_limit = EffectiveDeltaLimit(input);
+  const bool finite_ok = Finite(selected.u_w) && Finite(selected.u_delta) &&
+      Finite(phase_rate);
+  const bool amp_ok = bounds.u_w_abs_max == 0.0
+      ? selected.u_w == 0.0
+      : std::abs(selected.u_w) <= bounds.u_w_abs_max;
+  const bool phase_window_ok = output.phase_window_clipped ||
+      (phase_rate >= bounds.lower_nu && phase_rate <= bounds.upper_nu);
+  const bool transverse_ok = output.transverse_interval_clipped ||
+      (selected.u_delta >= output.preview_rate_interval.lower &&
+       selected.u_delta <= output.preview_rate_interval.upper);
+  const bool delta_limit_ok = std::abs(selected.u_delta) <= delta_limit;
+  const bool u_w_slew_ok = selected.u_w >= output.u_w.slew_lower &&
+      selected.u_w <= output.u_w.slew_upper;
+  const bool u_delta_slew_ok = selected.u_delta >= output.u_delta.slew_lower &&
+      selected.u_delta <= output.u_delta.slew_upper;
+  char buffer[512];
+  std::snprintf(
+      buffer, sizeof(buffer),
+      " ok[finite=%d amp=%d phase_win=%d transverse=%d delta_limit=%d "
+      "u_w_slew=%d u_delta_slew=%d consist=%d]",
+      (int)finite_ok, (int)amp_ok, (int)phase_window_ok, (int)transverse_ok,
+      (int)delta_limit_ok, (int)u_w_slew_ok, (int)u_delta_slew_ok,
+      (int)output.selectedUConsistent(0.0));
+  char numbers[512];
+  std::snprintf(
+      numbers, sizeof(numbers),
+      " rate=%.17g win=[%.17g,%.17g] u_w=%.17g max=%.17g slew=[%.17g,%.17g] "
+      "u_delta=%.17g preview=[%.17g,%.17g] limit=%.17g dslew=[%.17g,%.17g]",
+      phase_rate, bounds.lower_nu, bounds.upper_nu, selected.u_w,
+      bounds.u_w_abs_max, output.u_w.slew_lower, output.u_w.slew_upper,
+      selected.u_delta, output.preview_rate_interval.lower,
+      output.preview_rate_interval.upper, delta_limit,
+      output.u_delta.slew_lower, output.u_delta.slew_upper);
+  return std::string(buffer) + numbers;
 }
 
 bool Fail(PhaseOffsetAllocatorResult& output,
@@ -560,6 +617,28 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
     u_w_upper = 0.0;
   }
 
+  // Tangential-speed floor.  The realised tangential speed is
+  //   T . v_cmd = base_tangent_speed + |r_w| * u_w,
+  // so "tangential speed >= minimum" is a lower bound on u_w.  The port
+  // projector already applies exactly this constraint when it forms the port
+  // (port_projector.cpp: w_lower = max(w_lower, (tangent_speed_min -
+  // base_tangent_speed) / r_w_norm)); the allocator owns the phase window and
+  // amplitude, so without the same bound it can select a u_w that the runtime's
+  // tangential-speed audit then rejects, converting a reachable tick into a
+  // HOLD.  A zero minimum (every caller that does not set it, including every
+  // existing test) leaves this inactive.
+  if (input.bounds.tangent_speed_min > 0.0) {
+    const double r_w_norm = input.geometry.r_w.norm();
+    if (Finite(r_w_norm) && r_w_norm > 1e-9) {
+      const double tangent_lower =
+          (input.bounds.tangent_speed_min - input.base_tangent_speed) /
+          r_w_norm;
+      if (Finite(tangent_lower)) {
+        u_w_lower = std::max(u_w_lower, tangent_lower);
+      }
+    }
+  }
+
   const double delta_limit = EffectiveDeltaLimit(input);
   double u_delta_lower = 0.0;
   double u_delta_upper = 0.0;
@@ -721,7 +800,8 @@ bool PhaseOffsetAllocator::allocate(const PhaseOffsetAllocatorInput& input,
   if (!FinalCommandValid(input, output) ||
       !output.selectedUConsistent(0.0)) {
     return Fail(output, PhaseOffsetAllocatorStatus::NO_ADMISSIBLE_COMMAND,
-                "selected scalar command failed its bounded ZOH checks");
+                "selected scalar command failed its bounded ZOH checks" +
+                    FinalCommandFailDetail(input, output));
   }
 
   output.status = PhaseOffsetAllocatorStatus::SELECTED;

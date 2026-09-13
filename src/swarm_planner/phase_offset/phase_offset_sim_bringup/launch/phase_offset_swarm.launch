@@ -21,6 +21,16 @@
   <arg name="formation_goal_translation_y" default="-38.0"/>
   <arg name="formation_goal_translation_x" default="0.0"/>
   <arg name="formation_goal_base_y" default=""/>
+  <!-- Physics rate.  Measured 2026-09-12 on the 30-agent mockamap disk: the
+       simulator is NOT the 30-agent bottleneck.  At 1000 Hz the host ran
+       27/30 agents to their goals; at 250 Hz it ran 23/30, and the simulation
+       held 100% real time in both cases.  The CPU profile shows why: of
+       ~1090% total, formation_planning alone takes ~840% (30 x ~28%) while
+       quadrotor_simulator takes ~21%.  Lowering this rate therefore buys
+       almost nothing and slightly worsens the run, so the validated 1000 Hz
+       default is kept.  Address 30-agent capacity on the planner side
+       (per-UAV visualisation, tube update period, or agents per host) instead;
+       simulation_rate:=250 remains available as an explicit override. -->
   <arg name="simulation_rate" default="1000.0"/>
   <arg name="odom_rate" default="100.0"/>
   <arg name="start_at_hover" default="true"/>
@@ -48,9 +58,22 @@
   <arg name="map_size_z" default="2.5"/>
   <!-- Local sensing / planner half-range.  Raise it for the single-gate maps:
        with the default 4.0 m an agent that reaches the wall far from the only
-       opening cannot see it and holds.  SPH-planning runs 7.0. -->
-  <arg name="local_update_range_x" default="4.0"/>
-  <arg name="local_update_range_y" default="4.0"/>
+       opening cannot see it and holds.  SPH-planning runs 7.0.
+
+       Swarm default is 6.0 m (raised from 4.0): the random 3D mockamap fields
+       need the sensing box to reach the obstacle set from further away, and a
+       start safe zone must stay strictly INSIDE this half-range, otherwise the
+       box is empty and the map has no observation to certify.
+       The single-UAV chain (test_gvf.launch) keeps its own 4.0 default. -->
+  <!-- Enlarged from 6.0 to 8.0: the certified (known) domain is this sensor
+       box.  The Section tube scans forward 2.4 m from the PHASE, which can sit
+       ahead of a vehicle that was briefly blocked; with a 6 m half-range the
+       scan left the certified domain at a 3.6 m lag (scan_path_left_known_domain),
+       the bundle became unavailable and the governor HOLDed while the phase kept
+       creeping, so the lag could never recover.  8 m tolerates a 5.6 m lag, which
+       is what local_sensing costs ~0.011 core/agent to observe. -->
+  <arg name="local_update_range_x" default="8.0"/>
+  <arg name="local_update_range_y" default="8.0"/>
   <arg name="local_update_range_z" default="2.5"/>
   <arg name="nodelet_manager" default="/so3_nodelet_manager"/>
   <arg name="goal_connection_timeout" default="30.0"/>

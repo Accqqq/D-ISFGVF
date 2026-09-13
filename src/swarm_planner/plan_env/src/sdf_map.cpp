@@ -195,7 +195,16 @@ EnvironmentValidityStore& EnvironmentValidityStore::operator=(
 
 }  // namespace plan_env
 
-void SDFMap::invalidateKnownStaticObservationLocked() {
+void SDFMap::invalidateKnownStaticObservationLocked(const char* caller) {
+  // Diagnostic only: the caller label turns "the known domain went invalid"
+  // into an actionable fact.  Downstream this states as the tube's
+  // UNKNOWN_DOMAIN, the section bundle failing to build, guidance_invalid and
+  // finally a governor HOLD, so the label is the shortest path to the cause.
+  if (static_known_region_valid_) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[sdf_map] known static observation invalidated by %s",
+                      caller != nullptr ? caller : "unspecified");
+  }
   static_known_region_valid_ = false;
   static_known_region_min_.setZero();
   static_known_region_max_.setZero();
@@ -206,7 +215,7 @@ void SDFMap::beginEnvironmentChangeLocked() {
   if (environment_validity_store_.state) {
     environment_validity_store_.state->valid = false;
   }
-  invalidateKnownStaticObservationLocked();
+  invalidateKnownStaticObservationLocked("beginEnvironmentChange");
 }
 
 void SDFMap::finishEnvironmentChangeLocked() {
@@ -280,6 +289,8 @@ void SDFMap::initMap(ros::NodeHandle& nh,const std::string& particle, const std:
   nh.param("sdf_map/local_map_margin", mp_.local_map_margin_, 1);
   nh.param("sdf_map/ground_height", mp_.ground_height_, 1.0);
   nh.param("sdf_map/buffer_refresh_period", mp_.buffer_refresh_period_, 0.0);
+  nh.param("sdf_map/enable_buffer_fade_refresh",
+           mp_.enable_buffer_fade_refresh_, true);
   loadManualMapParams(nh, mp_);
 
   mp_.local_bound_inflate_ = max(mp_.resolution_, mp_.local_bound_inflate_);
@@ -467,6 +478,8 @@ void SDFMap::initMap(ros::NodeHandle& nh) {
   nh.param("sdf_map/local_map_margin", mp_.local_map_margin_, 1);
   nh.param("sdf_map/ground_height", mp_.ground_height_, 1.0);
   nh.param("sdf_map/buffer_refresh_period", mp_.buffer_refresh_period_, 0.0);
+  nh.param("sdf_map/enable_buffer_fade_refresh",
+           mp_.enable_buffer_fade_refresh_, true);
   loadManualMapParams(nh, mp_);
 
   mp_.local_bound_inflate_ = max(mp_.resolution_, mp_.local_bound_inflate_);
@@ -606,7 +619,7 @@ void SDFMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
   // Sensor-buffer clearing invalidates only the future complete-cloud known
   // declaration.  Existing immutable captures remain valid in the static
   // environment; a subsequent matching complete cloud can restore this box.
-  invalidateKnownStaticObservationLocked();
+  invalidateKnownStaticObservationLocked("clearBuffer");
 
   Eigen::Vector3i min_id, max_id;
   posToIndex(min_pos, min_id);
@@ -628,7 +641,7 @@ void SDFMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
 
 void SDFMap::gradualResetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos) {
   const std::lock_guard<std::recursive_mutex> lock(map_data_mutex_.mutex);
-  invalidateKnownStaticObservationLocked();
+  invalidateKnownStaticObservationLocked("gradualResetBuffer");
   // 渐进式清空缓冲区，避免突然清空造成闪烁
   Eigen::Vector3i min_id, max_id;
   posToIndex(min_pos, min_id);
@@ -1677,7 +1690,7 @@ Eigen::Vector3d SDFMap::closetPointInMap(const Eigen::Vector3d& pt, const Eigen:
 
 void SDFMap::clearAndInflateLocalMap() {
   const std::lock_guard<std::recursive_mutex> lock(map_data_mutex_.mutex);
-  invalidateKnownStaticObservationLocked();
+  invalidateKnownStaticObservationLocked("clearAndInflateLocalMap");
   /*clear outside local*/
   const int vec_margin = 5;
   // Eigen::Vector3i min_vec_margin = min_vec - Eigen::Vector3i(vec_margin,
@@ -1820,6 +1833,11 @@ void SDFMap::visCallback(const ros::TimerEvent& /*event*/) {
 void SDFMap::bufferRefreshCallback(const ros::TimerEvent& /*event*/){
   const std::lock_guard<std::recursive_mutex> lock(map_data_mutex_.mutex);
   if (!md_.has_odom_) return;
+  // Static scenes: keep the observations.  The fade refresh below erases
+  // occupancy around the drone and therefore also invalidates the known
+  // static observation; with nothing stale to age out that only makes the
+  // Section tube unusable for the following ticks.
+  if (!mp_.enable_buffer_fade_refresh_) return;
   
   // 检查无人机是否在移动，如果移动速度过快则延迟清空
   static Eigen::Vector3d last_camera_pos = md_.camera_pos_;
@@ -1952,7 +1970,7 @@ void SDFMap::odomCallback(const nav_msgs::OdometryConstPtr& odom) {
        (odom->header.stamp <= static_cloud_odom_history_.back().header.stamp ||
         odom->header.frame_id != static_cloud_odom_history_.back().header.frame_id))) {
     static_cloud_odom_history_.clear();
-    invalidateKnownStaticObservationLocked();
+    invalidateKnownStaticObservationLocked("odom_history_reset");
   } else {
     static_cloud_odom_history_.push_back(*odom);
     if (static_cloud_odom_history_.size() > 256U) {
@@ -1985,7 +2003,7 @@ void SDFMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img) {
   }
 
   if (isnan(md_.camera_pos_(0)) || isnan(md_.camera_pos_(1)) || isnan(md_.camera_pos_(2))) {
-    invalidateKnownStaticObservationLocked();
+    invalidateKnownStaticObservationLocked("nan_camera_pos");
     return;
   }
 
@@ -2590,8 +2608,13 @@ bool SDFMap::updateKnownDomainFromCloudLocked(
   // Diagnostics for the known-domain contract.  These report only why the
   // static observation was rejected; they never widen the claim.
   const auto reject_known = [this](const char* reason) {
-    (void)reason;
-    invalidateKnownStaticObservationLocked();
+    // Diagnostic only: this reason used to be discarded, which left a rejected
+    // static observation indistinguishable from "never observed" downstream
+    // (the tube then reports UNKNOWN_DOMAIN and the governor holds).
+    ROS_WARN_THROTTLE(1.0,
+                      "[sdf_map] static known-domain observation rejected: %s",
+                      reason);
+    invalidateKnownStaticObservationLocked("reject_known");
     return false;
   };
   if (!static_cloud_complete_declared_ || !static_cloud_contract_valid_ ||
@@ -2634,13 +2657,13 @@ bool SDFMap::updateKnownDomainFromCloudLocked(
                             source_odom->pose.pose.position.y,
                             source_odom->pose.pose.position.z);
   if (!source_center.allFinite() || !md_.camera_pos_.allFinite()) {
-    invalidateKnownStaticObservationLocked();
+    invalidateKnownStaticObservationLocked("nonfinite_source_center");
     return false;
   }
   for (const pcl::PointXYZ& point : points) {
     if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
         !std::isfinite(point.z)) {
-      invalidateKnownStaticObservationLocked();
+      invalidateKnownStaticObservationLocked("nonfinite_source_center");
       return false;
     }
   }
@@ -2653,7 +2676,7 @@ bool SDFMap::commitKnownStaticObservationLocked(
   const auto reject_commit = [this](const char* reason, const int axis) {
     (void)reason;
     (void)axis;
-    invalidateKnownStaticObservationLocked();
+    invalidateKnownStaticObservationLocked("nonfinite_points");
     return false;
   };
   if (!source_center.allFinite() || !md_.camera_pos_.allFinite()) {
@@ -2725,7 +2748,7 @@ bool SDFMap::commitKnownStaticObservationLocked(
                        mp_.map_voxel_num_(axis), halo,
                        lower_strict, upper_strict,
                        lower(axis), upper(axis))) {
-      invalidateKnownStaticObservationLocked();
+      invalidateKnownStaticObservationLocked("commit_reject");
       return false;
     }
   }
@@ -2737,6 +2760,13 @@ bool SDFMap::commitKnownStaticObservationLocked(
   static_known_region_max_ = upper;
   static_known_region_valid_ = true;
   static_cloud_last_stamp_ = cloud_stamp;
+  // Diagnostic only: pairs with the invalidation label so the "invalid ->
+  // valid" gap can be measured instead of inferred.
+  ROS_INFO_THROTTLE(1.0,
+                    "[sdf_map] known static observation committed: x[%.2f,%.2f] "
+                    "y[%.2f,%.2f] z[%.2f,%.2f] stamp=%.3f",
+                    lower.x(), upper.x(), lower.y(), upper.y(), lower.z(),
+                    upper.z(), cloud_stamp.toSec());
   return true;
 }
 

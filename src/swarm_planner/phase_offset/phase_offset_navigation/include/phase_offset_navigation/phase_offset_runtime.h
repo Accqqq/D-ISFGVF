@@ -518,6 +518,12 @@ class PhaseOffsetRuntime {
   // completion is observed and committed only after an accepted exact step
   // reaches neutral.
   void requestRecenter();
+  // Deterministic, non-rejecting bounded decay of the retained transverse
+  // offset: delta <- delta - sign(delta)*min(|delta|, max_step).  Same class as
+  // commitV2NoFail -- it cannot reject, allocate or run a proof.  Used only by
+  // the fallback that keeps a nonzero offset alive while no certified Section
+  // exists (instead of dropping the offset, which loses lateral containment).
+  void applyBoundedDeltaDecayNoFail(double max_step);
   bool recenterRequested() const { return returning_to_center_; }
   phase_offset_core::PortCommand previousFinalPort() const {
     return previous_final_port_;

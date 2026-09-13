@@ -423,6 +423,33 @@ bool PhaseOffsetMatchedAdapter::updateSectionLocked(
     return false;
   }
 
+  // Diagnostic only: decompose the ISF base rate.  w_dot = k1 (alpha + sigma) /
+  // |r_w|, so a collapsed rate is either a large lateral error rho (alpha ->
+  // alpha_min), a negative longitudinal error e_parallel (sigma -> -1, "wait
+  // for the UAV"), or an inflated reference derivative norm |r_w|.
+  {
+    const double rho_dbg = base.e_perp.norm();
+    const double rho0_dbg = std::max(1e-6, input.gains.progress_rho0);
+    const double delta_dbg = std::max(1e-6, input.gains.progress_delta);
+    const double alpha_dbg = input.gains.alpha_min +
+        (1.0 - input.gains.alpha_min) /
+            (1.0 + (rho_dbg / rho0_dbg) * (rho_dbg / rho0_dbg));
+    const double sigma_dbg = std::tanh(base.e_parallel / delta_dbg);
+    // Guarded: the unit tests exercise this path without ros::init(), and the
+    // THROTTLE macros call ros::Time::now() internally.
+    if (ros::isInitialized()) {
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[phase_offset_base] k1=%.3f k2=%.3f rho=%.3f e_par=%.3f "
+        "alpha=%.3f sigma=%.3f r_w_norm=%.4f w_dot=%.3f v_tau=%.3f "
+        "|v_cmd|=%.3f delta=%.3f w=%.3f",
+        input.gains.k1, input.gains.k2, rho_dbg, base.e_parallel, alpha_dbg,
+        sigma_dbg, reference.derivative_norm, base.w_dot,
+        base.v_cmd.dot(reference.tangent), base.v_cmd.norm(), retained_delta,
+        geometry.w);
+    }
+  }
+
   phase_offset_navigation::TubeViabilityInput preview_input;
   preview_input.current_w = geometry.w;
   preview_input.current_delta = retained_delta;
@@ -451,12 +478,14 @@ bool PhaseOffsetMatchedAdapter::updateSectionLocked(
   if (!phase_offset_navigation::TubeViability::evaluate(
           *bundle.profile, preview_input, preview) || !preview.valid ||
       !preview.feasible) {
-    ROS_WARN_THROTTLE(
+    if (ros::isInitialized()) {
+        ROS_WARN_THROTTLE(
         1.0,
         "[branch-debug] preview status=%d valid=%d feasible=%d inside=%d reason='%s'",
         static_cast<int>(preview.status), preview.valid ? 1 : 0,
         preview.feasible ? 1 : 0, preview.current_delta_inside ? 1 : 0,
         preview.reason.c_str());
+    }
     output.normal_preview = preview;
     output.allocator_value_failure = true;
     output.invalid_reason = "selected_step_unavailable";
@@ -518,11 +547,18 @@ bool PhaseOffsetMatchedAdapter::updateSectionLocked(
   allocator_input.preview = &preview;
   allocator_input.g_des = g_des;
   allocator_input.f_w0 = base.w_dot;
+  // Same tangential-speed floor the port projector applies, so the selected
+  // u_w cannot spend the tangential budget below the minimum and be rejected by
+  // the runtime audit (which would HOLD a planner-valid task).
+  allocator_input.base_tangent_speed =
+      base.v_cmd.dot(reference.tangent);
   allocator_input.previous_u = runtime_->previousFinalPort();
   allocator_input.dt = input.dt;
   allocator_input.bounds.lower_nu = config_.normal_preview_policy.lower_nu;
   allocator_input.bounds.upper_nu = config_.normal_preview_policy.upper_nu;
   allocator_input.bounds.u_w_abs_max = std::max(0.0, config_.u_w_abs_max);
+  allocator_input.bounds.tangent_speed_min =
+      std::max(0.0, config_.tangent_speed_min);
   allocator_input.bounds.upper_u_delta =
       std::max(0.0, config_.u_delta_abs_max);
   allocator_input.bounds.u_w_slew_rate = std::max(0.0, config_.u_w_rate_max);
@@ -558,6 +594,29 @@ bool PhaseOffsetMatchedAdapter::updateSectionLocked(
     return false;
   }
 
+  // Diagnostic only: records the allocator's phase-rate decision so a stalled
+  // agent can be attributed to a clipped phase window / clipped transverse
+  // interval rather than guessed at.  Logs nothing new; it only reports values
+  // the allocator already computed.
+  if (ros::isInitialized()) {
+    ROS_INFO_THROTTLE(
+      1.0,
+      "[phase_offset_alloc] f_w0=%.3f u_w_nom=%.3f u_delta_nom=%.3f "
+      "u_w=%.3f[%.3f,%.3f] u_delta=%.3f[%.3f,%.3f] "
+      "phase_rate_nom=%.3f phase_rate_sel=%.3f "
+      "phase_clipped=%d transverse_clipped=%d preview_valid=%d "
+      "preview=[%.3f,%.3f] delta=%.3f base_w_dot=%.3f",
+      allocator_input.f_w0, allocator.u_w_nom, allocator.u_delta_nom,
+      allocator.selected_u.u_w, allocator.u_w.lower, allocator.u_w.upper,
+      allocator.selected_u.u_delta, allocator.u_delta.lower,
+      allocator.u_delta.upper, allocator.phase_rate_nom,
+      allocator.phase_rate_selected, (int)allocator.phase_window_clipped,
+      (int)allocator.transverse_interval_clipped,
+      (int)allocator.preview_rate_interval.valid,
+      allocator.preview_rate_interval.lower,
+      allocator.preview_rate_interval.upper, retained_delta, base.w_dot);
+  }
+
   phase_offset_core::MatchedPortInput matched_input;
   matched_input.geometry = geometry;
   matched_input.base_v_cmd = base.v_cmd;
@@ -578,10 +637,12 @@ bool PhaseOffsetMatchedAdapter::updateSectionLocked(
   runtime_input.phase_window_saturated = allocator.phase_window_clipped;
   phase_offset_navigation::RuntimeSectionPreparedStep prepared;
   if (!runtime_->prepareSection(runtime_input, prepared) || !prepared.valid()) {
-    ROS_WARN_THROTTLE(
+    if (ros::isInitialized()) {
+        ROS_WARN_THROTTLE(
         1.0,
         "[branch-debug] prepare valid=%d reason='%s'",
         prepared.valid() ? 1 : 0, prepared.reason().c_str());
+    }
     output.normal_preview = preview;
     output.allocator = allocator;
     output.allocator_evaluated = true;

@@ -12,10 +12,13 @@ int main(int argc, char ** argv)
 
     gvf_manager manager(nh);
 
-    ros::AsyncSpinner spinner(8); //
+    int spinner_threads = 8;
+    nh.param("gvf/spinner_threads", spinner_threads, 8);
+    if (spinner_threads < 1) spinner_threads = 1;
+    ROS_INFO("[GVF] formation planner spinner_threads=%d", spinner_threads);
+    ros::AsyncSpinner spinner(spinner_threads);
     spinner.start();
     ros::waitForShutdown();
     
     return 0;
 }
-

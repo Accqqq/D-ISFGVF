@@ -35,6 +35,11 @@
     <arg name="phase_offset_manual_u_w_rate_max" default="0.60" />
     <arg name="phase_offset_manual_u_delta_rate_max" default="1.20" />
     <arg name="phase_offset_manual_phase_dot_min" default="0.02" />
+    <!-- Fallback while no certified Section exists: keep the retained offset
+         (bounded decay) and fly the coordinated reference instead of
+         HOLDing.  Default false = current behaviour bit-for-bit. -->
+    <arg name="phase_offset_recovery_from_hold_enable" default="false" />
+    <arg name="phase_offset_recovery_delta_step" default="0.05" />
     <arg name="phase_offset_manual_tangent_speed_min" default="0.02" />
     <arg name="phase_offset_manual_preflight_sample_step_w" default="0.10" />
     <!--  none/esdf/fixed -->
@@ -85,14 +90,24 @@
     <arg name="phase_offset_measurement_callback_csv_path" default="" />
     <arg name="phase_offset_measurement_tube_due_csv_path" default="" />
     <arg name="sdf_map_buffer_refresh_period" default="3.0" />
+    <!-- Static maps (e.g. the mockamap fields) have nothing stale to age out,
+         so the periodic fade refresh may be disabled: it erases the
+         occupancy around the drone and, because erased cells read as free,
+         must invalidate the known static observation, which makes the
+         Section tube unusable for the following ticks.  Default keeps the
+         existing dynamic-scene behaviour. -->
+    <arg name="sdf_map_enable_buffer_fade_refresh" default="true" />
     <!-- Planning  parameters-->
     <arg name="map_size_x_" value="20.0"/>
     <arg name="map_size_y_" value="30.0"/>
     <arg name="map_size_z_" value=" 2.5"/>
 
-    <arg name="local_update_range_x" value="4.0"/>
-    <arg name="local_update_range_y" value="4.0"/>
-    <arg name="local_update_range_z" value="2.5"/>
+    <!-- Declared as defaults, not constants: the single-UAV chain keeps 4.0,
+         while the swarm chain (phase_offset_agent.launch) overrides them so
+         local_sensing and the planner's map fuse the same half-range. -->
+    <arg name="local_update_range_x" default="4.0"/>
+    <arg name="local_update_range_y" default="4.0"/>
+    <arg name="local_update_range_z" default="2.5"/>
     
     <arg name="v_max" value="2.0"/>
     <arg name="a_max" value="2.5"/>
@@ -141,6 +156,10 @@
         <param name="phase_offset/manual/u_w_rate_max" value="$(arg phase_offset_manual_u_w_rate_max)" />
         <param name="phase_offset/manual/u_delta_rate_max" value="$(arg phase_offset_manual_u_delta_rate_max)" />
         <param name="phase_offset/manual/phase_dot_min" value="$(arg phase_offset_manual_phase_dot_min)" />
+        <param name="phase_offset/recovery_from_hold_enable"
+               value="$(arg phase_offset_recovery_from_hold_enable)" />
+        <param name="phase_offset/recovery_delta_step"
+               value="$(arg phase_offset_recovery_delta_step)" />
         <param name="phase_offset/manual/tangent_speed_min" value="$(arg phase_offset_manual_tangent_speed_min)" />
         <param name="phase_offset/manual/preflight_sample_step_w" value="$(arg phase_offset_manual_preflight_sample_step_w)" />
         <param name="phase_offset/manual/tube_source" value="$(arg phase_offset_manual_tube_source)" />
@@ -364,6 +383,8 @@
         <param name="sdf_map/frame_id"      value="world"/>
         <param name="sdf_map/buffer_refresh_period"
                value="$(arg sdf_map_buffer_refresh_period)" />
+        <param name="sdf_map/enable_buffer_fade_refresh"
+               value="$(arg sdf_map_enable_buffer_fade_refresh)" />
         <!-- geometric path searching -->
         <param name="astar/lambda_heu" value="10.0" type="double"/>
         <param name="astar/resolution_astar" value="0.1" type="double"/>

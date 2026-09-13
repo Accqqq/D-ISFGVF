@@ -1,0 +1,65 @@
+<launch>
+  <!--
+    Density-tunable 3D obstacle field for the PhaseOffsetSwarm scenarios.
+
+    Interface note: this publishes on /mock_map, the SAME topic the PCD loader
+    (map_generator/map_pub) uses, and local_sensing reads /mock_map as its
+    global map input by default.  So this file is a drop-in replacement for
+    map_generator/map_pub with a pcd argument; never run both at once.
+
+    Geometry (measured, not assumed): x/y are centred on the origin
+    (x in [-x_length/2, x_length/2]) while z runs 0 .. z_length.
+    The default swarm formation centre is (0, 20) and it flies to y = -18,
+    so y_length must stay >= 52 for the flight to remain inside the map.
+
+    Density knobs (type 1, Perlin):
+      fill        0.0 .. 0.4   higher = more obstacle voxels
+      complexity  0.0 .. 0.5   base noise frequency (larger = finer structure)
+      fractal     int          more octaves = more detail
+      attenuation 0.0 .. 0.5   octave attenuation
+    Other presets: type 2 random boxes (obstacle_number / width_min / width_max),
+    type 4 3D graph maze (numNodes / connectivity / roadRad / nodeRad).
+    Measured reference: 40x60x4 m @0.2 with fill=0.08 -> ~96k points.
+  -->
+  <arg name="seed" default="511"/>
+  <arg name="type" default="1"/>
+  <arg name="resolution" default="0.2"/>
+  <arg name="x_length" default="40"/>
+  <arg name="y_length" default="60"/>
+  <arg name="z_length" default="4"/>
+  <arg name="fill" default="0.08"/>
+  <arg name="complexity" default="0.07"/>
+  <arg name="fractal" default="1"/>
+  <arg name="attenuation" default="0.1"/>
+  <arg name="update_freq" default="1.0"/>
+  <arg name="enable_rviz" default="false"/>
+
+  <node pkg="mockamap" type="mockamap_node" name="mockamap_node" output="screen">
+    <param name="seed" type="int" value="$(arg seed)"/>
+    <param name="update_freq" type="double" value="$(arg update_freq)"/>
+    <param name="resolution" type="double" value="$(arg resolution)"/>
+    <param name="x_length" type="int" value="$(arg x_length)"/>
+    <param name="y_length" type="int" value="$(arg y_length)"/>
+    <param name="z_length" type="int" value="$(arg z_length)"/>
+    <param name="type" type="int" value="$(arg type)"/>
+    <param name="complexity" type="double" value="$(arg complexity)"/>
+    <param name="fill" type="double" value="$(arg fill)"/>
+    <param name="fractal" type="int" value="$(arg fractal)"/>
+    <param name="attenuation" type="double" value="$(arg attenuation)"/>
+    <!-- type 2 / type 3 / type 4 knobs, unused by type 1 -->
+    <param name="width_min" type="double" value="0.6"/>
+    <param name="width_max" type="double" value="1.5"/>
+    <param name="obstacle_number" type="int" value="40"/>
+    <param name="road_width" type="double" value="0.5"/>
+    <param name="add_wall_x" type="int" value="0"/>
+    <param name="add_wall_y" type="int" value="1"/>
+    <param name="maze_type" type="int" value="1"/>
+    <param name="numNodes" type="int" value="40"/>
+    <param name="connectivity" type="double" value="0.8"/>
+    <param name="nodeRad" type="int" value="1"/>
+    <param name="roadRad" type="int" value="10"/>
+  </node>
+
+  <node if="$(arg enable_rviz)" name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find mockamap)/config/rviz.rviz"/>
+</launch>

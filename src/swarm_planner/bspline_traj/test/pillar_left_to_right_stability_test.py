@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -45,25 +46,46 @@ COLLISION_MARGIN = 0.45   # horizontal distance to pillar surface
 ARRIVE_SEC = 45.0
 
 
+_owned_processes = []
+
+
 class Proc:
     def __init__(self, argv, logname):
         os.makedirs(LOG_DIR, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.log_path = os.path.join(LOG_DIR, logname + "_" + stamp + ".log")
         self.log = open(self.log_path, "a")
-        self.proc = subprocess.Popen(
-            argv, env=dict(os.environ), stdout=self.log,
-            stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            self.proc = subprocess.Popen(
+                argv, env=dict(os.environ), stdout=self.log,
+                stderr=subprocess.STDOUT, start_new_session=True)
+        except BaseException:
+            self.log.close()
+            raise
+        _owned_processes.append(self)
 
     def stop(self):
-        if self.proc.poll() is None:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-            try:
-                self.proc.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                self.proc.wait(timeout=5)
-        self.log.close()
+        # Popen created a new session: its PID is the owned process-group ID.
+        # Do not discover arbitrary groups by name or by the owner of a port.
+        try:
+            if self.proc.poll() is None:
+                try:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    self.proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    if self.proc.poll() is None:
+                        try:
+                            os.killpg(self.proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    self.proc.wait(timeout=5)
+        finally:
+            self.log.close()
+            if self.proc.poll() is not None and self in _owned_processes:
+                _owned_processes.remove(self)
 
 
 def port_open():
@@ -77,37 +99,17 @@ def port_open():
         return False
 
 
-def port_owner_pid():
-    try:
-        out = subprocess.check_output(["ss", "-tlnp"], text=True,
-                                      stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            if ":11311" in line:
-                m = re.search(r"pid=(\d+)", line)
-                if m:
-                    return int(m.group(1))
-    except Exception:
-        pass
-    return None
-
-
-def kill_leftover_ros():
-    pats = ["rosmaster -core", "roslaunch ", "formation_planning",
-            "multi_quadrotor_simulator_so3", "quadrotor_simulator_so3",
-            "map_pub ", "phase_offset_swarm_visualizer",
-            "swarm_scenario_publisher", "phase_offset_swarm.rviz",
-            "rosbag record"]
-    for pat in pats:
+def stop_owned_processes():
+    """Stop this invocation's recorded children only, newest first."""
+    for child in list(reversed(_owned_processes)):
         try:
-            out = subprocess.check_output(["pgrep", "-f", pat], text=True,
-                                          stderr=subprocess.DEVNULL)
-            for pid in out.strip().splitlines():
-                try:
-                    os.kill(int(pid), signal.SIGKILL)
-                except (OSError, ValueError):
-                    pass
-        except subprocess.CalledProcessError:
-            pass
+            child.stop()
+        except Exception as error:
+            print("Could not stop owned child %d: %s" %
+                  (child.proc.pid, error), file=sys.stderr)
+
+
+atexit.register(stop_owned_processes)
 
 
 def wait_master(timeout=25.0):
@@ -180,7 +182,7 @@ def min_obstacle_distances(xy):
 
 
 def run_once(stage, run_idx, tag):
-    kill_leftover_ros()
+    stop_owned_processes()
     if port_open():
         return {"ok": False, "error": "master busy"}
     roscore = Proc(["roscore"], tag + "_roscore")
@@ -482,16 +484,7 @@ def run_once(stage, run_idx, tag):
     finally:
         launch.stop()
         roscore.stop()
-        t_end = time.time() + 8.0
-        while time.time() < t_end and port_open():
-            pid = port_owner_pid()
-            if pid is not None:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-            time.sleep(0.2)
-        kill_leftover_ros()
+        stop_owned_processes()
 
 
 def main():

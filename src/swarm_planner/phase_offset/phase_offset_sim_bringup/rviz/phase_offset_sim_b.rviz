@@ -4,7 +4,7 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
-        - /UAV0 ESDF occupancy inflated1
+        - /Common open map1
       Splitter Ratio: 0.5
     Tree Height: 445
   - Class: rviz/Views
@@ -50,7 +50,7 @@ Visualization Manager:
       Axis: Z
       Channel Name: intensity
       Class: rviz/PointCloud2
-      Color: 136; 138; 133
+      Color: 114; 159; 207
       Color Transformer: FlatColor
       Decay Time: 0
       Enabled: true
@@ -62,7 +62,7 @@ Visualization Manager:
       Queue Size: 10
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.029999999329447746
+      Size (m): 0.05999999865889549
       Style: Flat Squares
       Topic: /mock_map
       Unreliable: false
@@ -74,36 +74,7 @@ Visualization Manager:
       Marker Topic: /phase_offset_swarm/vis/uavs
       Name: UAV bodies and labels
       Namespaces:
-        uav_0/body: false
-        uav_0/id: true
-        uav_1/body: false
-        uav_1/id: true
-        uav_10/body: false
-        uav_10/id: true
-        uav_11/body: false
-        uav_11/id: true
-        uav_12/body: false
-        uav_12/id: true
-        uav_13/body: false
-        uav_13/id: true
-        uav_14/body: false
-        uav_14/id: true
-        uav_2/body: false
-        uav_2/id: true
-        uav_3/body: false
-        uav_3/id: true
-        uav_4/body: false
-        uav_4/id: true
-        uav_5/body: false
-        uav_5/id: true
-        uav_6/body: false
-        uav_6/id: true
-        uav_7/body: false
-        uav_7/id: true
-        uav_8/body: false
-        uav_8/id: true
-        uav_9/body: false
-        uav_9/id: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -111,21 +82,7 @@ Visualization Manager:
       Marker Topic: /phase_offset_swarm/vis/trajectories
       Name: UAV trajectories
       Namespaces:
-        uav_0/trajectory: true
-        uav_1/trajectory: true
-        uav_10/trajectory: true
-        uav_11/trajectory: true
-        uav_12/trajectory: true
-        uav_13/trajectory: true
-        uav_14/trajectory: true
-        uav_2/trajectory: true
-        uav_3/trajectory: true
-        uav_4/trajectory: true
-        uav_5/trajectory: true
-        uav_6/trajectory: true
-        uav_7/trajectory: true
-        uav_8/trajectory: true
-        uav_9/trajectory: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -149,7 +106,7 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_0/particle0sdf_map/occupancy_inflate
       Unreliable: false
@@ -365,7 +322,7 @@ Visualization Manager:
       Marker Topic: /uav_0/goal_vis
       Name: UAV0 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -373,7 +330,7 @@ Visualization Manager:
       Marker Topic: /uav_0/particle0/gvf/traj_vis
       Name: UAV0 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -389,9 +346,7 @@ Visualization Manager:
       Marker Topic: /uav_0/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -399,7 +354,7 @@ Visualization Manager:
       Marker Topic: /uav_0/phase_offset_adjusted_path
       Name: UAV0 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -423,13 +378,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_1/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -519,7 +474,7 @@ Visualization Manager:
       Marker Topic: /uav_1/goal_vis
       Name: UAV1 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -527,7 +482,7 @@ Visualization Manager:
       Marker Topic: /uav_1/particle0/gvf/traj_vis
       Name: UAV1 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -543,9 +498,7 @@ Visualization Manager:
       Marker Topic: /uav_1/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -553,7 +506,7 @@ Visualization Manager:
       Marker Topic: /uav_1/phase_offset_adjusted_path
       Name: UAV1 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -577,13 +530,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_2/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -673,7 +626,7 @@ Visualization Manager:
       Marker Topic: /uav_2/goal_vis
       Name: UAV2 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -681,7 +634,7 @@ Visualization Manager:
       Marker Topic: /uav_2/particle0/gvf/traj_vis
       Name: UAV2 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -697,9 +650,7 @@ Visualization Manager:
       Marker Topic: /uav_2/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -707,7 +658,7 @@ Visualization Manager:
       Marker Topic: /uav_2/phase_offset_adjusted_path
       Name: UAV2 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -740,13 +691,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_3/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -836,7 +787,7 @@ Visualization Manager:
       Marker Topic: /uav_3/goal_vis
       Name: UAV3 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -844,7 +795,7 @@ Visualization Manager:
       Marker Topic: /uav_3/particle0/gvf/traj_vis
       Name: UAV3 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -860,9 +811,7 @@ Visualization Manager:
       Marker Topic: /uav_3/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -870,7 +819,7 @@ Visualization Manager:
       Marker Topic: /uav_3/phase_offset_adjusted_path
       Name: UAV3 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -894,13 +843,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_4/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -990,7 +939,7 @@ Visualization Manager:
       Marker Topic: /uav_4/goal_vis
       Name: UAV4 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -998,7 +947,7 @@ Visualization Manager:
       Marker Topic: /uav_4/particle0/gvf/traj_vis
       Name: UAV4 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1014,9 +963,7 @@ Visualization Manager:
       Marker Topic: /uav_4/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1024,7 +971,7 @@ Visualization Manager:
       Marker Topic: /uav_4/phase_offset_adjusted_path
       Name: UAV4 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1048,13 +995,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_5/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -1144,7 +1091,7 @@ Visualization Manager:
       Marker Topic: /uav_5/goal_vis
       Name: UAV5 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1152,7 +1099,7 @@ Visualization Manager:
       Marker Topic: /uav_5/particle0/gvf/traj_vis
       Name: UAV5 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1168,9 +1115,7 @@ Visualization Manager:
       Marker Topic: /uav_5/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1178,7 +1123,7 @@ Visualization Manager:
       Marker Topic: /uav_5/phase_offset_adjusted_path
       Name: UAV5 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1202,13 +1147,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_6/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -1298,7 +1243,7 @@ Visualization Manager:
       Marker Topic: /uav_6/goal_vis
       Name: UAV6 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1306,7 +1251,7 @@ Visualization Manager:
       Marker Topic: /uav_6/particle0/gvf/traj_vis
       Name: UAV6 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1322,9 +1267,7 @@ Visualization Manager:
       Marker Topic: /uav_6/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1332,7 +1275,7 @@ Visualization Manager:
       Marker Topic: /uav_6/phase_offset_adjusted_path
       Name: UAV6 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1356,13 +1299,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_7/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -1452,7 +1395,7 @@ Visualization Manager:
       Marker Topic: /uav_7/goal_vis
       Name: UAV7 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1460,7 +1403,7 @@ Visualization Manager:
       Marker Topic: /uav_7/particle0/gvf/traj_vis
       Name: UAV7 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1476,9 +1419,7 @@ Visualization Manager:
       Marker Topic: /uav_7/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1486,7 +1427,7 @@ Visualization Manager:
       Marker Topic: /uav_7/phase_offset_adjusted_path
       Name: UAV7 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1510,13 +1451,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_8/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -1606,7 +1547,7 @@ Visualization Manager:
       Marker Topic: /uav_8/goal_vis
       Name: UAV8 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1614,7 +1555,7 @@ Visualization Manager:
       Marker Topic: /uav_8/particle0/gvf/traj_vis
       Name: UAV8 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1630,9 +1571,7 @@ Visualization Manager:
       Marker Topic: /uav_8/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1640,7 +1579,7 @@ Visualization Manager:
       Marker Topic: /uav_8/phase_offset_adjusted_path
       Name: UAV8 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1664,13 +1603,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_9/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -1760,7 +1699,7 @@ Visualization Manager:
       Marker Topic: /uav_9/goal_vis
       Name: UAV9 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1768,7 +1707,7 @@ Visualization Manager:
       Marker Topic: /uav_9/particle0/gvf/traj_vis
       Name: UAV9 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1784,9 +1723,7 @@ Visualization Manager:
       Marker Topic: /uav_9/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1794,7 +1731,7 @@ Visualization Manager:
       Marker Topic: /uav_9/phase_offset_adjusted_path
       Name: UAV9 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1818,13 +1755,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_10/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -1914,7 +1851,7 @@ Visualization Manager:
       Marker Topic: /uav_10/goal_vis
       Name: UAV10 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1922,7 +1859,7 @@ Visualization Manager:
       Marker Topic: /uav_10/particle0/gvf/traj_vis
       Name: UAV10 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -1938,9 +1875,7 @@ Visualization Manager:
       Marker Topic: /uav_10/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -1948,7 +1883,7 @@ Visualization Manager:
       Marker Topic: /uav_10/phase_offset_adjusted_path
       Name: UAV10 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -1972,13 +1907,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_11/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -2068,7 +2003,7 @@ Visualization Manager:
       Marker Topic: /uav_11/goal_vis
       Name: UAV11 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2076,7 +2011,7 @@ Visualization Manager:
       Marker Topic: /uav_11/particle0/gvf/traj_vis
       Name: UAV11 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2092,9 +2027,7 @@ Visualization Manager:
       Marker Topic: /uav_11/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -2102,7 +2035,7 @@ Visualization Manager:
       Marker Topic: /uav_11/phase_offset_adjusted_path
       Name: UAV11 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -2126,13 +2059,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_12/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -2222,7 +2155,7 @@ Visualization Manager:
       Marker Topic: /uav_12/goal_vis
       Name: UAV12 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2230,7 +2163,7 @@ Visualization Manager:
       Marker Topic: /uav_12/particle0/gvf/traj_vis
       Name: UAV12 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2246,9 +2179,7 @@ Visualization Manager:
       Marker Topic: /uav_12/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -2256,7 +2187,7 @@ Visualization Manager:
       Marker Topic: /uav_12/phase_offset_adjusted_path
       Name: UAV12 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -2280,13 +2211,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_13/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -2376,7 +2307,7 @@ Visualization Manager:
       Marker Topic: /uav_13/goal_vis
       Name: UAV13 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2384,7 +2315,7 @@ Visualization Manager:
       Marker Topic: /uav_13/particle0/gvf/traj_vis
       Name: UAV13 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2400,9 +2331,7 @@ Visualization Manager:
       Marker Topic: /uav_13/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -2410,7 +2339,7 @@ Visualization Manager:
       Marker Topic: /uav_13/phase_offset_adjusted_path
       Name: UAV13 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -2434,13 +2363,13 @@ Visualization Manager:
       Queue Size: 300
       Selectable: true
       Size (Pixels): 2
-      Size (m): 0.1
+      Size (m): 0.10000000149011612
       Style: Points
       Topic: /uav_14/particle0sdf_map/occupancy_inflate
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: false
-      Value: true
+      Value: false
     - Alpha: 1
       Autocompute Intensity Bounds: true
       Autocompute Value Bounds:
@@ -2530,7 +2459,7 @@ Visualization Manager:
       Marker Topic: /uav_14/goal_vis
       Name: UAV14 goal
       Namespaces:
-        goal_visualization: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2538,7 +2467,7 @@ Visualization Manager:
       Marker Topic: /uav_14/particle0/gvf/traj_vis
       Name: UAV14 GVF frontend
       Namespaces:
-        path_cylinders: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -2554,9 +2483,7 @@ Visualization Manager:
       Marker Topic: /uav_14/phase_offset_section_tube
       Name: PhaseOffset Section Tube (left/right)
       Namespaces:
-        phase_offset_section_tube_fill: true
-        phase_offset_section_tube_left: true
-        phase_offset_section_tube_right: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
@@ -2564,7 +2491,7 @@ Visualization Manager:
       Marker Topic: /uav_14/phase_offset_adjusted_path
       Name: UAV14 intent-adjusted reference
       Namespaces:
-        phase_offset_adjusted_path: true
+        {}
       Queue Size: 100
       Value: true
   Enabled: true
@@ -2585,7 +2512,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 32.08279800415039
+      Distance: 50.482906341552734
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -2593,17 +2520,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -0.2048882246017456
-        Y: 0.9498913288116455
-        Z: 0.9998031258583069
+        X: -1.6081219911575317
+        Y: 2.442427158355713
+        Z: 0.46394169330596924
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
+      Pitch: 1.2047966718673706
       Target Frame: <Fixed Frame>
-      Yaw: 3.1500020027160645
+      Yaw: 3.1450018882751465
     Saved: ~
 Window Geometry:
   Displays:
