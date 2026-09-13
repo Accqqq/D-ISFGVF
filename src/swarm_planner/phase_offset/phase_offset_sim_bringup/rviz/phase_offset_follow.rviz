@@ -71,7 +71,7 @@ Visualization Manager:
     - Class: rviz/MarkerArray
       Enabled: true
       Marker Topic: /phase_offset_swarm/vis/uavs
-      Name: UAV bodies and labels
+      Name: UAV labels
       Namespaces:
         uav_0/body: false
         uav_0/id: true

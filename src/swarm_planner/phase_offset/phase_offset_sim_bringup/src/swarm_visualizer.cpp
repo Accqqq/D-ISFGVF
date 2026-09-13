@@ -6,6 +6,13 @@
 //
 // The trajectory marker is the FLOWN path, not a fading tail: it accumulates
 // the whole run so a finished flight stays on screen in RViz.
+//
+// This node publishes per-UAV labels and the flown-path trail only.  The
+// quadrotor body itself is the SAME marker the single-UAV chain shows: every
+// agent runs odom_visualization, which publishes the hummingbird mesh on
+// /uav_i/odom_visualization/robot (ns "mesh").  A coloured sphere used to be
+// drawn here as well; it enclosed that 0.4 m mesh, so the swarm looked like
+// balls instead of quadrotors.
 
 #include <algorithm>
 #include <array>
@@ -290,35 +297,16 @@ private:
       const int robot_id = robot_ids_[index];
       const double* color = kColors[static_cast<std::size_t>(robot_id) % 7];
 
-      visualization_msgs::Marker body;
-      body.header.frame_id = frame_id_;
-      body.header.stamp = now;
-      body.ns = "uav_" + std::to_string(robot_id) + "/body";
-      body.id = robot_id * 1000 + 1;
-      body.type = visualization_msgs::Marker::SPHERE;
-      body.action = visualization_msgs::Marker::ADD;
-      body.pose.position.x = last_positions_[index][0];
-      body.pose.position.y = last_positions_[index][1];
-      body.pose.position.z = last_positions_[index][2];
-      body.pose.orientation.w = 1.0;
-      body.scale.x = 0.55;
-      body.scale.y = 0.55;
-      body.scale.z = 0.35;
-      body.color.r = color[0];
-      body.color.g = color[1];
-      body.color.b = color[2];
-      body.color.a = 0.9;
-      uavs.markers.push_back(body);
-
       visualization_msgs::Marker label;
-      label.header = body.header;
+      label.header.frame_id = frame_id_;
+      label.header.stamp = now;
       label.ns = "uav_" + std::to_string(robot_id) + "/id";
       label.id = robot_id * 1000 + 2;
       label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
       label.action = visualization_msgs::Marker::ADD;
-      label.pose.position.x = body.pose.position.x;
-      label.pose.position.y = body.pose.position.y;
-      label.pose.position.z = body.pose.position.z + 0.5;
+      label.pose.position.x = last_positions_[index][0];
+      label.pose.position.y = last_positions_[index][1];
+      label.pose.position.z = last_positions_[index][2] + 0.5;
       label.pose.orientation.w = 1.0;
       label.scale.z = 0.5;
       label.color.r = 1.0;
@@ -329,7 +317,7 @@ private:
       uavs.markers.push_back(label);
 
       visualization_msgs::Marker path;
-      path.header = body.header;
+      path.header = label.header;
       path.ns = "uav_" + std::to_string(robot_id) + "/trajectory";
       path.id = robot_id * 1000 + 3;
       path.type = visualization_msgs::Marker::LINE_STRIP;
