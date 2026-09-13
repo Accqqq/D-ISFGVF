@@ -26,6 +26,10 @@
   <arg name="enable_follow_rviz" default="true"/>
   <arg name="follow_rviz_config"
        default="$(find phase_offset_sim_bringup)/rviz/phase_offset_follow.rviz"/>
+  <!-- Persistent flown-path trail; see phase_offset_world.launch. -->
+  <arg name="trajectory_buffer" default="20000"/>
+  <arg name="trajectory_min_step" default="0.05"/>
+  <arg name="trajectory_reset_step" default="5.0"/>
 
   <!-- mockamap 3D field parameters (density = fill).
 
@@ -77,6 +81,9 @@
         name="phase_offset_swarm_visualizer" output="screen">
     <param name="scenario_param" value="/sim_b_world/scenario/agents"/>
     <param name="frame_id" value="$(arg frame_id)"/>
+    <param name="trajectory_buffer" value="$(arg trajectory_buffer)"/>
+    <param name="trajectory_min_step" value="$(arg trajectory_min_step)"/>
+    <param name="trajectory_reset_step" value="$(arg trajectory_reset_step)"/>
   </node>
 
   <node if="$(arg enable_rviz)" pkg="rviz" type="rviz" name="rviz"

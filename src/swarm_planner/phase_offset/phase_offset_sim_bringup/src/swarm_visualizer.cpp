@@ -3,6 +3,9 @@
 // The node observes only each scenario-selected /uav_i/sim/odom stream and
 // publishes package-owned MarkerArrays.  It has no goal, planner, command,
 // or control feedback interfaces.
+//
+// The trajectory marker is the FLOWN path, not a fading tail: it accumulates
+// the whole run so a finished flight stays on screen in RViz.
 
 #include <algorithm>
 #include <array>
@@ -47,8 +50,19 @@ public:
     // the wait entirely.
     nh.param("scenario_wait_timeout", scenario_wait_timeout_s_, 0.0);
     nh.param("frame_id", frame_id_, std::string("world"));
-    nh.param("trajectory_buffer", trajectory_buffer_, 600);
+    // Persistent flown-path trail.  Points are decimated to one per
+    // trajectory_min_step so a full run costs a few hundred points per UAV
+    // instead of one per odometry tick; trajectory_buffer stays as a hard cap
+    // (20000 x 0.05 m = 1 km of flight).
+    nh.param("trajectory_buffer", trajectory_buffer_, 20000);
     trajectory_buffer_ = std::max(10, trajectory_buffer_);
+    nh.param("trajectory_min_step", trajectory_min_step_, 0.05);
+    trajectory_min_step_ = std::max(1e-3, trajectory_min_step_);
+    // An odometry jump larger than this is a new run or a teleport, not a
+    // flight; restarting the trail there keeps a line from being drawn across
+    // the map between two runs.
+    nh.param("trajectory_reset_step", trajectory_reset_step_, 5.0);
+    trajectory_reset_step_ = std::max(1.0, trajectory_reset_step_);
 
     if (frame_id_ != "world")
     {
@@ -188,9 +202,33 @@ private:
     if (!std::isfinite(position[0]) || !std::isfinite(position[1]) ||
         !std::isfinite(position[2]))
       return;
-    trajectories_[index].push_back(position);
-    while (static_cast<int>(trajectories_[index].size()) > trajectory_buffer_)
-      trajectories_[index].pop_front();
+    std::deque<std::array<double, 3>>& trail = trajectories_[index];
+    if (trail.empty())
+    {
+      trail.push_back(position);
+    }
+    else
+    {
+      const std::array<double, 3>& tip = trail.back();
+      const double dx = position[0] - tip[0];
+      const double dy = position[1] - tip[1];
+      const double dz = position[2] - tip[2];
+      const double step = std::sqrt(dx * dx + dy * dy + dz * dz);
+      if (step > trajectory_reset_step_)
+      {
+        trail.clear();
+        trail.push_back(position);
+      }
+      else if (step >= trajectory_min_step_)
+      {
+        trail.push_back(position);
+      }
+      // Anything closer than trajectory_min_step_ is not stored: the live pose
+      // is appended to the drawn strip instead (see publishMarkers), so the
+      // line always reaches the UAV without the trail gaining a point per tick.
+    }
+    while (static_cast<int>(trail.size()) > trajectory_buffer_)
+      trail.pop_front();
     last_positions_[index] = position;
     has_odom_[index] = true;
   }
@@ -310,6 +348,15 @@ private:
         marker_point.z = point[2];
         path.points.push_back(marker_point);
       }
+      // Close the drawn strip on the live pose (not stored, so it costs no
+      // memory and does not defeat the distance decimation above).
+      {
+        geometry_msgs::Point live_point;
+        live_point.x = last_positions_[index][0];
+        live_point.y = last_positions_[index][1];
+        live_point.z = last_positions_[index][2];
+        path.points.push_back(live_point);
+      }
       paths.markers.push_back(path);
     }
     uav_pub_.publish(uavs);
@@ -319,7 +366,9 @@ private:
   bool valid_ = true;
   std::string scenario_param_ = "/sim_b_world/scenario/agents";
   std::string frame_id_ = "world";
-  int trajectory_buffer_ = 600;
+  int trajectory_buffer_ = 20000;
+  double trajectory_min_step_ = 0.05;
+  double trajectory_reset_step_ = 5.0;
   double scenario_wait_timeout_s_ = 0.0;
   ros::NodeHandle nh_;
   std::vector<int> robot_ids_;
