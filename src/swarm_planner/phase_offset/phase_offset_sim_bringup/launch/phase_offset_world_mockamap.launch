@@ -51,7 +51,10 @@
   <arg name="map_seed" default="511"/>
   <arg name="map_type" default="1"/>
   <arg name="map_resolution" default="0.2"/>
-  <arg name="map_x_length" default="40"/>
+  <!-- Square field: x_length == y_length == 26 m (was 40 x 26, which looked
+       stretched).  The mission is unchanged: start disk y[14.5, 23.5] sits
+       north of the field, goal disk y[-11.5, -2.5] inside it. -->
+  <arg name="map_x_length" default="26"/>
   <arg name="map_y_length" default="26"/>
   <arg name="map_z_length" default="4"/>
   <!-- Measured flight-band occupancy on this 40 x 26 m field:
