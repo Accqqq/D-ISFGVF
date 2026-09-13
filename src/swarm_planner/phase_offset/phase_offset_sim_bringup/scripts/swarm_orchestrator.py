@@ -32,6 +32,11 @@ WORLD_FRAME = "world"
 MANAGER_NAME = "/so3_nodelet_manager"
 GOAL_TOPIC_TEMPLATE = "/uav_{robot_id}/goal"
 SPH_BETA_TOPIC_PATTERN = "/uav_{robot_id}/phase_offset/sph_beta"
+# The paper orders the SPH distances 0 < d_rep < d_star (= the formation
+# spacing).  The validated pair for a 1.5 m formation is d_rep = 1.4 m, so the
+# same ratio scales d_rep down with a tighter formation instead of letting the
+# ordering break and abort the neighbour runtime.
+SPH_REPULSION_RATIO = 1.4 / 1.5
 SPH_G_COORD_TOPIC_PATTERN = "/uav_{robot_id}/phase_offset/g_coord"
 # Keep the publisher fan-out bounded so a large batch does not overwhelm the
 # ROS master with simultaneous publisherUpdate callbacks.  The shared
@@ -469,6 +474,7 @@ def build_child_launch(scenario, initial_state_file, frame_id=WORLD_FRAME,
                        phase_offset_g_coord_fresh_timeout=0.10,
                        phase_offset_future_timestamp_tolerance=0.02,
                        sph_reference_spacing=1.5,
+                       sph_d_rep=1.4,
                        rviz_follow_agent=0,
                        sph_h=2.0,
                        local_update_range_x=4.0,
@@ -620,6 +626,8 @@ def build_child_launch(scenario, initial_state_file, frame_id=WORLD_FRAME,
             reference_densities[index],
             "    <arg name=\"sph_reference_spacing\" value=\"%.3f\"/>" %
             float(sph_reference_spacing),
+            "    <arg name=\"sph_d_rep\" value=\"%.3f\"/>" %
+            float(sph_d_rep),
             "    <arg name=\"rviz_follow_agent\" value=\"%d\"/>" %
             int(rviz_follow_agent),
             "    <arg name=\"sph_beta_topic\" value=\"%s\"/>" %
@@ -947,6 +955,7 @@ class SwarmSupervisor(object):
             all_visible_neighbors=self.options["all_visible_neighbors"],
             enable_sph_provider=self.options["enable_sph_provider"],
             sph_reference_spacing=self.options["sph_reference_spacing"],
+            sph_d_rep=self.options["sph_d_rep"],
             rviz_follow_agent=self.options["rviz_follow_agent"],
             sph_h=self.options["sph_h"],
             sph_beta_topic_pattern=self.options["sph_beta_topic_pattern"],
@@ -1141,6 +1150,9 @@ def _ros_options():
         # matches the formation the operator actually spawned.
         "sph_reference_spacing": float(
             rospy.get_param("~sph_reference_spacing", 0.0)),
+        # d_rep: activation distance of the bounded short-range repulsion [m].
+        # Zero (the launch default) means "scale with the formation spacing".
+        "sph_d_rep": float(rospy.get_param("~sph_d_rep", 0.0)),
         # Which agent the follow-camera RViz window centres on (that agent
         # broadcasts world->base).
         "rviz_follow_agent": _as_int(
@@ -1322,6 +1334,16 @@ def main(argv=None):
             options["sph_reference_spacing"] = (
                 options["formation_spacing"]
                 if options["agent_count"] > 0 else 1.5)
+        if options["sph_d_rep"] <= 0.0:
+            # Follow the formation spacing the operator actually spawned, so
+            # the paper ordering 0 < d_rep < d_star always holds.  The ratio
+            # reproduces the validated 1.5 m pair (d_rep = 1.4 m).
+            options["sph_d_rep"] = (
+                SPH_REPULSION_RATIO * options["sph_reference_spacing"])
+        if not 0.0 < options["sph_d_rep"] < options["sph_reference_spacing"]:
+            raise ValueError(
+                "sph_d_rep %.3f must satisfy 0 < sph_d_rep < sph_reference_spacing (%.3f)"
+                % (options["sph_d_rep"], options["sph_reference_spacing"]))
         scenario_path = options["scenario_file"]
         use_scenario_file = isinstance(scenario_path, str) and \
             scenario_path.strip() and \

@@ -114,6 +114,12 @@
   <!-- Kernel smoothing length.  The orchestrator uses the same value to build
        each agent's paper reference density rho_0 from the nominal formation. -->
   <arg name="sph_h" default="2.0"/>
+  <!-- d_rep: activation distance of the SPH short-range repulsion.  0 (the
+       default) derives it from the formation spacing that is actually flown,
+       preserving the paper ordering 0 < d_rep < d_star: the 1.5 m default
+       formation gives the validated d_rep = 1.4 m, and a tighter disk scales
+       it down with it. -->
+  <arg name="sph_d_rep" default="0.0"/>
   <arg name="sph_beta_topic_pattern" default="/uav_{robot_id}/phase_offset/sph_beta"/>
   <arg name="sph_g_coord_topic_pattern" default="/uav_{robot_id}/phase_offset/g_coord"/>
   <arg name="beta_fresh_timeout" default="0.10"/>
@@ -183,6 +189,7 @@
     <param name="enable_sph_provider" value="$(arg enable_sph_provider)"/>
     <param name="rviz_follow_agent" value="$(arg rviz_follow_agent)"/>
     <param name="sph_reference_spacing" value="$(arg sph_reference_spacing)"/>
+    <param name="sph_d_rep" value="$(arg sph_d_rep)"/>
     <param name="sph_h" value="$(arg sph_h)"/>
     <param name="sph_beta_topic_pattern" value="$(arg sph_beta_topic_pattern)"/>
     <param name="sph_g_coord_topic_pattern" value="$(arg sph_g_coord_topic_pattern)"/>
