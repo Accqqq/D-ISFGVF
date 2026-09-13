@@ -246,16 +246,38 @@ def circular_formation_offsets(agent_count, spacing, shape="disk", axis="y"):
                                else (0.0, along))
             return offsets
         raise ValueError("shape must be 'disk', 'ring' or 'line'")
-    offsets = [(0.0, 0.0)]
+    rings = []          # (ring index, capacity, count)
+    remaining = agent_count - 1
     ring = 1
-    while len(offsets) < agent_count:
+    while remaining > 0:
         radius = ring * spacing
         capacity = max(1, int(2.0 * math.pi * radius / spacing))
-        count = min(capacity, agent_count - len(offsets))
+        count = min(capacity, remaining)
+        rings.append((ring, capacity, count))
+        remaining -= count
+        ring += 1
+    # A disk whose outermost ring holds only a vehicle or two looks like a
+    # circle with a stray outlier (N=20 used to give 0 / 1.2 / 2.4 / 3.6 m with
+    # a single UAV on the 3.6 m ring).  Fold such a thin ring into the one
+    # below it and widen that ring so the neighbour spacing is preserved.
+    if len(rings) >= 2:
+        _, last_capacity, last_count = rings[-1]
+        if last_count < max(2, int(0.4 * last_capacity)):
+            rings.pop()
+            prev_ring, prev_capacity, prev_count = rings.pop()
+            rings.append((prev_ring, prev_capacity, prev_count + last_count))
+    offsets = [(0.0, 0.0)]
+    for ring, capacity, count in rings:
+        if count <= 0:
+            continue
+        radius = ring * spacing
+        if count > capacity:
+            # Merged ring: widen it just enough to keep `spacing` between
+            # neighbours along the circle.
+            radius = max(radius, count * spacing / (2.0 * math.pi))
         for index in range(count):
             angle = 2.0 * math.pi * index / float(count)
             offsets.append((radius * math.cos(angle), radius * math.sin(angle)))
-        ring += 1
     return offsets[:agent_count]
 
 
