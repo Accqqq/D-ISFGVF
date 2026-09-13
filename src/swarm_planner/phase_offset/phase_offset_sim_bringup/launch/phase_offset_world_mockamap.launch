@@ -51,12 +51,11 @@
   <arg name="map_seed" default="511"/>
   <arg name="map_type" default="1"/>
   <arg name="map_resolution" default="0.2"/>
-  <!-- Square field: x_length == y_length == 40 m (the old field was 40 x 26,
-       which looked stretched).  NOTE: with y_length 40 the field spans
-       y[-20, 20], so it covers the default start centre y = 20; flying this
-       variant needs the start moved north, e.g. init_y:=27 map_size_y:=70. -->
+  <!-- Field size kept as it was: 40 m in x, 26 m in y (world y[-13, 13]).
+       Map this window so the start disk y[14.5, 23.5] stays north of the
+       field and the goal disk y[-11.5, -2.5] stays inside it. -->
   <arg name="map_x_length" default="40"/>
-  <arg name="map_y_length" default="40"/>
+  <arg name="map_y_length" default="26"/>
   <arg name="map_z_length" default="4"/>
   <!-- Measured flight-band occupancy on this 40 x 26 m field:
        fill 0.08 -> 16.6% (42k points, the previous default),
