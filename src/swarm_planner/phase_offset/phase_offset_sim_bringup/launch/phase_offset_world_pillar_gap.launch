@@ -7,12 +7,12 @@
     Layout along the southbound flight axis (start at the north end):
       y [ 14.0, -0.6]  pillar field   (authentic crop of pillar.pcd)
       y [ -0.6, -5.6]  reformation gap (5.4 m of free space)
-      y [ -5.6,-10.6]  entrance funnel (free half-width 6.0 m -> 1.5 m)
-      y [-10.6,-19.6]  narrow corridor (3.0 m clear opening, 9 m long)
+      y [ -5.6,-10.6]  entrance funnel (free half-width 6.0 m -> 1.2 m)
+      y [-10.6,-19.6]  narrow corridor (2.4 m clear opening, 9 m long)
       y [-19.6,-30.0]  exit bay        (goal disk lands here)
 
     Funnel and corridor walls run out to the map window edge (|x| = 10 m), so
-    the 3 m opening is the only passage and the cluster is forced through it;
+    the 2.4 m opening is the only passage and the cluster is forced through it;
     keep map_size_x at its 20 m default.
 
     The swarm itself stays phase_offset_swarm.launch; the scenario needs its

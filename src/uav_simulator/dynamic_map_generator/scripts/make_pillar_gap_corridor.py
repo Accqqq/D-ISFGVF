@@ -5,8 +5,8 @@ Scenario (flight is southbound, i.e. along -y, start at the north end):
 
     y in [ 14.0, -0.6]   pillar field      authentic crop of pillar.pcd
     y in [ -0.6, -5.6]   reformation gap   5.4 m free, the cluster reforms
-    y in [ -5.6,-10.6]   entrance funnel   free half-width 6.0 m -> 1.5 m
-    y in [-10.6,-19.6]   narrow corridor   inner half-width 1.5 m, 9 m long
+    y in [ -5.6,-10.6]   entrance funnel   free half-width 6.0 m -> 1.2 m
+    y in [-10.6,-19.6]   narrow corridor   inner half-width 1.2 m, 9 m long
     y in [-19.6,-30.0]   exit bay          goal disk lands here
 
 The funnel and corridor walls reach the map window edge (|x| = 10 m), so the
@@ -42,7 +42,7 @@ PILLAR_FIELD_SOUTH_Y = 0.0      # keep pillars whose footprint centre is north o
 GAP_SOUTH_Y = -5.6              # free reformation gap
 FUNNEL_SOUTH_Y = -10.6          # funnel: half-width 6.0 -> 1.5 m
 CORRIDOR_SOUTH_Y = -19.6        # narrow corridor end (9 m long)
-CORRIDOR_HALF_WIDTH = 1.5       # inner half-width -> 3.0 m clear opening
+CORRIDOR_HALF_WIDTH = 1.2       # inner half-width -> 2.4 m clear opening
 FUNNEL_ENTRY_HALF_WIDTH = 6.0
 # Both walls run out to the map window edge, so the opening is the only way
 # through.  map_size_x must stay at its 20 m default for this to hold.
