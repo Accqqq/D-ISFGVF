@@ -4349,7 +4349,9 @@ bool gvf_manager::installPlannerOnlyFrontend(
     const std::shared_ptr<const ContinuousPhasePath>& copied_prefix_source,
     const double copied_prefix_end_w,
     const std::uint64_t expected_execution_generation,
-    nav_msgs::Path& path_msg)
+    nav_msgs::Path& path_msg,
+    const bool allow_retained_delta,
+    const SectionPathBundlePtr& section_bundle_to_commit)
 {
     path_msg = nav_msgs::Path();
     if (!pm.gvf_ || !path_owner || path_owner->empty() ||
@@ -4394,8 +4396,14 @@ bool gvf_manager::installPlannerOnlyFrontend(
     }
 
     std::shared_ptr<const ContinuousPhasePath> identified_path;
-    if (!assignPathIdentity(path_owner, identified_path) ||
-        !identified_path || identified_path->empty()) {
+    if (section_bundle_to_commit) {
+        if (!section_bundle_to_commit->path ||
+            section_bundle_to_commit->path->empty()) {
+            return false;
+        }
+        identified_path = section_bundle_to_commit->path;
+    } else if (!assignPathIdentity(path_owner, identified_path) ||
+               !identified_path || identified_path->empty()) {
         return false;
     }
     // Keep retired Section values alive until after all publication locks are
@@ -4426,7 +4434,8 @@ bool gvf_manager::installPlannerOnlyFrontend(
         runtime_lock = std::unique_lock<std::mutex>(
             phase_offset_matched_adapter_->runtime_command_mutex_);
         if (!phase_offset_matched_adapter_->runtime_ ||
-            phase_offset_matched_adapter_->runtime_->retainedDelta() != 0.0) {
+            (!allow_retained_delta &&
+             phase_offset_matched_adapter_->runtime_->retainedDelta() != 0.0)) {
             return false;
         }
     }
@@ -4486,8 +4495,15 @@ bool gvf_manager::installPlannerOnlyFrontend(
         // A successful zero-offset neutral replacement supersedes every old
         // Section candidate and manager handoff.  The Runtime itself remains
         // at delta==0; only the immutable bundle owners are retired here.
-        retired_current_bundle.swap(
-            phase_offset_matched_adapter_->section_bundle_);
+        if (section_bundle_to_commit) {
+            retired_current_bundle.swap(
+                phase_offset_matched_adapter_->section_bundle_);
+            phase_offset_matched_adapter_->section_bundle_ =
+                section_bundle_to_commit;
+        } else {
+            retired_current_bundle.swap(
+                phase_offset_matched_adapter_->section_bundle_);
+        }
         retired_staged_bundle.swap(
             phase_offset_matched_adapter_->staged_section_bundle_);
         retired_staged_source_path.swap(
@@ -8687,7 +8703,16 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                         old_path, phase_at_switch,
                                         matched_config_.tube.min_certified_forward_w,
                                         future_seam_w);
+                                const bool frontend_exhausted_w =
+                                    !future_seam_available ||
+                                    (old_path && !old_path->empty() &&
+                                     old_path->endW() - phase_at_switch <=
+                                         cmd_governor_l_max_ +
+                                             std::max(
+                                                 0.0,
+                                                 switch_governor_path_margin_w_));
                                 bool frontend_ready = false;
+                                bool used_mapped_fallback = false;
                                 std::shared_ptr<const ContinuousPhasePath>
                                     planner_only_prefix_source;
                                 double planner_only_prefix_end_w = phase_at_switch;
@@ -8705,7 +8730,8 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                         phase_at_switch >=
                                             old_path->startW() - 1e-9 &&
                                         phase_at_switch <=
-                                            old_path->endW() + 1e-9) {
+                                            old_path->endW() +
+                                                kExhaustedFrontendSeamSlackW) {
                                         // Exhausted frontend: use a backdated
                                         // C2 seam and the full source tail as
                                         // the copied-prefix window while
@@ -8738,14 +8764,75 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                                 install_w,
                                                 install_continuous_path);
                                     }
+                                    if (!frontend_ready &&
+                                        frontend_exhausted_w &&
+                                        old_path && !old_path->empty()) {
+                                        frontend_ready =
+                                            buildMappedPhaseFrontend(
+                                                phase_at_switch, path_end_w,
+                                                false, new_i0, cand_spline,
+                                                cand_traj, cand_time,
+                                                install_traj, install_vel,
+                                                install_time, install_w,
+                                                install_continuous_path);
+                                        used_mapped_fallback = frontend_ready;
+                                    }
                                     if (frontend_ready) {
-                                        frontend_ready = stageSectionPathHandoff(
-                                            fsm_phase, pm,
-                                            install_continuous_path,
-                                            install_traj, install_vel,
-                                            install_time, install_w, old_path,
-                                            copied_prefix_start_w,
-                                            copied_prefix_end_w);
+                                        if (used_mapped_fallback) {
+                                            const bool bundle_built =
+                                                buildAndStageSectionBundle(
+                                                    pm, fsm_phase,
+                                                    install_continuous_path,
+                                                    old_path,
+                                                    copied_prefix_start_w,
+                                                    copied_prefix_end_w);
+                                            SectionPathBundlePtr bundle;
+                                            if (bundle_built) {
+                                                bundle = phase_offset_matched_adapter_
+                                                             ->capturePendingSectionCandidate()
+                                                             .bundle;
+                                            }
+                                            if (bundle && bundle->path) {
+                                                nav_msgs::Path fallback_msg;
+                                                if (installPlannerOnlyFrontend(
+                                                        pm, install_traj,
+                                                        install_vel,
+                                                        install_time,
+                                                        install_w,
+                                                        bundle->path,
+                                                        current_time,
+                                                        fsm_phase, old_path,
+                                                        old_path->endW(),
+                                                        captured_execution_generation,
+                                                        fallback_msg, true,
+                                                        bundle)) {
+                                                    path_pub.publish(
+                                                        fallback_msg);
+                                                    installed = true;
+                                                    ROS_WARN(
+                                                        "[GVF][POINT_PHASE_V2][MAPPED_SECTION_FALLBACK] "
+                                                        "installed mapped path+bundle "
+                                                        "phase=%.3f path=[%.3f,%.3f]",
+                                                        fsm_phase.w,
+                                                        install_w.front(),
+                                                        install_w.back());
+                                                } else {
+                                                    frontend_ready = false;
+                                                }
+                                            } else {
+                                                frontend_ready = false;
+                                            }
+                                        } else {
+                                            frontend_ready =
+                                                stageSectionPathHandoff(
+                                                    fsm_phase, pm,
+                                                    install_continuous_path,
+                                                    install_traj, install_vel,
+                                                    install_time, install_w,
+                                                    old_path,
+                                                    copied_prefix_start_w,
+                                                    copied_prefix_end_w);
+                                        }
                                     }
                                     if (!frontend_ready &&
                                         phase_offset_matched_adapter_) {

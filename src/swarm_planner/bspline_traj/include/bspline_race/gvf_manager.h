@@ -672,7 +672,10 @@ class gvf_manager
                 copied_prefix_source,
             double copied_prefix_end_w,
             std::uint64_t expected_execution_generation,
-            nav_msgs::Path& path_msg);
+            nav_msgs::Path& path_msg,
+            bool allow_retained_delta = false,
+            const SectionPathBundlePtr& section_bundle_to_commit =
+                SectionPathBundlePtr());
         bool consumeCommittedSectionPathHandoff(
             gvfManager& pm, const ros::Time& now);
         // Finalize a point-goal terminal only after the caller's task witness
