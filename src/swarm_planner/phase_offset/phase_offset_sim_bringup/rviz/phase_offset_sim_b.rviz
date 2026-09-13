@@ -311,6 +311,46 @@ Visualization Manager:
       Value: true
     - Class: rviz/Marker
       Enabled: true
+      Marker Topic: /uav_15/odom_visualization/robot
+      Name: UAV15 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_16/odom_visualization/robot
+      Name: UAV16 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_17/odom_visualization/robot
+      Name: UAV17 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_18/odom_visualization/robot
+      Name: UAV18 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_19/odom_visualization/robot
+      Name: UAV19 quadrotor model
+      Namespaces:
+        {}
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
       Marker Topic: /uav_0/path_vis
       Name: UAV0 path visualization
       Namespaces:

@@ -73,36 +73,7 @@ Visualization Manager:
       Marker Topic: /phase_offset_swarm/vis/uavs
       Name: UAV labels
       Namespaces:
-        uav_0/body: false
-        uav_0/id: true
-        uav_1/body: false
-        uav_1/id: true
-        uav_10/body: false
-        uav_10/id: true
-        uav_11/body: false
-        uav_11/id: true
-        uav_12/body: false
-        uav_12/id: true
-        uav_13/body: false
-        uav_13/id: true
-        uav_14/body: false
-        uav_14/id: true
-        uav_2/body: false
-        uav_2/id: true
-        uav_3/body: false
-        uav_3/id: true
-        uav_4/body: false
-        uav_4/id: true
-        uav_5/body: false
-        uav_5/id: true
-        uav_6/body: false
-        uav_6/id: true
-        uav_7/body: false
-        uav_7/id: true
-        uav_8/body: false
-        uav_8/id: true
-        uav_9/body: false
-        uav_9/id: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -110,21 +81,7 @@ Visualization Manager:
       Marker Topic: /phase_offset_swarm/vis/trajectories
       Name: UAV trajectories
       Namespaces:
-        uav_0/trajectory: true
-        uav_1/trajectory: true
-        uav_10/trajectory: true
-        uav_11/trajectory: true
-        uav_12/trajectory: true
-        uav_13/trajectory: true
-        uav_14/trajectory: true
-        uav_2/trajectory: true
-        uav_3/trajectory: true
-        uav_4/trajectory: true
-        uav_5/trajectory: true
-        uav_6/trajectory: true
-        uav_7/trajectory: true
-        uav_8/trajectory: true
-        uav_9/trajectory: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -347,6 +304,46 @@ Visualization Manager:
       Enabled: true
       Marker Topic: /uav_14/odom_visualization/robot
       Name: UAV14 quadrotor model
+      Namespaces:
+        mesh: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_15/odom_visualization/robot
+      Name: UAV15 quadrotor model
+      Namespaces:
+        mesh: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_16/odom_visualization/robot
+      Name: UAV16 quadrotor model
+      Namespaces:
+        mesh: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_17/odom_visualization/robot
+      Name: UAV17 quadrotor model
+      Namespaces:
+        mesh: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_18/odom_visualization/robot
+      Name: UAV18 quadrotor model
+      Namespaces:
+        mesh: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /uav_19/odom_visualization/robot
+      Name: UAV19 quadrotor model
       Namespaces:
         mesh: true
       Queue Size: 100
