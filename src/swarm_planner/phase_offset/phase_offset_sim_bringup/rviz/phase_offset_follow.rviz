@@ -69,12 +69,12 @@ Visualization Manager:
     Use rainbow: true
     Value: true
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /phase_offset_swarm/vis/uavs
     Name: UAV labels
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: true
     Marker Topic: /phase_offset_swarm/vis/trajectories
@@ -194,138 +194,138 @@ Visualization Manager:
     Queue Size: 100
     Value: true
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_1/odom_visualization/robot
     Name: UAV1 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_2/odom_visualization/robot
     Name: UAV2 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_3/odom_visualization/robot
     Name: UAV3 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_4/odom_visualization/robot
     Name: UAV4 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_5/odom_visualization/robot
     Name: UAV5 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_6/odom_visualization/robot
     Name: UAV6 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_7/odom_visualization/robot
     Name: UAV7 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_8/odom_visualization/robot
     Name: UAV8 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_9/odom_visualization/robot
     Name: UAV9 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_10/odom_visualization/robot
     Name: UAV10 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_11/odom_visualization/robot
     Name: UAV11 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_12/odom_visualization/robot
     Name: UAV12 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_13/odom_visualization/robot
     Name: UAV13 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_14/odom_visualization/robot
     Name: UAV14 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_15/odom_visualization/robot
     Name: UAV15 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_16/odom_visualization/robot
     Name: UAV16 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_17/odom_visualization/robot
     Name: UAV17 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_18/odom_visualization/robot
     Name: UAV18 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_19/odom_visualization/robot
     Name: UAV19 quadrotor model
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: true
     Marker Topic: /uav_0/path_vis
@@ -348,12 +348,12 @@ Visualization Manager:
     Queue Size: 100
     Value: true
   - Class: rviz/MarkerArray
-    Enabled: false
+    Enabled: true
     Marker Topic: /uav_0/particle0/gvf/vector_field
     Name: UAV0 GVF vector field
     Namespaces: {}
     Queue Size: 100
-    Value: false
+    Value: true
   - Class: rviz/MarkerArray
     Enabled: true
     Marker Topic: /uav_0/phase_offset_section_tube
@@ -428,7 +428,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -447,12 +447,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_1/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -471,14 +471,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_1/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_1/path_vis
     Name: UAV1 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_1/goal_vis
@@ -487,12 +487,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_1/particle0/gvf/traj_vis
     Name: UAV1 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_1/particle0/gvf/vector_field
@@ -501,19 +501,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_1/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_1/phase_offset_adjusted_path
     Name: UAV1 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -574,7 +574,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -593,12 +593,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_2/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -617,14 +617,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_2/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_2/path_vis
     Name: UAV2 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_2/goal_vis
@@ -633,12 +633,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_2/particle0/gvf/traj_vis
     Name: UAV2 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_2/particle0/gvf/vector_field
@@ -647,19 +647,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_2/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_2/phase_offset_adjusted_path
     Name: UAV2 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Class: rviz/Axes
     Enabled: true
@@ -729,7 +729,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -748,12 +748,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_3/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -772,14 +772,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_3/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_3/path_vis
     Name: UAV3 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_3/goal_vis
@@ -788,12 +788,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_3/particle0/gvf/traj_vis
     Name: UAV3 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_3/particle0/gvf/vector_field
@@ -802,19 +802,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_3/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_3/phase_offset_adjusted_path
     Name: UAV3 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -875,7 +875,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -894,12 +894,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_4/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -918,14 +918,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_4/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_4/path_vis
     Name: UAV4 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_4/goal_vis
@@ -934,12 +934,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_4/particle0/gvf/traj_vis
     Name: UAV4 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_4/particle0/gvf/vector_field
@@ -948,19 +948,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_4/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_4/phase_offset_adjusted_path
     Name: UAV4 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1021,7 +1021,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1040,12 +1040,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_5/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1064,14 +1064,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_5/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_5/path_vis
     Name: UAV5 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_5/goal_vis
@@ -1080,12 +1080,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_5/particle0/gvf/traj_vis
     Name: UAV5 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_5/particle0/gvf/vector_field
@@ -1094,19 +1094,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_5/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_5/phase_offset_adjusted_path
     Name: UAV5 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1167,7 +1167,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1186,12 +1186,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_6/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1210,14 +1210,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_6/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_6/path_vis
     Name: UAV6 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_6/goal_vis
@@ -1226,12 +1226,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_6/particle0/gvf/traj_vis
     Name: UAV6 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_6/particle0/gvf/vector_field
@@ -1240,19 +1240,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_6/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_6/phase_offset_adjusted_path
     Name: UAV6 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1313,7 +1313,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1332,12 +1332,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_7/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1356,14 +1356,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_7/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_7/path_vis
     Name: UAV7 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_7/goal_vis
@@ -1372,12 +1372,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_7/particle0/gvf/traj_vis
     Name: UAV7 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_7/particle0/gvf/vector_field
@@ -1386,19 +1386,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_7/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_7/phase_offset_adjusted_path
     Name: UAV7 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1459,7 +1459,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1478,12 +1478,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_8/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1502,14 +1502,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_8/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_8/path_vis
     Name: UAV8 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_8/goal_vis
@@ -1518,12 +1518,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_8/particle0/gvf/traj_vis
     Name: UAV8 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_8/particle0/gvf/vector_field
@@ -1532,19 +1532,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_8/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_8/phase_offset_adjusted_path
     Name: UAV8 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1605,7 +1605,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1624,12 +1624,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_9/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1648,14 +1648,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_9/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_9/path_vis
     Name: UAV9 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_9/goal_vis
@@ -1664,12 +1664,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_9/particle0/gvf/traj_vis
     Name: UAV9 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_9/particle0/gvf/vector_field
@@ -1678,19 +1678,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_9/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_9/phase_offset_adjusted_path
     Name: UAV9 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1751,7 +1751,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1770,12 +1770,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_10/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1794,14 +1794,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_10/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_10/path_vis
     Name: UAV10 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_10/goal_vis
@@ -1810,12 +1810,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_10/particle0/gvf/traj_vis
     Name: UAV10 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_10/particle0/gvf/vector_field
@@ -1824,19 +1824,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_10/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_10/phase_offset_adjusted_path
     Name: UAV10 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -1897,7 +1897,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1916,12 +1916,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_11/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -1940,14 +1940,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_11/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_11/path_vis
     Name: UAV11 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_11/goal_vis
@@ -1956,12 +1956,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_11/particle0/gvf/traj_vis
     Name: UAV11 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_11/particle0/gvf/vector_field
@@ -1970,19 +1970,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_11/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_11/phase_offset_adjusted_path
     Name: UAV11 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -2043,7 +2043,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -2062,12 +2062,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_12/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -2086,14 +2086,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_12/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_12/path_vis
     Name: UAV12 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_12/goal_vis
@@ -2102,12 +2102,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_12/particle0/gvf/traj_vis
     Name: UAV12 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_12/particle0/gvf/vector_field
@@ -2116,19 +2116,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_12/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_12/phase_offset_adjusted_path
     Name: UAV12 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -2189,7 +2189,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -2208,12 +2208,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_13/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -2232,14 +2232,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_13/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_13/path_vis
     Name: UAV13 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_13/goal_vis
@@ -2248,12 +2248,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_13/particle0/gvf/traj_vis
     Name: UAV13 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_13/particle0/gvf/vector_field
@@ -2262,19 +2262,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_13/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_13/phase_offset_adjusted_path
     Name: UAV13 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Alpha: 1
     Autocompute Intensity Bounds: true
     Autocompute Value Bounds:
@@ -2335,7 +2335,7 @@ Visualization Manager:
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -2354,12 +2354,12 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_14/particle0/path
     Unreliable: false
-    Value: true
+    Value: false
   - Alpha: 1
     Buffer Length: 1
     Class: rviz/Path
     Color: 25; 255; 0
-    Enabled: true
+    Enabled: false
     Head Diameter: 0.30000001192092896
     Head Length: 0.20000000298023224
     Length: 0.30000001192092896
@@ -2378,14 +2378,14 @@ Visualization Manager:
     Shaft Length: 0.10000000149011612
     Topic: /uav_14/particle0/kinopath
     Unreliable: false
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_14/path_vis
     Name: UAV14 path visualization
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
     Enabled: false
     Marker Topic: /uav_14/goal_vis
@@ -2394,12 +2394,12 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_14/particle0/gvf/traj_vis
     Name: UAV14 GVF frontend
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/MarkerArray
     Enabled: false
     Marker Topic: /uav_14/particle0/gvf/vector_field
@@ -2408,19 +2408,19 @@ Visualization Manager:
     Queue Size: 100
     Value: false
   - Class: rviz/MarkerArray
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_14/phase_offset_section_tube
     Name: PhaseOffset Section Tube (left/right)
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   - Class: rviz/Marker
-    Enabled: true
+    Enabled: false
     Marker Topic: /uav_14/phase_offset_adjusted_path
     Name: UAV14 intent-adjusted reference
     Namespaces: {}
     Queue Size: 100
-    Value: true
+    Value: false
   Enabled: true
   Global Options:
     Background Color: 255; 255; 255
