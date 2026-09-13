@@ -705,7 +705,7 @@ class gvf_manager
             Eigen::MatrixXd& mapped_vel,
             Eigen::VectorXd& mapped_time,
             std::vector<double>& mapped_w,
-            std::shared_ptr<const ContinuousPhasePath>& continuous_path) const;
+            std::shared_ptr<const ContinuousPhasePath>& continuous_path);
         bool buildNominalContinuousPhasePath(
             double start_w,
             double end_w,

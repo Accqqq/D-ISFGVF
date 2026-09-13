@@ -3551,7 +3551,7 @@ bool gvf_manager::buildMappedPhaseFrontend(
     Eigen::MatrixXd& mapped_vel,
     Eigen::VectorXd& mapped_time,
     std::vector<double>& mapped_w,
-    std::shared_ptr<const ContinuousPhasePath>& continuous_path) const
+    std::shared_ptr<const ContinuousPhasePath>& continuous_path)
 {
     continuous_path.reset();
     const int rows = static_cast<int>(candidate_traj.rows());
@@ -3602,7 +3602,14 @@ bool gvf_manager::buildMappedPhaseFrontend(
             immutable_path, mapped_traj, mapped_vel, mapped_time, mapped_w)) {
         return false;
     }
-    continuous_path = immutable_path;
+    // Stamp the path identity exactly like every other constructed frontend
+    // does.  Without it pathRevision() stays 0 and the Section bundle builder
+    // rejects the path ("build guard rejected ... rev=0"), which deadlocked
+    // the switch: the tube could not be rebuilt and navigation stayed on the
+    // exhausted frontend forever.
+    if (!assignPathIdentity(immutable_path, continuous_path)) {
+        return false;
+    }
     return true;
 }
 
@@ -8776,6 +8783,12 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                                 install_time, install_w,
                                                 install_continuous_path);
                                         used_mapped_fallback = frontend_ready;
+                                        if (!frontend_ready) {
+                                            ROS_WARN_THROTTLE(
+                                                1.0,
+                                                "[GVF][POINT_PHASE_V2] mapped fallback frontend unavailable phase=%.3f; keeping current frontend",
+                                                phase_at_switch);
+                                        }
                                     }
                                     if (frontend_ready) {
                                         if (used_mapped_fallback) {
@@ -8818,9 +8831,32 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                                         install_w.back());
                                                 } else {
                                                     frontend_ready = false;
+                                                    if (phase_offset_matched_adapter_) {
+                                                        // A tube that cannot be
+                                                        // rebuilt must release its
+                                                        // authority, not freeze
+                                                        // navigation: the next
+                                                        // cycle then lands on the
+                                                        // neutral mapped frontend.
+                                                        phase_offset_matched_adapter_
+                                                            ->requestRecenter();
+                                                    }
+                                                    ROS_WARN_THROTTLE(
+                                                        1.0,
+                                                        "[GVF][POINT_PHASE_V2] mapped fallback install rejected phase=%.3f; tube authority released",
+                                                        fsm_phase.w);
                                                 }
                                             } else {
                                                 frontend_ready = false;
+                                                if (phase_offset_matched_adapter_) {
+                                                    phase_offset_matched_adapter_
+                                                        ->requestRecenter();
+                                                }
+                                                ROS_WARN_THROTTLE(
+                                                    1.0,
+                                                    "[GVF][POINT_PHASE_V2] section bundle unavailable phase=%.3f bundle_built=%d; tube authority released",
+                                                    fsm_phase.w,
+                                                    (int)bundle_built);
                                             }
                                         } else {
                                             frontend_ready =
@@ -8867,6 +8903,30 @@ void gvf_manager::FSMCallback(const ros::TimerEvent& event)
                                             install_continuous_path);
                                         planner_only_execution_generation =
                                             captured_execution_generation;
+                                        if (!frontend_ready &&
+                                            frontend_exhausted_w) {
+                                            // No future seam and no C2 connector:
+                                            // the frontend is exhausted, and this
+                                            // switch carries no lateral tube
+                                            // authority (retained delta is zero),
+                                            // so the mapped frontend is the safe
+                                            // landing.  Install it rather than
+                                            // holding on an exhausted frontend.
+                                            frontend_ready =
+                                                buildMappedPhaseFrontend(
+                                                    phase_at_switch, path_end_w,
+                                                    false, new_i0, cand_spline,
+                                                    cand_traj, cand_time,
+                                                    install_traj, install_vel,
+                                                    install_time, install_w,
+                                                    install_continuous_path);
+                                            if (frontend_ready) {
+                                                planner_only_prefix_source =
+                                                    old_path;
+                                                planner_only_prefix_end_w =
+                                                    path_end_w;
+                                            }
+                                        }
                                     }
                                 } else {
                                     frontend_ready = buildMappedPhaseFrontend(
